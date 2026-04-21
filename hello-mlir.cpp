@@ -9,21 +9,6 @@
 #include "mlir/Pass/PassManager.h"
 #include "llvm/Support/raw_ostream.h"
 
-#define GET_DIALECT_DEFS
-#include "HTileOpsDialect.cpp.inc"
-
-namespace htile {
-void HTileDialect::initialize() {
-  addOperations<
-#define GET_OP_LIST
-#include "HTileOps.cpp.inc"
-      >();
-}
-} // namespace htile
-
-#define GET_OP_CLASSES
-#include "HTileOps.cpp.inc"
-
 namespace {
 
 struct HelloWorldPass
@@ -33,7 +18,7 @@ struct HelloWorldPass
 
   llvm::StringRef getArgument() const final { return "hello-world"; }
   llvm::StringRef getDescription() const final {
-    return "Print hello world for each toy.hello operation.";
+    return "Print hello world for each htile.hello operation.";
   }
 
   void runOnOperation() final {
