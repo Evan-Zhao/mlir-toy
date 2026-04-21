@@ -31,8 +31,15 @@ mlir_tablegen(HTileOpsDialect.h.inc -gen-dialect-decls -dialect=htile)
 mlir_tablegen(HTileOpsDialect.cpp.inc -gen-dialect-defs -dialect=htile)
 add_public_tablegen_target(HTileOpsIncGen)
 
+set(LLVM_TARGET_DEFINITIONS include/HTile/HTileAttrs.td)
+mlir_tablegen(HTileAttrs.h.inc -gen-attrdef-decls -attrdefs-dialect=htile)
+mlir_tablegen(HTileAttrs.cpp.inc -gen-attrdef-defs -attrdefs-dialect=htile)
+mlir_tablegen(HTileEnums.h.inc -gen-enum-decls)
+mlir_tablegen(HTileEnums.cpp.inc -gen-enum-defs)
+add_public_tablegen_target(HTileAttrsIncGen)
+
 add_library(HTileDialect STATIC lib/HTile/HTileDialect.cpp)
-add_dependencies(HTileDialect HTileOpsIncGen)
+add_dependencies(HTileDialect HTileOpsIncGen HTileAttrsIncGen)
 llvm_update_compile_flags(HTileDialect)
 
 target_include_directories(HTileDialect

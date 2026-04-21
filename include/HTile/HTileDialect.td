@@ -7,4 +7,6 @@ def HTile_Dialect : Dialect {
   let description = [{
     Neptune's tile dialect.
   }];
+
+  let useDefaultAttributePrinterParser = 1;
 }
