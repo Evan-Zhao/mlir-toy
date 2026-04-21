@@ -157,6 +157,24 @@ def HTile_LoadOp : Op<HTile_Dialect, "load"> {
     "$source `[` $offsets `]` attr-dict `:` type($source) `->` type($result)";
 }
 
+def HTile_CopyOp : Op<HTile_Dialect, "copy"> {
+  let summary = "copy a tile value to a different tile placement";
+  let description = [{
+    Materializes a tile value as another tile value, usually with a different
+    HTile tensor encoding. This models synchronous movement between tile
+    placements such as shared memory and local/register fragments.
+
+    This op is not a global memory access. Use `htile.load` and `htile.store`
+    for memory-like sources and destinations.
+  }];
+
+  let arguments = (ins AnyRankedTensor:$input);
+  let results = (outs AnyRankedTensor:$result);
+
+  let assemblyFormat =
+    "$input attr-dict `:` type($input) `->` type($result)";
+}
+
 def HTile_StoreOp : Op<HTile_Dialect, "store"> {
   let summary = "store a tile to memory";
   let description = [{
