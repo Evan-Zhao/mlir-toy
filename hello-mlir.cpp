@@ -1,5 +1,5 @@
-#include "Toy/ToyDialect.h"
-#include "Toy/ToyOps.h"
+#include "HTile/HTileDialect.h"
+#include "HTile/HTileOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -10,19 +10,19 @@
 #include "llvm/Support/raw_ostream.h"
 
 #define GET_DIALECT_DEFS
-#include "ToyOpsDialect.cpp.inc"
+#include "HTileOpsDialect.cpp.inc"
 
-namespace toy {
-void ToyDialect::initialize() {
+namespace htile {
+void HTileDialect::initialize() {
   addOperations<
 #define GET_OP_LIST
-#include "ToyOps.cpp.inc"
+#include "HTileOps.cpp.inc"
       >();
 }
-} // namespace toy
+} // namespace htile
 
 #define GET_OP_CLASSES
-#include "ToyOps.cpp.inc"
+#include "HTileOps.cpp.inc"
 
 namespace {
 
@@ -39,7 +39,7 @@ struct HelloWorldPass
   void runOnOperation() final {
     mlir::ModuleOp module = getOperation();
 
-    module.walk([](toy::HelloOp op) {
+    module.walk([](htile::HelloOp op) {
       llvm::outs() << "Hello from HelloWorldPass visiting "
                    << op->getName().getStringRef() << "\n";
     });
@@ -50,14 +50,14 @@ struct HelloWorldPass
 
 int main() {
   mlir::MLIRContext context;
-  context.getOrLoadDialect<toy::ToyDialect>();
+  context.getOrLoadDialect<htile::HTileDialect>();
 
   mlir::OpBuilder builder(&context);
 
   auto module = mlir::ModuleOp::create(builder.getUnknownLoc());
   module->setAttr("hello.message", builder.getStringAttr("Hello from MLIR 20"));
   builder.setInsertionPointToStart(module.getBody());
-  builder.create<toy::HelloOp>(builder.getUnknownLoc());
+  builder.create<htile::HelloOp>(builder.getUnknownLoc());
 
   if (failed(mlir::verify(module))) {
     llvm::errs() << "Generated module failed verification\n";

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(NeptuneMLIRHello LANGUAGES CXX)
+project(NeptuneMLIR LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
@@ -24,15 +24,15 @@ include_directories(${CMAKE_CURRENT_BINARY_DIR})
 include_directories(${LLVM_INCLUDE_DIRS})
 include_directories(${MLIR_INCLUDE_DIRS})
 
-set(LLVM_TARGET_DEFINITIONS include/Toy/ToyOps.td)
-mlir_tablegen(ToyOps.h.inc -gen-op-decls)
-mlir_tablegen(ToyOps.cpp.inc -gen-op-defs)
-mlir_tablegen(ToyOpsDialect.h.inc -gen-dialect-decls -dialect=toy)
-mlir_tablegen(ToyOpsDialect.cpp.inc -gen-dialect-defs -dialect=toy)
-add_public_tablegen_target(ToyOpsIncGen)
+set(LLVM_TARGET_DEFINITIONS include/HTile/HTileOps.td)
+mlir_tablegen(HTileOps.h.inc -gen-op-decls)
+mlir_tablegen(HTileOps.cpp.inc -gen-op-defs)
+mlir_tablegen(HTileOpsDialect.h.inc -gen-dialect-decls -dialect=htile)
+mlir_tablegen(HTileOpsDialect.cpp.inc -gen-dialect-defs -dialect=htile)
+add_public_tablegen_target(HTileOpsIncGen)
 
 add_executable(hello-mlir hello-mlir.cpp)
-add_dependencies(hello-mlir ToyOpsIncGen)
+add_dependencies(hello-mlir HTileOpsIncGen)
 llvm_update_compile_flags(hello-mlir)
 
 target_include_directories(hello-mlir
