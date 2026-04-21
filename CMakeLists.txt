@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(NeptuneMLIR LANGUAGES CXX)
+project(NeptuneMLIR LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
@@ -38,23 +38,32 @@ mlir_tablegen(HTileEnums.h.inc -gen-enum-decls)
 mlir_tablegen(HTileEnums.cpp.inc -gen-enum-defs)
 add_public_tablegen_target(HTileAttrsIncGen)
 
-
-# Create a static library and a shared library for the HTile dialect.
-# The shared library is used in `mlir-opt`, e.g.,
-# `mlir-opt --load-dialect-plugin=<path>/libHTilePlugin.so ...`
 set(HTILE_DIALECT_SOURCES lib/HTile/HTileDialect.cpp)
-add_library(HTileDialect STATIC SHARED ${HTILE_DIALECT_SOURCES})
-add_dependencies(HTileDialect HTileOpsIncGen HTileAttrsIncGen)
-llvm_update_compile_flags(HTileDialect)
-target_include_directories(HTileDialect
-  PUBLIC
+
+# Static lib for linking into executables (e.g. hello-mlir).
+add_library(HTileDialect STATIC ${HTILE_DIALECT_SOURCES})
+mlir_target_link_libraries(HTileDialect PUBLIC MLIRIR MLIRSupport)
+
+# Shared plugin for `mlir-opt --load-dialect-plugin=<path>/libHTileDialect.dylib`.
+# Must NOT statically embed MLIR libs — mlir-opt already provides them via
+# libMLIR.dylib, and duplicate TypeID registries cause a segfault on load.
+add_library(HTileDialectPlugin SHARED ${HTILE_DIALECT_SOURCES})
+# Resolve MLIR/LLVM symbols from the host process at runtime.
+if(APPLE)
+  target_link_options(HTileDialectPlugin PRIVATE -undefined dynamic_lookup)
+endif()
+
+foreach(target HTileDialect HTileDialectPlugin)
+  add_dependencies(${target} HTileOpsIncGen HTileAttrsIncGen)
+  llvm_update_compile_flags(${target})
+  target_include_directories(${target} PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_BINARY_DIR}
     ${LLVM_INCLUDE_DIRS}
     ${MLIR_INCLUDE_DIRS}
-)
-target_compile_definitions(HTileDialect PRIVATE ${LLVM_DEFINITIONS})
-mlir_target_link_libraries(HTileDialect PUBLIC MLIRIR MLIRSupport)
+  )
+  target_compile_definitions(${target} PRIVATE ${LLVM_DEFINITIONS})
+endforeach()
 
 add_executable(hello-mlir hello-mlir.cpp)
 llvm_update_compile_flags(hello-mlir)
