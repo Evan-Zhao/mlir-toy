@@ -1,0 +1,79 @@
+#include "Toy/ToyDialect.h"
+#include "Toy/ToyOps.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/Verifier.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
+#include "llvm/Support/raw_ostream.h"
+
+#define GET_DIALECT_DEFS
+#include "ToyOpsDialect.cpp.inc"
+
+namespace toy {
+void ToyDialect::initialize() {
+  addOperations<
+#define GET_OP_LIST
+#include "ToyOps.cpp.inc"
+      >();
+}
+} // namespace toy
+
+#define GET_OP_CLASSES
+#include "ToyOps.cpp.inc"
+
+namespace {
+
+struct HelloWorldPass
+    : public mlir::PassWrapper<HelloWorldPass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(HelloWorldPass)
+
+  llvm::StringRef getArgument() const final { return "hello-world"; }
+  llvm::StringRef getDescription() const final {
+    return "Print hello world for each toy.hello operation.";
+  }
+
+  void runOnOperation() final {
+    mlir::ModuleOp module = getOperation();
+
+    module.walk([](toy::HelloOp op) {
+      llvm::outs() << "Hello from HelloWorldPass visiting "
+                   << op->getName().getStringRef() << "\n";
+    });
+  }
+};
+
+} // namespace
+
+int main() {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<toy::ToyDialect>();
+
+  mlir::OpBuilder builder(&context);
+
+  auto module = mlir::ModuleOp::create(builder.getUnknownLoc());
+  module->setAttr("hello.message", builder.getStringAttr("Hello from MLIR 20"));
+  builder.setInsertionPointToStart(module.getBody());
+  builder.create<toy::HelloOp>(builder.getUnknownLoc());
+
+  if (failed(mlir::verify(module))) {
+    llvm::errs() << "Generated module failed verification\n";
+    return 1;
+  }
+
+  mlir::PassManager passManager(&context);
+  passManager.addPass(std::make_unique<HelloWorldPass>());
+  if (failed(passManager.run(module))) {
+    llvm::errs() << "Pass pipeline failed\n";
+    return 1;
+  }
+
+  llvm::outs() << "\nFinal IR:\n";
+  module.print(llvm::outs());
+  llvm::outs() << "\n";
+
+  return 0;
+}
