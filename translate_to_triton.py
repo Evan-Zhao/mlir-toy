@@ -8,117 +8,26 @@ mlir-opt is called as a subprocess to convert HTile dialect ops to generic form.
 """
 
 import ast
-import subprocess
-import sys
 
 import mlir.ir as ir
 
-DEFAULT_PLUGIN = "build/libHTileDialectPlugin.dylib"
-
-# ---------------------------------------------------------------------------
-# AST helpers
-# ---------------------------------------------------------------------------
-
-
-def _name(s: str) -> ast.Name:
-    return ast.Name(id=s, ctx=ast.Load())
-
-
-def _const(v) -> ast.Constant:
-    return ast.Constant(value=v)
-
-
-def _tl(attr: str) -> ast.Attribute:
-    return ast.Attribute(value=_name("tl"), attr=attr, ctx=ast.Load())
-
-
-def _tl_call(fn: str, *args: ast.expr, **kwargs: ast.expr) -> ast.Call:
-    return ast.Call(
-        func=_tl(fn),
-        args=list(args),
-        keywords=[ast.keyword(arg=k, value=v) for k, v in kwargs.items()],
-    )
-
-
-def _call(func: ast.expr, *args: ast.expr, **kwargs: ast.expr) -> ast.Call:
-    return ast.Call(
-        func=func,
-        args=list(args),
-        keywords=[ast.keyword(arg=k, value=v) for k, v in kwargs.items()],
-    )
-
-
-def _assign(name: str, value: ast.expr) -> ast.Assign:
-    return ast.Assign(
-        targets=[ast.Name(id=name, ctx=ast.Store())], value=value, lineno=0
-    )
-
-
-def _list(*elts: ast.expr) -> ast.List:
-    return ast.List(elts=list(elts), ctx=ast.Load())
-
-
-def _mlir_dtype_to_tl(dtype: str) -> ast.expr:
-    mapping = {
-        "f16": "float16",
-        "f32": "float32",
-        "f64": "float64",
-        "i8": "int8",
-        "i16": "int16",
-        "i32": "int32",
-        "i64": "int64",
-    }
-    return _tl(mapping.get(dtype, dtype))
-
-
-# ---------------------------------------------------------------------------
-# MLIR type helpers
-# ---------------------------------------------------------------------------
-
-
-def _tensor_shape(mlir_type) -> tuple[list[int], str]:
-    """Return (shape, element_dtype_str) from an MLIR RankedTensorType."""
-    if not isinstance(mlir_type, ir.RankedTensorType):
-        raise NotImplementedError(f"expected RankedTensorType, got {mlir_type}")
-    return list(mlir_type.shape), str(mlir_type.element_type)
-
-
-def _memref_shape(mlir_type) -> tuple[list[int], str]:
-    """Return (shape, element_dtype_str) from an MLIR MemRefType."""
-    if not isinstance(mlir_type, ir.MemRefType):
-        raise NotImplementedError(f"expected MemRefType, got {mlir_type}")
-    return list(mlir_type.shape), str(mlir_type.element_type)
-
-
-def _op_type_name(op) -> str:
-    """Return the operation type name (e.g. 'func.func').
-
-    Specialized OpView subclasses for registered dialects may override .name to
-    return a dialect-specific attribute (FuncOp.name returns sym_name, etc.).
-    The invariant op type name lives on the underlying Operation object.
-    """
-    if isinstance(op, ir.OpView):
-        return op.operation.name
-    return op.name  # op is already an ir.Operation
-
-
-# ---------------------------------------------------------------------------
-# Module helpers
-# ---------------------------------------------------------------------------
-
-
-def _module_top_ops(module: ir.Module):
-    """Yield the true top-level ops from a parsed module.
-
-    ir.Module.parse() on generic-form text (which starts with "builtin.module"(...))
-    may produce a module whose body contains a single inner builtin.module rather than
-    the real top-level ops directly.  This unwraps that extra layer when present.
-    """
-    ops = list(module.body.operations)
-    if len(ops) == 1 and _op_type_name(ops[0]) == "builtin.module":
-        yield from ops[0].regions[0].blocks[0].operations
-    else:
-        yield from ops
+from translate_common import (
+    DEFAULT_PLUGIN,
+    _assign,
+    _call,
+    _const,
+    _func_sym_name,
+    _list,
+    _memref_shape,
+    _mlir_dtype_to_tl,
+    _module_top_ops,
+    _name,
+    _op_type_name,
+    _tensor_shape,
+    _tl,
+    _tl_call,
+    translate_file_with,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -172,13 +81,7 @@ class Translator:
     def _func(self, op: ir.OpView) -> ast.FunctionDef:
         entry = op.regions[0].blocks[0]
 
-        # FuncOp.name returns the sym_name StringAttr; fall back to getting from attributes.
-        raw_name = op.name
-        if isinstance(raw_name, ir.StringAttr):
-            kernel_name = raw_name.value
-        else:
-            sym_attr = op.attributes.get("sym_name")
-            kernel_name = ir.StringAttr(sym_attr).value if sym_attr else "kernel"
+        kernel_name = _func_sym_name(op)
 
         params: list[ast.arg] = []
         for arg in entry.arguments:
@@ -567,21 +470,7 @@ class Translator:
 
 def translate_file(path: str, plugin: str | None = None) -> ast.Module:
     """Run mlir-opt on *path*, parse with mlir.ir, and return a Python ast.Module."""
-    cmd = ["mlir-opt"]
-    if plugin:
-        cmd.append(f"--load-dialect-plugin={plugin}")
-    cmd += ["--mlir-print-op-generic", "--cse", "--canonicalize", path]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(result.stderr, file=sys.stderr)
-        sys.exit(1)
-
-    ctx = ir.Context()
-    ctx.allow_unregistered_dialects = True
-    with ctx:
-        module = ir.Module.parse(result.stdout)
-        translator = Translator()
-        return translator.translate(module)
+    return translate_file_with(path, Translator, plugin)
 
 
 def main():
