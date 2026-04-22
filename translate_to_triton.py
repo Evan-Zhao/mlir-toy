@@ -570,7 +570,7 @@ def translate_file(path: str, plugin: str | None = None) -> ast.Module:
     cmd = ["mlir-opt"]
     if plugin:
         cmd.append(f"--load-dialect-plugin={plugin}")
-    cmd += ["--mlir-print-op-generic", path]
+    cmd += ["--mlir-print-op-generic", "--cse", "--canonicalize", path]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(result.stderr, file=sys.stderr)
