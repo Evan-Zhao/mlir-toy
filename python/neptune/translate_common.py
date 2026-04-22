@@ -159,12 +159,23 @@ def _parse_dense_i64_array(attr) -> list[int]:
     return list(ir.DenseI64ArrayAttr(attr))
 
 
-def parse_mlir_module(path: str, plugin: str | None = None) -> ir.Module:
+def parse_mlir_module(
+    path: str,
+    plugin: str | None = None,
+    pass_pipeline: str | None = None,
+    pass_plugin: str | None = None,
+) -> ir.Module:
     """Run mlir-opt on *path* and parse the generic-form MLIR module."""
     cmd = ["mlir-opt"]
     if plugin:
         cmd.append(f"--load-dialect-plugin={plugin}")
-    cmd += ["--mlir-print-op-generic", "--cse", "--canonicalize", path]
+    if pass_plugin:
+        cmd.append(f"--load-pass-plugin={pass_plugin}")
+    if pass_pipeline:
+        cmd.append(f"--pass-pipeline={pass_pipeline}")
+        cmd += ["--mlir-print-op-generic", path]
+    else:
+        cmd += ["--mlir-print-op-generic", "--cse", "--canonicalize", path]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(result.stderr, file=sys.stderr)
@@ -177,8 +188,12 @@ def parse_mlir_module(path: str, plugin: str | None = None) -> ir.Module:
 
 
 def translate_file_with(
-    path: str, translator_cls: Type, plugin: str | None = None
+    path: str,
+    translator_cls: Type,
+    plugin: str | None = None,
+    pass_pipeline: str | None = None,
+    pass_plugin: str | None = None,
 ) -> ast.Module:
-    module = parse_mlir_module(path, plugin)
+    module = parse_mlir_module(path, plugin, pass_pipeline, pass_plugin)
     translator = translator_cls()
     return translator.translate(module)

@@ -1,6 +1,7 @@
 #include "HTile/HTileAttrs.h"
 #include "HTile/HTileDialect.h"
 #include "HTile/HTileOps.h"
+#include "HTile/HTilePasses.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -31,6 +32,7 @@ mlirGetDialectPluginInfo() {
       LLVM_VERSION_STRING,
       [](mlir::DialectRegistry *registry) {
         registry->insert<htile::HTileDialect>();
+        htile::registerHTilePasses();
       }};
 }
 

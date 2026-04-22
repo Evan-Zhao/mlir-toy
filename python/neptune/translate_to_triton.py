@@ -10,7 +10,6 @@ mlir-opt is called as a subprocess to convert HTile dialect ops to generic form.
 import ast
 
 import mlir.ir as ir
-
 from translate_common import (
     DEFAULT_PLUGIN,
     _assign,
@@ -23,16 +22,20 @@ from translate_common import (
     _module_top_ops,
     _name,
     _op_type_name,
+    _parse_dense_i64_array,
     _tensor_shape,
     _tl,
     _tl_call,
     translate_file_with,
 )
 
-
 # ---------------------------------------------------------------------------
 # Translator
 # ---------------------------------------------------------------------------
+
+HTILE_DOT_TRANSPOSE_TO_LOAD_ORDER_PIPELINE = (
+    "builtin.module(htile-dot-transpose-to-load-order,cse,canonicalize)"
+)
 
 
 class Translator:
@@ -228,6 +231,15 @@ class Translator:
         stmts, base_ptr, tile_indices, tile_strides = self._fold_batch_dims(
             op.operands[0], indices, mem_shape, tile_shape
         )
+        dimension_order = self._dimension_order(op, len(tile_shape))
+        mem_tile_shape = mem_shape[-len(tile_shape) :]
+        logical_shape = [mem_tile_shape[i] for i in dimension_order]
+        logical_strides = [tile_strides[i] for i in dimension_order]
+        logical_offsets = [tile_indices[i] for i in dimension_order]
+        block_ptr_order = sorted(  # type: ignore
+            range(len(logical_strides)), key=logical_strides.__getitem__
+        )
+
         bp = self._fresh("bp")
         stmts.append(
             _assign(
@@ -235,13 +247,13 @@ class Translator:
                 _call(
                     _tl("make_block_ptr"),
                     base=base_ptr,
-                    shape=_list(*[_const(s) for s in mem_shape[-2:]]),
-                    strides=_list(*[_const(s) for s in tile_strides]),
+                    shape=_list(*[_const(s) for s in logical_shape]),
+                    strides=_list(*[_const(s) for s in logical_strides]),
                     offsets=_list(
-                        *[self._expr(i) for i in tile_indices[: len(tile_shape)]]
+                        *[self._expr(i) for i in logical_offsets[: len(tile_shape)]]
                     ),
                     block_shape=_list(*[_const(s) for s in tile_shape]),
-                    order=_list(*[_const(i) for i in reversed(range(len(tile_shape)))]),
+                    order=_list(*[_const(i) for i in block_ptr_order]),
                 ),
             )
         )
@@ -257,6 +269,17 @@ class Translator:
             )
         )
         return stmts
+
+    def _dimension_order(self, op: ir.OpView, rank: int) -> list[int]:
+        attr = op.attributes.get("dimension_order")
+        if attr is None:
+            return list(range(rank))
+        order = _parse_dense_i64_array(attr)
+        if len(order) != rank:
+            raise NotImplementedError(
+                f"dimension_order rank mismatch: got {order}, rank {rank}"
+            )
+        return order
 
     def _htile_store(self, op: ir.OpView) -> list[ast.stmt]:
         tile_val = op.operands[0]
@@ -344,6 +367,19 @@ class Translator:
         ]
 
     def _htile_dot(self, op: ir.OpView) -> list[ast.stmt]:
+        transpose_attrs = [
+            name
+            for name in ("transpose_a", "transpose_b")
+            if op.attributes.get(name) is not None
+        ]
+        if transpose_attrs:
+            joined = ", ".join(transpose_attrs)
+            raise NotImplementedError(
+                "Triton translation requires htile.dot transpose attributes "
+                f"to be fissioned before emission; found {joined}. "
+                "Run the htile-dot-transpose-to-load-order pass, or inspect "
+                "why that pass did not rewrite this dot."
+            )
         name = self._bind(op.results[0], "tile")
         lhs = self._expr(op.operands[0])
         rhs = self._expr(op.operands[1])
@@ -470,7 +506,13 @@ class Translator:
 
 def translate_file(path: str, plugin: str | None = None) -> ast.Module:
     """Run mlir-opt on *path*, parse with mlir.ir, and return a Python ast.Module."""
-    return translate_file_with(path, Translator, plugin)
+    return translate_file_with(
+        path,
+        Translator,
+        plugin,
+        pass_pipeline=HTILE_DOT_TRANSPOSE_TO_LOAD_ORDER_PIPELINE,
+        pass_plugin=plugin,
+    )
 
 
 def main():

@@ -38,11 +38,14 @@ mlir_tablegen(HTileEnums.h.inc -gen-enum-decls)
 mlir_tablegen(HTileEnums.cpp.inc -gen-enum-defs)
 add_public_tablegen_target(HTileAttrsIncGen)
 
-set(HTILE_DIALECT_SOURCES lib/HTile/HTileDialect.cpp)
+set(HTILE_DIALECT_SOURCES
+  lib/HTile/HTileDialect.cpp
+  lib/HTile/HTilePasses.cpp
+)
 
 # Static lib for linking into executables (e.g. hello-mlir).
 add_library(HTileDialect STATIC ${HTILE_DIALECT_SOURCES})
-mlir_target_link_libraries(HTileDialect PUBLIC MLIRIR MLIRSupport)
+mlir_target_link_libraries(HTileDialect PUBLIC MLIRIR MLIRPass MLIRSupport)
 
 # Shared plugin for `mlir-opt --load-dialect-plugin=<path>/libHTileDialect.dylib`.
 # Must NOT statically embed MLIR libs — mlir-opt already provides them via
@@ -68,4 +71,4 @@ endforeach()
 add_executable(hello-mlir hello-mlir.cpp)
 llvm_update_compile_flags(hello-mlir)
 target_compile_definitions(hello-mlir PRIVATE ${LLVM_DEFINITIONS})
-mlir_target_link_libraries(hello-mlir PRIVATE HTileDialect MLIRPass)
+mlir_target_link_libraries(hello-mlir PRIVATE HTileDialect)

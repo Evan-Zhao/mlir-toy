@@ -27,7 +27,7 @@ def flash_attention_htile(ptr_0, ptr_1, ptr_2, ptr_3):
     for j_22 in range(c_4, c_7, c_5):
         v_23 = j_22 * c_7
         ptr_24 = ptr_1 + (0 + c_4 * 16777216 + pid_h * 524288)
-        bp_25 = tl.make_block_ptr(base=ptr_24, shape=[4096, 128], strides=[128, 1], offsets=[v_23, c_4], block_shape=[64, 128], order=[1, 0])
+        bp_25 = tl.make_block_ptr(base=ptr_24, shape=[128, 4096], strides=[1, 128], offsets=[c_4, v_23], block_shape=[128, 64], order=[0, 1])
         tile_26 = tl.load(bp_25, boundary_check=[0, 1])
         tile_27 = tl.dot(tile_15, tile_26)
         tile_28 = tl.full([128, 64], c_11, tl.float32)
