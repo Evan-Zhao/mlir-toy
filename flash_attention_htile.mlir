@@ -125,7 +125,7 @@ module {
             : tensor<128xf32, #local>,
               tensor<128x128xf32, #local>,
               tensor<128xf32, #local>
-      }
+      } {htile.pipeline_stages = 2 : i32}
 
       %exp_sum_128_empty = tensor.empty()
           : tensor<128x128xf32, #local>
