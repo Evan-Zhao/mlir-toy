@@ -23,12 +23,17 @@ def HTile_DotOp : Op<HTile_Dialect, "dot"> {
     Computes a dot product / matrix multiply between two tile values,
     optionally accumulating into an existing accumulator tile.
     The result element type encodes the output dtype.
+
+    `transpose_a` and `transpose_b` logically transpose the corresponding
+    operand before the multiply, without requiring a separate `htile.permute`.
   }];
 
   let arguments = (ins
     AnyRankedTensor:$lhs,
     AnyRankedTensor:$rhs,
-    Optional<AnyRankedTensor>:$acc
+    Optional<AnyRankedTensor>:$acc,
+    UnitAttr:$transpose_a,
+    UnitAttr:$transpose_b
   );
   let results = (outs AnyRankedTensor:$result);
 

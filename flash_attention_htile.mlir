@@ -48,11 +48,9 @@ module {
 
         %k_shared = htile.load %k[%bz, %by, %j_base, %c0]
             : memref<1x32x4096x128xf16> -> tensor<64x128xf16, #shared>
-        %k_shared_t = htile.permute %k_shared permutation [1, 0]
-            : tensor<64x128xf16, #shared> -> tensor<128x64xf16, #shared>
 
-        %qk = htile.dot %q_shared, %k_shared_t
-            : tensor<128x128xf16, #shared>, tensor<128x64xf16, #shared>
+        %qk = htile.dot %q_shared, %k_shared {transpose_b}
+            : tensor<128x128xf16, #shared>, tensor<64x128xf16, #shared>
             -> tensor<128x64xf32, #local>
 
         %scale_tile = htile.full %scale
