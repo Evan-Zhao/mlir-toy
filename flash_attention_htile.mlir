@@ -24,7 +24,7 @@ module {
     %scale = arith.constant 1.2751743082459868E-1 : f32
 
     gpu.launch blocks(%bx, %by, %bz) in (%grid_x = %c32, %grid_y = %c32, %grid_z = %c1)
-               threads(%tx, %ty, %tz) in (%block_x = %c1, %block_y = %c1, %block_z = %c1) {
+               threads(%tx, %ty, %tz) in (%block_x = %c128, %block_y = %c1, %block_z = %c1) {
       %i_base = arith.muli %bx, %c128 : index
 
       %q_shared = htile.load %q[%bz, %by, %i_base, %c0]
