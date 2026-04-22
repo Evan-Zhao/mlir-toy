@@ -60,7 +60,7 @@ module {
         %score = arith.mulf %qk, %scale_tile
             : tensor<128x64xf32, #local>
 
-        %row_max = htile.reduce %score axis 1 {kind = "max"}
+        %row_max = htile.reduce %score axis 1 kind "max"
             : tensor<128x64xf32, #local> -> tensor<128xf32, #local>
         %max_next = arith.maximumf %max_prev_i, %row_max
             : tensor<128xf32, #local>
@@ -80,7 +80,7 @@ module {
         %softmax_exp = math.exp2 %shifted_score
             : tensor<128x64xf32, #local>
 
-        %row_exp_sum = htile.reduce %softmax_exp axis 1 {kind = "sum"}
+        %row_exp_sum = htile.reduce %softmax_exp axis 1 kind "sum"
             : tensor<128x64xf32, #local> -> tensor<128xf32, #local>
 
         %exp_sum_delta = arith.subf %max_prev_i, %max_next
@@ -138,11 +138,11 @@ module {
 
       %norm = arith.divf %acc_final, %exp_sum_128
           : tensor<128x128xf32, #local>
-      %norm_f16_shared = arith.truncf %norm
-          : tensor<128x128xf32, #local> to tensor<128x128xf16, #shared>
+      %norm_f16 = arith.truncf %norm
+          : tensor<128x128xf32, #local> to tensor<128x128xf16, #local>
 
-      htile.store %norm_f16_shared, %out[%bz, %by, %i_base, %c0]
-          : tensor<128x128xf16, #shared>, memref<1x32x4096x128xf16>
+      htile.store %norm_f16, %out[%bz, %by, %i_base, %c0]
+          : tensor<128x128xf16, #local>, memref<1x32x4096x128xf16>
 
       gpu.terminator
     }
