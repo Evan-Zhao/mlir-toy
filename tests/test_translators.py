@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "python" / "neptune"))
 
 from translate_to_tilelang import translate_file as translate_tilelang  # noqa: E402
 from translate_common import translate_file_with  # noqa: E402
+from translate_to_cutile import translate_file as translate_cutile  # noqa: E402
 from translate_to_triton import translate_file as translate_triton  # noqa: E402
 from translate_to_triton import Translator as TritonTranslator  # noqa: E402
 
@@ -53,6 +54,14 @@ def test_tilelang_translator_matches_golden():
     assert_matches_golden(
         translate_tilelang(str(MLIR_FILE), str(PLUGIN)),
         "flash_attention_tilelang.py",
+    )
+
+
+def test_cutile_translator_matches_golden():
+    require_translator_deps()
+    assert_matches_golden(
+        translate_cutile(str(MLIR_FILE), str(PLUGIN)),
+        "flash_attention_cutile.py",
     )
 
 

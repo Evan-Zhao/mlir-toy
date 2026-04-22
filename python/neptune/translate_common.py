@@ -11,6 +11,9 @@ from typing import Type
 import mlir.ir as ir
 
 DEFAULT_PLUGIN = "build/libHTileDialectPlugin.dylib"
+HTILE_DOT_TRANSPOSE_TO_LOAD_ORDER_PIPELINE = (
+    "builtin.module(htile-dot-transpose-to-load-order,cse,canonicalize)"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +160,39 @@ def _parse_attr_str(attr) -> str:
 
 def _parse_dense_i64_array(attr) -> list[int]:
     return list(ir.DenseI64ArrayAttr(attr))
+
+
+def _dimension_order(op: ir.OpView, rank: int) -> list[int]:
+    attr = op.attributes.get("dimension_order")
+    if attr is None:
+        return list(range(rank))
+    order = _parse_dense_i64_array(attr)
+    if len(order) != rank:
+        raise NotImplementedError(
+            f"dimension_order rank mismatch: got {order}, rank {rank}"
+        )
+    return order
+
+
+def _dot_transpose_attrs(op: ir.OpView) -> list[str]:
+    return [
+        name
+        for name in ("transpose_a", "transpose_b")
+        if op.attributes.get(name) is not None
+    ]
+
+
+def _reject_dot_transpose_attrs(op: ir.OpView, backend: str) -> None:
+    transpose_attrs = _dot_transpose_attrs(op)
+    if not transpose_attrs:
+        return
+    joined = ", ".join(transpose_attrs)
+    raise NotImplementedError(
+        f"{backend} translation requires htile.dot transpose attributes "
+        f"to be fissioned before emission; found {joined}. "
+        "Run the htile-dot-transpose-to-load-order pass, or inspect "
+        "why that pass did not rewrite this dot."
+    )
 
 
 def parse_mlir_module(

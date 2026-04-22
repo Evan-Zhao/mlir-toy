@@ -1,35 +1,60 @@
 #!/usr/bin/env python3
-"""HTile MLIR -> Triton Python translator using MLIR Python bindings.
+"""HTile MLIR -> NVIDIA cuTile Python translator using MLIR Python bindings.
 
 Usage:
-    python translate_to_triton.py <input.mlir> [--plugin <plugin.dylib>]
+    python translate_to_cutile.py <input.mlir> [--plugin <plugin.dylib>]
 
-mlir-opt is called as a subprocess to convert HTile dialect ops to generic form.
+This backend is intentionally value-based: cuTile tiles are immutable values, so
+the lowering is closer to the Triton translator than to TileLang.
 """
+
+from __future__ import annotations
 
 import ast
 
 import mlir.ir as ir
+
 from translate_common import (
     DEFAULT_PLUGIN,
     HTILE_DOT_TRANSPOSE_TO_LOAD_ORDER_PIPELINE,
     _assign,
+    _attr,
     _call,
     _const,
     _dimension_order,
+    _expr_stmt,
     _func_sym_name,
-    _list,
     _memref_shape,
-    _mlir_dtype_to_tl,
     _module_top_ops,
     _name,
     _op_type_name,
+    _parse_dense_i64_array,
     _reject_dot_transpose_attrs,
     _tensor_shape,
-    _tl,
-    _tl_call,
+    _tuple,
     translate_file_with,
 )
+
+
+def _ct(attr: str) -> ast.Attribute:
+    return _attr(_name("ct"), attr)
+
+
+def _ct_call(fn: str, *args: ast.expr, **kwargs: ast.expr) -> ast.Call:
+    return _call(_ct(fn), *args, **kwargs)
+
+
+def _mlir_dtype_to_ct(dtype: str) -> ast.expr:
+    mapping = {
+        "f16": "float16",
+        "f32": "float32",
+        "f64": "float64",
+        "i8": "int8",
+        "i16": "int16",
+        "i32": "int32",
+        "i64": "int64",
+    }
+    return _ct(mapping.get(dtype, dtype))
 
 
 class Translator:
@@ -61,12 +86,7 @@ class Translator:
 
     def translate(self, module: ir.Module) -> ast.Module:
         body: list[ast.stmt] = [
-            ast.Import(names=[ast.alias(name="triton")]),
-            ast.ImportFrom(
-                module="triton",
-                names=[ast.alias(name="language", asname="tl")],
-                level=0,
-            ),
+            ast.Import(names=[ast.alias(name="cuda.tile", asname="ct")]),
         ]
         for op in _module_top_ops(module):
             if _op_type_name(op) == "func.func":
@@ -77,13 +97,11 @@ class Translator:
 
     def _func(self, op: ir.OpView) -> ast.FunctionDef:
         entry = op.regions[0].blocks[0]
-
         kernel_name = _func_sym_name(op)
 
         params: list[ast.arg] = []
         for arg in entry.arguments:
-            pname = self._bind(arg, "ptr")
-            params.append(ast.arg(arg=pname, annotation=None))
+            params.append(ast.arg(arg=self._bind(arg, "arr"), annotation=None))
 
         pre_stmts: list[ast.stmt] = []
         kernel_stmts: list[ast.stmt] = []
@@ -94,7 +112,6 @@ class Translator:
                 kernel_stmts = self._gpu_launch(child_op)
 
         body = pre_stmts + kernel_stmts or [ast.Pass()]
-        decorator = ast.Attribute(value=_name("triton"), attr="jit", ctx=ast.Load())
         arguments = ast.arguments(
             posonlyargs=[],
             args=params,
@@ -108,7 +125,7 @@ class Translator:
             name=kernel_name,
             args=arguments,
             body=body,
-            decorator_list=[decorator],
+            decorator_list=[_ct("kernel")],
             returns=None,
             lineno=0,
             col_offset=0,
@@ -121,10 +138,10 @@ class Translator:
         args = list(body_block.arguments)
         stmts: list[ast.stmt] = []
 
-        pid_names = ["pid_m", "pid_h", "pid_b"]
-        for arg, pid, axis in zip(args[:3], pid_names, [0, 1, 2]):
-            self._names[arg] = pid
-            stmts.append(_assign(pid, _tl_call("program_id", _const(axis))))
+        bid_names = ["bid_m", "bid_h", "bid_b"]
+        for arg, bid, axis in zip(args[:3], bid_names, [0, 1, 2]):
+            self._names[arg] = bid
+            stmts.append(_assign(bid, _ct_call("bid", _const(axis))))
         for arg in args[3:]:
             self._names[arg] = "_"
 
@@ -148,9 +165,9 @@ class Translator:
             "arith.mulf": lambda o: self._binop(o, ast.Mult()),
             "arith.subf": lambda o: self._binop(o, ast.Sub()),
             "arith.divf": lambda o: self._binop(o, ast.Div()),
-            "arith.maximumf": lambda o: self._tl_binop(o, "maximum"),
+            "arith.maximumf": lambda o: self._ct_binop(o, "maximum"),
             "arith.truncf": self._arith_truncf,
-            "math.exp2": lambda o: self._tl_unary(o, "exp2"),
+            "math.exp2": lambda o: self._ct_unary(o, "exp2"),
             "htile.load": self._htile_load,
             "htile.store": self._htile_store,
             "htile.full": self._htile_full,
@@ -168,10 +185,10 @@ class Translator:
         }
         handler = dispatch.get(_op_type_name(op))
         if handler is None:
-            return [ast.Expr(value=_const(f"# TODO: {_op_type_name(op)}"))]
+            return [_expr_stmt(_const(f"# TODO: {_op_type_name(op)}"))]
         return handler(op)
 
-    # --- arith ops ---
+    # --- arithmetic ops ---
 
     def _arith_constant(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "c")
@@ -186,33 +203,35 @@ class Translator:
 
     def _binop(self, op: ir.OpView, py_op: ast.operator) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
-        lhs = self._expr(op.operands[0])
-        rhs = self._expr(op.operands[1])
-        return [_assign(name, ast.BinOp(left=lhs, op=py_op, right=rhs))]
+        return [
+            _assign(
+                name,
+                ast.BinOp(
+                    left=self._expr(op.operands[0]),
+                    op=py_op,
+                    right=self._expr(op.operands[1]),
+                ),
+            )
+        ]
 
-    def _tl_binop(self, op: ir.OpView, fn: str) -> list[ast.stmt]:
+    def _ct_binop(self, op: ir.OpView, fn: str) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
         return [
             _assign(
                 name,
-                _tl_call(fn, self._expr(op.operands[0]), self._expr(op.operands[1])),
+                _ct_call(fn, self._expr(op.operands[0]), self._expr(op.operands[1])),
             )
         ]
 
-    def _tl_unary(self, op: ir.OpView, fn: str) -> list[ast.stmt]:
+    def _ct_unary(self, op: ir.OpView, fn: str) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
-        return [_assign(name, _tl_call(fn, self._expr(op.operands[0])))]
+        return [_assign(name, _ct_call(fn, self._expr(op.operands[0])))]
 
     def _arith_truncf(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
         _, dtype = _tensor_shape(op.results[0].type)
-        if not dtype:
-            dtype = str(op.results[0].type)
         return [
-            _assign(
-                name,
-                _tl_call("cast", self._expr(op.operands[0]), _mlir_dtype_to_tl(dtype)),
-            )
+            _assign(name, _ct_call("astype", self._expr(op.operands[0]), _mlir_dtype_to_ct(dtype)))
         ]
 
     # --- htile ops ---
@@ -220,119 +239,88 @@ class Translator:
     def _htile_load(self, op: ir.OpView) -> list[ast.stmt]:
         mem_shape, _ = _memref_shape(op.operands[0].type)
         tile_shape, _ = _tensor_shape(op.results[0].type)
-        indices = list(op.operands[1:])
+        offsets = list(op.operands[1:])
+        if len(offsets) != len(mem_shape):
+            raise NotImplementedError("cuTile load expects one offset per memref dimension")
 
-        stmts, base_ptr, tile_indices, tile_strides = self._fold_batch_dims(
-            op.operands[0], indices, mem_shape, tile_shape
-        )
+        batch_dims = len(mem_shape) - len(tile_shape)
+        if batch_dims < 0:
+            raise NotImplementedError("cuTile load rank mismatch")
+
         dimension_order = _dimension_order(op, len(tile_shape))
-        mem_tile_shape = mem_shape[-len(tile_shape) :]
-        logical_shape = [mem_tile_shape[i] for i in dimension_order]
-        logical_strides = [tile_strides[i] for i in dimension_order]
-        logical_offsets = [tile_indices[i] for i in dimension_order]
-        block_ptr_order = sorted(  # type: ignore
-            range(len(logical_strides)), key=logical_strides.__getitem__
-        )
+        full_order = list(range(batch_dims)) + [
+            batch_dims + dim for dim in dimension_order
+        ]
+        full_tile_shape = [1] * batch_dims + [
+            tile_shape[dim] for dim in range(len(tile_shape))
+        ]
+        index = self._tile_space_index(offsets, full_order, full_tile_shape)
 
-        bp = self._fresh("bp")
-        stmts.append(
+        loaded = self._fresh("load")
+        stmts = [
             _assign(
-                bp,
-                _call(
-                    _tl("make_block_ptr"),
-                    base=base_ptr,
-                    shape=_list(*[_const(s) for s in logical_shape]),
-                    strides=_list(*[_const(s) for s in logical_strides]),
-                    offsets=_list(
-                        *[self._expr(i) for i in logical_offsets[: len(tile_shape)]]
-                    ),
-                    block_shape=_list(*[_const(s) for s in tile_shape]),
-                    order=_list(*[_const(i) for i in block_ptr_order]),
+                loaded,
+                _ct_call(
+                    "load",
+                    self._expr(op.operands[0]),
+                    _tuple(*index),
+                    _tuple(*[_const(s) for s in full_tile_shape]),
+                    order=_tuple(*[_const(i) for i in full_order]),
                 ),
             )
-        )
-        tile = self._bind(op.results[0], "tile")
+        ]
+
+        result = self._bind(op.results[0], "tile")
         stmts.append(
             _assign(
-                tile,
-                _tl_call(
-                    "load",
-                    _name(bp),
-                    boundary_check=_list(*[_const(i) for i in range(len(tile_shape))]),
-                ),
+                result,
+                _ct_call("reshape", _name(loaded), _tuple(*[_const(s) for s in tile_shape])),
             )
         )
         return stmts
 
     def _htile_store(self, op: ir.OpView) -> list[ast.stmt]:
-        tile_val = op.operands[0]
         mem_shape, _ = _memref_shape(op.operands[1].type)
         tile_shape, _ = _tensor_shape(op.operands[0].type)
-        indices = list(op.operands[2:])
+        offsets = list(op.operands[2:])
+        if len(offsets) != len(mem_shape):
+            raise NotImplementedError("cuTile store expects one offset per memref dimension")
 
-        stmts, base_ptr, tile_indices, tile_strides = self._fold_batch_dims(
-            op.operands[1], indices, mem_shape, tile_shape
+        batch_dims = len(mem_shape) - len(tile_shape)
+        full_order = list(range(len(mem_shape)))
+        full_tile_shape = [1] * batch_dims + tile_shape
+        index = self._tile_space_index(offsets, full_order, full_tile_shape)
+        tile = _ct_call(
+            "reshape",
+            self._expr(op.operands[0]),
+            _tuple(*[_const(s) for s in full_tile_shape]),
         )
-        bp = self._fresh("bp")
-        stmts.append(
-            _assign(
-                bp,
-                _call(
-                    _tl("make_block_ptr"),
-                    base=base_ptr,
-                    shape=_list(*[_const(s) for s in mem_shape[-2:]]),
-                    strides=_list(*[_const(s) for s in tile_strides]),
-                    offsets=_list(
-                        *[self._expr(i) for i in tile_indices[: len(tile_shape)]]
-                    ),
-                    block_shape=_list(*[_const(s) for s in tile_shape]),
-                    order=_list(*[_const(i) for i in reversed(range(len(tile_shape)))]),
-                ),
+        return [
+            _expr_stmt(
+                _ct_call("store", self._expr(op.operands[1]), _tuple(*index), tile)
             )
-        )
-        stmts.append(
-            ast.Expr(
-                value=_tl_call(
-                    "store",
-                    _name(bp),
-                    self._expr(tile_val),
-                    boundary_check=_list(*[_const(i) for i in range(len(tile_shape))]),
-                )
-            )
-        )
-        return stmts
+        ]
 
-    def _fold_batch_dims(
+    def _tile_space_index(
         self,
-        memref_val: ir.Value,
-        indices: list[ir.Value],
-        mem_shape: list[int],
-        tile_shape: list[int],
-    ):
-        """Fold batch dimensions into a pointer offset.
+        offsets: list[ir.Value],
+        full_order: list[int],
+        full_tile_shape: list[int],
+    ) -> list[ast.expr]:
+        index: list[ast.expr] = []
+        # cuTile indexes the logical tile-space order, but offsets are still
+        # expressed in memory-axis order.
+        for logical_axis, mem_axis in enumerate(full_order):
+            extent = full_tile_shape[logical_axis]
+            index.append(self._index_div(self._expr(offsets[mem_axis]), extent))
+        return index
 
-        Returns (stmts, base_ptr_expr, tile_indices, tile_strides).
-        """
-        stmts: list[ast.stmt] = []
-        base_ptr = self._expr(memref_val)
-        if len(mem_shape) > 2 and len(indices) >= len(mem_shape):
-            strides = [1] * len(mem_shape)
-            for i in range(len(mem_shape) - 2, -1, -1):
-                strides[i] = strides[i + 1] * mem_shape[i + 1]
-            batch_dims = len(mem_shape) - 2
-            offset: ast.expr = _const(0)
-            for i in range(batch_dims):
-                term = ast.BinOp(
-                    left=self._expr(indices[i]), op=ast.Mult(), right=_const(strides[i])
-                )
-                offset = ast.BinOp(left=offset, op=ast.Add(), right=term)
-            ptr = self._fresh("ptr")
-            stmts.append(
-                _assign(ptr, ast.BinOp(left=base_ptr, op=ast.Add(), right=offset))
-            )
-            base_ptr = _name(ptr)
-            return stmts, base_ptr, indices[batch_dims:], strides[batch_dims:]
-        return stmts, base_ptr, indices, [1] * len(tile_shape)
+    def _index_div(self, offset: ast.expr, extent: int) -> ast.expr:
+        if extent == 1:
+            return offset
+        if isinstance(offset, ast.Constant) and isinstance(offset.value, int):
+            return _const(offset.value // extent)
+        return ast.BinOp(left=offset, op=ast.FloorDiv(), right=_const(extent))
 
     def _htile_full(self, op: ir.OpView) -> list[ast.stmt]:
         shape, dtype = _tensor_shape(op.results[0].type)
@@ -340,25 +328,41 @@ class Translator:
         return [
             _assign(
                 name,
-                _tl_call(
+                _ct_call(
                     "full",
-                    _list(*[_const(s) for s in shape]),
+                    _tuple(*[_const(s) for s in shape]),
                     self._expr(op.operands[0]),
-                    _mlir_dtype_to_tl(dtype),
+                    dtype=_mlir_dtype_to_ct(dtype),
                 ),
             )
         ]
 
     def _htile_dot(self, op: ir.OpView) -> list[ast.stmt]:
-        _reject_dot_transpose_attrs(op, "Triton")
+        _reject_dot_transpose_attrs(op, "cuTile")
+
         name = self._bind(op.results[0], "tile")
-        lhs = self._expr(op.operands[0])
-        rhs = self._expr(op.operands[1])
-        acc = self._expr(op.operands[2]) if len(op.operands) > 2 else None
-        call = (
-            _tl_call("dot", lhs, rhs) if acc is None else _tl_call("dot", lhs, rhs, acc)
+        shape, dtype = _tensor_shape(op.results[0].type)
+        acc = (
+            self._expr(op.operands[2])
+            if len(op.operands) > 2
+            else _ct_call(
+                "full",
+                _tuple(*[_const(s) for s in shape]),
+                _const(0),
+                dtype=_mlir_dtype_to_ct(dtype),
+            )
         )
-        return [_assign(name, call)]
+        return [
+            _assign(
+                name,
+                _ct_call(
+                    "mma",
+                    self._expr(op.operands[0]),
+                    self._expr(op.operands[1]),
+                    acc,
+                ),
+            )
+        ]
 
     def _htile_reduce(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "red")
@@ -370,11 +374,11 @@ class Translator:
         return [
             _assign(
                 name,
-                _tl_call(
+                _ct_call(
                     fn,
                     self._expr(op.operands[0]),
                     _const(axis),
-                    keep_dims=_const(False),
+                    keepdims=_const(False),
                 ),
             )
         ]
@@ -382,41 +386,41 @@ class Translator:
     def _htile_permute(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "tile")
         perm_attr = op.attributes.get("permutation")
-        perm = list(ir.DenseI64ArrayAttr(perm_attr)) if perm_attr else [1, 0]
+        perm = _parse_dense_i64_array(perm_attr) if perm_attr else [1, 0]
         return [
             _assign(
                 name,
-                _tl_call(
+                _ct_call(
                     "permute",
                     self._expr(op.operands[0]),
-                    _list(*[_const(p) for p in perm]),
+                    _tuple(*[_const(p) for p in perm]),
                 ),
             )
         ]
 
     def _htile_copy(self, op: ir.OpView) -> list[ast.stmt]:
-        # Placement change only — alias the SSA value, emit nothing.
+        # Placement change only; cuTile has no explicit shared/local placement.
         self._names[op.results[0]] = self._get(op.operands[0])
         return []
 
-    # --- linalg.broadcast -> unsqueeze ---
+    # --- linalg.broadcast -> expand dims ---
 
     def _linalg_broadcast(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "bcast")
         src = self._expr(op.operands[0])
         dims_attr = op.attributes.get("dimensions")
-        dims = list(ir.DenseI64ArrayAttr(dims_attr)) if dims_attr else [1]
+        dims = _parse_dense_i64_array(dims_attr) if dims_attr else [1]
         shape, _ = _tensor_shape(op.results[0].type)
-        rank_out = len(shape)
 
-        indices: list[ast.expr] = []
-        for out_dim in range(rank_out):
-            indices.append(_const(None) if out_dim in dims else ast.Slice())
-
-        idx = (
-            ast.Tuple(elts=indices, ctx=ast.Load()) if len(indices) > 1 else indices[0]
-        )
-        return [_assign(name, ast.Subscript(value=src, slice=idx, ctx=ast.Load()))]
+        expr = src
+        for dim in dims:
+            expr = _ct_call("expand_dims", expr, axis=_const(dim))
+        return [
+            _assign(
+                name,
+                _ct_call("broadcast_to", expr, _tuple(*[_const(s) for s in shape])),
+            )
+        ]
 
     # --- scf.for ---
 
@@ -470,18 +474,14 @@ class Translator:
         return stmts
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-
 def translate_file(path: str, plugin: str | None = None) -> ast.Module:
-    """Run mlir-opt on *path*, parse with mlir.ir, and return a Python ast.Module."""
     return translate_file_with(
         path,
         Translator,
         plugin,
-        pass_pipeline=HTILE_DOT_TRANSPOSE_TO_LOAD_ORDER_PIPELINE,
+        pass_pipeline=(
+            HTILE_DOT_TRANSPOSE_TO_LOAD_ORDER_PIPELINE if plugin else None
+        ),
         pass_plugin=plugin,
     )
 
