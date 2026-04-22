@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
-"""HTile MLIR -> Triton Python translator.
+"""HTile MLIR -> Triton Python translator using MLIR Python bindings.
 
 Usage:
     python translate_to_triton.py <input.mlir> [--plugin <plugin.dylib>]
 
-Imports the parsed op-tree from mlir_generic_parser and walks it to emit
-Python ast nodes, then unparses them to produce a Triton kernel source string.
+mlir-opt is called as a subprocess to convert HTile dialect ops to generic form.
 """
 
 import ast
+import subprocess
+import sys
 
-from mlir_generic_parser import (
-    Block,
-    Op,
-    Region,
-    parse_memref_shape,
-    parse_mlir_file,
-    parse_tensor_shape,
-)
+import mlir.ir as ir
 
 DEFAULT_PLUGIN = "build/libHTileDialectPlugin.dylib"
 
@@ -78,37 +72,88 @@ def _mlir_dtype_to_tl(dtype: str) -> ast.expr:
 
 
 # ---------------------------------------------------------------------------
+# MLIR type helpers
+# ---------------------------------------------------------------------------
+
+
+def _tensor_shape(mlir_type) -> tuple[list[int], str]:
+    """Return (shape, element_dtype_str) from an MLIR RankedTensorType."""
+    if not isinstance(mlir_type, ir.RankedTensorType):
+        raise NotImplementedError(f"expected RankedTensorType, got {mlir_type}")
+    return list(mlir_type.shape), str(mlir_type.element_type)
+
+
+def _memref_shape(mlir_type) -> tuple[list[int], str]:
+    """Return (shape, element_dtype_str) from an MLIR MemRefType."""
+    if not isinstance(mlir_type, ir.MemRefType):
+        raise NotImplementedError(f"expected MemRefType, got {mlir_type}")
+    return list(mlir_type.shape), str(mlir_type.element_type)
+
+
+def _op_type_name(op) -> str:
+    """Return the operation type name (e.g. 'func.func').
+
+    Specialized OpView subclasses for registered dialects may override .name to
+    return a dialect-specific attribute (FuncOp.name returns sym_name, etc.).
+    The invariant op type name lives on the underlying Operation object.
+    """
+    if isinstance(op, ir.OpView):
+        return op.operation.name
+    return op.name  # op is already an ir.Operation
+
+
+# ---------------------------------------------------------------------------
+# Module helpers
+# ---------------------------------------------------------------------------
+
+
+def _module_top_ops(module: ir.Module):
+    """Yield the true top-level ops from a parsed module.
+
+    ir.Module.parse() on generic-form text (which starts with "builtin.module"(...))
+    may produce a module whose body contains a single inner builtin.module rather than
+    the real top-level ops directly.  This unwraps that extra layer when present.
+    """
+    ops = list(module.body.operations)
+    if len(ops) == 1 and _op_type_name(ops[0]) == "builtin.module":
+        yield from ops[0].regions[0].blocks[0].operations
+    else:
+        yield from ops
+
+
+# ---------------------------------------------------------------------------
 # Translator
 # ---------------------------------------------------------------------------
 
 
 class Translator:
     def __init__(self):
-        self._names: dict[str, str] = {}  # SSA name -> Python identifier
+        # Keys are mlir.ir.Value objects (hash by underlying C++ pointer).
+        self._names: dict[ir.Value, str] = {}
         self._counter = 0
-        self._for_output_names: list[list[str]] = []  # stack for scf.for iter args
+        self._for_output_names: list[list[str]] = []
 
     def _fresh(self, hint="v") -> str:
         n = f"{hint}_{self._counter}"
         self._counter += 1
         return n
 
-    def _bind(self, ssa: str, hint="v") -> str:
+    def _bind(self, value: ir.Value, hint="v") -> str:
         name = self._fresh(hint)
-        self._names[ssa] = name
+        self._names[value] = name
         return name
 
-    def _get(self, ssa: str) -> str:
-        if ssa not in self._names:
-            raise KeyError(f"Unbound SSA value: {ssa}")
-        return self._names[ssa]
+    def _get(self, value: ir.Value) -> str:
+        if value not in self._names:
+            raise KeyError(f"Unbound SSA value: {value}")
+        return self._names[value]
 
-    def _expr(self, ssa: str) -> ast.expr:
-        return _name(self._get(ssa))
+    def _expr(self, value: ir.Value) -> ast.expr:
+        return _name(self._get(value))
 
     # --- module entry ---
 
-    def translate(self, module_region: Region) -> ast.Module:
+    def translate(self, module: ir.Module) -> ast.Module:
         body: list[ast.stmt] = [
             ast.Import(names=[ast.alias(name="triton")]),
             ast.ImportFrom(
@@ -117,46 +162,51 @@ class Translator:
                 level=0,
             ),
         ]
-        for op in module_region.blocks[0].ops:
-            if op.name == "func.func":
+        for op in _module_top_ops(module):
+            if _op_type_name(op) == "func.func":
                 body.append(self._func(op))
         mod = ast.Module(body=body, type_ignores=[])
         ast.fix_missing_locations(mod)
         return mod
 
-    def _func(self, op: Op) -> ast.FunctionDef:
+    def _func(self, op: ir.OpView) -> ast.FunctionDef:
         entry = op.regions[0].blocks[0]
 
-        # Bind memref args to pointer parameter names
+        # FuncOp.name returns the sym_name StringAttr; fall back to getting from attributes.
+        raw_name = op.name
+        if isinstance(raw_name, ir.StringAttr):
+            kernel_name = raw_name.value
+        else:
+            sym_attr = op.attributes.get("sym_name")
+            kernel_name = ir.StringAttr(sym_attr).value if sym_attr else "kernel"
+
         params: list[ast.arg] = []
-        for arg_name, _ in entry.args:
-            pname = self._bind(arg_name, "ptr")
+        for arg in entry.arguments:
+            pname = self._bind(arg, "ptr")
             params.append(ast.arg(arg=pname, annotation=None))
 
-        # Separate constants defined before gpu.launch from the kernel body
         pre_stmts: list[ast.stmt] = []
         kernel_stmts: list[ast.stmt] = []
-        for child_op in entry.ops:
-            if child_op.name == "arith.constant":
+        for child_op in entry.operations:
+            if _op_type_name(child_op) == "arith.constant":
                 pre_stmts.extend(self._arith_constant(child_op))
-            elif child_op.name == "gpu.launch":
+            elif _op_type_name(child_op) == "gpu.launch":
                 kernel_stmts = self._gpu_launch(child_op)
 
         body = pre_stmts + kernel_stmts or [ast.Pass()]
         decorator = ast.Attribute(value=_name("triton"), attr="jit", ctx=ast.Load())
-        # Derive kernel name from the func sym_name if available (set during translation)
-        kernel_name = getattr(self, "_kernel_name", "kernel")
-        return ast.FunctionDef(
+        arguments = ast.arguments(
+            posonlyargs=[],
+            args=params,
+            vararg=None,
+            kwonlyargs=[],
+            kw_defaults=[],
+            kwarg=None,
+            defaults=[],
+        )
+        return ast.FunctionDef(  # type: ignore
             name=kernel_name,
-            args=ast.arguments(
-                posonlyargs=[],
-                args=params,
-                vararg=None,
-                kwonlyargs=[],
-                kw_defaults=[],
-                kwarg=None,
-                defaults=[],
-            ),
+            args=arguments,
             body=body,
             decorator_list=[decorator],
             returns=None,
@@ -166,31 +216,30 @@ class Translator:
 
     # --- gpu.launch -> kernel body ---
 
-    def _gpu_launch(self, op: Op) -> list[ast.stmt]:
+    def _gpu_launch(self, op: ir.OpView) -> list[ast.stmt]:
         body_block = op.regions[0].blocks[0]
+        args = list(body_block.arguments)
         stmts: list[ast.stmt] = []
 
-        # First 3 block args are the block indices (bx, by, bz) -> program IDs
         pid_names = ["pid_m", "pid_h", "pid_b"]
-        for (arg_name, _), pid, axis in zip(body_block.args[:3], pid_names, [0, 1, 2]):
-            self._names[arg_name] = pid
+        for arg, pid, axis in zip(args[:3], pid_names, [0, 1, 2]):
+            self._names[arg] = pid
             stmts.append(_assign(pid, _tl_call("program_id", _const(axis))))
-        # Remaining args (tx/ty/tz and grid/block sizes) are unused in Triton
-        for arg_name, _ in body_block.args[3:]:
-            self._names[arg_name] = "_"
+        for arg in args[3:]:
+            self._names[arg] = "_"
 
         stmts.extend(self._block_ops(body_block))
         return stmts
 
     # --- block and op dispatch ---
 
-    def _block_ops(self, block: Block) -> list[ast.stmt]:
+    def _block_ops(self, block: ir.Block) -> list[ast.stmt]:
         stmts = []
-        for op in block.ops:
+        for op in block.operations:
             stmts.extend(self._op(op))
         return stmts
 
-    def _op(self, op: Op) -> list[ast.stmt]:
+    def _op(self, op: ir.OpView) -> list[ast.stmt]:
         dispatch = {
             "arith.constant": self._arith_constant,
             "arith.muli": lambda o: self._binop(o, ast.Mult()),
@@ -212,29 +261,36 @@ class Translator:
             "linalg.broadcast": self._linalg_broadcast,
             "scf.for": self._scf_for,
             "scf.yield": self._scf_yield,
-            # ops that produce no Triton code
             "tensor.empty": lambda o: [],
             "gpu.terminator": lambda o: [],
             "func.return": lambda o: [],
             "linalg.yield": lambda o: [],
         }
-        handler = dispatch.get(op.name)
+        handler = dispatch.get(_op_type_name(op))
         if handler is None:
-            return [ast.Expr(value=_const(f"# TODO: {op.name}"))]
+            return [ast.Expr(value=_const(f"# TODO: {_op_type_name(op)}"))]
         return handler(op)
 
     # --- arith ops ---
 
-    def _arith_constant(self, op: Op) -> list[ast.stmt]:
+    def _arith_constant(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "c")
-        return [_assign(name, _const(op.props.get("value")))]
+        attr = op.attributes.get("value")
+        if isinstance(attr, ir.IntegerAttr):
+            val = attr.value
+        elif isinstance(attr, ir.FloatAttr):
+            val = attr.value
+        else:
+            raise NotImplementedError(f"unsupported arith.constant value attr: {attr}")
+        return [_assign(name, _const(val))]
 
-    def _binop(self, op: Op, py_op: ast.operator) -> list[ast.stmt]:
+    def _binop(self, op: ir.OpView, py_op: ast.operator) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
-        lhs, rhs = self._expr(op.operands[0]), self._expr(op.operands[1])
+        lhs = self._expr(op.operands[0])
+        rhs = self._expr(op.operands[1])
         return [_assign(name, ast.BinOp(left=lhs, op=py_op, right=rhs))]
 
-    def _tl_binop(self, op: Op, fn: str) -> list[ast.stmt]:
+    def _tl_binop(self, op: ir.OpView, fn: str) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
         return [
             _assign(
@@ -243,15 +299,15 @@ class Translator:
             )
         ]
 
-    def _tl_unary(self, op: Op, fn: str) -> list[ast.stmt]:
+    def _tl_unary(self, op: ir.OpView, fn: str) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
         return [_assign(name, _tl_call(fn, self._expr(op.operands[0])))]
 
-    def _arith_truncf(self, op: Op) -> list[ast.stmt]:
+    def _arith_truncf(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
-        _, dtype = (
-            parse_tensor_shape(op.result_types[0]) if op.result_types else ([], "f16")
-        )
+        _, dtype = _tensor_shape(op.results[0].type)
+        if not dtype:
+            dtype = str(op.results[0].type)
         return [
             _assign(
                 name,
@@ -261,17 +317,14 @@ class Translator:
 
     # --- htile ops ---
 
-    def _htile_load(self, op: Op) -> list[ast.stmt]:
-        memref_type = op.operand_types[0] if op.operand_types else ""
-        result_type = op.result_types[0] if op.result_types else ""
-        mem_shape, _ = parse_memref_shape(memref_type)
-        tile_shape, _ = parse_tensor_shape(result_type)
+    def _htile_load(self, op: ir.OpView) -> list[ast.stmt]:
+        mem_shape, _ = _memref_shape(op.operands[0].type)
+        tile_shape, _ = _tensor_shape(op.results[0].type)
+        indices = list(op.operands[1:])
 
-        indices = op.operands[1:]
         stmts, base_ptr, tile_indices, tile_strides = self._fold_batch_dims(
             op.operands[0], indices, mem_shape, tile_shape
         )
-
         bp = self._fresh("bp")
         stmts.append(
             _assign(
@@ -302,18 +355,15 @@ class Translator:
         )
         return stmts
 
-    def _htile_store(self, op: Op) -> list[ast.stmt]:
-        tile_ssa = op.operands[0]
-        memref_type = op.operand_types[1] if len(op.operand_types) > 1 else ""
-        tile_type = op.operand_types[0] if op.operand_types else ""
-        mem_shape, _ = parse_memref_shape(memref_type)
-        tile_shape, _ = parse_tensor_shape(tile_type)
+    def _htile_store(self, op: ir.OpView) -> list[ast.stmt]:
+        tile_val = op.operands[0]
+        mem_shape, _ = _memref_shape(op.operands[1].type)
+        tile_shape, _ = _tensor_shape(op.operands[0].type)
+        indices = list(op.operands[2:])
 
-        indices = op.operands[2:]
         stmts, base_ptr, tile_indices, tile_strides = self._fold_batch_dims(
             op.operands[1], indices, mem_shape, tile_shape
         )
-
         bp = self._fresh("bp")
         stmts.append(
             _assign(
@@ -336,17 +386,26 @@ class Translator:
                 value=_tl_call(
                     "store",
                     _name(bp),
-                    self._expr(tile_ssa),
+                    self._expr(tile_val),
                     boundary_check=_list(*[_const(i) for i in range(len(tile_shape))]),
                 )
             )
         )
         return stmts
 
-    def _fold_batch_dims(self, memref_ssa, indices, mem_shape, tile_shape):
-        """Fold batch dimensions into a pointer offset; return (stmts, base_ptr, tile_indices, tile_strides)."""
+    def _fold_batch_dims(
+        self,
+        memref_val: ir.Value,
+        indices: list[ir.Value],
+        mem_shape: list[int],
+        tile_shape: list[int],
+    ):
+        """Fold batch dimensions into a pointer offset.
+
+        Returns (stmts, base_ptr_expr, tile_indices, tile_strides).
+        """
         stmts: list[ast.stmt] = []
-        base_ptr = self._expr(memref_ssa)
+        base_ptr = self._expr(memref_val)
         if len(mem_shape) > 2 and len(indices) >= len(mem_shape):
             strides = [1] * len(mem_shape)
             for i in range(len(mem_shape) - 2, -1, -1):
@@ -366,10 +425,8 @@ class Translator:
             return stmts, base_ptr, indices[batch_dims:], strides[batch_dims:]
         return stmts, base_ptr, indices, [1] * len(tile_shape)
 
-    def _htile_full(self, op: Op) -> list[ast.stmt]:
-        shape, dtype = (
-            parse_tensor_shape(op.result_types[0]) if op.result_types else ([1], "f32")
-        )
+    def _htile_full(self, op: ir.OpView) -> list[ast.stmt]:
+        shape, dtype = _tensor_shape(op.results[0].type)
         name = self._bind(op.results[0], "tile")
         return [
             _assign(
@@ -383,19 +440,22 @@ class Translator:
             )
         ]
 
-    def _htile_dot(self, op: Op) -> list[ast.stmt]:
+    def _htile_dot(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "tile")
-        lhs, rhs = self._expr(op.operands[0]), self._expr(op.operands[1])
+        lhs = self._expr(op.operands[0])
+        rhs = self._expr(op.operands[1])
         acc = self._expr(op.operands[2]) if len(op.operands) > 2 else None
         call = (
             _tl_call("dot", lhs, rhs) if acc is None else _tl_call("dot", lhs, rhs, acc)
         )
         return [_assign(name, call)]
 
-    def _htile_reduce(self, op: Op) -> list[ast.stmt]:
+    def _htile_reduce(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "red")
-        axis = op.props.get("axis", 1)
-        kind = op.props.get("kind", "sum")
+        axis_attr = op.attributes.get("axis")
+        kind_attr = op.attributes.get("kind")
+        axis = ir.IntegerAttr(axis_attr).value if axis_attr else 1
+        kind = ir.StringAttr(kind_attr).value if kind_attr else "sum"
         fn = "max" if kind == "max" else "sum"
         return [
             _assign(
@@ -409,9 +469,10 @@ class Translator:
             )
         ]
 
-    def _htile_permute(self, op: Op) -> list[ast.stmt]:
+    def _htile_permute(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "tile")
-        perm = op.props.get("permutation", [1, 0])
+        perm_attr = op.attributes.get("permutation")
+        perm = list(ir.DenseI64ArrayAttr(perm_attr)) if perm_attr else [1, 0]
         return [
             _assign(
                 name,
@@ -423,20 +484,20 @@ class Translator:
             )
         ]
 
-    def _htile_copy(self, op: Op) -> list[ast.stmt]:
-        # Placement change only — alias the name, emit nothing
+    def _htile_copy(self, op: ir.OpView) -> list[ast.stmt]:
+        # Placement change only — alias the SSA value, emit nothing.
         self._names[op.results[0]] = self._get(op.operands[0])
         return []
 
     # --- linalg.broadcast -> unsqueeze ---
 
-    def _linalg_broadcast(self, op: Op) -> list[ast.stmt]:
+    def _linalg_broadcast(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "bcast")
         src = self._expr(op.operands[0])
-        dims = op.props.get("dimensions", [1])
-        rank_out = (
-            len(parse_tensor_shape(op.result_types[0])[0]) if op.result_types else 2
-        )
+        dims_attr = op.attributes.get("dimensions")
+        dims = list(ir.DenseI64ArrayAttr(dims_attr)) if dims_attr else [1]
+        shape, _ = _tensor_shape(op.results[0].type)
+        rank_out = len(shape)
 
         indices: list[ast.expr] = []
         for out_dim in range(rank_out):
@@ -449,30 +510,29 @@ class Translator:
 
     # --- scf.for ---
 
-    def _scf_for(self, op: Op) -> list[ast.stmt]:
+    def _scf_for(self, op: ir.OpView) -> list[ast.stmt]:
         lb = self._expr(op.operands[0])
         ub = self._expr(op.operands[1])
         step = self._expr(op.operands[2])
 
         body_block = op.regions[0].blocks[0]
-        loop_var_arg = body_block.args[0][0]
-        iter_bargs = [a[0] for a in body_block.args[1:]]
+        loop_var = body_block.arguments[0]
+        iter_bargs = list(body_block.arguments[1:])
+        iter_inits = list(op.operands[3:])
 
-        # Emit init assignments before the loop; bind iter block args to the same names
         pre: list[ast.stmt] = []
         out_names: list[str] = []
-        for init_ssa, barg in zip(op.operands[3:], iter_bargs):
+        for init_val, barg in zip(iter_inits, iter_bargs):
             out = self._fresh("acc")
             out_names.append(out)
             self._names[barg] = out
-            pre.append(_assign(out, self._expr(init_ssa)))
+            pre.append(_assign(out, self._expr(init_val)))
 
-        # Bind the scf.for results to the same names (they hold the post-loop values)
         for res, out in zip(op.results, out_names):
             self._names[res] = out
 
         lv = self._fresh("j")
-        self._names[loop_var_arg] = lv
+        self._names[loop_var] = lv
 
         self._for_output_names.append(out_names)
         body_stmts = self._block_ops(body_block) or [ast.Pass()]
@@ -481,28 +541,47 @@ class Translator:
         for_stmt = ast.For(
             target=ast.Name(id=lv, ctx=ast.Store()),
             iter=_call(_name("range"), lb, ub, step),
-            body=body_stmts,
+            body=body_stmts,  # type: ignore
             orelse=[],
             lineno=0,
             col_offset=0,
         )
         return pre + [for_stmt]
 
-    def _scf_yield(self, op: Op) -> list[ast.stmt]:
+    def _scf_yield(self, op: ir.OpView) -> list[ast.stmt]:
         if not self._for_output_names:
             return []
         out_names = self._for_output_names[-1]
         stmts = []
-        for out, val_ssa in zip(out_names, op.operands):
-            val_name = self._get(val_ssa)
+        for out, val in zip(out_names, op.operands):
+            val_name = self._get(val)
             if val_name != out:
                 stmts.append(_assign(out, _name(val_name)))
         return stmts
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Entry point
 # ---------------------------------------------------------------------------
+
+
+def translate_file(path: str, plugin: str | None = None) -> ast.Module:
+    """Run mlir-opt on *path*, parse with mlir.ir, and return a Python ast.Module."""
+    cmd = ["mlir-opt"]
+    if plugin:
+        cmd.append(f"--load-dialect-plugin={plugin}")
+    cmd += ["--mlir-print-op-generic", path]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(result.stderr, file=sys.stderr)
+        sys.exit(1)
+
+    ctx = ir.Context()
+    ctx.allow_unregistered_dialects = True
+    with ctx:
+        module = ir.Module.parse(result.stdout)
+        translator = Translator()
+        return translator.translate(module)
 
 
 def main():
@@ -513,10 +592,7 @@ def main():
     ap.add_argument("--plugin", default=DEFAULT_PLUGIN)
     args = ap.parse_args()
 
-    region = parse_mlir_file(args.mlir_file, args.plugin)
-
-    translator = Translator()
-    py_module = translator.translate(region)
+    py_module = translate_file(args.mlir_file, args.plugin)
     print(ast.unparse(py_module))
 
 
