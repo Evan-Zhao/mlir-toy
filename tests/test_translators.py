@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "python" / "neptune"))
 
 from translate_to_tilelang import translate_file as translate_tilelang  # noqa: E402
 from translate_to_triton import translate_file as translate_triton  # noqa: E402
