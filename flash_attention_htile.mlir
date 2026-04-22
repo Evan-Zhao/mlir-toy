@@ -49,7 +49,7 @@ module {
         %k_shared = htile.load %k[%bz, %by, %j_base, %c0]
             : memref<1x32x4096x128xf16> -> tensor<64x128xf16, #shared>
 
-        %qk = htile.dot %q_shared, %k_shared {transpose_b}
+        %qk = htile.dot %q_shared, %k_shared {transpose_b, warp_policy = "full_row"}
             : tensor<128x128xf16, #shared>, tensor<64x128xf16, #shared>
             -> tensor<128x64xf32, #local>
 
@@ -95,7 +95,7 @@ module {
 
         %v_shared = htile.load %v[%bz, %by, %j_base, %c0]
             : memref<1x32x4096x128xf16> -> tensor<64x128xf16, #shared>
-        %acc_rf = htile.dot %softmax_exp_f16, %v_shared
+        %acc_rf = htile.dot %softmax_exp_f16, %v_shared {warp_policy = "full_row"}
             : tensor<128x64xf16, #local>, tensor<64x128xf16, #shared>
             -> tensor<128x128xf32, #local>
 

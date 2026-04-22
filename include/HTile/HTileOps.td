@@ -8,6 +8,16 @@ include "HTile/HTileDialect.td"
 include "mlir/IR/CommonTypeConstraints.td"
 include "mlir/IR/CommonAttrConstraints.td"
 
+def HTile_WarpPolicyAttr : Attr<And<[
+  StrAttr.predicate,
+  CPred<"([](::mlir::Attribute attr) { auto value = ::llvm::cast<::mlir::StringAttr>(attr).getValue(); return value == \"square\" || value == \"full_row\" || value == \"full_col\"; })($_self)">
+]>, "TileLang GEMM warp policy string attribute"> {
+  let storageType = "::mlir::StringAttr";
+  let returnType = "::mlir::StringAttr";
+  let convertFromStorage = "$_self";
+  let constBuilderCall = "$0";
+}
+
 def HTile_HelloOp : Op<HTile_Dialect, "hello"> {
   let summary = "trivial hello operation";
   let description = [{
@@ -26,6 +36,10 @@ def HTile_DotOp : Op<HTile_Dialect, "dot"> {
 
     `transpose_a` and `transpose_b` logically transpose the corresponding
     operand before the multiply, without requiring a separate `htile.permute`.
+
+    `warp_policy` is an optional backend lowering hint for partitioning GEMM
+    work across warps. TileLang currently recognizes `square`, `full_row`, and
+    `full_col`.
   }];
 
   let arguments = (ins
@@ -33,7 +47,8 @@ def HTile_DotOp : Op<HTile_Dialect, "dot"> {
     AnyRankedTensor:$rhs,
     Optional<AnyRankedTensor>:$acc,
     UnitAttr:$transpose_a,
-    UnitAttr:$transpose_b
+    UnitAttr:$transpose_b,
+    OptionalAttr<HTile_WarpPolicyAttr>:$warp_policy
   );
   let results = (outs AnyRankedTensor:$result);
 
