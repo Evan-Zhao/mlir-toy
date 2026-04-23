@@ -42,7 +42,7 @@ int main() {
   auto module = mlir::ModuleOp::create(builder.getUnknownLoc());
   module->setAttr("hello.message", builder.getStringAttr("Hello from MLIR 20"));
   builder.setInsertionPointToStart(module.getBody());
-  builder.create<htile::HelloOp>(builder.getUnknownLoc());
+  htile::HelloOp::create(builder, builder.getUnknownLoc());
 
   if (failed(mlir::verify(module))) {
     llvm::errs() << "Generated module failed verification\n";
