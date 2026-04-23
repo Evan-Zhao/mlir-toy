@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import ast
 import subprocess
-import sys
 from typing import Type
 
 import mlir.ir as ir
@@ -217,8 +216,12 @@ def parse_mlir_module(
         cmd += ["--mlir-print-op-generic", "--cse", "--canonicalize", path]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(result.stderr, file=sys.stderr)
-        sys.exit(1)
+        stderr = result.stderr.strip()
+        stdout = result.stdout.strip()
+        details = stderr or stdout or "mlir-opt failed without output"
+        raise RuntimeError(
+            f"mlir-opt failed with exit code {result.returncode}: {details}"
+        )
 
     ctx = ir.Context()
     ctx.allow_unregistered_dialects = True
