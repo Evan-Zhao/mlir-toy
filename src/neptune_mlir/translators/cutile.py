@@ -2,19 +2,17 @@
 """HTile MLIR -> NVIDIA cuTile Python translator using MLIR Python bindings.
 
 Usage:
-    python translate_to_cutile.py <input.mlir> [--plugin <plugin.dylib>]
+    python -m neptune_mlir.translators.cutile <input.mlir> [--plugin <plugin.dylib>]
 
 This backend is intentionally value-based: cuTile tiles are immutable values, so
 the lowering is closer to the Triton translator than to TileLang.
 """
 
-from __future__ import annotations
-
 import ast
 
 import mlir.ir as ir
 
-from translate_common import (
+from .common import (
     DEFAULT_PLUGIN,
     HTILE_DOT_TRANSPOSE_TO_LOAD_ORDER_PIPELINE,
     _assign,
@@ -121,10 +119,10 @@ class Translator:
             kwarg=None,
             defaults=[],
         )
-        return ast.FunctionDef(  # type: ignore
+        return ast.FunctionDef(
             name=kernel_name,
             args=arguments,
-            body=body,
+            body=body,  # type: ignore
             decorator_list=[_ct("kernel")],
             returns=None,
             lineno=0,
@@ -231,7 +229,12 @@ class Translator:
         name = self._bind(op.results[0], "v")
         _, dtype = _tensor_shape(op.results[0].type)
         return [
-            _assign(name, _ct_call("astype", self._expr(op.operands[0]), _mlir_dtype_to_ct(dtype)))
+            _assign(
+                name,
+                _ct_call(
+                    "astype", self._expr(op.operands[0]), _mlir_dtype_to_ct(dtype)
+                ),
+            )
         ]
 
     # --- htile ops ---
@@ -241,7 +244,9 @@ class Translator:
         tile_shape, _ = _tensor_shape(op.results[0].type)
         offsets = list(op.operands[1:])
         if len(offsets) != len(mem_shape):
-            raise NotImplementedError("cuTile load expects one offset per memref dimension")
+            raise NotImplementedError(
+                "cuTile load expects one offset per memref dimension"
+            )
 
         batch_dims = len(mem_shape) - len(tile_shape)
         if batch_dims < 0:
@@ -257,7 +262,7 @@ class Translator:
         index = self._tile_space_index(offsets, full_order, full_tile_shape)
 
         loaded = self._fresh("load")
-        stmts = [
+        stmts: list[ast.stmt] = [
             _assign(
                 loaded,
                 _ct_call(
@@ -274,7 +279,9 @@ class Translator:
         stmts.append(
             _assign(
                 result,
-                _ct_call("reshape", _name(loaded), _tuple(*[_const(s) for s in tile_shape])),
+                _ct_call(
+                    "reshape", _name(loaded), _tuple(*[_const(s) for s in tile_shape])
+                ),
             )
         )
         return stmts
@@ -284,7 +291,9 @@ class Translator:
         tile_shape, _ = _tensor_shape(op.operands[0].type)
         offsets = list(op.operands[2:])
         if len(offsets) != len(mem_shape):
-            raise NotImplementedError("cuTile store expects one offset per memref dimension")
+            raise NotImplementedError(
+                "cuTile store expects one offset per memref dimension"
+            )
 
         batch_dims = len(mem_shape) - len(tile_shape)
         full_order = list(range(len(mem_shape)))
@@ -479,9 +488,7 @@ def translate_file(path: str, plugin: str | None = None) -> ast.Module:
         path,
         Translator,
         plugin,
-        pass_pipeline=(
-            HTILE_DOT_TRANSPOSE_TO_LOAD_ORDER_PIPELINE if plugin else None
-        ),
+        pass_pipeline=(HTILE_DOT_TRANSPOSE_TO_LOAD_ORDER_PIPELINE if plugin else None),
         pass_plugin=plugin,
     )
 

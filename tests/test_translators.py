@@ -10,21 +10,25 @@ from pathlib import Path
 
 import pytest
 
+from neptune_mlir.plugin import find_plugin_path  # noqa: E402
+from neptune_mlir.translators.common import translate_file_with  # noqa: E402
+from neptune_mlir.translators.cutile import (
+    translate_file as translate_cutile,  # noqa: E402
+)
+from neptune_mlir.translators.tilelang import (  # noqa: E402
+    translate_file as translate_tilelang,
+)
+from neptune_mlir.translators.triton import Translator as TritonTranslator  # noqa: E402
+from neptune_mlir.translators.triton import (
+    translate_file as translate_triton,  # noqa: E402
+)
+
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "python" / "neptune"))
-
-from translate_common import translate_file_with  # noqa: E402
-from translate_to_cutile import translate_file as translate_cutile  # noqa: E402
-from translate_to_tilelang import translate_file as translate_tilelang  # noqa: E402
-from translate_to_triton import Translator as TritonTranslator  # noqa: E402
-from translate_to_triton import translate_file as translate_triton  # noqa: E402
-
-plugins = list((ROOT / "build").glob("libHTileDialectPlugin.*"))
-if len(plugins) != 1:
-    raise RuntimeError(f"Expected exactly one HTile dialect plugin; found {plugins}")
-PLUGIN = plugins[0]
+PLUGIN = find_plugin_path()
+if PLUGIN is None:
+    pytest.exit("MLIR plugin path not found")
 GOLDEN_DIR = ROOT / "tests" / "golden"
-MLIR_FILE = ROOT / "tests" / "flash_attention_htile.mlir"
+MLIR_FILE = ROOT / "tests" / "data" / "flash_attention_htile.mlir"
 DOT_TRANSPOSE_PASS_PIPELINE = (
     "builtin.module(htile-dot-transpose-to-load-order,cse,canonicalize)"
 )
@@ -36,7 +40,7 @@ FLASH_REF_BLOCK_ROWS = 128
 def require_translator_deps():
     if shutil.which("mlir-opt") is None:
         pytest.skip("mlir-opt is required for translator tests")
-    if not PLUGIN.exists():
+    if PLUGIN is None or not PLUGIN.exists():
         pytest.skip(f"HTile dialect plugin is missing: {PLUGIN}")
 
 

@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.20)
 
 project(NeptuneMLIR LANGUAGES C CXX)
 
+include(GNUInstallDirs)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 set(CMAKE_CXX_EXTENSIONS NO)
@@ -72,3 +74,16 @@ add_executable(hello-mlir hello-mlir.cpp)
 llvm_update_compile_flags(hello-mlir)
 target_compile_definitions(hello-mlir PRIVATE ${LLVM_DEFINITIONS})
 mlir_target_link_libraries(hello-mlir PRIVATE HTileDialect)
+
+if(SKBUILD)
+  set(NEPTUNE_MLIR_PLUGIN_INSTALL_DIR "neptune_mlir/_native")
+else()
+  set(NEPTUNE_MLIR_PLUGIN_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}")
+endif()
+
+install(
+  TARGETS HTileDialectPlugin
+  LIBRARY DESTINATION "${NEPTUNE_MLIR_PLUGIN_INSTALL_DIR}"
+  RUNTIME DESTINATION "${NEPTUNE_MLIR_PLUGIN_INSTALL_DIR}"
+  ARCHIVE DESTINATION "${NEPTUNE_MLIR_PLUGIN_INSTALL_DIR}"
+)

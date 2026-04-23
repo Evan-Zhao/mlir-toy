@@ -2,7 +2,7 @@
 """HTile MLIR -> TileLang Python translator using MLIR Python bindings.
 
 Usage:
-    python translate_to_tilelang.py <input.mlir> [--plugin <plugin.dylib>]
+    python -m neptune_mlir.translators.tilelang <input.mlir> [--plugin <plugin.dylib>]
 """
 
 from __future__ import annotations
@@ -12,10 +12,9 @@ from dataclasses import dataclass
 
 import mlir.ir as ir
 
-from translate_common import (
-    DEFAULT_PLUGIN,
+from .common import (
     _T,
-    _T_call,
+    DEFAULT_PLUGIN,
     _assign,
     _attr,
     _const,
@@ -33,6 +32,7 @@ from translate_common import (
     _parse_dense_i64_array,
     _store_subscript,
     _subscript,
+    _T_call,
     _tensor_shape,
     _tuple,
     translate_file_with,
@@ -120,7 +120,7 @@ class Translator:
             kwarg=None,
             defaults=[],
         )
-        return ast.FunctionDef(  # type: ignore
+        return ast.FunctionDef(
             name=kernel_name,
             args=arguments,
             body=body,
@@ -150,7 +150,10 @@ class Translator:
         grid = [self._expr(v) for v in op.operands[:3]]
         block = [self._expr(v) for v in op.operands[3:6]]
         threads: ast.expr
-        if self._const_int(op.operands[4]) == 1 and self._const_int(op.operands[5]) == 1:
+        if (
+            self._const_int(op.operands[4]) == 1
+            and self._const_int(op.operands[5]) == 1
+        ):
             threads = block[0]
         else:
             threads = _list(*block)
@@ -161,7 +164,7 @@ class Translator:
                 *[_name(name, ast.Store()) for name in block_names], ctx=ast.Store()
             ),
         )
-        return [ast.With(items=[with_item], body=body, lineno=0, col_offset=0)]
+        return [ast.With(items=[with_item], body=body, lineno=0, col_offset=0)]  # type: ignore
 
     # --- allocation pass ---
 
@@ -185,7 +188,9 @@ class Translator:
             if _is_ranked_tensor_type(result.type):
                 name = self._bind(result, self._result_hint(op_name))
                 shape, dtype = _tensor_shape(result.type)
-                alloc_fn = "alloc_shared" if self._is_shared(result.type) else "alloc_fragment"
+                alloc_fn = (
+                    "alloc_shared" if self._is_shared(result.type) else "alloc_fragment"
+                )
                 allocs.append(
                     _assign(
                         name,
@@ -265,7 +270,11 @@ class Translator:
         return [
             _assign(
                 name,
-                ast.BinOp(left=self._expr(op.operands[0]), op=py_op, right=self._expr(op.operands[1])),
+                ast.BinOp(
+                    left=self._expr(op.operands[0]),
+                    op=py_op,
+                    right=self._expr(op.operands[1]),
+                ),
             )
         ]
 
@@ -286,7 +295,12 @@ class Translator:
         if not _is_ranked_tensor_type(op.results[0].type):
             name = self._bind(op.results[0], "v")
             return [
-                _assign(name, _T_call("max", self._expr(op.operands[0]), self._expr(op.operands[1])))
+                _assign(
+                    name,
+                    _T_call(
+                        "max", self._expr(op.operands[0]), self._expr(op.operands[1])
+                    ),
+                )
             ]
 
         def build(indices: list[ast.expr]) -> ast.expr:
@@ -318,13 +332,15 @@ class Translator:
         shape, _ = _tensor_shape(result.type)
         out = self._get(result)
         index_names = [self._fresh(f"i{dim}") for dim in range(len(shape))]
-        indices = [_name(n) for n in index_names]
+        indices: list[ast.expr] = [_name(n) for n in index_names]
         target: ast.expr
         if len(index_names) == 1:
             target = _name(index_names[0], ast.Store())
         else:
-            target = _tuple(*[_name(n, ast.Store()) for n in index_names], ctx=ast.Store())
-        body = [
+            target = _tuple(
+                *[_name(n, ast.Store()) for n in index_names], ctx=ast.Store()
+            )
+        body: list[ast.stmt] = [
             ast.Assign(
                 targets=[_store_subscript(_name(out), indices)],
                 value=expr_builder(indices),
@@ -364,7 +380,11 @@ class Translator:
         return [_expr_stmt(_T_call("copy", self._expr(op.operands[0]), dst))]
 
     def _htile_full(self, op: ir.OpView) -> list[ast.stmt]:
-        return [_expr_stmt(_T_call("fill", self._expr(op.results[0]), self._expr(op.operands[0])))]
+        return [
+            _expr_stmt(
+                _T_call("fill", self._expr(op.results[0]), self._expr(op.operands[0]))
+            )
+        ]
 
     def _htile_dot(self, op: ir.OpView) -> list[ast.stmt]:
         dst = self._expr(op.results[0])
@@ -384,18 +404,37 @@ class Translator:
 
         stmts.append(
             _expr_stmt(
-                _T_call("gemm", self._expr(op.operands[0]), self._expr(op.operands[1]), dst, **kwargs)
+                _T_call(
+                    "gemm",
+                    self._expr(op.operands[0]),
+                    self._expr(op.operands[1]),
+                    dst,
+                    **kwargs,
+                )
             )
         )
         return stmts
 
     def _htile_reduce(self, op: ir.OpView) -> list[ast.stmt]:
-        kind = _parse_attr_str(op.attributes.get("kind")) if op.attributes.get("kind") else "sum"
-        axis = _parse_attr_int(op.attributes.get("axis")) if op.attributes.get("axis") else 1
+        kind = (
+            _parse_attr_str(op.attributes.get("kind"))
+            if op.attributes.get("kind")
+            else "sum"
+        )
+        axis = (
+            _parse_attr_int(op.attributes.get("axis"))
+            if op.attributes.get("axis")
+            else 1
+        )
         fn = "reduce_max" if kind == "max" else "reduce_sum"
         return [
             _expr_stmt(
-                _T_call(fn, self._expr(op.operands[0]), self._expr(op.results[0]), dim=_const(axis))
+                _T_call(
+                    fn,
+                    self._expr(op.operands[0]),
+                    self._expr(op.results[0]),
+                    dim=_const(axis),
+                )
             )
         ]
 
@@ -453,7 +492,7 @@ class Translator:
             ast.For(
                 target=_name(loop_name, ast.Store()),
                 iter=iter_expr,
-                body=body,
+                body=body,  # type: ignore
                 orelse=[],
                 lineno=0,
                 col_offset=0,
