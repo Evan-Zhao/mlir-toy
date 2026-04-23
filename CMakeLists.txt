@@ -49,9 +49,10 @@ set(HTILE_DIALECT_SOURCES
 add_library(HTileDialect STATIC ${HTILE_DIALECT_SOURCES})
 mlir_target_link_libraries(HTileDialect PUBLIC MLIRIR MLIRPass MLIRSupport)
 
-# Shared plugin for `mlir-opt --load-dialect-plugin=<path>/libHTileDialect.dylib`.
-# Must NOT statically embed MLIR libs — mlir-opt already provides them via
-# libMLIR.dylib, and duplicate TypeID registries cause a segfault on load.
+# Shared plugin for `mlir-opt --load-dialect-plugin=<path>/libHTileDialect.so`
+# (or `.dylib` for macOS).
+# Must NOT statically embed MLIR libs -- mlir-opt already provides them via
+# libMLIR.so, and duplicate TypeID registries cause a segfault on load.
 add_library(HTileDialectPlugin SHARED ${HTILE_DIALECT_SOURCES})
 # Resolve MLIR/LLVM symbols from the host process at runtime.
 if(APPLE)

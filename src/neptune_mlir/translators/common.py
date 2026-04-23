@@ -13,11 +13,7 @@ import mlir.ir as ir
 from ..plugin import find_plugin_path
 
 DEFAULT_PLUGIN = find_plugin_path()
-if DEFAULT_PLUGIN is None:
-    raise ImportError(
-        "Translators failed to initialize because MLIR plugin path was not found"
-    )
-DEFAULT_PLUGIN = DEFAULT_PLUGIN.as_posix()
+DEFAULT_PLUGIN = None if DEFAULT_PLUGIN is None else DEFAULT_PLUGIN.as_posix()
 HTILE_DOT_TRANSPOSE_TO_LOAD_ORDER_PIPELINE = (
     "builtin.module(htile-dot-transpose-to-load-order,cse,canonicalize)"
 )

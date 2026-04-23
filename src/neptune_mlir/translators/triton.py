@@ -2,7 +2,7 @@
 """HTile MLIR -> Triton Python translator using MLIR Python bindings.
 
 Usage:
-    python translate_to_triton.py <input.mlir> [--plugin <plugin.dylib>]
+    python -m neptune_mlir.translators.triton <input.mlir> [--plugin <plugin.dylib>]
 
 mlir-opt is called as a subprocess to convert HTile dialect ops to generic form.
 """
@@ -10,7 +10,8 @@ mlir-opt is called as a subprocess to convert HTile dialect ops to generic form.
 import ast
 
 import mlir.ir as ir
-from translate_common import (
+
+from .common import (
     DEFAULT_PLUGIN,
     HTILE_DOT_TRANSPOSE_TO_LOAD_ORDER_PIPELINE,
     _assign,
@@ -104,10 +105,10 @@ class Translator:
             kwarg=None,
             defaults=[],
         )
-        return ast.FunctionDef(  # type: ignore
+        return ast.FunctionDef(
             name=kernel_name,
             args=arguments,
-            body=body,
+            body=body,  # type: ignore
             decorator_list=[decorator],
             returns=None,
             lineno=0,
