@@ -71,11 +71,6 @@ foreach(target HTileDialect HTileDialectPlugin)
   target_compile_definitions(${target} PRIVATE ${LLVM_DEFINITIONS})
 endforeach()
 
-add_executable(hello-mlir hello-mlir.cpp)
-llvm_update_compile_flags(hello-mlir)
-target_compile_definitions(hello-mlir PRIVATE ${LLVM_DEFINITIONS})
-mlir_target_link_libraries(hello-mlir PRIVATE HTileDialect)
-
 if(SKBUILD)
   set(NEPTUNE_MLIR_PLUGIN_INSTALL_DIR "neptune_mlir/_native")
 else()

@@ -22,6 +22,3 @@ neptune-cutile = "neptune_mlir.translators.cutile:main"
 cmake.version = ">=3.20"
 wheel.packages = ["src/neptune_mlir"]
 build-dir = "build/{wheel_tag}"
-
-[tool.scikit-build.cmake.define]
-NEPTUNE_MLIR_BUILD_HELLO = "OFF"
