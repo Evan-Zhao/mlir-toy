@@ -32,8 +32,8 @@ The scheduled L1 program should expose:
 | `get_block(name)` | Avoid relying on frontend block names. Match structurally using Transform dialect matchers and custom match ops. |
 | `tile_loops([i, j])` | `transform.structured.tile_using_forall` for outer `(B, H, M)` tiling, then `transform.structured.tile_using_for` or custom tiling into an `affine.for` for the streaming K/V block loop. |
 | `bind_block_idx([*axes, i0])` | Represent as `scf.forall` at L1. GPU block mapping is deferred to later lowering. |
-| `reverse_compute_at` | Use `transform.structured.fuse_into_containing_op` where upstream tiling/fusion is sufficient. Use custom transform logic when fusing through online-softmax repair. |
-| `rolling_update` | Implement as a custom Transform dialect op, e.g. `transform.tileir.rolling_update`. |
+| `reverse_compute_at` | Use `transform.structured.fuse_into_containing_op` for producer-into-consumer cases. Use `transform.linalg_ext.fuse_unary_elementwise_consumer_into_loop` for the score epilogue, and custom transform logic when fusing through online-softmax repair. |
+| `rolling_update` | Implement as a custom Transform dialect op, e.g. `transform.linalg_ext.rolling_update`. |
 | `split_scan_buffer` | Model as explicit loop-carried tensors in `affine.for iter_args`. |
 | `decompose_reduction` | Use Linalg reduction structure plus explicit initial tensors and loop-carried state. |
 | `set_scope`, `cache_read`, `cache_write` | Not represented in L1. Defer memory placement to L1-to-HTile lowering. |
@@ -42,7 +42,7 @@ The scheduled L1 program should expose:
 
 ## Structural Matching Strategy
 
-Do not require `tileir.tag` or TVM-style block names in the algorithmic IR.
+Do not require `custom tags` or TVM-style block names in the algorithmic IR.
 
 Use a layered matcher design:
 
@@ -78,6 +78,43 @@ Use a layered matcher design:
    - body computes `x * constant`,
    - scale constant is either `1/sqrt(D)` or can be converted to `log2(e)/sqrt(D)` when switching to `exp2`.
 
+   This op is a downstream consumer of the tiled QK result. Upstream
+   `transform.structured.fuse_into_containing_op` cannot directly move it into
+   the QK streaming loop because that transform is producer-into-containing-op
+   fusion: the producer must already have a use inside the containing op. Here
+   the dependency points the other way:
+
+   ```text
+   qk_tile loop -> full S tensor -> score scaling consumer
+   ```
+
+   For FlashAttention we need the score scale inside the streaming loop before
+   softmax repair:
+
+   ```text
+   qk_tile = Q_tile @ K_tile^T
+   score_tile = qk_tile * scale
+   ```
+
+   Add a deliberately narrow reverse-fusion transform for this case:
+
+   ```mlir
+   %score_fused, %j_loop_1 =
+     transform.linalg_ext.fuse_unary_elementwise_consumer_into_loop
+       %score into %j_loop
+       : (!transform.any_op, !transform.any_op)
+      -> (!transform.any_op, !transform.any_op)
+   ```
+
+   The first implementation should support a single `linalg.map` consumer with
+   one tensor input and one tensor output, where the containing op is the
+   `scf.for` streaming loop produced by QK tiling. It rewrites the loop body so
+   the elementwise map is applied to the tile before the tile is inserted into
+   the loop-carried result, then replaces uses of the original full-tensor
+   consumer result with the containing tiled result. This is intentionally not a
+   general TVM-style `reverse_compute_at`; it is the minimal valid transform
+   needed for score scaling.
+
 4. **Find softmax**
    Prefer decomposing `linalg.softmax` first into explicit max/exp/sum/div ops.
 
@@ -93,7 +130,7 @@ Use a layered matcher design:
 
    ```mlir
    %qk, %scale, %row_max, %exp, %row_sum, %norm =
-     transform.match.tileir.attention_softmax_chain %func
+     transform.match.linalg_ext.attention_softmax_chain %func
        : (!transform.any_op)
       -> (!transform.any_op, !transform.any_op, !transform.any_op,
           !transform.any_op, !transform.any_op, !transform.any_op)
@@ -130,7 +167,7 @@ pattern:
 Add a custom matcher for rank-polymorphic einsum/einops structure:
 
 ```mlir
-%qk = transform.match.tileir.einsum %func
+%qk = transform.match.linalg_ext.einsum %func
     {pattern = "...ik,...jk->...ij"}
   : (!transform.any_op) -> !transform.any_op
 ```
@@ -151,7 +188,7 @@ This matcher should compose with `transform.match.structured.body` or a custom
 contraction-body predicate:
 
 ```mlir
-%qk = transform.match.tileir.einsum %func
+%qk = transform.match.linalg_ext.einsum %func
     {pattern = "...ik,...jk->...ij"}
   : (!transform.any_op) -> !transform.any_op
 
@@ -173,7 +210,7 @@ Longer term, generalize from einsum to einops-style operators by matching named
 axis expressions:
 
 ```mlir
-%pack = transform.match.tileir.einops %func
+%pack = transform.match.linalg_ext.einops %func
     {pattern = "b h (m bm) d -> b h m bm d"}
   : (!transform.any_op) -> !transform.any_op
 ```
@@ -195,7 +232,7 @@ module attributes {transform.with_named_sequence} {
       : (!transform.any_op) -> !transform.any_op
 
     %qk, %scale, %row_max, %exp, %row_sum, %pv, %norm, %cast =
-      transform.match.tileir.attention_pattern %func
+      transform.match.linalg_ext.attention_pattern %func
         : (!transform.any_op)
        -> (!transform.any_op, !transform.any_op, !transform.any_op,
            !transform.any_op, !transform.any_op, !transform.any_op,
@@ -210,21 +247,21 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
 
     %scale_fused, %j_loop_1 =
-      transform.structured.fuse_into_containing_op %scale into %j_loop
+      transform.linalg_ext.fuse_unary_elementwise_consumer_into_loop %scale into %j_loop
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
 
     %row_max_rf =
-      transform.tileir.rolling_update %row_max into %j_loop_1
+      transform.linalg_ext.rolling_update %row_max into %j_loop_1
         {factor_axis = 0 : i64}
         : (!transform.any_op, !transform.any_op) -> !transform.any_op
 
     %row_sum_rf =
-      transform.tileir.rolling_update %row_sum into %j_loop_1
+      transform.linalg_ext.rolling_update %row_sum into %j_loop_1
         {factor_axis = 0 : i64}
         : (!transform.any_op, !transform.any_op) -> !transform.any_op
 
     %pv_rf =
-      transform.tileir.rolling_update %pv into %j_loop_1
+      transform.linalg_ext.rolling_update %pv into %j_loop_1
         {factor_axis = 0 : i64}
         : (!transform.any_op, !transform.any_op) -> !transform.any_op
 
@@ -290,9 +327,10 @@ out      = acc_final / l_final
    - final cast.
 
 3. **Add transform extension plumbing**
-   Register a TileIR/Neptune transform dialect extension that defines:
-   - `transform.match.tileir.attention_pattern`,
-   - `transform.tileir.rolling_update`,
+   Register a LinalgExt/Neptune transform dialect extension that defines:
+   - `transform.match.linalg_ext.attention_pattern`,
+   - `transform.linalg_ext.fuse_unary_elementwise_consumer_into_loop`,
+   - `transform.linalg_ext.rolling_update`,
    - optional cleanup pattern descriptors such as exp2-hoist-across-broadcast.
 
 4. **Implement tiling and fusion without rolling update**
@@ -424,7 +462,7 @@ are not semantically wrong because they do not replace the original result yet.
 
 ### Proposed Smaller Transform Ops
 
-#### `transform.match.tileir.rolling_frontier`
+#### `transform.match.linalg_ext.rolling_frontier`
 
 Pure matcher/analysis op.
 
@@ -444,7 +482,7 @@ This should not mutate payload IR. It replaces TVM's frontier discovery logic
 and should fail with a silenceable failure if the graph is not a supported
 rolling-update pattern.
 
-#### `transform.tileir.clone_chain_under_loop`
+#### `transform.linalg_ext.clone_chain_under_loop`
 
 Clone or tile the matched spatial producer chain under the target loop.
 
@@ -454,7 +492,7 @@ the only producer. The original producer chain stays live until publication.
 For attention, this creates loop-local score tiles and elementwise score
 transforms inside the streaming loop.
 
-#### `transform.tileir.reduction_to_scan`
+#### `transform.linalg_ext.reduction_to_scan`
 
 Convert one frontier reduction into an explicit scan or loop-carried tile state.
 
@@ -474,7 +512,7 @@ l_next = exp2(m_prev - m_next) * l_prev + row_sum(p_tile)
 The transform should be allowed to choose the `iter_args` representation for L1,
 even if the TVM implementation used scan buffers internally.
 
-#### `transform.tileir.derive_rolling_repair`
+#### `transform.linalg_ext.derive_rolling_repair`
 
 Pure analysis op.
 
@@ -499,7 +537,7 @@ acc_next = broadcast(scale) * acc_prev + pv
 This op should not mutate IR. It can return a parameter/attribute describing the
 repair plan.
 
-#### `transform.tileir.rfactor_reduction`
+#### `transform.linalg_ext.rfactor_reduction`
 
 Factor the target reduction over the streaming loop.
 
@@ -510,7 +548,7 @@ from full `P @ V` to per-KV-block `p_tile @ v_tile`.
 This op can be smaller than TVM's generalized rfactor because L1 can represent
 the factored value directly as a tile tensor in the loop body.
 
-#### `transform.tileir.apply_rolling_repair`
+#### `transform.linalg_ext.apply_rolling_repair`
 
 Apply the repair expression to the factored/sidecar computation.
 
@@ -523,7 +561,7 @@ acc_next = exp2(m_prev - m_next) * acc_prev + p_tile @ v_tile
 This is the point where the sidecar computation becomes mathematically complete,
 but it still does not need to replace the original result.
 
-#### `transform.tileir.publish_scheduled_result`
+#### `transform.linalg_ext.publish_scheduled_result`
 
 Replace the original algorithmic result with the completed scheduled result.
 
@@ -621,7 +659,7 @@ Useful knobs become:
 The scheduler can still expose a composite convenience transform:
 
 ```mlir
-transform.tileir.flash_attention_schedule %attention
+transform.linalg_ext.flash_attention_schedule %attention
   {m_tile = 128, kv_tile = 64}
 ```
 

@@ -2,11 +2,28 @@
 // flash_attention_l1.mlir. Mirrors `_schedule_attention_flash` from Neptune.
 //
 // Usage:
-//   mlir-opt attention_l0.mlir \
-//     --transform-preload-library=transform-library-paths=attention_l0_to_l1.transform.mlir \
+//   mlir-opt tests/data/attention_l0.mlir \
+//     --load-dialect-plugin=build/libLinalgExtTransformPlugin.dylib \
+//     --transform-preload-library=transform-library-paths=tests/data/attention_l0_to_l1.transform.mlir \
 //     --transform-interpreter
 
 module attributes {transform.with_named_sequence} {
+  transform.named_sequence @match_unary_elementwise(
+      %candidate: !transform.any_op {transform.readonly}) -> !transform.any_op {
+    %matched = transform.match.structured %candidate
+        : (!transform.any_op) -> !transform.any_op {
+    ^bb0(%op: !transform.any_op):
+      transform.match.structured.body %op {elementwise} : !transform.any_op
+
+      %num_inputs = transform.match.structured.num_inputs %op
+          : (!transform.any_op) -> !transform.param<i64>
+      %one = transform.param.constant 1 : i64 -> !transform.param<i64>
+      transform.match.param.cmpi eq %num_inputs, %one : !transform.param<i64>
+
+      transform.match.structured.yield %op : !transform.any_op
+    }
+    transform.yield %matched : !transform.any_op
+  }
 
   transform.named_sequence @__transform_main(
       %module: !transform.any_op) {
@@ -58,11 +75,24 @@ module attributes {transform.with_named_sequence} {
           tile_sizes [1, 1, 128, 0, 0]
         : (!transform.any_op)
        -> (!transform.any_op, !transform.any_op)
-
     %b0_inner, %j0_loop =
       transform.structured.tile_using_for %b0_outer
           tile_sizes [0, 0, 0, 128, 0]
         : (!transform.any_op)
+       -> (!transform.any_op, !transform.any_op)
+
+    // ============================================================
+    // Step 2. Match element-wise ops that consume b0, and fuse them into the j0 loop.
+    // (For attention, this step would only match the score-scaling op.)
+    //   TVM: sch.reverse_compute_at(b1, j0)
+    // ============================================================
+    %consumers = transform.get_consumers_of_result %forall_loop[0]
+        : (!transform.any_op) -> !transform.any_op
+    %score_ops = transform.collect_matching @match_unary_elementwise in %consumers
+        : (!transform.any_op) -> !transform.any_op
+    %b1_fused, %j0_loop_1 =
+      transform.linalg_ext.fuse_unary_elementwise_consumer_into_loop %score_ops into %j0_loop
+        : (!transform.any_op, !transform.any_op)
        -> (!transform.any_op, !transform.any_op)
 
     // ============================================================

@@ -21,6 +21,7 @@ include(AddLLVM)
 include(TableGen)
 include(AddMLIR)
 
+# These are used for tablegen
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
 include_directories(${LLVM_INCLUDE_DIRS})
@@ -40,36 +41,44 @@ mlir_tablegen(HTileEnums.h.inc -gen-enum-decls)
 mlir_tablegen(HTileEnums.cpp.inc -gen-enum-defs)
 add_public_tablegen_target(HTileAttrsIncGen)
 
-set(HTILE_DIALECT_SOURCES
-  lib/HTile/HTileDialect.cpp
-  lib/HTile/HTilePasses.cpp
-)
+set(LLVM_TARGET_DEFINITIONS include/LinalgExt/LinalgExtTransformOps.td)
+mlir_tablegen(LinalgExtTransformOps.h.inc -gen-op-decls)
+mlir_tablegen(LinalgExtTransformOps.cpp.inc -gen-op-defs)
+add_public_tablegen_target(LinalgExtTransformOpsIncGen)
 
-# Static lib for linking into executables (e.g. hello-mlir).
-add_library(HTileDialect STATIC ${HTILE_DIALECT_SOURCES})
-mlir_target_link_libraries(HTileDialect PUBLIC MLIRIR MLIRPass MLIRSupport)
+function(make_mlir_opt_plugin)
+  cmake_parse_arguments(ARG "" "TARGET" "SOURCES;DEPS" ${ARGN})
+  # Shared plugin for `mlir-opt --load-dialect-plugin=<path>/libHTileDialect.so`
+  # (or `.dylib` for macOS).
+  # Must NOT statically embed MLIR libs -- mlir-opt already provides them via
+  # libMLIR.so, and duplicate TypeID registries cause a segfault on load.
+  add_library(${ARG_TARGET} SHARED ${ARG_SOURCES})
+  # Resolve MLIR/LLVM symbols from the host process at runtime.
+  if(APPLE)
+    target_link_options(${ARG_TARGET} PRIVATE -undefined dynamic_lookup)
+  endif()
 
-# Shared plugin for `mlir-opt --load-dialect-plugin=<path>/libHTileDialect.so`
-# (or `.dylib` for macOS).
-# Must NOT statically embed MLIR libs -- mlir-opt already provides them via
-# libMLIR.so, and duplicate TypeID registries cause a segfault on load.
-add_library(HTileDialectPlugin SHARED ${HTILE_DIALECT_SOURCES})
-# Resolve MLIR/LLVM symbols from the host process at runtime.
-if(APPLE)
-  target_link_options(HTileDialectPlugin PRIVATE -undefined dynamic_lookup)
-endif()
-
-foreach(target HTileDialect HTileDialectPlugin)
-  add_dependencies(${target} HTileOpsIncGen HTileAttrsIncGen)
-  llvm_update_compile_flags(${target})
-  target_include_directories(${target} PUBLIC
+  add_dependencies(${ARG_TARGET} ${ARG_DEPS})
+  llvm_update_compile_flags(${ARG_TARGET})
+  target_include_directories(${ARG_TARGET} PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_BINARY_DIR}
     ${LLVM_INCLUDE_DIRS}
     ${MLIR_INCLUDE_DIRS}
   )
-  target_compile_definitions(${target} PRIVATE ${LLVM_DEFINITIONS})
-endforeach()
+  target_compile_definitions(${ARG_TARGET} PRIVATE ${LLVM_DEFINITIONS})
+endfunction()
+
+make_mlir_opt_plugin(
+  TARGET HTileDialect
+  SOURCES lib/HTile/HTileDialect.cpp lib/HTile/HTilePasses.cpp
+  DEPS HTileOpsIncGen HTileAttrsIncGen
+)
+make_mlir_opt_plugin(
+  TARGET LinalgExtTransform
+  SOURCES lib/LinalgExt/LinalgExtTransformOps.cpp
+  DEPS LinalgExtTransformOpsIncGen
+)
 
 if(SKBUILD)
   set(NEPTUNE_MLIR_PLUGIN_INSTALL_DIR "neptune_mlir/_native")
@@ -78,7 +87,7 @@ else()
 endif()
 
 install(
-  TARGETS HTileDialectPlugin
+  TARGETS HTileDialect LinalgExtTransform
   LIBRARY DESTINATION "${NEPTUNE_MLIR_PLUGIN_INSTALL_DIR}"
   RUNTIME DESTINATION "${NEPTUNE_MLIR_PLUGIN_INSTALL_DIR}"
   ARCHIVE DESTINATION "${NEPTUNE_MLIR_PLUGIN_INSTALL_DIR}"
