@@ -92,7 +92,10 @@ make_mlir_opt_plugin(
 )
 make_mlir_opt_plugin(
   TARGET LinalgExtTransform
-  SOURCES lib/LinalgExt/LinalgExtTransformOps.cpp
+  SOURCES
+    lib/LinalgExt/LinalgExtPlugin.cpp
+    lib/LinalgExt/FusionTransformOps.cpp
+    lib/LinalgExt/RollingUpdateTransformOps.cpp
   DEPS LinalgExtTransformOpsIncGen
 )
 
