@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 project(NeptuneMLIR LANGUAGES C CXX)
 
 include(GNUInstallDirs)
+include(CTest)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
@@ -20,6 +21,21 @@ list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
 include(AddLLVM)
 include(TableGen)
 include(AddMLIR)
+
+set(LLVM_LIT_ARGS "-sv" CACHE STRING "Default options for lit")
+
+if(BUILD_TESTING AND NOT LLVM_EXTERNAL_LIT)
+  # Sadly LLVM installation doesn't provide `llvm-lit`.
+  # You'll only have `llvm-lit` around if you have an LLVM *build* dir.
+  find_program(NEPTUNE_MLIR_LIT NAMES llvm-lit)
+  if(NOT NEPTUNE_MLIR_LIT)
+    # Try `lit`, which can be installed via `pip install lit`.
+    find_program(NEPTUNE_MLIR_LIT NAMES lit)
+  endif()
+  if(NEPTUNE_MLIR_LIT)
+    set(LLVM_EXTERNAL_LIT "${NEPTUNE_MLIR_LIT}" CACHE STRING "Command used to spawn lit" FORCE)
+  endif()
+endif()
 
 # These are used for tablegen
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -92,3 +108,7 @@ install(
   RUNTIME DESTINATION "${NEPTUNE_MLIR_PLUGIN_INSTALL_DIR}"
   ARCHIVE DESTINATION "${NEPTUNE_MLIR_PLUGIN_INSTALL_DIR}"
 )
+
+if(BUILD_TESTING)
+  add_subdirectory(tests)
+endif()
