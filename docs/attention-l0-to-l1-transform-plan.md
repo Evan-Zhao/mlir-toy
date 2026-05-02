@@ -27,18 +27,18 @@ The scheduled L1 program should expose:
 
 ## TVM to MLIR Primitive Map
 
-| TVM primitive                            | MLIR plan                                                                                                                                                                                                                                               |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `get_block(name)`                        | Avoid relying on frontend block names. Match structurally using Transform dialect matchers and custom match ops.                                                                                                                                        |
-| `tile_loops([i, j])`                     | `transform.structured.tile_using_forall` for outer `(B, H, M)` tiling, then `transform.structured.tile_using_for` or custom tiling into an `affine.for` for the streaming K/V block loop.                                                               |
-| `bind_block_idx([*axes, i0])`            | Represent as `scf.forall` at L1. GPU block mapping is deferred to later lowering.                                                                                                                                                                       |
-| `reverse_compute_at`                     | Use `transform.structured.fuse_into_containing_op` for producer-into-consumer cases. Use `transform.linalg_ext.fuse_unary_elementwise_consumer_into_loop` for the score epilogue, and custom transform logic when fusing through online-softmax repair. |
-| `rolling_update`                         | Implement as a custom Transform dialect op, e.g. `transform.linalg_ext.rolling_update`.                                                                                                                                                                 |
-| `split_scan_buffer`                      | Model as explicit loop-carried tensors in `affine.for iter_args`.                                                                                                                                                                                       |
-| `decompose_reduction`                    | Use Linalg reduction structure plus explicit initial tensors and loop-carried state.                                                                                                                                                                    |
-| `set_scope`, `cache_read`, `cache_write` | Not represented in L1. Defer memory placement to L1-to-HTile lowering.                                                                                                                                                                                  |
-| `to_tile_expr_form`, `mem2reg`           | L1 is already value-based over tile tensors.                                                                                                                                                                                                            |
-| `rewrite_expr`, `cse`                    | Use canonicalization/CSE plus a targeted rewrite pattern for row-wise `exp2` hoisting if needed.                                                                                                                                                        |
+| TVM primitive                            | MLIR plan                                                                                                                                                                                 |
+| ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `get_block(name)`                        | Avoid relying on frontend block names. Match structurally using Transform dialect matchers and custom match ops.                                                                          |
+| `tile_loops([i, j])`                     | `transform.structured.tile_using_forall` for outer `(B, H, M)` tiling, then `transform.structured.tile_using_for` or custom tiling into an `affine.for` for the streaming K/V block loop. |
+| `bind_block_idx([*axes, i0])`            | Represent as `scf.forall` at L1. GPU block mapping is deferred to later lowering.                                                                                                         |
+| `reverse_compute_at`                     | Implement a custom `fuse_map_consumer_into_loop` for upward fusion (limited to map operations). `transform.structured.fuse_into_containing_op` can only do downward fusion.               |
+| `rolling_update`                         | Implement as a custom Transform dialect op, e.g. `transform.linalg_ext.rolling_update`.                                                                                                   |
+| `split_scan_buffer`                      | Model as explicit loop-carried tensors in `affine.for iter_args`.                                                                                                                         |
+| `decompose_reduction`                    | Use Linalg reduction structure plus explicit initial tensors and loop-carried state.                                                                                                      |
+| `set_scope`, `cache_read`, `cache_write` | Not represented in L1. Defer memory placement to L1-to-HTile lowering.                                                                                                                    |
+| `to_tile_expr_form`, `mem2reg`           | L1 is already value-based over tile tensors.                                                                                                                                              |
+| `rewrite_expr`, `cse`                    | Use canonicalization/CSE plus a targeted rewrite pattern for row-wise `exp2` hoisting if needed.                                                                                          |
 
 ## Structural Matching Strategy
 
@@ -100,7 +100,7 @@ Use a layered matcher design:
 
     ```mlir
     %score_fused, %j_loop_1 =
-      transform.linalg_ext.fuse_unary_elementwise_consumer_into_loop
+      transform.linalg_ext.fuse_map_consumer_into_loop
         %score into %j_loop
         : (!transform.any_op, !transform.any_op)
        -> (!transform.any_op, !transform.any_op)
@@ -247,7 +247,7 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
 
     %scale_fused, %j_loop_1 =
-      transform.linalg_ext.fuse_unary_elementwise_consumer_into_loop %scale into %j_loop
+      transform.linalg_ext.fuse_map_consumer_into_loop %scale into %j_loop
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
 
     %row_max_rf =
@@ -329,7 +329,7 @@ out      = acc_final / l_final
 3. **Add transform extension plumbing**
    Register a LinalgExt/Neptune transform dialect extension that defines:
     - `transform.match.linalg_ext.attention_pattern`,
-    - `transform.linalg_ext.fuse_unary_elementwise_consumer_into_loop`,
+    - `transform.linalg_ext.fuse_map_consumer_into_loop`,
     - `transform.linalg_ext.rolling_update`,
     - optional cleanup pattern descriptors such as exp2-hoist-across-broadcast.
 

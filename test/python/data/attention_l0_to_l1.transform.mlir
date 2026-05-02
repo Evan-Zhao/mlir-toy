@@ -36,7 +36,7 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     // Fail if there are zero or multiple such consumers.
     %fused_consumer, %updated_loop =
-      transform.linalg_ext.fuse_unary_elementwise_consumer_into_loop %consumers_1 into %producer_loop
+      transform.linalg_ext.fuse_map_consumer_into_loop %consumers_1 into %producer_loop
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
     transform.yield %fused_consumer, %updated_loop : !transform.any_op, !transform.any_op
   }
@@ -44,6 +44,12 @@ module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
     %func = transform.structured.match ops{["func.func"]} in %module
         : (!transform.any_op) -> !transform.any_op
+
+    // Step 0. Decompose softmax into linalg ops.
+    %softmax = transform.structured.match ops{["linalg.softmax"]} in %func
+      : (!transform.any_op) -> !transform.any_op
+    %decomposed = transform.structured.decompose_interface %softmax
+      : (!transform.any_op) -> !transform.any_op
 
     // Step 1. Pattern match a matmul to find "matmul1" in attention,
     // then tile its outer iteration space.
