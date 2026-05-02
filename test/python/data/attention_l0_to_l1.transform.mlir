@@ -28,17 +28,15 @@ module attributes {transform.with_named_sequence} {
   // Fuse the consumer `c` of an op `op` if `c` only reads from `op` and nothing else.
   // Fails if there are zero or multiple such consumers.
   transform.named_sequence @fuse_up_elemwise_consumer(
-      %producer: !transform.any_op {transform.readonly},
-      %loop: !transform.any_op {transform.consumed}
+      %producer_loop: !transform.any_op {transform.consumed}
   ) -> (!transform.any_op, !transform.any_op) {
-    %consumers = transform.get_consumers_of_result %producer[0]
+    %consumers = transform.get_consumers_of_result %producer_loop[0]
         : (!transform.any_op) -> !transform.any_op
     %consumers_1 = transform.collect_matching @match_unary_elemwise in %consumers
         : (!transform.any_op) -> !transform.any_op
     // Fail if there are zero or multiple such consumers.
-    transform.print %consumers_1 : !transform.any_op
     %fused_consumer, %updated_loop =
-      transform.linalg_ext.fuse_unary_elementwise_consumer_into_loop %consumers_1 into %loop
+      transform.linalg_ext.fuse_unary_elementwise_consumer_into_loop %consumers_1 into %producer_loop
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
     transform.yield %fused_consumer, %updated_loop : !transform.any_op, !transform.any_op
   }
@@ -75,31 +73,19 @@ module attributes {transform.with_named_sequence} {
       transform.match.structured.yield %candidate : !transform.any_op
     }
     // == Tiling
-    //   TVM: i0, j0 = tile_loops(sch, [i, j], decisions=[128, 128])
-    //        bind_block_idx(sch, [*axes, i0])
-    //   Iteration order on b0 is (b, h, i, j, k).
-    //   - (b, h, i) -> outer parallel scf.forall
-    //     (the eventual block grid; no #gpu mapping at L1).
-    //   - j        -> sequential scf.for
-    //     (the K/V-block streaming loop).
-    //   - k        -> stays as the matmul's inner reduction
-    //     (un-tiled; head dim = 128 fits).
+    // We'll tile all parallel dimensions of b0 (b, h, i, j) into a scf.forall loop,
+    // which has a parallel execution intent.
+    // Soon the `j` dimension will become sequential as fusion happens,
+    // but we'll worry about that later.
     %b0_outer, %forall_loop =
-      transform.structured.tile_using_forall %b0
-          tile_sizes [1, 1, 128, 0, 0]
-        : (!transform.any_op)
-       -> (!transform.any_op, !transform.any_op)
-    %b0_inner, %j0_loop =
-      transform.structured.tile_using_for %b0_outer
-          tile_sizes [0, 0, 0, 128, 0]
-        : (!transform.any_op)
-       -> (!transform.any_op, !transform.any_op)
+      transform.structured.tile_using_forall %b0 tile_sizes [1, 1, 128, 128, 0]
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
 
     // Step 2. Match element-wise ops that consume b0, and fuse them into the j0 loop.
     // (For attention, this step would only match the score-scaling op.)
     //   TVM: sch.reverse_compute_at(b1, j0)
-    %b1_fused, %j0_loop_1 = transform.include @fuse_up_elemwise_consumer failures(propagate)
-        (%forall_loop, %j0_loop) : (!transform.any_op, !transform.any_op)
+    %b1_fused, %forall_loop_1 = transform.include @fuse_up_elemwise_consumer failures(propagate)
+        (%forall_loop) : (!transform.any_op)
         -> (!transform.any_op, !transform.any_op)
 
     // Step 7. Canonicalize + CSE.
