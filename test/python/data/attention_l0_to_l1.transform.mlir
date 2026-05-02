@@ -41,6 +41,37 @@ module attributes {transform.with_named_sequence} {
     transform.yield %fused_consumer, %updated_loop : !transform.any_op, !transform.any_op
   }
 
+  transform.named_sequence @match_unary_reduction(
+      %candidate: !transform.any_op {transform.readonly}
+  ) -> !transform.any_op {
+    %matched = transform.match.structured %candidate
+        : (!transform.any_op) -> !transform.any_op {
+    ^bb0(%op: !transform.any_op):
+      %num_inputs = transform.match.structured.num_inputs %op
+          : (!transform.any_op) -> !transform.param<i64>
+      %one = transform.param.constant 1 : i64 -> !transform.param<i64>
+      transform.match.param.cmpi eq %num_inputs, %one : !transform.param<i64>
+      transform.match.structured.dim %op[0, 1, 2] {parallel} : !transform.any_op
+      transform.match.structured.dim %op[3] {reduction} : !transform.any_op
+      transform.match.structured.yield %op : !transform.any_op
+    }
+    transform.yield %matched : !transform.any_op
+  }
+
+  transform.named_sequence @fuse_up_reduction_consumer(
+      %producer_loop: !transform.any_op {transform.consumed}
+  ) -> (!transform.any_op, !transform.any_op, !transform.any_op) {
+    %consumers = transform.get_consumers_of_result %producer_loop[0]
+        : (!transform.any_op) -> !transform.any_op
+    %consumers_1 = transform.collect_matching @match_unary_reduction in %consumers
+        : (!transform.any_op) -> !transform.any_op
+    %fused_consumer, %updated_loop, %inner_loop =
+      transform.linalg_ext.fuse_reduction_consumer_into_forall %consumers_1 into %producer_loop
+        : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+    transform.yield %fused_consumer, %updated_loop, %inner_loop
+      : !transform.any_op, !transform.any_op, !transform.any_op
+  }
+
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
     %func = transform.structured.match ops{["func.func"]} in %module
         : (!transform.any_op) -> !transform.any_op
@@ -93,6 +124,9 @@ module attributes {transform.with_named_sequence} {
     %b1_fused, %forall_loop_1 = transform.include @fuse_up_elemwise_consumer failures(propagate)
         (%forall_loop) : (!transform.any_op)
         -> (!transform.any_op, !transform.any_op)
+    %b2_fused, %forall_loop_2, %j0_loop = transform.include @fuse_up_reduction_consumer failures(propagate)
+        (%forall_loop_1) : (!transform.any_op)
+        -> (!transform.any_op, !transform.any_op, !transform.any_op)
 
     // Step 7. Canonicalize + CSE.
     transform.apply_patterns to %func {
