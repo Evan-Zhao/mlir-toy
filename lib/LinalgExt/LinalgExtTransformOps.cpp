@@ -1,7 +1,6 @@
-#include "LinalgExt/LinalgExtTransform.h"
 #include "LinalgExt/LinalgExtTransformOps.h"
+#include "LinalgExt/LinalgExtTransform.h"
 
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -38,16 +37,37 @@ LogicalResult verifyUnaryMap(linalg::MapOp map) {
   return success();
 }
 
+FailureOr<tensor::InsertSliceOp> getInsertSliceForLoopResult(scf::ForOp loop,
+                                                             OpResult result) {
+  if (result.getOwner() != loop.getOperation())
+    return failure();
+  auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
+  if (!yield)
+    return failure();
+  return yield.getOperand(result.getResultNumber())
+      .getDefiningOp<tensor::InsertSliceOp>();
+}
+
+FailureOr<tensor::ParallelInsertSliceOp>
+getParallelInsertSliceForLoopResult(scf::ForallOp loop, OpResult result) {
+  if (result.getOwner() != loop.getOperation())
+    return failure();
+  BlockArgument bbArg = loop.getTiedBlockArgument(result);
+  SmallVector<Operation *> combiningOps = loop.getCombiningOps(bbArg);
+  if (combiningOps.size() != 1)
+    return failure();
+  return dyn_cast<tensor::ParallelInsertSliceOp>(combiningOps.front());
+}
+
 linalg::MapOp cloneMapOnTile(RewriterBase &rewriter, linalg::MapOp sourceMap,
-                             Value inputTile, Value initTile,
-                             Location loc) {
+                             Value inputTile, Value initTile, Location loc) {
   auto cloned = linalg::MapOp::create(
       rewriter, loc, ValueRange{inputTile}, initTile,
       [&](OpBuilder &builder, Location nestedLoc, ValueRange newArgs) {
         Block &oldBlock = sourceMap.getMapper().front();
         IRMapping mapping;
-        for (auto [oldArg, newArg] : llvm::zip_equal(oldBlock.getArguments(),
-                                                     newArgs))
+        for (auto [oldArg, newArg] :
+             llvm::zip_equal(oldBlock.getArguments(), newArgs))
           mapping.map(oldArg, newArg);
 
         for (Operation &op : oldBlock.without_terminator())
@@ -90,50 +110,75 @@ LinalgExtFuseUnaryElementwiseConsumerIntoLoopOp::apply(
     return emitSilenceableFailure(
         transform, "expected a unary tensor linalg.map consumer");
 
-  auto loop = dyn_cast<scf::ForOp>(loops.front());
-  if (!loop)
-    return emitSilenceableFailure(transform,
-                                  "expected an scf.for containing loop");
+  auto loopLike = dyn_cast<LoopLikeOpInterface>(loops.front());
+  if (!loopLike)
+    return emitSilenceableFailure(
+        transform, "expected an scf.for or scf.forall containing loop");
 
   Value consumerInput = map.getInputs().front();
-  Operation *producerContainer = consumerInput.getDefiningOp();
-  if (!producerContainer)
+  auto producerResult = dyn_cast<OpResult>(consumerInput);
+  if (!producerResult)
     return emitSilenceableFailure(
-        transform, "consumer input must be produced by an operation");
-  if (!isAncestor(producerContainer, loop))
+        transform, "consumer input must be produced by the containing loop");
+  Operation *producerContainer = producerResult.getOwner();
+  if (producerContainer != loopLike.getOperation() &&
+      !isAncestor(producerContainer, loopLike.getOperation()))
     return emitSilenceableFailure(
         transform,
         "containing loop must be nested under the consumer input producer");
 
-  auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
-  if (!yield || yield.getResults().size() != 1)
-    return emitSilenceableFailure(
-        transform, "expected containing loop to yield one tensor value");
+  linalg::MapOp fused;
+  if (auto forLoop = dyn_cast<scf::ForOp>(loopLike.getOperation())) {
+    FailureOr<tensor::InsertSliceOp> maybeInsert =
+        getInsertSliceForLoopResult(forLoop, producerResult);
+    if (failed(maybeInsert) || !*maybeInsert)
+      return emitSilenceableFailure(
+          transform,
+          "expected the loop result consumed by the map to be yielded via "
+          "tensor.insert_slice");
 
-  auto insert = yield.getResults().front().getDefiningOp<tensor::InsertSliceOp>();
-  if (!insert)
-    return emitSilenceableFailure(
-        transform, "expected loop yield operand to be a tensor.insert_slice");
+    auto insert = *maybeInsert;
+    rewriter.setInsertionPoint(insert);
+    auto initTile = tensor::ExtractSliceOp::create(
+        rewriter, insert.getLoc(), insert.getSource().getType(),
+        insert.getDest(), insert.getMixedOffsets(), insert.getMixedSizes(),
+        insert.getMixedStrides());
+    fused = cloneMapOnTile(rewriter, map, insert.getSource(),
+                           initTile.getResult(), map.getLoc());
 
-  rewriter.setInsertionPoint(insert);
-  auto initTile = tensor::ExtractSliceOp::create(
-      rewriter, insert.getLoc(), insert.getSource().getType(), insert.getDest(),
-      insert.getMixedOffsets(), insert.getMixedSizes(),
-      insert.getMixedStrides());
-  linalg::MapOp fused =
-      cloneMapOnTile(rewriter, map, insert.getSource(), initTile.getResult(),
-                     map.getLoc());
+    rewriter.modifyOpInPlace(insert, [&]() {
+      insert.getSourceMutable().assign(fused.getResult().front());
+    });
+  } else {
+    auto forallLoop = cast<scf::ForallOp>(loopLike.getOperation());
+    FailureOr<tensor::ParallelInsertSliceOp> maybeInsert =
+        getParallelInsertSliceForLoopResult(forallLoop, producerResult);
+    if (failed(maybeInsert) || !*maybeInsert)
+      return emitSilenceableFailure(
+          transform,
+          "expected the loop result consumed by the map to be combined via "
+          "tensor.parallel_insert_slice");
 
-  rewriter.modifyOpInPlace(insert, [&]() {
-    insert.getSourceMutable().assign(fused.getResult().front());
-  });
+    auto insert = *maybeInsert;
+    rewriter.setInsertionPoint(insert->getParentOp());
+    auto initTile = tensor::ExtractSliceOp::create(
+        rewriter, insert.getLoc(), insert.getSource().getType(),
+        insert.getDest(), insert.getMixedOffsets(), insert.getMixedSizes(),
+        insert.getMixedStrides());
+    fused = cloneMapOnTile(rewriter, map, insert.getSource(),
+                           initTile.getResult(), map.getLoc());
+
+    rewriter.modifyOpInPlace(insert, [&]() {
+      insert.getSourceMutable().assign(fused.getResult().front());
+    });
+  }
 
   rewriter.replaceOp(map, consumerInput);
 
   transformResults.set(getOperation()->getResult(0),
                        ArrayRef<Operation *>{fused.getOperation()});
   transformResults.set(getOperation()->getResult(1),
-                       ArrayRef<Operation *>{loop.getOperation()});
+                       ArrayRef<Operation *>{loopLike.getOperation()});
   return DiagnosedSilenceableFailure::success();
 }
 
@@ -164,11 +209,8 @@ void registerLinalgExtTransformExtension(mlir::DialectRegistry &registry) {
 
 extern "C" LLVM_ATTRIBUTE_WEAK mlir::DialectPluginLibraryInfo
 mlirGetDialectPluginInfo() {
-  return {
-      MLIR_PLUGIN_API_VERSION,
-      "LinalgExtTransformPlugin",
-      LLVM_VERSION_STRING,
-      [](mlir::DialectRegistry *registry) {
-        linalg_ext::registerLinalgExtTransformExtension(*registry);
-      }};
+  return {MLIR_PLUGIN_API_VERSION, "LinalgExtTransformPlugin",
+          LLVM_VERSION_STRING, [](mlir::DialectRegistry *registry) {
+            linalg_ext::registerLinalgExtTransformExtension(*registry);
+          }};
 }

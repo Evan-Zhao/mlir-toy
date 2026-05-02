@@ -11,8 +11,8 @@ def LinalgExtFuseUnaryElementwiseConsumerIntoLoopOp
   let summary = "Fuse a unary elementwise consumer into an scf.for tile loop";
 
   let description = [{
-    Fuses a single unary tensor `linalg.map` consumer into an `scf.for` loop
-    that materializes tiles of the consumer input.
+    Fuses a single unary tensor `linalg.map` consumer into an `scf.for` or
+    `scf.forall` loop that materializes tiles of the consumer input.
 
     This is a deliberately narrow reverse-fusion primitive for the
     FlashAttention score-scale epilogue:
@@ -23,11 +23,13 @@ def LinalgExtFuseUnaryElementwiseConsumerIntoLoopOp
     insert_slice score_tile into loop result
     ```
 
-    The op expects the containing loop to yield through a `tensor.insert_slice`
-    whose source is the producer tile. It clones the `linalg.map` body on that
-    tile, rewires the insert source to the mapped tile, replaces uses of the
-    original full-tensor consumer result with the producer container result,
-    and erases the original consumer when dead.
+    The op expects the containing loop result consumed by the map to be
+    materialized through either a `tensor.insert_slice` (`scf.for`) or a
+    `tensor.parallel_insert_slice` (`scf.forall`) whose source is the producer
+    tile. It clones the `linalg.map` body on that tile, rewires the insert
+    source to the mapped tile, replaces uses of the original full-tensor
+    consumer result with the producer container result, and erases the original
+    consumer when dead.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$consumer_op,
