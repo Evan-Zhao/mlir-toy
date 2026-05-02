@@ -88,8 +88,7 @@ linalg::MapOp cloneMapOnTile(RewriterBase &rewriter, linalg::MapOp sourceMap,
 namespace mlir {
 namespace transform {
 
-DiagnosedSilenceableFailure
-LinalgExtFuseUnaryElementwiseConsumerIntoLoopOp::apply(
+DiagnosedSilenceableFailure LinalgExtFuseMapConsumerIntoLoopOp::apply(
     transform::TransformRewriter &rewriter, TransformResults &transformResults,
     TransformState &state) {
   SmallVector<Operation *> consumers =
@@ -197,8 +196,7 @@ void registerLinalgExtTransformExtension(mlir::DialectRegistry &registry) {
       using mlir::Dialect::addOperations;
     };
     static_cast<TransformDialectAccess *>(dialect)
-        ->addOperations<
-            mlir::transform::LinalgExtFuseUnaryElementwiseConsumerIntoLoopOp>();
+        ->addOperations<mlir::transform::LinalgExtFuseMapConsumerIntoLoopOp>();
   });
 }
 
