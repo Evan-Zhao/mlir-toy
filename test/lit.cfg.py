@@ -12,7 +12,7 @@ config.suffixes = [".mlir"]
 config.test_source_root = os.path.dirname(__file__)
 config.test_exec_root = os.path.join(config.neptune_mlir_obj_root, "tests")
 
-config.excludes = ["python", "Input"]
+config.excludes = ["python", "Inputs", "__pycache__"]
 
 llvm_config.with_system_environment(["HOME", "INCLUDE", "LIB", "TMP", "TEMP"])
 llvm_config.use_default_substitutions()
