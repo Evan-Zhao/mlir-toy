@@ -41,3 +41,33 @@ def LinalgExtFuseMapConsumerIntoLoopOp
                        " `:` functional-type(operands, results)";
 
 }
+
+def LinalgExtFuseReductionConsumerIntoForallOp
+    : Op<Transform_Dialect,
+         "linalg_ext.fuse_reduction_consumer_into_forall",
+         [FunctionalStyleTransformOpTrait,
+          DeclareOpInterfaceMethods<TransformOpInterface>,
+          MemoryEffectsOpInterface]> {
+  let summary = "Fuse a unary reduction consumer by sequentializing one forall dimension";
+
+  let description = [{
+    Fuses a single unary tensor reduction `linalg.generic` consumer into an
+    `scf.forall` loop that materializes tiles of the consumer input.
+
+    This is a narrow reverse-fusion primitive for the FlashAttention row-max
+    stage. It rewrites the target `scf.forall` by removing the tiled dimension
+    that corresponds to the reduction axis, introduces an inner sequential
+    `scf.for`, computes the producer tiles and reduction update inside that
+    loop, and publishes the completed producer slice and reduced tile once per
+    outer `scf.forall` instance.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$consumer_op,
+                       TransformHandleTypeInterface:$containing_loop);
+  let results = (outs TransformHandleTypeInterface:$fused_op,
+                      TransformHandleTypeInterface:$new_containing_loop,
+                      TransformHandleTypeInterface:$new_inner_loop);
+
+  let assemblyFormat = "$consumer_op `into` $containing_loop attr-dict "
+                       " `:` functional-type(operands, results)";
+}
