@@ -23,12 +23,12 @@ from neptune_mlir.translators.triton import (
     translate_file as translate_triton,  # noqa: E402
 )
 
-ROOT = Path(__file__).resolve().parents[1]
+PARENT_DIR = Path(__file__).resolve().parent
 PLUGIN = find_plugin_path()
 if PLUGIN is None:
     pytest.exit("MLIR plugin path not found")
-GOLDEN_DIR = ROOT / "tests" / "golden"
-MLIR_FILE = ROOT / "tests" / "data" / "flash_attention_htile.mlir"
+GOLDEN_DIR = PARENT_DIR / "golden"
+MLIR_FILE = PARENT_DIR / "data" / "flash_attention_htile.mlir"
 DOT_TRANSPOSE_PASS_PIPELINE = (
     "builtin.module(htile-dot-transpose-to-load-order,cse,canonicalize)"
 )

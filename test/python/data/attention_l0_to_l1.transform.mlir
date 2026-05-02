@@ -2,9 +2,9 @@
 // flash_attention_l1.mlir. Mirrors `_schedule_attention_flash` from Neptune.
 //
 // Usage:
-//   mlir-opt tests/data/attention_l0.mlir \
-//     --load-dialect-plugin=build/libLinalgExtTransform.dylib \
-//     --transform-preload-library=transform-library-paths=tests/data/attention_l0_to_l1.transform.mlir \
+//   mlir-opt test/python/data/attention_l0.mlir \
+//     --load-dialect-plugin=build/libLinalgExtTransform.so \
+//     --transform-preload-library=transform-library-paths=test/python/data/attention_l0_to_l1.transform.mlir \
 //     --transform-interpreter
 
 module attributes {transform.with_named_sequence} {
