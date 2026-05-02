@@ -32,7 +32,7 @@ The scheduled L1 program should expose:
 | `get_block(name)`                        | Avoid relying on frontend block names. Match structurally using Transform dialect matchers and custom match ops.                                                                          |
 | `tile_loops([i, j])`                     | `transform.structured.tile_using_forall` for outer `(B, H, M)` tiling, then `transform.structured.tile_using_for` or custom tiling into an `affine.for` for the streaming K/V block loop. |
 | `bind_block_idx([*axes, i0])`            | Represent as `scf.forall` at L1. GPU block mapping is deferred to later lowering.                                                                                                         |
-| `reverse_compute_at`                     | Implement a custom `fuse_map_consumer_into_loop` for upward fusion (limited to map operations). `transform.structured.fuse_into_containing_op` can only do downward fusion.               |
+| `reverse_compute_at`                     | Implement custom upward-fusion transforms. Start with `fuse_map_consumer_into_loop` for pointwise consumers, then add reduction-specific fusion for `scf.forall`. See `docs/attention-upward-fusion-design.md`. |
 | `rolling_update`                         | Implement as a custom Transform dialect op, e.g. `transform.linalg_ext.rolling_update`.                                                                                                   |
 | `split_scan_buffer`                      | Model as explicit loop-carried tensors in `affine.for iter_args`.                                                                                                                         |
 | `decompose_reduction`                    | Use Linalg reduction structure plus explicit initial tensors and loop-carried state.                                                                                                      |
@@ -78,42 +78,11 @@ Use a layered matcher design:
     - body computes `x * constant`,
     - scale constant is either `1/sqrt(D)` or can be converted to `log2(e)/sqrt(D)` when switching to `exp2`.
 
-    This op is a downstream consumer of the tiled QK result. Upstream
-    `transform.structured.fuse_into_containing_op` cannot directly move it into
-    the QK streaming loop because that transform is producer-into-containing-op
-    fusion: the producer must already have a use inside the containing op. Here
-    the dependency points the other way:
-
-    ```text
-    qk_tile loop -> full S tensor -> score scaling consumer
-    ```
-
-    For FlashAttention we need the score scale inside the streaming loop before
-    softmax repair:
-
-    ```text
-    qk_tile = Q_tile @ K_tile^T
-    score_tile = qk_tile * scale
-    ```
-
-    Add a deliberately narrow reverse-fusion transform for this case:
-
-    ```mlir
-    %score_fused, %j_loop_1 =
-      transform.linalg_ext.fuse_map_consumer_into_loop
-        %score into %j_loop
-        : (!transform.any_op, !transform.any_op)
-       -> (!transform.any_op, !transform.any_op)
-    ```
-
-    The first implementation should support a single `linalg.map` consumer with
-    one tensor input and one tensor output, where the containing op is the
-    `scf.for` streaming loop produced by QK tiling. It rewrites the loop body so
-    the elementwise map is applied to the tile before the tile is inserted into
-    the loop-carried result, then replaces uses of the original full-tensor
-    consumer result with the containing tiled result. This is intentionally not a
-    general TVM-style `reverse_compute_at`; it is the minimal valid transform
-    needed for score scaling.
+    The detailed design for upward fusion is intentionally kept out of this
+    document. At this level, the schedule only assumes a custom
+    `transform.linalg_ext.fuse_map_consumer_into_loop` primitive that can move
+    score scaling under the tiled producer loop. See
+    `docs/attention-upward-fusion-design.md`.
 
 4. **Find softmax**
    Prefer decomposing `linalg.softmax` first into explicit max/exp/sum/div ops.
@@ -285,6 +254,8 @@ module attributes {transform.with_named_sequence} {
 
 The exact op names and return handles can change during implementation, but the
 schedule should remain readable as a structural schedule over matched handles.
+Detailed design for the custom upward-fusion ops is in
+`docs/attention-upward-fusion-design.md`.
 
 ## `rolling_update` Semantics
 
