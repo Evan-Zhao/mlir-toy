@@ -27,18 +27,18 @@ The scheduled L1 program should expose:
 
 ## TVM to MLIR Primitive Map
 
-| TVM primitive | MLIR plan |
-| --- | --- |
-| `get_block(name)` | Avoid relying on frontend block names. Match structurally using Transform dialect matchers and custom match ops. |
-| `tile_loops([i, j])` | `transform.structured.tile_using_forall` for outer `(B, H, M)` tiling, then `transform.structured.tile_using_for` or custom tiling into an `affine.for` for the streaming K/V block loop. |
-| `bind_block_idx([*axes, i0])` | Represent as `scf.forall` at L1. GPU block mapping is deferred to later lowering. |
-| `reverse_compute_at` | Use `transform.structured.fuse_into_containing_op` for producer-into-consumer cases. Use `transform.linalg_ext.fuse_unary_elementwise_consumer_into_loop` for the score epilogue, and custom transform logic when fusing through online-softmax repair. |
-| `rolling_update` | Implement as a custom Transform dialect op, e.g. `transform.linalg_ext.rolling_update`. |
-| `split_scan_buffer` | Model as explicit loop-carried tensors in `affine.for iter_args`. |
-| `decompose_reduction` | Use Linalg reduction structure plus explicit initial tensors and loop-carried state. |
-| `set_scope`, `cache_read`, `cache_write` | Not represented in L1. Defer memory placement to L1-to-HTile lowering. |
-| `to_tile_expr_form`, `mem2reg` | L1 is already value-based over tile tensors. |
-| `rewrite_expr`, `cse` | Use canonicalization/CSE plus a targeted rewrite pattern for row-wise `exp2` hoisting if needed. |
+| TVM primitive                            | MLIR plan                                                                                                                                                                                                                                               |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `get_block(name)`                        | Avoid relying on frontend block names. Match structurally using Transform dialect matchers and custom match ops.                                                                                                                                        |
+| `tile_loops([i, j])`                     | `transform.structured.tile_using_forall` for outer `(B, H, M)` tiling, then `transform.structured.tile_using_for` or custom tiling into an `affine.for` for the streaming K/V block loop.                                                               |
+| `bind_block_idx([*axes, i0])`            | Represent as `scf.forall` at L1. GPU block mapping is deferred to later lowering.                                                                                                                                                                       |
+| `reverse_compute_at`                     | Use `transform.structured.fuse_into_containing_op` for producer-into-consumer cases. Use `transform.linalg_ext.fuse_unary_elementwise_consumer_into_loop` for the score epilogue, and custom transform logic when fusing through online-softmax repair. |
+| `rolling_update`                         | Implement as a custom Transform dialect op, e.g. `transform.linalg_ext.rolling_update`.                                                                                                                                                                 |
+| `split_scan_buffer`                      | Model as explicit loop-carried tensors in `affine.for iter_args`.                                                                                                                                                                                       |
+| `decompose_reduction`                    | Use Linalg reduction structure plus explicit initial tensors and loop-carried state.                                                                                                                                                                    |
+| `set_scope`, `cache_read`, `cache_write` | Not represented in L1. Defer memory placement to L1-to-HTile lowering.                                                                                                                                                                                  |
+| `to_tile_expr_form`, `mem2reg`           | L1 is already value-based over tile tensors.                                                                                                                                                                                                            |
+| `rewrite_expr`, `cse`                    | Use canonicalization/CSE plus a targeted rewrite pattern for row-wise `exp2` hoisting if needed.                                                                                                                                                        |
 
 ## Structural Matching Strategy
 
@@ -51,98 +51,98 @@ Use a layered matcher design:
 
 2. **Find the QK contraction**
    Match a `linalg.generic` or named contraction with:
-   - rank-5 iterator space `(b, h, i, j, k)`,
-   - four parallel dimensions and one reduction dimension,
-   - two tensor inputs and one tensor output,
-   - input maps equivalent to `Q[b,h,i,k]` and `K[b,h,j,k]`,
-   - output map equivalent to `S[b,h,i,j]`,
-   - body equivalent to f16 extension, multiply, f32 accumulation.
+    - rank-5 iterator space `(b, h, i, j, k)`,
+    - four parallel dimensions and one reduction dimension,
+    - two tensor inputs and one tensor output,
+    - input maps equivalent to `Q[b,h,i,k]` and `K[b,h,j,k]`,
+    - output map equivalent to `S[b,h,i,j]`,
+    - body equivalent to f16 extension, multiply, f32 accumulation.
 
-   Prefer upstream structured matchers where possible:
-   - `transform.match.structured`
-   - `transform.match.structured.rank`
-   - `transform.match.structured.num_inputs`
-   - `transform.match.structured.num_inits`
-   - `transform.match.structured.input`
-   - `transform.match.structured.init`
-   - `transform.match.structured.body`
-   - `transform.match.structured.classify_contraction_dims`
+    Prefer upstream structured matchers where possible:
+    - `transform.match.structured`
+    - `transform.match.structured.rank`
+    - `transform.match.structured.num_inputs`
+    - `transform.match.structured.num_inits`
+    - `transform.match.structured.input`
+    - `transform.match.structured.init`
+    - `transform.match.structured.body`
+    - `transform.match.structured.classify_contraction_dims`
 
-   Add a custom matcher if upstream matchers cannot express the required affine
-   map relationship between `Q`, `K`, and `S`.
+    Add a custom matcher if upstream matchers cannot express the required affine
+    map relationship between `Q`, `K`, and `S`.
 
 3. **Find score scaling**
    Navigate from the QK result to its consumers and match an elementwise scale:
-   - single tensor input from QK,
-   - same output shape as QK,
-   - body computes `x * constant`,
-   - scale constant is either `1/sqrt(D)` or can be converted to `log2(e)/sqrt(D)` when switching to `exp2`.
+    - single tensor input from QK,
+    - same output shape as QK,
+    - body computes `x * constant`,
+    - scale constant is either `1/sqrt(D)` or can be converted to `log2(e)/sqrt(D)` when switching to `exp2`.
 
-   This op is a downstream consumer of the tiled QK result. Upstream
-   `transform.structured.fuse_into_containing_op` cannot directly move it into
-   the QK streaming loop because that transform is producer-into-containing-op
-   fusion: the producer must already have a use inside the containing op. Here
-   the dependency points the other way:
+    This op is a downstream consumer of the tiled QK result. Upstream
+    `transform.structured.fuse_into_containing_op` cannot directly move it into
+    the QK streaming loop because that transform is producer-into-containing-op
+    fusion: the producer must already have a use inside the containing op. Here
+    the dependency points the other way:
 
-   ```text
-   qk_tile loop -> full S tensor -> score scaling consumer
-   ```
+    ```text
+    qk_tile loop -> full S tensor -> score scaling consumer
+    ```
 
-   For FlashAttention we need the score scale inside the streaming loop before
-   softmax repair:
+    For FlashAttention we need the score scale inside the streaming loop before
+    softmax repair:
 
-   ```text
-   qk_tile = Q_tile @ K_tile^T
-   score_tile = qk_tile * scale
-   ```
+    ```text
+    qk_tile = Q_tile @ K_tile^T
+    score_tile = qk_tile * scale
+    ```
 
-   Add a deliberately narrow reverse-fusion transform for this case:
+    Add a deliberately narrow reverse-fusion transform for this case:
 
-   ```mlir
-   %score_fused, %j_loop_1 =
-     transform.linalg_ext.fuse_unary_elementwise_consumer_into_loop
-       %score into %j_loop
-       : (!transform.any_op, !transform.any_op)
-      -> (!transform.any_op, !transform.any_op)
-   ```
+    ```mlir
+    %score_fused, %j_loop_1 =
+      transform.linalg_ext.fuse_unary_elementwise_consumer_into_loop
+        %score into %j_loop
+        : (!transform.any_op, !transform.any_op)
+       -> (!transform.any_op, !transform.any_op)
+    ```
 
-   The first implementation should support a single `linalg.map` consumer with
-   one tensor input and one tensor output, where the containing op is the
-   `scf.for` streaming loop produced by QK tiling. It rewrites the loop body so
-   the elementwise map is applied to the tile before the tile is inserted into
-   the loop-carried result, then replaces uses of the original full-tensor
-   consumer result with the containing tiled result. This is intentionally not a
-   general TVM-style `reverse_compute_at`; it is the minimal valid transform
-   needed for score scaling.
+    The first implementation should support a single `linalg.map` consumer with
+    one tensor input and one tensor output, where the containing op is the
+    `scf.for` streaming loop produced by QK tiling. It rewrites the loop body so
+    the elementwise map is applied to the tile before the tile is inserted into
+    the loop-carried result, then replaces uses of the original full-tensor
+    consumer result with the containing tiled result. This is intentionally not a
+    general TVM-style `reverse_compute_at`; it is the minimal valid transform
+    needed for score scaling.
 
 4. **Find softmax**
    Prefer decomposing `linalg.softmax` first into explicit max/exp/sum/div ops.
 
-   After decomposition, structurally match:
-   - row max reduction over the key dimension,
-   - shifted score computation,
-   - exp or exp2,
-   - row sum reduction over the key dimension,
-   - normalization divide.
+    After decomposition, structurally match:
+    - row max reduction over the key dimension,
+    - shifted score computation,
+    - exp or exp2,
+    - row sum reduction over the key dimension,
+    - normalization divide.
 
-   If upstream softmax decomposition does not preserve enough navigability,
-   introduce a custom matcher:
+    If upstream softmax decomposition does not preserve enough navigability,
+    introduce a custom matcher:
 
-   ```mlir
-   %qk, %scale, %row_max, %exp, %row_sum, %norm =
-     transform.match.linalg_ext.attention_softmax_chain %func
-       : (!transform.any_op)
-      -> (!transform.any_op, !transform.any_op, !transform.any_op,
-          !transform.any_op, !transform.any_op, !transform.any_op)
-   ```
+    ```mlir
+    %qk, %scale, %row_max, %exp, %row_sum, %norm =
+      transform.match.linalg_ext.attention_softmax_chain %func
+        : (!transform.any_op)
+       -> (!transform.any_op, !transform.any_op, !transform.any_op,
+           !transform.any_op, !transform.any_op, !transform.any_op)
+    ```
 
 5. **Find PV contraction**
    Match the second contraction structurally:
-   - input 0 is the softmax probability tensor or its f16 cast,
-   - input 1 is `V[b,h,j,d]`,
-   - reduction dimension is key position `j`,
-   - output map is `O[b,h,i,d]`,
-   - body performs multiply and f32 accumulation.
+    - input 0 is the softmax probability tensor or its f16 cast,
+    - input 1 is `V[b,h,j,d]`,
+    - reduction dimension is key position `j`,
+    - output map is `O[b,h,i,d]`,
+    - body performs multiply and f32 accumulation.
 
 6. **Find final cast**
    Match the final `arith.truncf` from f32 output accumulation to f16 result.
@@ -320,18 +320,18 @@ out      = acc_final / l_final
 
 2. **Add structural matchers**
    Start with matchers for:
-   - QK contraction,
-   - score scaling,
-   - softmax chain,
-   - PV contraction,
-   - final cast.
+    - QK contraction,
+    - score scaling,
+    - softmax chain,
+    - PV contraction,
+    - final cast.
 
 3. **Add transform extension plumbing**
    Register a LinalgExt/Neptune transform dialect extension that defines:
-   - `transform.match.linalg_ext.attention_pattern`,
-   - `transform.linalg_ext.fuse_unary_elementwise_consumer_into_loop`,
-   - `transform.linalg_ext.rolling_update`,
-   - optional cleanup pattern descriptors such as exp2-hoist-across-broadcast.
+    - `transform.match.linalg_ext.attention_pattern`,
+    - `transform.linalg_ext.fuse_unary_elementwise_consumer_into_loop`,
+    - `transform.linalg_ext.rolling_update`,
+    - optional cleanup pattern descriptors such as exp2-hoist-across-broadcast.
 
 4. **Implement tiling and fusion without rolling update**
    Verify that the schedule can tile QK and fuse score computation structurally.
@@ -366,11 +366,11 @@ Use layered tests:
 3. Small synthetic tests for `rolling_update` on max, sum, and matmul
    reductions.
 4. End-to-end structural test from `attention_l0.mlir` to L1 shape:
-   - contains `scf.forall`,
-   - contains `affine.for` with `iter_args`,
-   - contains row max and row sum reductions,
-   - contains PV matmul,
-   - contains final normalization.
+    - contains `scf.forall`,
+    - contains `affine.for` with `iter_args`,
+    - contains row max and row sum reductions,
+    - contains PV matmul,
+    - contains final normalization.
 5. Golden/canonicalized comparison against `flash_attention_l1.mlir`.
 6. Existing HTile/backend translator tests remain downstream checks once L1 is
    lowered further.
@@ -413,9 +413,9 @@ bundles these phases:
 
 1. **Frontier discovery**
    `FrontierBuildHelper` walks producers of the target block and returns:
-   - incomplete reduce producers under the target loop,
-   - post-loop/frontier reductions for split-K mode,
-   - topologically ordered spatial blocks between the target and frontier.
+    - incomplete reduce producers under the target loop,
+    - post-loop/frontier reductions for split-K mode,
+    - topologically ordered spatial blocks between the target and frontier.
 
 2. **Unsafe fusion**
    `RollingUpdate` disables schedule checks and reverse-compute-ats every block
@@ -579,29 +579,29 @@ For the current attention example, the decomposed pipeline should be:
 5. Clone/tile QK and score scaling inside the streaming loop.
 6. Add row-max recurrence:
 
-   ```text
-   row_max = reduce_max(score_tile)
-   m_next = max(m_prev, row_max)
-   ```
+    ```text
+    row_max = reduce_max(score_tile)
+    m_next = max(m_prev, row_max)
+    ```
 
 7. Add probability tile:
 
-   ```text
-   p_tile = exp2(score_tile - broadcast(m_next))
-   ```
+    ```text
+    p_tile = exp2(score_tile - broadcast(m_next))
+    ```
 
 8. Add row-sum recurrence:
 
-   ```text
-   row_sum = reduce_sum(p_tile)
-   l_next = exp2(m_prev - m_next) * l_prev + row_sum
-   ```
+    ```text
+    row_sum = reduce_sum(p_tile)
+    l_next = exp2(m_prev - m_next) * l_prev + row_sum
+    ```
 
 9. Add PV partial:
 
-   ```text
-   pv = p_tile @ v_tile
-   ```
+    ```text
+    pv = p_tile @ v_tile
+    ```
 
 10. Add accumulator recurrence:
 
