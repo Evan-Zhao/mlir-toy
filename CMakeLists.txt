@@ -37,11 +37,12 @@ if(BUILD_TESTING AND NOT LLVM_EXTERNAL_LIT)
   endif()
 endif()
 
-# These are used for tablegen
+# These are used for tablegen. Mark LLVM/MLIR includes as system headers so
+# stricter warning profiles focus on this repo rather than upstream headers.
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
-include_directories(${LLVM_INCLUDE_DIRS})
-include_directories(${MLIR_INCLUDE_DIRS})
+include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
+include_directories(SYSTEM ${MLIR_INCLUDE_DIRS})
 
 set(LLVM_TARGET_DEFINITIONS include/HTile/HTileOps.td)
 mlir_tablegen(HTileOps.h.inc -gen-op-decls)
@@ -79,10 +80,32 @@ function(make_mlir_opt_plugin)
   target_include_directories(${ARG_TARGET} PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_BINARY_DIR}
+  )
+  target_include_directories(${ARG_TARGET} SYSTEM PUBLIC
     ${LLVM_INCLUDE_DIRS}
     ${MLIR_INCLUDE_DIRS}
   )
   target_compile_definitions(${ARG_TARGET} PRIVATE ${LLVM_DEFINITIONS})
+
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(${ARG_TARGET} PRIVATE
+      -Wall -Wextra -Wpedantic -Wimplicit-fallthrough
+      -Wnon-virtual-dtor -Wunused-function -Wno-unused-parameter
+    )
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+      target_compile_options(${ARG_TARGET} PRIVATE
+        -Wunneeded-internal-declaration
+      )
+    endif()
+    if(NEPTUNE_MLIR_WARNINGS_AS_ERRORS)
+      target_compile_options(${ARG_TARGET} PRIVATE -Werror)
+    endif()
+  elseif(MSVC)
+    target_compile_options(${ARG_TARGET} PRIVATE /W4)
+    if(NEPTUNE_MLIR_WARNINGS_AS_ERRORS)
+      target_compile_options(${ARG_TARGET} PRIVATE /WX)
+    endif()
+  endif()
 endfunction()
 
 make_mlir_opt_plugin(
