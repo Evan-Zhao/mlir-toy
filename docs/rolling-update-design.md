@@ -2,34 +2,144 @@
 
 ## Goal
 
-This note isolates the `rolling_update` part of the attention L0-to-L1
-schedule.
+This note describes the rolling-update part of the attention L0-to-L1
+schedule in its current MLIR form.
 
-In TVM terms, this is the transformation that turns a reduction under a
-streaming loop into an online recurrence with repaired writeback. For
-FlashAttention, it is the mechanism that fuses and synchronizes:
+In TVM terms, rolling update is the reduction-side analogue of
+`reverse_compute_at`: move a consumer chain under a streaming loop, then repair
+the incomplete reduction so the loop-local update becomes globally correct.
 
-- row max,
-- probability tile construction,
-- row sum,
-- `P @ V`,
-- accumulator repair.
+For FlashAttention, this is the mechanism behind:
 
-The main schedule remains in
-`test/python/data/attention_l0_to_l1.transform.mlir`. This document is the
-detailed design reference for the custom rolling-update transforms needed there.
+- running row max under the K/V streaming loop,
+- building probability tiles from the updated max,
+- updating row sum online,
+- updating `P @ V` online,
+- normalizing after the loop.
 
-## What `rolling_update` Means
+The main schedule remains in `test/python/data/attention_l0_to_l1.transform.mlir`.
 
-At a high level, `rolling_update` is the TVM-style primitive that:
+## Core Idea
 
-1. finds reductions that are incomplete under a streaming loop,
-2. fuses the necessary producer chain under that loop,
-3. converts those reductions into loop-carried state,
-4. derives the algebra needed to repair the partial update,
-5. publishes a globally correct result.
+The current design has three stages:
 
-For attention, this produces the online-softmax recurrences:
+1. analyze the forward elementwise chain from a loop-local value to the first
+   reduction frontier,
+2. force-fuse that ordered elementwise chain under the streaming loop as a
+   sidecar computation,
+3. checkpoint at the reduction frontier and rebuild it as a repaired
+   recurrence.
+
+This keeps the payload IR verifier-valid throughout the schedule while still
+matching the shape of TVM's rolling update.
+
+## Transform Split
+
+### `transform.match.linalg_ext.rolling_update_fwd_frontier`
+
+Pure analysis. Signature:
+
+```text
+(producer_op) -> (elemwise_ops_topo_sorted, frontier_ops)
+```
+
+Starting from a producer operation, walk forward through use-def edges while the
+path stays elementwise. Stop at the first reduction-like frontier.
+
+Return:
+
+- one handle containing the elementwise ops in producer-to-consumer order,
+- one handle containing the reduction frontier op or ops.
+
+The ordering matters. Later transforms rely on this handle being ordered from
+the op closest to the loop producer to the op closest to the reduction frontier.
+
+This analysis should fail on shapes that are not a single supported chain, for example:
+
+- branching elementwise users,
+- non-elementwise intermediates before the frontier,
+- frontier ops that are not supported rolling-update reductions.
+
+### `transform.linalg_ext.force_fuse_elemwise_chain_into_loop`
+
+This is the MLIR equivalent of the "naive fusion" in Neptune-TVM rolling update.
+The main difference is this version clones the element-wise operations
+to create a "sidecar" chain of ops whose results are not used yet,
+so technically no program semantic is violated.
+
+Signature:
+
+```text
+(elemwise_chain_ops, streaming_loop) -> (sidecar_chain_ops, new_streaming_loop)
+```
+
+Given:
+
+- the ordered elementwise handle from `transform.match.linalg_ext.rolling_update_fwd_frontier`,
+- a streaming loop handle,
+
+the transform should clone each elementwise op, fuse it under the loop,
+and return the cloned sidecar ops in strictly the same order.
+
+The sidecar chain is intentionally incomplete at this point.
+It may compute values that are different from their out-of-loop counterparts.
+That is acceptable as long as those sidecar values are not published to the original users yet.
+
+### Reduction Checkpoint And Repair
+
+This is the atomic step where rolling update becomes semantically complete.
+
+Signature:
+
+```text
+(frontier_op, sidecar_chain_ops, streaming_loop)
+  -> (repaired_frontier_op, repaired_sidecar_chain_ops, new_streaming_loop)
+```
+
+Inputs:
+
+- the frontier reduction,
+- the ordered sidecar chain already fused under the loop,
+- the refreshed loop handle.
+
+The transform should:
+
+- convert the frontier reduction into loop-carried state,
+- derive the repair term implied by the sidecar chain,
+- rewrite the frontier and dependent sidecar ops to use the repaired
+  recurrence,
+- return refreshed handles for the repaired chain and loop.
+
+This is the place to build recurrences such as:
+
+```text
+m_next   = max(m_prev, row_max(score_tile))
+p_tile   = exp2(score_tile - m_next)
+l_next   = exp2(m_prev - m_next) * l_prev + row_sum(p_tile)
+acc_next = exp2(m_prev - m_next) * acc_prev + p_tile @ v_tile
+```
+
+The important design constraint is that this step stays atomic. Before the
+repair is applied, the sidecar chain is not yet a correct replacement for the
+original reduction.
+
+## Attention Example
+
+For the current attention schedule, the intended flow is:
+
+1. Build the outer `scf.forall` over output tiles and the inner streaming loop
+   over K/V blocks.
+2. Fuse QK and score scaling under that streaming loop.
+3. Run `transform.match.linalg_ext.rolling_update_fwd_frontier` starting from
+   the loop-local score tile. This should find the ordered elementwise chain
+   leading into the next rolling reduction frontier.
+4. Force-fuse that elementwise chain under the streaming loop as sidecar ops.
+5. Checkpoint at the frontier reduction and rebuild it as the online
+   recurrence.
+6. Continue to the next frontier until the loop carries the full online
+   softmax state.
+
+The end result is the usual FlashAttention recurrence:
 
 ```text
 m_next   = max(m_prev, row_max(score_tile))
@@ -39,241 +149,27 @@ acc_next = exp2(m_prev - m_next) * acc_prev + p_tile @ v_tile
 out      = acc_final / l_final
 ```
 
-This is the reduction counterpart to TVM `reverse_compute_at`: it does not just
-move a consumer under a loop, it also changes the meaning of the reduction so
-that the loop-local partial computation becomes globally correct.
-
-## Why MLIR Should Decompose It
-
-The TVM primitive is intentionally large because it mutates the only live TIR
-buffer graph. Stopping halfway can expose invalid intermediate states.
-
-In MLIR, tensor SSA gives a better structure:
-
-- the original algorithmic chain can remain live,
-- a new scheduled sidecar chain can be built in parallel,
-- only a final publish step has to replace the original result.
-
-That makes it practical to decompose `rolling_update` into smaller transform
-ops while keeping the payload IR verifier-valid throughout the schedule.
-
-## TVM Reference Behavior
-
-The current TVM implementation in
-`/Users/evanzhao/workspace/nautilus/src/tir/schedule/primitive/reduction.cc`
-bundles these phases:
-
-1. frontier discovery,
-2. unsafe fusion under the target loop,
-3. reduce-to-scan conversion,
-4. mock inlining for analysis,
-5. algebraic repair derivation,
-6. generalized rfactor,
-7. writeback repair.
-
-The dangerous phases are the ones that mutate live producers or expose partial
-results before repair.
-
-## MLIR Decomposition
-
-The intended MLIR decomposition is:
-
-### `transform.match.linalg_ext.rolling_frontier`
-
-Pure analysis op.
-
-Input:
-
-- target reduction-like op,
-- target streaming loop,
-- optional mode such as `scan` or `split_k`.
-
-Output:
-
-- frontier reduction handles,
-- spatial producer-chain handles in topological order,
-- metadata describing incomplete values and reduction dimensions.
-
-This replaces TVM frontier discovery and should fail silenceably if the graph
-is not a supported rolling-update pattern.
-
-### `transform.linalg_ext.clone_chain_under_loop`
-
-Clone or tile the spatial producer chain under the target loop.
-
-This is the MLIR replacement for TVM’s unsafe reverse-compute-at phase. The
-original producer chain stays live until a final publish step.
-
-For attention, this is where loop-local score tiles and score elementwise
-transforms are created under the streaming loop.
-
-### `transform.linalg_ext.reduction_to_scan`
-
-Convert one frontier reduction into explicit loop-carried state.
-
-For L1, the preferred representation is usually `affine.for` or `scf.for`
-`iter_args`, not an expanded scan buffer:
-
-```text
-m_next = max(m_prev, row_max(score_tile))
-l_next = exp2(m_prev - m_next) * l_prev + row_sum(p_tile)
-```
-
-### `transform.linalg_ext.derive_rolling_repair`
-
-Pure analysis op.
-
-Given:
-
-- reducer kind,
-- cloned producer chain,
-- incomplete-value metadata,
-- previous/current value mapping,
-
-derive the algebraic repair plan needed to turn partial results into the global
-result.
-
-For FlashAttention, this should derive or recognize:
-
-```text
-scale = exp2(m_prev - m_next)
-l_next = scale * l_prev + row_sum
-acc_next = broadcast(scale) * acc_prev + pv
-```
-
-### `transform.linalg_ext.rfactor_reduction`
-
-Factor the target reduction over the streaming loop.
-
-In MLIR, this should prefer constructing a sidecar partial computation instead
-of replacing original uses immediately. For attention, this is the step that
-turns a full `P @ V` into per-K/V-block `p_tile @ v_tile`.
-
-### `transform.linalg_ext.apply_rolling_repair`
-
-Apply the repair algebra to the factored computation.
-
-For attention, this creates the loop-carried accumulator recurrence:
-
-```text
-acc_next = exp2(m_prev - m_next) * acc_prev + p_tile @ v_tile
-```
-
-At this point, the sidecar computation is mathematically complete, but it still
-does not have to replace the original result.
-
-### `transform.linalg_ext.publish_scheduled_result`
-
-Replace the original algorithmic result with the completed scheduled result.
-
-This is the only externally visible step. After publication, canonicalization
-and DCE can remove the old L0 chain.
-
-## FlashAttention-Specific Pipeline
-
-For the current attention example, the decomposed pipeline is:
-
-1. Match the attention chain structurally.
-2. Create the outer `scf.forall` over `(B, H, M-block)`.
-3. Extract `q_tile` once per output tile.
-4. Create the inner streaming loop over K/V blocks.
-5. Clone or tile QK and score scaling inside the streaming loop.
-6. Add row-max recurrence:
-
-   ```text
-   row_max = reduce_max(score_tile)
-   m_next = max(m_prev, row_max)
-   ```
-
-7. Add probability tile:
-
-   ```text
-   p_tile = exp2(score_tile - broadcast(m_next))
-   ```
-
-8. Add row-sum recurrence:
-
-   ```text
-   row_sum = reduce_sum(p_tile)
-   l_next = exp2(m_prev - m_next) * l_prev + row_sum
-   ```
-
-9. Add `P @ V` partial:
-
-   ```text
-   pv = p_tile @ v_tile
-   ```
-
-10. Add accumulator recurrence:
-
-   ```text
-   acc_next = broadcast(exp2(m_prev - m_next)) * acc_prev + pv
-   ```
-
-11. Normalize after the loop:
-
-   ```text
-   out_tile = acc_final / broadcast(l_final)
-   ```
-
-12. Insert the output tile into the `scf.forall` shared output.
-13. Publish the scheduled result and DCE the original chain.
-
-## Atomicity Boundaries
-
-These steps can be independent because they do not expose incorrect values to
-original users:
-
-- frontier matching and analysis,
-- sidecar cloning and tile extraction,
-- repair derivation,
-- row-max recurrence construction,
-- row-sum recurrence construction,
-- `P @ V` partial construction,
-- accumulator recurrence construction.
-
-These should remain atomic internally:
-
-- any step that replaces live uses with a value that is only correct after
-  repair,
-- any step that mutates the only live producer chain instead of cloning it,
-- final publish plus required result checks.
-
-The preferred design is to avoid the first two cases whenever possible.
+## Transform-Dialect Caveats
+
+- Rewriting the streaming loop invalidates nested handles. Any transform in the
+  force-fusion or checkpoint stage must return a refreshed loop handle.
+- The sidecar chain should remain separate from the original chain until a
+  final publish step. That is what makes intermediate states safe.
+- Ordered multi-op handles are part of the contract here. The later transforms
+  should not treat the elementwise chain as an unordered set.
 
 ## Testing Guidance
 
 Rolling update should be tested in layers:
 
-1. matcher-only tests for frontier discovery,
-2. small synthetic tests for max, sum, and matmul rolling updates,
-3. end-to-end attention structure tests checking:
-   - outer `scf.forall`,
-   - inner streaming loop with `iter_args`,
-   - row-max and row-sum recurrences,
-   - `P @ V` partial,
-   - final normalization.
+1. analysis-only tests for `rolling_update_fwd_frontier`,
+2. small synthetic tests for force-fused elementwise chains,
+3. reduction-checkpoint tests for max, sum, and matmul-style rolling updates,
+4. end-to-end attention tests that check the final loop-carried recurrence
+   shape.
 
-## Autoscheduler Implications
+## Autoscheduler Note
 
-The autoscheduler should tune smaller semantic steps rather than a single
-monolithic `rolling_update`.
-
-Useful knobs include:
-
-- outer M tile size,
-- streaming K/V block size,
-- scan-buffer versus loop-carried-state representation,
-- accumulator element type and truncation points,
-- where probability tiles are materialized or fused,
-- whether to use `exp` or `exp2`.
-
-A high-level convenience transform can still exist, for example:
-
-```mlir
-transform.linalg_ext.flash_attention_schedule %attention
-  {m_tile = 128, kv_tile = 64}
-```
-
-but it should lower internally to the smaller rolling-update transform family
-above.
+This split is also the right granularity for tuning. The autoscheduler can vary
+tile sizes and fusion choices independently without having to treat rolling
+update as one monolithic primitive.

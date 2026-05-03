@@ -101,3 +101,31 @@ def LinalgExtRollingUpdateFwdFrontierOp
 
   let assemblyFormat = "$producer_op attr-dict `:` functional-type(operands, results)";
 }
+
+def LinalgExtForceFuseElemwiseChainIntoLoopOp
+    : Op<Transform_Dialect,
+         "linalg_ext.force_fuse_elemwise_chain_into_loop",
+         [FunctionalStyleTransformOpTrait,
+          DeclareOpInterfaceMethods<TransformOpInterface>,
+          MemoryEffectsOpInterface]> {
+  let summary = "Clone and force-fuse an ordered elementwise chain under a streaming loop";
+
+  let description = [{
+    Takes an ordered handle of elementwise ops and a streaming `scf.for` loop,
+    then rebuilds that loop to carry one sidecar tensor result per elementwise
+    op.
+
+    Each elementwise op is cloned under the loop in the same order as the input
+    handle. The original out-of-loop chain remains live. The cloned sidecar
+    chain is intentionally incomplete and should be consumed later by a rolling
+    reduction repair transform.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$elemwise_chain_ops,
+                       TransformHandleTypeInterface:$streaming_loop);
+  let results = (outs TransformHandleTypeInterface:$sidecar_chain_ops,
+                      TransformHandleTypeInterface:$new_streaming_loop);
+
+  let assemblyFormat = "$elemwise_chain_ops `into` $streaming_loop attr-dict "
+                       " `:` functional-type(operands, results)";
+}
