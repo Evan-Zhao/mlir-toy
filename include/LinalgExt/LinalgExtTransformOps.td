@@ -71,3 +71,33 @@ def LinalgExtFuseReductionConsumerIntoForallOp
   let assemblyFormat = "$consumer_op `into` $containing_loop attr-dict "
                        " `:` functional-type(operands, results)";
 }
+
+def LinalgExtRollingUpdateFwdFrontierOp
+    : Op<Transform_Dialect,
+         "match.linalg_ext.rolling_update_fwd_frontier",
+         [FunctionalStyleTransformOpTrait,
+          DeclareOpInterfaceMethods<TransformOpInterface>,
+          MemoryEffectsOpInterface]> {
+  let summary = "Walk from def to use to find the next smallest set of elementwise ops that rolling update can fuse";
+
+  let description = [{
+    Pure analysis op that walks the forward use-def chain starting from
+    `producer_op`, collecting elementwise op until the path ends in a reduction op.
+
+    It returns:
+    - `elemwise_ops`: a transform handle that maps to a sequence of elementwise
+      ops, sorted from def to use (from `producer_op` to frontier consumer),
+    - `frontier_ops`: a transform handle that maps to the reduction-like frontier op(s)
+      reached by that walk.
+
+    It throws an error if the frontier is not closed: i.e., if any path from `producer_op`
+    does not end in a reduction op. A typical reason is an elementwise op directly used
+    as the return value of the surrounding function.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$producer_op);
+  let results = (outs TransformHandleTypeInterface:$elemwise_ops,
+                      TransformHandleTypeInterface:$frontier_ops);
+
+  let assemblyFormat = "$producer_op attr-dict `:` functional-type(operands, results)";
+}
