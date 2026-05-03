@@ -1,5 +1,5 @@
-#include "LinalgExt/LinalgExtTransformOps.h"
 #include "LinalgExt/LinalgExtTransform.h"
+#include "LinalgExt/LinalgExtTransformOps.h"
 
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/Tools/Plugins/DialectPlugin.h"
@@ -18,7 +18,7 @@ void registerLinalgExtTransformExtension(mlir::DialectRegistry &registry) {
     };
     static_cast<TransformDialectAccess *>(dialect)
         ->addOperations<
-            mlir::transform::LinalgExtFuseMapConsumerIntoLoopOp,
+            mlir::transform::LinalgExtFuseElemwiseIntoProducerOp,
             mlir::transform::LinalgExtFuseReductionConsumerIntoForallOp>();
   });
 }

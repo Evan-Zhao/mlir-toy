@@ -4,6 +4,7 @@
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/IR/IRMapping.h"
@@ -13,20 +14,78 @@ using namespace mlir;
 
 namespace {
 
-bool isAncestor(Operation *ancestor, Operation *op) {
-  for (Operation *parent = op->getParentOp(); parent;
-       parent = parent->getParentOp())
-    if (parent == ancestor)
-      return true;
-  return false;
-}
+#define EXTRACT_SINGLE_CONSUMER_SINGLE_LOOP(CONSUMER, LOOP)                    \
+  SmallVector<Operation *> _consumers =                                        \
+      llvm::to_vector(state.getPayloadOps(getConsumerOp()));                   \
+  SmallVector<Operation *> _loops =                                            \
+      llvm::to_vector(state.getPayloadOps(getContainingLoop()));               \
+  if (_consumers.size() != 1)                                                  \
+    return emitSilenceableFailure(transform,                                   \
+                                  "expected exactly one consumer payload op"); \
+  if (_loops.size() != 1)                                                      \
+    return emitSilenceableFailure(                                             \
+        transform, "expected exactly one containing loop payload op");         \
+  auto(CONSUMER) = _consumers.front();                                         \
+  auto(LOOP) = _loops.front();
 
 LogicalResult verifyUnaryMap(linalg::MapOp map) {
-  if (map.getInputs().size() != 1)
+  if (map.getNumDpsInits() != 1)
     return failure();
   if (map->getNumResults() != 1)
     return failure();
   return success();
+}
+
+LogicalResult verifyElementwiseGeneric(linalg::GenericOp generic) {
+  if (generic.getNumDpsInits() != 1)
+    return failure();
+  if (generic->getNumResults() != 1)
+    return failure();
+  if (!generic.isAllParallelLoops())
+    return failure();
+  if (!generic.hasPureTensorSemantics())
+    return failure();
+  if (!llvm::all_of(generic.getIndexingMapsArray(),
+                    [](AffineMap map) { return map.isProjectedPermutation(); }))
+    return failure();
+  return success();
+}
+
+FailureOr<SmallVector<LoopLikeOpInterface>>
+collectLoopNestRootedAt(Operation *root) {
+  if (auto forallOp = dyn_cast<scf::ForallOp>(root))
+    return SmallVector<LoopLikeOpInterface>{forallOp};
+
+  auto forOp = dyn_cast<scf::ForOp>(root);
+  if (!forOp)
+    return failure();
+
+  SmallVector<LoopLikeOpInterface> loops;
+  loops.push_back(forOp);
+
+  while (true) {
+    auto currentFor = cast<scf::ForOp>(loops.back().getOperation());
+    auto yieldOp = cast<scf::YieldOp>(currentFor.getBody()->getTerminator());
+
+    scf::ForOp nestedFor;
+    for (Value yielded : yieldOp.getOperands()) {
+      auto yieldedResult = dyn_cast<OpResult>(yielded);
+      if (!yieldedResult)
+        continue;
+      auto candidate = dyn_cast<scf::ForOp>(yieldedResult.getOwner());
+      if (!candidate || candidate->getBlock() != currentFor.getBody())
+        continue;
+      if (nestedFor && nestedFor != candidate)
+        return failure();
+      nestedFor = candidate;
+    }
+
+    if (!nestedFor)
+      break;
+    loops.push_back(nestedFor);
+  }
+
+  return loops;
 }
 
 LogicalResult verifyUnarySingleReductionGeneric(linalg::GenericOp generic) {
@@ -80,17 +139,6 @@ int64_t getSingleReductionDim(linalg::GenericOp generic) {
     if (iteratorType == utils::IteratorType::reduction)
       return index;
   return -1;
-}
-
-FailureOr<tensor::InsertSliceOp> getInsertSliceForLoopResult(scf::ForOp loop,
-                                                             OpResult result) {
-  if (result.getOwner() != loop.getOperation())
-    return failure();
-  auto yield = dyn_cast<scf::YieldOp>(loop.getBody()->getTerminator());
-  if (!yield)
-    return failure();
-  return yield.getOperand(result.getResultNumber())
-      .getDefiningOp<tensor::InsertSliceOp>();
 }
 
 FailureOr<tensor::ParallelInsertSliceOp>
@@ -184,30 +232,6 @@ void cloneSingleRegionBody(OpBuilder &builder, Location nestedLoc,
   linalg::YieldOp::create(builder, nestedLoc, yielded);
 }
 
-linalg::MapOp cloneMapOnTile(RewriterBase &rewriter, linalg::MapOp sourceMap,
-                             Value inputTile, Value initTile, Location loc) {
-  auto cloned = linalg::MapOp::create(
-      rewriter, loc, ValueRange{inputTile}, initTile,
-      [&](OpBuilder &builder, Location nestedLoc, ValueRange newArgs) {
-        Block &oldBlock = sourceMap.getMapper().front();
-        IRMapping mapping;
-        for (auto [oldArg, newArg] :
-             llvm::zip_equal(oldBlock.getArguments(), newArgs))
-          mapping.map(oldArg, newArg);
-
-        for (Operation &op : oldBlock.without_terminator())
-          builder.clone(op, mapping);
-
-        auto oldYield = cast<linalg::YieldOp>(oldBlock.getTerminator());
-        SmallVector<Value> yielded;
-        yielded.reserve(oldYield.getValues().size());
-        for (Value value : oldYield.getValues())
-          yielded.push_back(mapping.lookup(value));
-        linalg::YieldOp::create(builder, nestedLoc, yielded);
-      });
-  return cloned;
-}
-
 linalg::GenericOp cloneGenericOnTile(RewriterBase &rewriter,
                                      linalg::GenericOp sourceGeneric,
                                      Value inputTile, Value initTile,
@@ -227,121 +251,57 @@ linalg::GenericOp cloneGenericOnTile(RewriterBase &rewriter,
 namespace mlir {
 namespace transform {
 
-DiagnosedSilenceableFailure LinalgExtFuseMapConsumerIntoLoopOp::apply(
+DiagnosedSilenceableFailure LinalgExtFuseElemwiseIntoProducerOp::apply(
     transform::TransformRewriter &rewriter, TransformResults &transformResults,
     TransformState &state) {
-  SmallVector<Operation *> consumers =
-      llvm::to_vector(state.getPayloadOps(getConsumerOp()));
-  SmallVector<Operation *> loops =
-      llvm::to_vector(state.getPayloadOps(getContainingLoop()));
-
   auto transform = cast<TransformOpInterface>(getOperation());
-  if (consumers.size() != 1)
-    return emitSilenceableFailure(transform,
-                                  "expected exactly one consumer payload op");
-  if (loops.size() != 1)
-    return emitSilenceableFailure(
-        transform, "expected exactly one containing loop payload op");
+  EXTRACT_SINGLE_CONSUMER_SINGLE_LOOP(consumer, loop);
 
-  auto map = dyn_cast<linalg::MapOp>(consumers.front());
-  if (!map || failed(verifyUnaryMap(map)))
+  auto map = dyn_cast<linalg::MapOp>(consumer);
+  auto generic = dyn_cast<linalg::GenericOp>(consumer);
+  if ((!map || failed(verifyUnaryMap(map))) &&
+      (!generic || failed(verifyElementwiseGeneric(generic))))
     return emitSilenceableFailure(
-        transform, "expected a unary tensor linalg.map consumer");
+        transform, "expected an elementwise consumer: either linalg.map or "
+                   "linalg.generic with all-parallel loops");
 
-  auto loopLike = dyn_cast<LoopLikeOpInterface>(loops.front());
-  if (!loopLike)
-    return emitSilenceableFailure(
-        transform, "expected an scf.for or scf.forall containing loop");
-
-  Value consumerInput = map.getInputs().front();
-  auto producerResult = dyn_cast<OpResult>(consumerInput);
-  if (!producerResult)
-    return emitSilenceableFailure(
-        transform, "consumer input must be produced by the containing loop");
-  Operation *producerContainer = producerResult.getOwner();
-  if (producerContainer != loopLike.getOperation() &&
-      !isAncestor(producerContainer, loopLike.getOperation()))
+  auto loopNest = collectLoopNestRootedAt(loop);
+  if (failed(loopNest))
     return emitSilenceableFailure(
         transform,
-        "containing loop must be nested under the consumer input producer");
+        "expected containing loop to be an scf.for/scf.forall root of a "
+        "supported tiled loop nest");
 
-  linalg::MapOp fused;
-  if (auto forLoop = dyn_cast<scf::ForOp>(loopLike.getOperation())) {
-    FailureOr<tensor::InsertSliceOp> maybeInsert =
-        getInsertSliceForLoopResult(forLoop, producerResult);
-    if (failed(maybeInsert) || !*maybeInsert)
-      return emitSilenceableFailure(
-          transform,
-          "expected the loop result consumed by the map to be yielded via "
-          "tensor.insert_slice");
+  FailureOr<scf::SCFFuseConsumerOfSliceResult> fuseResult =
+      scf::tileAndFuseConsumer(rewriter, consumer, *loopNest);
+  if (failed(fuseResult))
+    return emitSilenceableFailure(
+        transform, "failed to tile and fuse elementwise consumer into loop");
+  if (fuseResult->tiledOps.empty())
+    return emitSilenceableFailure(
+        transform, "consumer had no operands defined by the containing loop");
 
-    auto insert = *maybeInsert;
-    rewriter.setInsertionPoint(insert);
-    auto initTile = tensor::ExtractSliceOp::create(
-        rewriter, insert.getLoc(), insert.getSource().getType(),
-        insert.getDest(), insert.getMixedOffsets(), insert.getMixedSizes(),
-        insert.getMixedStrides());
-    fused = cloneMapOnTile(rewriter, map, insert.getSource(),
-                           initTile.getResult(), map.getLoc());
+  if (isOpTriviallyDead(consumer))
+    rewriter.eraseOp(consumer);
 
-    rewriter.modifyOpInPlace(insert, [&]() {
-      insert.getSourceMutable().assign(fused.getResult().front());
-    });
-  } else {
-    auto forallLoop = cast<scf::ForallOp>(loopLike.getOperation());
-    FailureOr<tensor::ParallelInsertSliceOp> maybeInsert =
-        getParallelInsertSliceForLoopResult(forallLoop, producerResult);
-    if (failed(maybeInsert) || !*maybeInsert)
-      return emitSilenceableFailure(
-          transform,
-          "expected the loop result consumed by the map to be combined via "
-          "tensor.parallel_insert_slice");
-
-    auto insert = *maybeInsert;
-    rewriter.setInsertionPoint(insert->getParentOp());
-    auto initTile = tensor::ExtractSliceOp::create(
-        rewriter, insert.getLoc(), insert.getSource().getType(),
-        insert.getDest(), insert.getMixedOffsets(), insert.getMixedSizes(),
-        insert.getMixedStrides());
-    fused = cloneMapOnTile(rewriter, map, insert.getSource(),
-                           initTile.getResult(), map.getLoc());
-
-    rewriter.modifyOpInPlace(insert, [&]() {
-      insert.getSourceMutable().assign(fused.getResult().front());
-    });
-  }
-
-  rewriter.replaceOp(map, consumerInput);
-
-  transformResults.set(getOperation()->getResult(0),
-                       ArrayRef<Operation *>{fused.getOperation()});
+  transformResults.set(getOperation()->getResult(0), fuseResult->tiledOps);
   transformResults.set(getOperation()->getResult(1),
-                       ArrayRef<Operation *>{loopLike.getOperation()});
+                       ArrayRef<Operation *>{loopNest->front().getOperation()});
   return DiagnosedSilenceableFailure::success();
 }
 
 DiagnosedSilenceableFailure LinalgExtFuseReductionConsumerIntoForallOp::apply(
     transform::TransformRewriter &rewriter, TransformResults &transformResults,
     TransformState &state) {
-  SmallVector<Operation *> consumers =
-      llvm::to_vector(state.getPayloadOps(getConsumerOp()));
-  SmallVector<Operation *> loops =
-      llvm::to_vector(state.getPayloadOps(getContainingLoop()));
-
   auto transform = cast<TransformOpInterface>(getOperation());
-  if (consumers.size() != 1)
-    return emitSilenceableFailure(transform,
-                                  "expected exactly one consumer payload op");
-  if (loops.size() != 1)
-    return emitSilenceableFailure(
-        transform, "expected exactly one containing loop payload op");
+  EXTRACT_SINGLE_CONSUMER_SINGLE_LOOP(consumer, loop);
 
-  auto generic = dyn_cast<linalg::GenericOp>(consumers.front());
+  auto generic = dyn_cast<linalg::GenericOp>(consumer);
   if (!generic || failed(verifyUnarySingleReductionGeneric(generic)))
     return emitSilenceableFailure(
         transform, "expected a unary single-reduction linalg.generic consumer");
 
-  auto forallLoop = dyn_cast<scf::ForallOp>(loops.front());
+  auto forallLoop = dyn_cast<scf::ForallOp>(loop);
   if (!forallLoop)
     return emitSilenceableFailure(transform,
                                   "expected an scf.forall containing loop");

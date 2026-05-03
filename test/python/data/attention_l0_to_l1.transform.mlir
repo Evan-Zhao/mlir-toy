@@ -8,18 +8,14 @@
 //     --transform-interpreter
 
 module attributes {transform.with_named_sequence} {
-  // Checks if an op `op` is an element-wise map with only one input.
-  transform.named_sequence @match_unary_elemwise(
+  // Checks if an op `op` is an element-wise operation, including linalg.generic and linalg.map.
+  transform.named_sequence @match_elemwise(
       %candidate: !transform.any_op {transform.readonly}
   ) -> !transform.any_op {
     %matched = transform.match.structured %candidate
         : (!transform.any_op) -> !transform.any_op {
     ^bb0(%op: !transform.any_op):
       transform.match.structured.body %op {elementwise} : !transform.any_op
-      %num_inputs = transform.match.structured.num_inputs %op
-          : (!transform.any_op) -> !transform.param<i64>
-      %one = transform.param.constant 1 : i64 -> !transform.param<i64>
-      transform.match.param.cmpi eq %num_inputs, %one : !transform.param<i64>
       transform.match.structured.yield %op : !transform.any_op
     }
     transform.yield %matched : !transform.any_op
@@ -32,11 +28,11 @@ module attributes {transform.with_named_sequence} {
   ) -> (!transform.any_op, !transform.any_op) {
     %consumers = transform.get_consumers_of_result %producer_loop[0]
         : (!transform.any_op) -> !transform.any_op
-    %consumers_1 = transform.collect_matching @match_unary_elemwise in %consumers
+    %consumers_1 = transform.collect_matching @match_elemwise in %consumers
         : (!transform.any_op) -> !transform.any_op
     // Fail if there are zero or multiple such consumers.
     %fused_consumer, %updated_loop =
-      transform.linalg_ext.fuse_map_consumer_into_loop %consumers_1 into %producer_loop
+      transform.linalg_ext.fuse_elemwise_into_producer %consumers_1 into %producer_loop
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
     transform.yield %fused_consumer, %updated_loop : !transform.any_op, !transform.any_op
   }
@@ -121,17 +117,19 @@ module attributes {transform.with_named_sequence} {
     // Step 2. Match element-wise ops that consume b0, and fuse them into the j0 loop.
     // (For attention, this step would only match the score-scaling op.)
     //   TVM: sch.reverse_compute_at(b1, j0)
-    %b1_fused, %forall_loop_1 = transform.include @fuse_up_elemwise_consumer failures(propagate)
-        (%forall_loop) : (!transform.any_op)
+    %bscale, %forall_loop_1 = transform.include @fuse_up_elemwise_consumer
+        failures(propagate) (%forall_loop) : (!transform.any_op)
         -> (!transform.any_op, !transform.any_op)
-    %b2_fused, %forall_loop_2, %j0_loop = transform.include @fuse_up_reduction_consumer failures(propagate)
-        (%forall_loop_1) : (!transform.any_op)
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !transform.any_op
+    %bsum, %forall_loop_2, %j0_loop = transform.include @fuse_up_reduction_consumer
+        failures(propagate) (%forall_loop_1) : (!transform.any_op)
         -> (!transform.any_op, !transform.any_op, !transform.any_op)
+    %bexp, %forall_loop_3 = transform.include @fuse_up_elemwise_consumer
+        failures(propagate) (%forall_loop_2) : (!transform.any_op)
+        -> (!transform.any_op, !transform.any_op)
 
     // Step 7. Canonicalize + CSE.
-    transform.apply_patterns to %func {
-      transform.apply_patterns.canonicalization
-    } : !transform.any_op
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %func : !transform.any_op
 
     transform.yield

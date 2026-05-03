@@ -10,37 +10,27 @@ The intent is the same as TVM `reverse_compute_at`: move a consumer under the
 loop nest that already materializes tiles of its input. In MLIR, this is not a
 single general upstream primitive, so Neptune uses two narrow transform ops:
 
-- `transform.linalg_ext.fuse_map_consumer_into_loop`
+- `transform.linalg_ext.fuse_elemwise_into_producer`
 - `transform.linalg_ext.fuse_reduction_consumer_into_forall`
 
 Both are specialized for fusing a Linalg consumer operation into an SCF loop nest.
 
-## `fuse_map_consumer_into_loop`
+## `fuse_elemwise_into_producer`
 
-`transform.linalg_ext.fuse_map_consumer_into_loop` is the pointwise case.
+`transform.linalg_ext.fuse_elemwise_into_producer` applies pointwise,
+"upward" (consumer into producer) fusion. It takes:
 
-It takes:
+- an elementwise consumer, currently either:
+  - a single-result `linalg.map`, or
+  - a single-result, single-init `linalg.generic` with all-parallel loops and
+    projected-permutation indexing maps,
+- a containing tiled loop nest rooted at `scf.for` or `scf.forall`.
 
-- a unary `linalg.map` consumer,
-- a containing tiled `scf.for` or `scf.forall` whose result is the map input.
+The implementation is intentionally thin. It delegates most of the real work to
+upstream `scf::tileAndFuseConsumer` after checking that the consumer is
+elementwise and that the supplied loop is the root of a supported tiled loop nest.
 
-It rewrites:
-
-```text
-tile producer -> publish tile -> full tensor -> linalg.map
-```
-
-into:
-
-```text
-tile producer -> linalg.map on tile -> publish mapped tile
-```
-
-This is a narrow MLIR version of TVM `reverse_compute_at` for elementwise
-consumers. It is sound because each published tile remains disjoint and no
-cross-iteration combine is introduced.
-
-For attention, this is the score-scaling step:
+For attention, this is used to fused the score-scaling step into the main loop nest:
 
 ```text
 qk = Q @ K^T
@@ -128,7 +118,7 @@ row_max = reduce_max(score, dim = j)
 the schedule uses the two ops in order:
 
 1. tile the `qk` producer,
-2. fuse `scale` upward with `fuse_map_consumer_into_loop`,
+2. fuse `scale` upward with `fuse_elemwise_into_producer`,
 3. fuse `row_max` upward with `fuse_reduction_consumer_into_forall`.
 
 After the reduction fusion, the relevant loop shape is:

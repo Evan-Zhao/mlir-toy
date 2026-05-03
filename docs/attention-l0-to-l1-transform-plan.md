@@ -27,18 +27,18 @@ The scheduled L1 program should expose:
 
 ## TVM to MLIR Primitive Map
 
-| TVM primitive                            | MLIR plan                                                                                                                                                                                 |
-| ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `get_block(name)`                        | Avoid relying on frontend block names. Match structurally using Transform dialect matchers and custom match ops.                                                                          |
-| `tile_loops([i, j])`                     | `transform.structured.tile_using_forall` for outer `(B, H, M)` tiling, then `transform.structured.tile_using_for` or custom tiling into an `affine.for` for the streaming K/V block loop. |
-| `bind_block_idx([*axes, i0])`            | Represent as `scf.forall` at L1. GPU block mapping is deferred to later lowering.                                                                                                         |
-| `reverse_compute_at`                     | Implement custom upward-fusion transforms. Start with `fuse_map_consumer_into_loop` for pointwise consumers, then add reduction-specific fusion for `scf.forall`. See `docs/attention-upward-fusion-design.md`. |
-| `rolling_update`                         | Implement as a custom Transform dialect transform family for online-softmax-style repaired reductions. See `docs/attention-rolling-update-design.md`.                                   |
-| `split_scan_buffer`                      | Model as explicit loop-carried tensors in `affine.for iter_args`.                                                                                                                         |
-| `decompose_reduction`                    | Use Linalg reduction structure plus explicit initial tensors and loop-carried state.                                                                                                      |
-| `set_scope`, `cache_read`, `cache_write` | Not represented in L1. Defer memory placement to L1-to-HTile lowering.                                                                                                                    |
-| `to_tile_expr_form`, `mem2reg`           | L1 is already value-based over tile tensors.                                                                                                                                              |
-| `rewrite_expr`, `cse`                    | Use canonicalization/CSE plus a targeted rewrite pattern for row-wise `exp2` hoisting if needed.                                                                                          |
+| TVM primitive                            | MLIR plan                                                                                                                                                                                                       |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `get_block(name)`                        | Avoid relying on frontend block names. Match structurally using Transform dialect matchers and custom match ops.                                                                                                |
+| `tile_loops([i, j])`                     | `transform.structured.tile_using_forall` for outer `(B, H, M)` tiling, then `transform.structured.tile_using_for` or custom tiling into an `affine.for` for the streaming K/V block loop.                       |
+| `bind_block_idx([*axes, i0])`            | Represent as `scf.forall` at L1. GPU block mapping is deferred to later lowering.                                                                                                                               |
+| `reverse_compute_at`                     | Implement custom upward-fusion transforms. Start with `fuse_elemwise_into_producer` for pointwise consumers, then add reduction-specific fusion for `scf.forall`. See `docs/attention-upward-fusion-design.md`. |
+| `rolling_update`                         | Implement as a custom Transform dialect transform family for online-softmax-style repaired reductions. See `docs/attention-rolling-update-design.md`.                                                           |
+| `split_scan_buffer`                      | Model as explicit loop-carried tensors in `affine.for iter_args`.                                                                                                                                               |
+| `decompose_reduction`                    | Use Linalg reduction structure plus explicit initial tensors and loop-carried state.                                                                                                                            |
+| `set_scope`, `cache_read`, `cache_write` | Not represented in L1. Defer memory placement to L1-to-HTile lowering.                                                                                                                                          |
+| `to_tile_expr_form`, `mem2reg`           | L1 is already value-based over tile tensors.                                                                                                                                                                    |
+| `rewrite_expr`, `cse`                    | Use canonicalization/CSE plus a targeted rewrite pattern for row-wise `exp2` hoisting if needed.                                                                                                                |
 
 ## Structural Matching Strategy
 
@@ -80,7 +80,7 @@ Use a layered matcher design:
 
     The detailed design for upward fusion is intentionally kept out of this
     document. At this level, the schedule only assumes a custom
-    `transform.linalg_ext.fuse_map_consumer_into_loop` primitive that can move
+    `transform.linalg_ext.fuse_elemwise_into_producer` primitive that can move
     score scaling under the tiled producer loop. See
     `docs/attention-upward-fusion-design.md`.
 
@@ -216,7 +216,7 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
 
     %scale_fused, %j_loop_1 =
-      transform.linalg_ext.fuse_map_consumer_into_loop %scale into %j_loop
+      transform.linalg_ext.fuse_elemwise_into_producer %scale into %j_loop
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
 
     %row_max_rf =
@@ -284,7 +284,7 @@ documented in `docs/attention-rolling-update-design.md`.
 3. **Add transform extension plumbing**
    Register a LinalgExt/Neptune transform dialect extension that defines:
     - `transform.match.linalg_ext.attention_pattern`,
-    - `transform.linalg_ext.fuse_map_consumer_into_loop`,
+    - `transform.linalg_ext.fuse_elemwise_into_producer`,
     - `transform.linalg_ext.rolling_update`,
     - optional cleanup pattern descriptors such as exp2-hoist-across-broadcast.
 
