@@ -2,9 +2,9 @@ include "mlir/Dialect/Transform/IR/TransformDialect.td"
 include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
-def LinalgExtFuseMapConsumerIntoLoopOp
+def LinalgExtFuseElemwiseIntoProducerOp
     : Op<Transform_Dialect,
-         "linalg_ext.fuse_map_consumer_into_loop",
+         "linalg_ext.fuse_elemwise_into_producer",
          [FunctionalStyleTransformOpTrait,
           DeclareOpInterfaceMethods<TransformOpInterface>,
           MemoryEffectsOpInterface]> {
