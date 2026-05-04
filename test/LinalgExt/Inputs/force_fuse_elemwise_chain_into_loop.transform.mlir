@@ -4,8 +4,8 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %loop = transform.structured.match ops{["scf.for"]} in %func
         : (!transform.any_op) -> !transform.any_op
-    %elemwise, %frontier =
-      transform.match.linalg_ext.rolling_update_fwd_frontier %loop
+    %reduce, %elemwise =
+      transform.match.linalg_ext.rolling_update_next_reduction %loop
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     %loop_2 = transform.structured.match ops{["scf.for"]} in %func
         : (!transform.any_op) -> !transform.any_op

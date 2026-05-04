@@ -87,44 +87,6 @@ FailureOr<Value> createDestinationForResultAtInsertionPoint(RewriterBase &rewrit
       .getResult();
 }
 
-using OpsT = SmallVector<Operation *>;
-
-std::optional<std::pair<OpsT, OpsT>> collectRollingFrontierPath(Operation *op) {
-  OpsT elementwiseOps, frontierOps;
-  SmallPtrSet<Operation *, 8> visitedOps;
-  std::deque<std::pair<Operation *, bool>> worklist;
-  worklist.push_back({op, false});
-
-  while (!worklist.empty()) {
-    auto [currentOp, foundReduction] = worklist.front();
-    worklist.pop_front();
-    if (visitedOps.contains(currentOp))
-      continue;
-    visitedOps.insert(currentOp);
-
-    if (foundReduction) {
-      frontierOps.push_back(currentOp);
-      continue;
-    }
-
-    if (currentOp != op)
-      elementwiseOps.push_back(currentOp);
-
-    bool hasUsers = false;
-    for (Value result : currentOp->getOpResults()) {
-      for (auto user : result.getUsers()) {
-        worklist.push_back({user, isReductionLike(user)});
-        hasUsers = true;
-      }
-    }
-    if (!hasUsers) {
-      currentOp->emitRemark("path ends here without seeing a reduction");
-      return std::nullopt;
-    }
-  }
-  return {{elementwiseOps, frontierOps}};
-}
-
 struct SidecarValueInfo {
   Value fullValue, tileValue;
   SmallVector<OpFoldResult> tileOffsets, tileSizes;
@@ -204,21 +166,64 @@ namespace mlir {
 namespace transform {
 
 DiagnosedSilenceableFailure
-LinalgExtRollingUpdateFwdFrontierOp::apply(transform::TransformRewriter &rewriter,
-                                           TransformResults &transformResults,
-                                           TransformState &state) {
+LinalgExtRollingUpdateNextReductionOp::apply(transform::TransformRewriter &rewriter,
+                                             TransformResults &transformResults,
+                                             TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
-  SmallVector<Operation *> producers = llvm::to_vector(state.getPayloadOps(getProducerOp()));
-  if (producers.size() != 1)
+  auto producers = state.getPayloadOps(getProducerOp());
+  if (!llvm::hasSingleElement(producers))
     return emitSilenceableFailure(
         transform, "expected exactly one producer payload op in the transform handle");
+  Operation *producer = *producers.begin();
 
-  auto frontierResult = collectRollingFrontierPath(producers.front());
-  if (!frontierResult)
-    return emitSilenceableFailure(transform, "target has no closed rolling update frontier");
-  auto [elemwiseOps, frontierOps] = *frontierResult;
-  transformResults.set(getOperation()->getResult(0), elemwiseOps);
-  transformResults.set(getOperation()->getResult(1), frontierOps);
+  // Forward BFS: find the nearest reduction. `visited` doubles as the
+  // forward-reachable set for the backward walk below.
+  SmallPtrSet<Operation *, 16> visited({producer});
+  std::deque<Operation *> queue({producer});
+  Operation *reduce = nullptr;
+  while (!queue.empty()) {
+    Operation *current = queue.front();
+    queue.pop_front();
+    if (current != producer && isReductionLike(current)) {
+      reduce = current;
+      break;
+    }
+    for (Value result : current->getOpResults())
+      for (Operation *user : result.getUsers())
+        if (visited.insert(user).second)
+          queue.push_back(user);
+  }
+  if (!reduce)
+    return emitSilenceableFailure(transform, "no reduction reachable from producer op");
+
+  // Backward walk from `reduce`, bounded by `visited`. This isolates the ops that
+  // are strictly between `producer` and `reduce`, excluding side-path ops that are
+  // forward-reachable but not ancestors of `reduce`.
+  SmallVector<Operation *> elemwiseOps;
+  {
+    SmallPtrSet<Operation *, 16> bvisited({reduce});
+    std::deque<Operation *> bqueue({reduce});
+    while (!bqueue.empty()) {
+      Operation *current = bqueue.front();
+      bqueue.pop_front();
+      if (current != reduce) {
+        if (failed(verifyForceFusibleElementwiseOp(current)))
+          return emitSilenceableFailure(
+              transform, "expected all ops between producer_op and reduce_op to be elementwise");
+        elemwiseOps.push_back(current);
+      }
+      for (Value operand : current->getOperands()) {
+        Operation *defOp = operand.getDefiningOp();
+        if (defOp && defOp != producer && visited.contains(defOp))
+          if (bvisited.insert(defOp).second)
+            bqueue.push_back(defOp);
+      }
+    }
+  }
+  llvm::sort(elemwiseOps, [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
+
+  transformResults.set(getOperation()->getResult(0), {reduce});
+  transformResults.set(getOperation()->getResult(1), elemwiseOps);
   return DiagnosedSilenceableFailure::success();
 }
 

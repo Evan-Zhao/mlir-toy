@@ -136,13 +136,12 @@ module attributes {transform.with_named_sequence} {
 
     // Step 4. Prepare for rolling update. Rolling update can fuse two reductions together,
     // including all element-wise ops between them.
-    // There is an analysis that returns which elemwise ops and reduction ops will be affected in this process.
-    %elemwises, %reduces =
-      transform.match.linalg_ext.rolling_update_fwd_frontier %forall_loop_2
+    // First use rolling_update_next_reduction to find the next reduction op.
+    %reduce, %elemwise =
+      transform.match.linalg_ext.rolling_update_next_reduction %forall_loop_2
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %first_reduce, %_1 = transform.split_handle %reduces { overflow_result = 1 : i64 }
-        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    // TODO: implement rolling update transforms and use them here.
+    transform.print %reduce : !transform.any_op
+    transform.print %elemwise : !transform.any_op
 
     // Step 7. Canonicalize + CSE.
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !transform.any_op

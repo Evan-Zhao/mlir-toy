@@ -23,8 +23,8 @@ The main schedule remains in `test/python/data/attention_l0_to_l1.transform.mlir
 
 The current design has three stages:
 
-1. analyze the forward elementwise chain from a loop-local value to the first
-   reduction frontier,
+1. find the nearest reduction consumer from a loop-local value via forward BFS,
+   returning both that reduction and the ordered elementwise chain between them,
 2. force-fuse that ordered elementwise chain under the streaming loop as a
    sidecar computation,
 3. checkpoint at the reduction frontier and rebuild it as a repaired
@@ -35,30 +35,36 @@ matching the shape of TVM's rolling update.
 
 ## Transform Split
 
-### `transform.match.linalg_ext.rolling_update_fwd_frontier`
+### `transform.match.linalg_ext.rolling_update_next_reduction`
 
-Pure analysis. Signature:
+Pure analysis. Uses `NavigationTransformOpTrait`, so the input handle is not
+consumed. Signature:
 
 ```text
-(producer_op) -> (elemwise_ops_topo_sorted, frontier_ops)
+(producer_op) -> (next_reduce_op, elemwise_ops)
 ```
 
-Starting from a producer operation, walk forward through use-def edges while the
-path stays elementwise. Stop at the first reduction-like frontier.
+Performs a forward BFS on the def-use graph starting from `producer_op`, where
+each edge has unit length. Returns the first reduction-like op encountered —
+i.e., the reduction at minimum BFS distance — along with all elementwise ops
+strictly between `producer_op` and that reduction.
 
 Return:
 
-- one handle containing the elementwise ops in producer-to-consumer order,
-- one handle containing the reduction frontier op or ops.
+- `next_reduce_op`: a handle containing the single nearest reduction op,
+- `elemwise_ops`: a handle containing the elementwise ops on the path from
+  `producer_op` to that reduction, sorted in producer-to-consumer order.
 
-The ordering matters. Later transforms rely on this handle being ordered from
-the op closest to the loop producer to the op closest to the reduction frontier.
+BFS naturally handles branching use-def graphs: when the producer has multiple
+direct consumers, the one that is a reduction is found at the current BFS
+level before any of its transitive successors. In the attention graph
+(`loop → red1(max) + elem1(exp_shift, uses loop+red1) → red2(sum) → …`),
+BFS returns `red1` at distance 1 and an empty `elemwise_ops` handle, because
+`red1` directly consumes the loop output even though `elem1` does too.
 
-This analysis should fail on shapes that are not a single supported chain, for example:
-
-- branching elementwise users,
-- non-elementwise intermediates before the frontier,
-- frontier ops that are not supported rolling-update reductions.
+The op fails if no reduction is reachable from `producer_op`, or if any op
+between `producer_op` and the nearest reduction is not a supported elementwise
+(all-parallel `linalg.generic` or `linalg.map` with one result).
 
 ### `transform.linalg_ext.force_fuse_elemwise_chain_into_loop`
 
@@ -75,7 +81,7 @@ Signature:
 
 Given:
 
-- the ordered elementwise handle from `transform.match.linalg_ext.rolling_update_fwd_frontier`,
+- the ordered elementwise handle from `transform.match.linalg_ext.rolling_update_next_reduction`,
 - a streaming loop handle,
 
 the transform should clone each elementwise op, fuse it under the loop,
@@ -130,9 +136,9 @@ For the current attention schedule, the intended flow is:
 1. Build the outer `scf.forall` over output tiles and the inner streaming loop
    over K/V blocks.
 2. Fuse QK and score scaling under that streaming loop.
-3. Run `transform.match.linalg_ext.rolling_update_fwd_frontier` starting from
-   the loop-local score tile. This should find the ordered elementwise chain
-   leading into the next rolling reduction frontier.
+3. Run `transform.match.linalg_ext.rolling_update_next_reduction` starting from
+   the loop-local score tile. This finds the nearest reduction frontier and
+   returns the ordered elementwise chain leading into it.
 4. Force-fuse that elementwise chain under the streaming loop as sidecar ops.
 5. Checkpoint at the frontier reduction and rebuild it as the online
    recurrence.
@@ -151,6 +157,11 @@ out      = acc_final / l_final
 
 ## Transform-Dialect Caveats
 
+- `rolling_update_next_reduction` uses `NavigationTransformOpTrait` and does
+  not consume its input handle; the producer handle remains valid after the
+  call. Transforms that rewrite the loop (`force_fuse_elemwise_chain_into_loop`,
+  checkpoint repair) use `FunctionalStyleTransformOpTrait` and do consume their
+  inputs — always use the refreshed handles they return.
 - Rewriting the streaming loop invalidates nested handles. Any transform in the
   force-fusion or checkpoint stage must return a refreshed loop handle.
 - The sidecar chain should remain separate from the original chain until a
@@ -162,7 +173,7 @@ out      = acc_final / l_final
 
 Rolling update should be tested in layers:
 
-1. analysis-only tests for `rolling_update_fwd_frontier`,
+1. analysis-only tests for `rolling_update_next_reduction`,
 2. small synthetic tests for force-fused elementwise chains,
 3. reduction-checkpoint tests for max, sum, and matmul-style rolling updates,
 4. end-to-end attention tests that check the final loop-carried recurrence
