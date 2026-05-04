@@ -140,8 +140,12 @@ module attributes {transform.with_named_sequence} {
     %reduce, %elemwise =
       transform.match.linalg_ext.rolling_update_next_reduction %forall_loop_2
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.print %func : !transform.any_op
     transform.print %reduce : !transform.any_op
     transform.print %elemwise : !transform.any_op
+    %elemwise_sidecars, %forall_loop_3 = transform.linalg_ext.rolling_update_force_fuse_elemwise
+        %elemwise into %forall_loop_2 : (!transform.any_op, !transform.any_op)
+        -> (!transform.any_op, !transform.any_op)
 
     // Step 7. Canonicalize + CSE.
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !transform.any_op
