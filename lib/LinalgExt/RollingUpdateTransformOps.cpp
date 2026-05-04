@@ -228,9 +228,9 @@ LinalgExtRollingUpdateNextReductionOp::apply(transform::TransformRewriter &rewri
 }
 
 DiagnosedSilenceableFailure
-LinalgExtForceFuseElemwiseChainIntoLoopOp::apply(transform::TransformRewriter &rewriter,
-                                                 TransformResults &transformResults,
-                                                 TransformState &state) {
+LinalgExtRollingUpdateForceFuseElemwise::apply(transform::TransformRewriter &rewriter,
+                                               TransformResults &transformResults,
+                                               TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
   SmallVector<Operation *> elemwiseOps =
       llvm::to_vector(state.getPayloadOps(getElemwiseChainOps()));

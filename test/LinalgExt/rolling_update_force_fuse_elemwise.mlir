@@ -1,6 +1,6 @@
 // RUN: mlir-opt %s \
 // RUN:   --load-dialect-plugin=%neptune_linalg_ext_plugin \
-// RUN:   --transform-preload-library=transform-library-paths=%S/Inputs/force_fuse_elemwise_chain_into_loop.transform.mlir \
+// RUN:   --transform-preload-library=transform-library-paths=%S/Inputs/rolling_update_force_fuse_elemwise.transform.mlir \
 // RUN:   --transform-interpreter | FileCheck %s
 
 module {

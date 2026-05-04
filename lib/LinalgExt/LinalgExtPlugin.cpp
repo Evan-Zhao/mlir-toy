@@ -19,7 +19,7 @@ void registerLinalgExtTransformExtension(mlir::DialectRegistry &registry) {
         ->addOperations<mlir::transform::LinalgExtFuseElemwiseIntoProducerOp,
                         mlir::transform::LinalgExtFuseReductionConsumerIntoForallOp,
                         mlir::transform::LinalgExtRollingUpdateNextReductionOp,
-                        mlir::transform::LinalgExtForceFuseElemwiseChainIntoLoopOp>();
+                        mlir::transform::LinalgExtRollingUpdateForceFuseElemwise>();
   });
 }
 
