@@ -72,32 +72,28 @@ def LinalgExtFuseReductionConsumerIntoForallOp
                        " `:` functional-type(operands, results)";
 }
 
-def LinalgExtRollingUpdateFwdFrontierOp
+def LinalgExtRollingUpdateNextReductionOp
     : Op<Transform_Dialect,
-         "match.linalg_ext.rolling_update_fwd_frontier",
-         [FunctionalStyleTransformOpTrait,
+         "match.linalg_ext.rolling_update_next_reduction",
+         [NavigationTransformOpTrait,
           DeclareOpInterfaceMethods<TransformOpInterface>,
           MemoryEffectsOpInterface]> {
-  let summary = "Walk from def to use to find the next smallest set of elementwise ops that rolling update can fuse";
+  let summary = "Find the nearest reduction consumer from a producer op via forward BFS";
 
   let description = [{
-    Pure analysis op that walks the forward use-def chain starting from
-    `producer_op`, collecting elementwise op until the path ends in a reduction op.
+    Pure analysis op. Performs a forward BFS on the def-use graph starting from
+    `producer_op` (each edge has unit length) and locates the first
+    reduction-like op encountered — i.e., the reduction at minimum BFS distance.
 
-    It returns:
-    - `elemwise_ops`: a transform handle that maps to a sequence of elementwise
-      ops, sorted from def to use (from `producer_op` to frontier consumer),
-    - `frontier_ops`: a transform handle that maps to the reduction-like frontier op(s)
-      reached by that walk.
+    Returns the located reduction op; and the elementwise ops between it and the producer,
+    sorted in def-to-use topological order.
 
-    It throws an error if the frontier is not closed: i.e., if any path from `producer_op`
-    does not end in a reduction op. A typical reason is an elementwise op directly used
-    as the return value of the surrounding function.
+    Fails if no reduction is reachable from `producer_op`.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$producer_op);
-  let results = (outs TransformHandleTypeInterface:$elemwise_ops,
-                      TransformHandleTypeInterface:$frontier_ops);
+  let results = (outs TransformHandleTypeInterface:$next_reduce_op,
+                      TransformHandleTypeInterface:$elemwise_ops);
 
   let assemblyFormat = "$producer_op attr-dict `:` functional-type(operands, results)";
 }

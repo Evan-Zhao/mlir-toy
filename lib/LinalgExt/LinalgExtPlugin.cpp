@@ -18,7 +18,7 @@ void registerLinalgExtTransformExtension(mlir::DialectRegistry &registry) {
     static_cast<TransformDialectAccess *>(dialect)
         ->addOperations<mlir::transform::LinalgExtFuseElemwiseIntoProducerOp,
                         mlir::transform::LinalgExtFuseReductionConsumerIntoForallOp,
-                        mlir::transform::LinalgExtRollingUpdateFwdFrontierOp,
+                        mlir::transform::LinalgExtRollingUpdateNextReductionOp,
                         mlir::transform::LinalgExtForceFuseElemwiseChainIntoLoopOp>();
   });
 }
