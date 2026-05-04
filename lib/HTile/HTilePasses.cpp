@@ -19,8 +19,7 @@ namespace {
 
 constexpr StringLiteral kDimensionOrderAttrName = "dimension_order";
 
-RankedTensorType permuteTensorType(RankedTensorType type,
-                                   ArrayRef<int64_t> permutation) {
+RankedTensorType permuteTensorType(RankedTensorType type, ArrayRef<int64_t> permutation) {
   SmallVector<int64_t> shape;
   shape.reserve(permutation.size());
   for (int64_t dim : permutation)
@@ -53,9 +52,7 @@ struct DotTransposeToLoadOrderPass
     : public PassWrapper<DotTransposeToLoadOrderPass, OperationPass<>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DotTransposeToLoadOrderPass)
 
-  StringRef getArgument() const override {
-    return "htile-dot-transpose-to-load-order";
-  }
+  StringRef getArgument() const override { return "htile-dot-transpose-to-load-order"; }
 
   StringRef getDescription() const override {
     return "Fission htile.dot transpose attributes into htile.permute and "
@@ -97,9 +94,8 @@ struct DotTransposeToLoadOrderPass
         return dot.emitOpError("transpose_a fission expects a rank-2 lhs");
       auto type = cast<RankedTensorType>(dot.getLhs().getType());
       auto permutedType = permuteTensorType(type, transpose);
-      auto permute =
-          builder.create<PermuteOp>(dot.getLoc(), permutedType, dot.getLhs(),
-                                    builder.getDenseI64ArrayAttr(transpose));
+      auto permute = builder.create<PermuteOp>(dot.getLoc(), permutedType, dot.getLhs(),
+                                               builder.getDenseI64ArrayAttr(transpose));
       dot->setOperand(0, permute.getResult());
       dot->removeAttr("transpose_a");
     }
@@ -109,9 +105,8 @@ struct DotTransposeToLoadOrderPass
         return dot.emitOpError("transpose_b fission expects a rank-2 rhs");
       auto type = cast<RankedTensorType>(dot.getRhs().getType());
       auto permutedType = permuteTensorType(type, transpose);
-      auto permute =
-          builder.create<PermuteOp>(dot.getLoc(), permutedType, dot.getRhs(),
-                                    builder.getDenseI64ArrayAttr(transpose));
+      auto permute = builder.create<PermuteOp>(dot.getLoc(), permutedType, dot.getRhs(),
+                                               builder.getDenseI64ArrayAttr(transpose));
       dot->setOperand(1, permute.getResult());
       dot->removeAttr("transpose_b");
     }
@@ -126,12 +121,10 @@ struct DotTransposeToLoadOrderPass
 
     ArrayRef<int64_t> permutation = permute.getPermutation();
     OpBuilder builder(permute);
-    auto fusedLoad = builder.create<LoadOp>(
-        permute.getLoc(), permute.getResult().getType(), load.getSource(),
-        load.getOffsets());
+    auto fusedLoad = builder.create<LoadOp>(permute.getLoc(), permute.getResult().getType(),
+                                            load.getSource(), load.getOffsets());
     fusedLoad->setAttrs(load->getAttrDictionary());
-    fusedLoad->setAttr(kDimensionOrderAttrName,
-                       composeDimensionOrder(builder, load, permutation));
+    fusedLoad->setAttr(kDimensionOrderAttrName, composeDimensionOrder(builder, load, permutation));
 
     permute.getResult().replaceAllUsesWith(fusedLoad.getResult());
     permute.erase();
@@ -156,8 +149,7 @@ void registerHTilePasses() {
 
 } // namespace htile
 
-extern "C" LLVM_ATTRIBUTE_WEAK mlir::PassPluginLibraryInfo
-mlirGetPassPluginInfo() {
+extern "C" LLVM_ATTRIBUTE_WEAK mlir::PassPluginLibraryInfo mlirGetPassPluginInfo() {
   return {MLIR_PLUGIN_API_VERSION, "HTilePassPlugin", LLVM_VERSION_STRING,
           []() { htile::registerHTilePasses(); }};
 }
