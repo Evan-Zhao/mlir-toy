@@ -102,8 +102,7 @@ module attributes {transform.with_named_sequence} {
     %fused_bscale, %forall_loop_1 =
       transform.linalg_ext.fuse_elemwise_into_producer %bscale into %forall_loop
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
-    // Fusion can create redundant loop-carried values, so we apply canonicalization
-    // to remove them.
+    // Fusion can create redundant loop-carried values and canonicalization removes them.
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !transform.any_op
 
     // Step 3. Match a reduction op that is a consumer of bscale.
@@ -118,7 +117,9 @@ module attributes {transform.with_named_sequence} {
     %fused_bsum, %forall_loop_2, %j0_loop =
       transform.linalg_ext.fuse_reduction_consumer_into_forall %bsum into %forall_loop_1
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
-    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !transform.any_op
+    // This CSE is actually required here so the next `fuse_elemwise_into_producer` can work
+    // because it unifies identical affine map operations.
+    transform.apply_cse to %func : !transform.any_op
 
     // Step 4. Prepare for rolling update. Rolling update can fuse two reductions together,
     // including all element-wise ops between them.
@@ -126,14 +127,9 @@ module attributes {transform.with_named_sequence} {
     %reduce, %elemwise =
       transform.match.linalg_ext.rolling_update_next_reduction %forall_loop_2
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    transform.print %func : !transform.any_op
-    transform.print %reduce : !transform.any_op
-    transform.print %elemwise : !transform.any_op
-    %elemwise_sidecars, %forall_loop_3 = transform.linalg_ext.rolling_update_force_fuse_elemwise
-        %elemwise into %forall_loop_2 : (!transform.any_op, !transform.any_op)
-        -> (!transform.any_op, !transform.any_op)
-
-    // Step 7. Canonicalize + CSE.
+    %elemwise_1, %forall_loop_3 =
+      transform.linalg_ext.fuse_elemwise_into_producer %elemwise into %forall_loop_2
+        : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %func : !transform.any_op
 
