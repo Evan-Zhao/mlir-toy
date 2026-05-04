@@ -65,9 +65,8 @@ SmallVector<Value> getElementwiseInputs(Operation *op) {
   return llvm::to_vector(cast<linalg::GenericOp>(op).getInputs());
 }
 
-FailureOr<Value>
-createDestinationForResultAtInsertionPoint(RewriterBase &rewriter,
-                                           OpResult opResult) {
+FailureOr<Value> createDestinationForResultAtInsertionPoint(RewriterBase &rewriter,
+                                                            OpResult opResult) {
   auto tensorType = dyn_cast<TensorType>(opResult.getType());
   if (!tensorType)
     return failure();
@@ -75,8 +74,7 @@ createDestinationForResultAtInsertionPoint(RewriterBase &rewriter,
   SmallVector<OpFoldResult> mixedSizes;
   if (!tensorType.hasStaticShape()) {
     ReifiedRankedShapedTypeDims reifiedShapes;
-    if (failed(reifyResultShapes(rewriter, opResult.getDefiningOp(),
-                                 reifiedShapes)))
+    if (failed(reifyResultShapes(rewriter, opResult.getDefiningOp(), reifiedShapes)))
       return failure();
     mixedSizes = reifiedShapes[opResult.getResultNumber()];
   } else {
@@ -134,22 +132,19 @@ struct SidecarValueInfo {
 
 using ResultsT = SmallVector<OpFoldResult>;
 
-std::variant<DiagnosedSilenceableFailure,
-             std::tuple<TilingInterface, ResultsT, ResultsT>>
-createTiledSidecarOp(
-    transform::TransformRewriter &rewriter,
-    const transform::TransformOpInterface &transform,
-    TilingInterface clonedConsumerOp,
-    const SmallVectorImpl<Value> &originalInputs, scf::ForOp &currentLoop,
-    const DenseMap<Value, SidecarValueInfo> &sidecarValueInfo,
-    const DenseMap<unsigned, tensor::InsertSliceOp> &loopResultInserts) {
+std::variant<DiagnosedSilenceableFailure, std::tuple<TilingInterface, ResultsT, ResultsT>>
+createTiledSidecarOp(transform::TransformRewriter &rewriter,
+                     const transform::TransformOpInterface &transform,
+                     TilingInterface clonedConsumerOp, const SmallVectorImpl<Value> &originalInputs,
+                     scf::ForOp &currentLoop,
+                     const DenseMap<Value, SidecarValueInfo> &sidecarValueInfo,
+                     const DenseMap<unsigned, tensor::InsertSliceOp> &loopResultInserts) {
   SmallVector<unsigned> fusedOperandNumbers;
   SmallVector<SmallVector<OpFoldResult>> fusedOffsets;
   SmallVector<SmallVector<OpFoldResult>> fusedSizes;
   SmallVector<Value> fusedTiles;
   for (auto [operandNum, originalInput] : llvm::enumerate(originalInputs)) {
-    if (auto it = sidecarValueInfo.find(originalInput);
-        it != sidecarValueInfo.end()) {
+    if (auto it = sidecarValueInfo.find(originalInput); it != sidecarValueInfo.end()) {
       fusedOperandNumbers.push_back(operandNum);
       fusedOffsets.push_back(it->second.tileOffsets);
       fusedSizes.push_back(it->second.tileSizes);
@@ -170,41 +165,35 @@ createTiledSidecarOp(
     fusedTiles.push_back(loopInsert.getSource());
   }
   if (fusedOperandNumbers.empty())
-    return emitSilenceableFailure(
-        transform, "expected each elementwise op in the chain to consume at "
-                   "least one loop-local or prior sidecar value");
+    return emitSilenceableFailure(transform,
+                                  "expected each elementwise op in the chain to consume at "
+                                  "least one loop-local or prior sidecar value");
 
-  FailureOr<TilingResult> tiledSidecar =
-      clonedConsumerOp.getTiledImplementationFromOperandTiles(
-          rewriter, fusedOperandNumbers, fusedOffsets, fusedSizes);
+  FailureOr<TilingResult> tiledSidecar = clonedConsumerOp.getTiledImplementationFromOperandTiles(
+      rewriter, fusedOperandNumbers, fusedOffsets, fusedSizes);
   if (failed(tiledSidecar) || tiledSidecar->tiledOps.empty() ||
       tiledSidecar->tiledValues.size() != 1)
-    return emitSilenceableFailure(
-        transform, "failed to tile sidecar elementwise op from operand tiles");
+    return emitSilenceableFailure(transform,
+                                  "failed to tile sidecar elementwise op from operand tiles");
 
   auto tiledSidecarOp = cast<TilingInterface>(tiledSidecar->tiledOps[0]);
-  for (auto [fusedOperandNum, fusedTile] :
-       llvm::zip_equal(fusedOperandNumbers, fusedTiles)) {
-    rewriter.replaceAllUsesWith(tiledSidecarOp->getOperand(fusedOperandNum),
-                                fusedTile);
+  for (auto [fusedOperandNum, fusedTile] : llvm::zip_equal(fusedOperandNumbers, fusedTiles)) {
+    rewriter.replaceAllUsesWith(tiledSidecarOp->getOperand(fusedOperandNum), fusedTile);
   }
   rewriter.eraseOp(clonedConsumerOp);
 
   SmallVector<OpFoldResult> iterDomainOffsets, iterDomainSizes;
   if (failed(tiledSidecarOp.getIterationDomainTileFromOperandTiles(
-          rewriter, fusedOperandNumbers, fusedOffsets, fusedSizes,
-          iterDomainOffsets, iterDomainSizes)))
-    return emitSilenceableFailure(
-        transform,
-        "failed to get iteration domain tile from sidecar operand tiles");
+          rewriter, fusedOperandNumbers, fusedOffsets, fusedSizes, iterDomainOffsets,
+          iterDomainSizes)))
+    return emitSilenceableFailure(transform,
+                                  "failed to get iteration domain tile from sidecar operand tiles");
 
   SmallVector<OpFoldResult> resultOffsets, resultSizes;
-  if (failed(tiledSidecarOp.getResultTilePosition(
-          rewriter, 0, iterDomainOffsets, iterDomainSizes, resultOffsets,
-          resultSizes)))
-    return emitSilenceableFailure(
-        transform,
-        "failed to get result tile position for sidecar elementwise op");
+  if (failed(tiledSidecarOp.getResultTilePosition(rewriter, 0, iterDomainOffsets, iterDomainSizes,
+                                                  resultOffsets, resultSizes)))
+    return emitSilenceableFailure(transform,
+                                  "failed to get result tile position for sidecar elementwise op");
 
   return std::make_tuple(tiledSidecarOp, resultOffsets, resultSizes);
 }
@@ -214,53 +203,48 @@ createTiledSidecarOp(
 namespace mlir {
 namespace transform {
 
-DiagnosedSilenceableFailure LinalgExtRollingUpdateFwdFrontierOp::apply(
-    transform::TransformRewriter &rewriter, TransformResults &transformResults,
-    TransformState &state) {
+DiagnosedSilenceableFailure
+LinalgExtRollingUpdateFwdFrontierOp::apply(transform::TransformRewriter &rewriter,
+                                           TransformResults &transformResults,
+                                           TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
-  SmallVector<Operation *> producers =
-      llvm::to_vector(state.getPayloadOps(getProducerOp()));
+  SmallVector<Operation *> producers = llvm::to_vector(state.getPayloadOps(getProducerOp()));
   if (producers.size() != 1)
     return emitSilenceableFailure(
-        transform,
-        "expected exactly one producer payload op in the transform handle");
+        transform, "expected exactly one producer payload op in the transform handle");
 
   auto frontierResult = collectRollingFrontierPath(producers.front());
   if (!frontierResult)
-    return emitSilenceableFailure(
-        transform, "target has no closed rolling update frontier");
+    return emitSilenceableFailure(transform, "target has no closed rolling update frontier");
   auto [elemwiseOps, frontierOps] = *frontierResult;
   transformResults.set(getOperation()->getResult(0), elemwiseOps);
   transformResults.set(getOperation()->getResult(1), frontierOps);
   return DiagnosedSilenceableFailure::success();
 }
 
-DiagnosedSilenceableFailure LinalgExtForceFuseElemwiseChainIntoLoopOp::apply(
-    transform::TransformRewriter &rewriter, TransformResults &transformResults,
-    TransformState &state) {
+DiagnosedSilenceableFailure
+LinalgExtForceFuseElemwiseChainIntoLoopOp::apply(transform::TransformRewriter &rewriter,
+                                                 TransformResults &transformResults,
+                                                 TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
   SmallVector<Operation *> elemwiseOps =
       llvm::to_vector(state.getPayloadOps(getElemwiseChainOps()));
-  SmallVector<Operation *> loops =
-      llvm::to_vector(state.getPayloadOps(getStreamingLoop()));
+  SmallVector<Operation *> loops = llvm::to_vector(state.getPayloadOps(getStreamingLoop()));
 
   if (elemwiseOps.empty())
-    return emitSilenceableFailure(
-        transform, "expected at least one elementwise payload op");
+    return emitSilenceableFailure(transform, "expected at least one elementwise payload op");
   if (loops.size() != 1)
-    return emitSilenceableFailure(
-        transform, "expected exactly one streaming loop payload op");
+    return emitSilenceableFailure(transform, "expected exactly one streaming loop payload op");
 
   auto currentLoop = dyn_cast<scf::ForOp>(loops.front());
   if (!currentLoop)
-    return emitSilenceableFailure(
-        transform, "expected the streaming loop to be an scf.for");
+    return emitSilenceableFailure(transform, "expected the streaming loop to be an scf.for");
 
   for (Operation *elemwiseOp : elemwiseOps)
     if (failed(verifyForceFusibleElementwiseOp(elemwiseOp)))
-      return emitSilenceableFailure(
-          transform, "expected every op in the chain to be an elementwise "
-                     "linalg.map or linalg.generic with one tensor result");
+      return emitSilenceableFailure(transform,
+                                    "expected every op in the chain to be an elementwise "
+                                    "linalg.map or linalg.generic with one tensor result");
 
   // Step 1. Each elemwise op to fuse may introduce extra loop-carried values.
   // Rebuild the streaming loop once with extra iter_arg needed to hold these
@@ -270,17 +254,17 @@ DiagnosedSilenceableFailure LinalgExtForceFuseElemwiseChainIntoLoopOp::apply(
   rewriter.setInsertionPoint(currentLoop);
   SmallVector<Value> newInitArgs = llvm::to_vector(currentLoop.getInitArgs());
   for (Operation *elemwiseOp : elemwiseOps) {
-    auto destination = createDestinationForResultAtInsertionPoint(
-        rewriter, elemwiseOp->getResult(0));
+    auto destination =
+        createDestinationForResultAtInsertionPoint(rewriter, elemwiseOp->getResult(0));
     if (failed(destination))
-      return emitSilenceableFailure(
-          transform, "failed to create a dominating destination tensor for "
-                     "an elementwise sidecar result");
+      return emitSilenceableFailure(transform,
+                                    "failed to create a dominating destination tensor for "
+                                    "an elementwise sidecar result");
     newInitArgs.push_back(*destination);
   }
-  auto newLoop = scf::ForOp::create(
-      rewriter, currentLoop.getLoc(), currentLoop.getLowerBound(),
-      currentLoop.getUpperBound(), currentLoop.getStep(), newInitArgs);
+  auto newLoop =
+      scf::ForOp::create(rewriter, currentLoop.getLoc(), currentLoop.getLowerBound(),
+                         currentLoop.getUpperBound(), currentLoop.getStep(), newInitArgs);
 
   // 1.2. Set up old value to new value mapping for the loop induction variable
   // and region iter args.
@@ -325,40 +309,33 @@ DiagnosedSilenceableFailure LinalgExtForceFuseElemwiseChainIntoLoopOp::apply(
     SmallVector<Value> originalInputs = getElementwiseInputs(elemwiseOp);
     SmallVector<Value> remappedFullInputs = originalInputs;
     for (Value &input : remappedFullInputs) {
-      if (auto mapped = sidecarValueInfo.find(input);
-          mapped != sidecarValueInfo.end()) {
+      if (auto mapped = sidecarValueInfo.find(input); mapped != sidecarValueInfo.end()) {
         input = mapped->second.fullValue;
-      } else if (auto mapped = loopResultValues.find(input);
-                 mapped != loopResultValues.end()) {
+      } else if (auto mapped = loopResultValues.find(input); mapped != loopResultValues.end()) {
         input = mapped->second;
       }
     }
 
     SmallVector<Value> remappedOperands = remappedFullInputs;
-    Value sidecarFullTensor =
-        newLoop.getRegionIterArgs()[oldNumResults + index];
+    Value sidecarFullTensor = newLoop.getRegionIterArgs()[oldNumResults + index];
     remappedOperands.push_back(sidecarFullTensor);
-    Operation *clonedConsumer = mlir::clone(
-        rewriter, elemwiseOp, elemwiseOp->getResultTypes(), remappedOperands);
+    Operation *clonedConsumer =
+        mlir::clone(rewriter, elemwiseOp, elemwiseOp->getResultTypes(), remappedOperands);
     auto clonedConsumerOp = dyn_cast<TilingInterface>(clonedConsumer);
     if (!clonedConsumerOp)
-      return emitSilenceableFailure(
-          transform, "expected cloned elementwise op to implement "
-                     "TilingInterface");
+      return emitSilenceableFailure(transform, "expected cloned elementwise op to implement "
+                                               "TilingInterface");
 
-    auto tileOpResult = createTiledSidecarOp(
-        rewriter, transform, clonedConsumerOp, originalInputs, currentLoop,
-        sidecarValueInfo, loopResultInserts);
+    auto tileOpResult = createTiledSidecarOp(rewriter, transform, clonedConsumerOp, originalInputs,
+                                             currentLoop, sidecarValueInfo, loopResultInserts);
     if (std::holds_alternative<DiagnosedSilenceableFailure>(tileOpResult))
       return std::get<DiagnosedSilenceableFailure>(std::move(tileOpResult));
-    auto [tiledSidecarOp, resultOffsets, resultSizes] =
-        std::get<1>(tileOpResult);
+    auto [tiledSidecarOp, resultOffsets, resultSizes] = std::get<1>(tileOpResult);
 
-    SmallVector<OpFoldResult> resultStrides(resultOffsets.size(),
-                                            rewriter.getIndexAttr(1));
-    auto sidecarInsert = tensor::InsertSliceOp::create(
-        rewriter, elemwiseOp->getLoc(), tiledSidecarOp->getResult(0),
-        sidecarFullTensor, resultOffsets, resultSizes, resultStrides);
+    SmallVector<OpFoldResult> resultStrides(resultOffsets.size(), rewriter.getIndexAttr(1));
+    auto sidecarInsert =
+        tensor::InsertSliceOp::create(rewriter, elemwiseOp->getLoc(), tiledSidecarOp->getResult(0),
+                                      sidecarFullTensor, resultOffsets, resultSizes, resultStrides);
 
     sidecarOps.push_back(tiledSidecarOp.getOperation());
     sidecarValueInfo[elemwiseOp->getResult(0)] = SidecarValueInfo{
@@ -373,15 +350,12 @@ DiagnosedSilenceableFailure LinalgExtForceFuseElemwiseChainIntoLoopOp::apply(
   // Step 3. Publish all sidecar tensors as extra loop results, then replace
   // the old loop while leaving the original out-of-loop chain untouched.
   SmallVector<Value> newYieldOperands = clonedYieldOperands;
-  newYieldOperands.append(sidecarYieldOperands.begin(),
-                          sidecarYieldOperands.end());
+  newYieldOperands.append(sidecarYieldOperands.begin(), sidecarYieldOperands.end());
   scf::YieldOp::create(rewriter, currentLoop.getLoc(), newYieldOperands);
 
-  rewriter.replaceOp(currentLoop,
-                     newLoop.getResults().take_front(oldNumResults));
+  rewriter.replaceOp(currentLoop, newLoop.getResults().take_front(oldNumResults));
   transformResults.set(getOperation()->getResult(0), sidecarOps);
-  transformResults.set(getOperation()->getResult(1),
-                       ArrayRef<Operation *>{newLoop.getOperation()});
+  transformResults.set(getOperation()->getResult(1), ArrayRef<Operation *>{newLoop.getOperation()});
   return DiagnosedSilenceableFailure::success();
 }
 

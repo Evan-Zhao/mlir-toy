@@ -1,11 +1,11 @@
-#include "HTile/HTileAttrs.h"
 #include "HTile/HTileDialect.h"
+#include "HTile/HTileAttrs.h"
 #include "HTile/HTileOps.h"
 #include "HTile/HTilePasses.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
-#include "llvm/ADT/TypeSwitch.h"
 #include "mlir/Tools/Plugins/DialectPlugin.h"
+#include "llvm/ADT/TypeSwitch.h"
 
 #define GET_DIALECT_DEFS
 #include "HTileOpsDialect.cpp.inc"
@@ -24,16 +24,12 @@ void HTileDialect::initialize() {
 }
 } // namespace htile
 
-extern "C" LLVM_ATTRIBUTE_WEAK mlir::DialectPluginLibraryInfo
-mlirGetDialectPluginInfo() {
-  return {
-      MLIR_PLUGIN_API_VERSION,
-      "HTileDialectPlugin",
-      LLVM_VERSION_STRING,
-      [](mlir::DialectRegistry *registry) {
-        registry->insert<htile::HTileDialect>();
-        htile::registerHTilePasses();
-      }};
+extern "C" LLVM_ATTRIBUTE_WEAK mlir::DialectPluginLibraryInfo mlirGetDialectPluginInfo() {
+  return {MLIR_PLUGIN_API_VERSION, "HTileDialectPlugin", LLVM_VERSION_STRING,
+          [](mlir::DialectRegistry *registry) {
+            registry->insert<htile::HTileDialect>();
+            htile::registerHTilePasses();
+          }};
 }
 
 #include "HTileEnums.cpp.inc"

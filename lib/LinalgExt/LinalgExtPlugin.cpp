@@ -11,17 +11,15 @@ void registerLinalgExtTransformExtension(mlir::DialectRegistry &registry) {
   // this out-of-tree plugin. Register the op directly as a narrow workaround;
   // the ops are still constrained by their TableGen traits and verified when
   // used.
-  registry.addExtension(+[](mlir::MLIRContext *,
-                            mlir::transform::TransformDialect *dialect) {
+  registry.addExtension(+[](mlir::MLIRContext *, mlir::transform::TransformDialect *dialect) {
     struct TransformDialectAccess : public mlir::transform::TransformDialect {
       using mlir::Dialect::addOperations;
     };
     static_cast<TransformDialectAccess *>(dialect)
-        ->addOperations<
-            mlir::transform::LinalgExtFuseElemwiseIntoProducerOp,
-            mlir::transform::LinalgExtFuseReductionConsumerIntoForallOp,
-            mlir::transform::LinalgExtRollingUpdateFwdFrontierOp,
-            mlir::transform::LinalgExtForceFuseElemwiseChainIntoLoopOp>();
+        ->addOperations<mlir::transform::LinalgExtFuseElemwiseIntoProducerOp,
+                        mlir::transform::LinalgExtFuseReductionConsumerIntoForallOp,
+                        mlir::transform::LinalgExtRollingUpdateFwdFrontierOp,
+                        mlir::transform::LinalgExtForceFuseElemwiseChainIntoLoopOp>();
   });
 }
 
@@ -30,10 +28,9 @@ void registerLinalgExtTransformExtension(mlir::DialectRegistry &registry) {
 #define GET_OP_CLASSES
 #include "LinalgExtTransformOps.cpp.inc"
 
-extern "C" LLVM_ATTRIBUTE_WEAK mlir::DialectPluginLibraryInfo
-mlirGetDialectPluginInfo() {
-  return {MLIR_PLUGIN_API_VERSION, "LinalgExtTransformPlugin",
-          LLVM_VERSION_STRING, [](mlir::DialectRegistry *registry) {
+extern "C" LLVM_ATTRIBUTE_WEAK mlir::DialectPluginLibraryInfo mlirGetDialectPluginInfo() {
+  return {MLIR_PLUGIN_API_VERSION, "LinalgExtTransformPlugin", LLVM_VERSION_STRING,
+          [](mlir::DialectRegistry *registry) {
             linalg_ext::registerLinalgExtTransformExtension(*registry);
           }};
 }

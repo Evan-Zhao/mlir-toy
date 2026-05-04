@@ -14,18 +14,14 @@ using namespace mlir;
 
 namespace {
 
-#define EXTRACT_SINGLE_CONSUMER_SINGLE_LOOP(CONSUMER, LOOP)                    \
-  SmallVector<Operation *> _consumers =                                        \
-      llvm::to_vector(state.getPayloadOps(getConsumerOp()));                   \
-  SmallVector<Operation *> _loops =                                            \
-      llvm::to_vector(state.getPayloadOps(getContainingLoop()));               \
-  if (_consumers.size() != 1)                                                  \
-    return emitSilenceableFailure(transform,                                   \
-                                  "expected exactly one consumer payload op"); \
-  if (_loops.size() != 1)                                                      \
-    return emitSilenceableFailure(                                             \
-        transform, "expected exactly one containing loop payload op");         \
-  auto(CONSUMER) = _consumers.front();                                         \
+#define EXTRACT_SINGLE_CONSUMER_SINGLE_LOOP(CONSUMER, LOOP)                                        \
+  SmallVector<Operation *> _consumers = llvm::to_vector(state.getPayloadOps(getConsumerOp()));     \
+  SmallVector<Operation *> _loops = llvm::to_vector(state.getPayloadOps(getContainingLoop()));     \
+  if (_consumers.size() != 1)                                                                      \
+    return emitSilenceableFailure(transform, "expected exactly one consumer payload op");          \
+  if (_loops.size() != 1)                                                                          \
+    return emitSilenceableFailure(transform, "expected exactly one containing loop payload op");   \
+  auto(CONSUMER) = _consumers.front();                                                             \
   auto(LOOP) = _loops.front();
 
 LogicalResult verifyUnaryMap(linalg::MapOp map) {
@@ -51,8 +47,7 @@ LogicalResult verifyElementwiseGeneric(linalg::GenericOp generic) {
   return success();
 }
 
-FailureOr<SmallVector<LoopLikeOpInterface>>
-collectLoopNestRootedAt(Operation *root) {
+FailureOr<SmallVector<LoopLikeOpInterface>> collectLoopNestRootedAt(Operation *root) {
   if (auto forallOp = dyn_cast<scf::ForallOp>(root))
     return SmallVector<LoopLikeOpInterface>{forallOp};
 
@@ -94,20 +89,16 @@ LogicalResult verifyUnarySingleReductionGeneric(linalg::GenericOp generic) {
   if (generic->getNumResults() != 1)
     return failure();
 
-  auto inputType =
-      dyn_cast<RankedTensorType>(generic.getInputs().front().getType());
-  auto resultType =
-      dyn_cast<RankedTensorType>(generic.getResults().front().getType());
-  if (!inputType || !resultType ||
-      inputType.getRank() != resultType.getRank() + 1)
+  auto inputType = dyn_cast<RankedTensorType>(generic.getInputs().front().getType());
+  auto resultType = dyn_cast<RankedTensorType>(generic.getResults().front().getType());
+  if (!inputType || !resultType || inputType.getRank() != resultType.getRank() + 1)
     return failure();
 
   AffineMap inputMap = generic.getIndexingMapsArray().front();
   if (!inputMap.isIdentity())
     return failure();
 
-  SmallVector<utils::IteratorType> iteratorTypes =
-      llvm::to_vector(generic.getIteratorTypesArray());
+  SmallVector<utils::IteratorType> iteratorTypes = llvm::to_vector(generic.getIteratorTypesArray());
   int64_t reductionDim = -1;
   for (auto [index, iteratorType] : llvm::enumerate(iteratorTypes)) {
     if (iteratorType != utils::IteratorType::reduction)
@@ -134,15 +125,14 @@ LogicalResult verifyUnarySingleReductionGeneric(linalg::GenericOp generic) {
 }
 
 int64_t getSingleReductionDim(linalg::GenericOp generic) {
-  for (auto [index, iteratorType] :
-       llvm::enumerate(generic.getIteratorTypesArray()))
+  for (auto [index, iteratorType] : llvm::enumerate(generic.getIteratorTypesArray()))
     if (iteratorType == utils::IteratorType::reduction)
       return index;
   return -1;
 }
 
-FailureOr<tensor::ParallelInsertSliceOp>
-getParallelInsertSliceForLoopResult(scf::ForallOp loop, OpResult result) {
+FailureOr<tensor::ParallelInsertSliceOp> getParallelInsertSliceForLoopResult(scf::ForallOp loop,
+                                                                             OpResult result) {
   if (result.getOwner() != loop.getOperation())
     return failure();
   BlockArgument bbArg = loop.getTiedBlockArgument(result);
@@ -152,8 +142,7 @@ getParallelInsertSliceForLoopResult(scf::ForallOp loop, OpResult result) {
   return dyn_cast<tensor::ParallelInsertSliceOp>(combiningOps.front());
 }
 
-template <typename T>
-SmallVector<T> dropAt(const SmallVector<T> &values, int64_t index) {
+template <typename T> SmallVector<T> dropAt(const SmallVector<T> &values, int64_t index) {
   SmallVector<T> result;
   result.reserve(values.size() - 1);
   for (auto [i, value] : llvm::enumerate(values))
@@ -176,26 +165,23 @@ std::optional<unsigned> findLoopIvIndex(Value value, ArrayRef<Value> ivs) {
   return std::nullopt;
 }
 
-OpFoldResult remapOpFoldResult(RewriterBase &rewriter, Location loc,
-                               OpFoldResult ofr, Value from, Value to) {
+OpFoldResult remapOpFoldResult(RewriterBase &rewriter, Location loc, OpFoldResult ofr, Value from,
+                               Value to) {
   if (auto attr = dyn_cast<Attribute>(ofr))
     return attr;
   Value value = cast<Value>(ofr);
   if (value == from)
     return to;
   auto affineApply = value.getDefiningOp<affine::AffineApplyOp>();
-  if (!affineApply || affineApply.getNumOperands() != 1 ||
-      affineApply.getOperand(0) != from)
+  if (!affineApply || affineApply.getNumOperands() != 1 || affineApply.getOperand(0) != from)
     return value;
-  return affine::AffineApplyOp::create(
-             rewriter, loc, affineApply.getAffineMap(), ValueRange{to})
+  return affine::AffineApplyOp::create(rewriter, loc, affineApply.getAffineMap(), ValueRange{to})
       .getResult();
 }
 
-SmallVector<OpFoldResult>
-remapOpFoldResults(RewriterBase &rewriter, Location loc,
-                   ArrayRef<OpFoldResult> values,
-                   ArrayRef<std::pair<Value, Value>> mapping) {
+SmallVector<OpFoldResult> remapOpFoldResults(RewriterBase &rewriter, Location loc,
+                                             ArrayRef<OpFoldResult> values,
+                                             ArrayRef<std::pair<Value, Value>> mapping) {
   SmallVector<OpFoldResult> remapped = llvm::to_vector(values);
   for (auto [from, to] : mapping)
     for (OpFoldResult &value : remapped)
@@ -203,8 +189,7 @@ remapOpFoldResults(RewriterBase &rewriter, Location loc,
   return remapped;
 }
 
-RankedTensorType inferTensorTypeFromMixedSizes(ArrayRef<OpFoldResult> sizes,
-                                               Type elementType) {
+RankedTensorType inferTensorTypeFromMixedSizes(ArrayRef<OpFoldResult> sizes, Type elementType) {
   SmallVector<int64_t> shape;
   shape.reserve(sizes.size());
   for (OpFoldResult size : sizes) {
@@ -214,11 +199,10 @@ RankedTensorType inferTensorTypeFromMixedSizes(ArrayRef<OpFoldResult> sizes,
   return RankedTensorType::get(shape, elementType);
 }
 
-void cloneSingleRegionBody(OpBuilder &builder, Location nestedLoc,
-                           Block &oldBlock, ValueRange newArgs) {
+void cloneSingleRegionBody(OpBuilder &builder, Location nestedLoc, Block &oldBlock,
+                           ValueRange newArgs) {
   IRMapping mapping;
-  for (auto [oldArg, newArg] :
-       llvm::zip_equal(oldBlock.getArguments(), newArgs))
+  for (auto [oldArg, newArg] : llvm::zip_equal(oldBlock.getArguments(), newArgs))
     mapping.map(oldArg, newArg);
 
   for (Operation &op : oldBlock.without_terminator())
@@ -232,17 +216,13 @@ void cloneSingleRegionBody(OpBuilder &builder, Location nestedLoc,
   linalg::YieldOp::create(builder, nestedLoc, yielded);
 }
 
-linalg::GenericOp cloneGenericOnTile(RewriterBase &rewriter,
-                                     linalg::GenericOp sourceGeneric,
-                                     Value inputTile, Value initTile,
-                                     Location loc) {
+linalg::GenericOp cloneGenericOnTile(RewriterBase &rewriter, linalg::GenericOp sourceGeneric,
+                                     Value inputTile, Value initTile, Location loc) {
   return linalg::GenericOp::create(
-      rewriter, loc, TypeRange{initTile.getType()}, ValueRange{inputTile},
-      ValueRange{initTile}, sourceGeneric.getIndexingMapsArray(),
-      sourceGeneric.getIteratorTypesArray(),
+      rewriter, loc, TypeRange{initTile.getType()}, ValueRange{inputTile}, ValueRange{initTile},
+      sourceGeneric.getIndexingMapsArray(), sourceGeneric.getIteratorTypesArray(),
       [&](OpBuilder &builder, Location nestedLoc, ValueRange newArgs) {
-        cloneSingleRegionBody(builder, nestedLoc,
-                              sourceGeneric->getRegion(0).front(), newArgs);
+        cloneSingleRegionBody(builder, nestedLoc, sourceGeneric->getRegion(0).front(), newArgs);
       });
 }
 
@@ -251,9 +231,10 @@ linalg::GenericOp cloneGenericOnTile(RewriterBase &rewriter,
 namespace mlir {
 namespace transform {
 
-DiagnosedSilenceableFailure LinalgExtFuseElemwiseIntoProducerOp::apply(
-    transform::TransformRewriter &rewriter, TransformResults &transformResults,
-    TransformState &state) {
+DiagnosedSilenceableFailure
+LinalgExtFuseElemwiseIntoProducerOp::apply(transform::TransformRewriter &rewriter,
+                                           TransformResults &transformResults,
+                                           TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
   EXTRACT_SINGLE_CONSUMER_SINGLE_LOOP(consumer, loop);
 
@@ -261,25 +242,24 @@ DiagnosedSilenceableFailure LinalgExtFuseElemwiseIntoProducerOp::apply(
   auto generic = dyn_cast<linalg::GenericOp>(consumer);
   if ((!map || failed(verifyUnaryMap(map))) &&
       (!generic || failed(verifyElementwiseGeneric(generic))))
-    return emitSilenceableFailure(
-        transform, "expected an elementwise consumer: either linalg.map or "
-                   "linalg.generic with all-parallel loops");
+    return emitSilenceableFailure(transform,
+                                  "expected an elementwise consumer: either linalg.map or "
+                                  "linalg.generic with all-parallel loops");
 
   auto loopNest = collectLoopNestRootedAt(loop);
   if (failed(loopNest))
-    return emitSilenceableFailure(
-        transform,
-        "expected containing loop to be an scf.for/scf.forall root of a "
-        "supported tiled loop nest");
+    return emitSilenceableFailure(transform,
+                                  "expected containing loop to be an scf.for/scf.forall root of a "
+                                  "supported tiled loop nest");
 
   FailureOr<scf::SCFFuseConsumerOfSliceResult> fuseResult =
       scf::tileAndFuseConsumer(rewriter, consumer, *loopNest);
   if (failed(fuseResult))
-    return emitSilenceableFailure(
-        transform, "failed to tile and fuse elementwise consumer into loop");
+    return emitSilenceableFailure(transform,
+                                  "failed to tile and fuse elementwise consumer into loop");
   if (fuseResult->tiledOps.empty())
-    return emitSilenceableFailure(
-        transform, "consumer had no operands defined by the containing loop");
+    return emitSilenceableFailure(transform,
+                                  "consumer had no operands defined by the containing loop");
 
   if (isOpTriviallyDead(consumer))
     rewriter.eraseOp(consumer);
@@ -290,54 +270,49 @@ DiagnosedSilenceableFailure LinalgExtFuseElemwiseIntoProducerOp::apply(
   return DiagnosedSilenceableFailure::success();
 }
 
-DiagnosedSilenceableFailure LinalgExtFuseReductionConsumerIntoForallOp::apply(
-    transform::TransformRewriter &rewriter, TransformResults &transformResults,
-    TransformState &state) {
+DiagnosedSilenceableFailure
+LinalgExtFuseReductionConsumerIntoForallOp::apply(transform::TransformRewriter &rewriter,
+                                                  TransformResults &transformResults,
+                                                  TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
   EXTRACT_SINGLE_CONSUMER_SINGLE_LOOP(consumer, loop);
 
   auto generic = dyn_cast<linalg::GenericOp>(consumer);
   if (!generic || failed(verifyUnarySingleReductionGeneric(generic)))
-    return emitSilenceableFailure(
-        transform, "expected a unary single-reduction linalg.generic consumer");
+    return emitSilenceableFailure(transform,
+                                  "expected a unary single-reduction linalg.generic consumer");
 
   auto forallLoop = dyn_cast<scf::ForallOp>(loop);
   if (!forallLoop)
-    return emitSilenceableFailure(transform,
-                                  "expected an scf.forall containing loop");
+    return emitSilenceableFailure(transform, "expected an scf.forall containing loop");
   if (forallLoop.getNumResults() != 1)
-    return emitSilenceableFailure(
-        transform, "expected the scf.forall to have exactly one result");
+    return emitSilenceableFailure(transform, "expected the scf.forall to have exactly one result");
 
   auto producerResult = dyn_cast<OpResult>(generic.getInputs().front());
   if (!producerResult || producerResult.getOwner() != forallLoop.getOperation())
     return emitSilenceableFailure(
-        transform,
-        "expected the reduction input to be produced by the target scf.forall");
+        transform, "expected the reduction input to be produced by the target scf.forall");
 
   FailureOr<tensor::ParallelInsertSliceOp> maybeProducerInsert =
       getParallelInsertSliceForLoopResult(forallLoop, producerResult);
   if (failed(maybeProducerInsert) || !*maybeProducerInsert)
     return emitSilenceableFailure(
-        transform,
-        "expected the loop result consumed by the reduction to be combined via "
-        "tensor.parallel_insert_slice");
+        transform, "expected the loop result consumed by the reduction to be combined via "
+                   "tensor.parallel_insert_slice");
   auto producerInsert = *maybeProducerInsert;
 
   int64_t reductionDim = getSingleReductionDim(generic);
   OpFoldResult reductionOffset = producerInsert.getMixedOffsets()[reductionDim];
   Value reductionOffsetValue = dyn_cast<Value>(reductionOffset);
   if (!reductionOffsetValue)
-    return emitSilenceableFailure(transform,
-                                  "expected the reduced producer dimension to "
-                                  "have a dynamic tile offset");
+    return emitSilenceableFailure(transform, "expected the reduced producer dimension to "
+                                             "have a dynamic tile offset");
   std::optional<unsigned> removedIvIndex =
       findLoopIvIndex(reductionOffsetValue, forallLoop.getInductionVars());
   if (!removedIvIndex)
-    return emitSilenceableFailure(
-        transform,
-        "expected the reduced producer dimension to be controlled by one "
-        "scf.forall induction variable");
+    return emitSilenceableFailure(transform,
+                                  "expected the reduced producer dimension to be controlled by one "
+                                  "scf.forall induction variable");
 
   // Step 1. Rebuild the outer forall without the reduction-tiled dimension and
   // add the reduction result tensor as a new shared output.
@@ -348,9 +323,8 @@ DiagnosedSilenceableFailure LinalgExtFuseReductionConsumerIntoForallOp::apply(
   Value reductionInit = generic.getDpsInits().front();
   newOutputs.push_back(reductionInit);
   rewriter.setInsertionPoint(generic);
-  auto newForall =
-      scf::ForallOp::create(rewriter, forallLoop.getLoc(), outerLbs, outerUbs,
-                            outerSteps, newOutputs, std::nullopt, nullptr);
+  auto newForall = scf::ForallOp::create(rewriter, forallLoop.getLoc(), outerLbs, outerUbs,
+                                         outerSteps, newOutputs, std::nullopt, nullptr);
 
   // Step 2. Materialize the outer-thread slices that will be updated by the
   // new inner sequential loop.
@@ -359,14 +333,11 @@ DiagnosedSilenceableFailure LinalgExtFuseReductionConsumerIntoForallOp::apply(
   Value outerReductionArg = newForall.getRegionOutArgs().back();
   Value removedIv = forallLoop.getInductionVars()[*removedIvIndex];
   Value removedLb = getValueOrCreateConstantIndexOp(
-      rewriter, forallLoop.getLoc(),
-      forallLoop.getMixedLowerBound()[*removedIvIndex]);
+      rewriter, forallLoop.getLoc(), forallLoop.getMixedLowerBound()[*removedIvIndex]);
   Value removedUb = getValueOrCreateConstantIndexOp(
-      rewriter, forallLoop.getLoc(),
-      forallLoop.getMixedUpperBound()[*removedIvIndex]);
-  Value removedStep = getValueOrCreateConstantIndexOp(
-      rewriter, forallLoop.getLoc(),
-      forallLoop.getMixedStep()[*removedIvIndex]);
+      rewriter, forallLoop.getLoc(), forallLoop.getMixedUpperBound()[*removedIvIndex]);
+  Value removedStep = getValueOrCreateConstantIndexOp(rewriter, forallLoop.getLoc(),
+                                                      forallLoop.getMixedStep()[*removedIvIndex]);
 
   SmallVector<std::pair<Value, Value>> outerIvMapping;
   outerIvMapping.reserve(forallLoop.getInductionVars().size());
@@ -376,53 +347,43 @@ DiagnosedSilenceableFailure LinalgExtFuseReductionConsumerIntoForallOp::apply(
       outerIvMapping.emplace_back(oldIv, removedLb);
       continue;
     }
-    outerIvMapping.emplace_back(oldIv,
-                                newForall.getInductionVars()[newOuterIvPos++]);
+    outerIvMapping.emplace_back(oldIv, newForall.getInductionVars()[newOuterIvPos++]);
   }
 
-  SmallVector<OpFoldResult> panelOffsets =
-      remapOpFoldResults(rewriter, forallLoop.getLoc(),
-                         producerInsert.getMixedOffsets(), outerIvMapping);
-  SmallVector<OpFoldResult> panelSizes =
-      llvm::to_vector(producerInsert.getMixedSizes());
+  SmallVector<OpFoldResult> panelOffsets = remapOpFoldResults(
+      rewriter, forallLoop.getLoc(), producerInsert.getMixedOffsets(), outerIvMapping);
+  SmallVector<OpFoldResult> panelSizes = llvm::to_vector(producerInsert.getMixedSizes());
   auto producerType = cast<RankedTensorType>(producerResult.getType());
   if (producerType.isDynamicDim(reductionDim)) {
     panelSizes[reductionDim] =
-        tensor::DimOp::create(rewriter, forallLoop.getLoc(), producerResult,
-                              reductionDim)
+        tensor::DimOp::create(rewriter, forallLoop.getLoc(), producerResult, reductionDim)
             .getResult();
   } else {
-    panelSizes[reductionDim] =
-        rewriter.getIndexAttr(producerType.getDimSize(reductionDim));
+    panelSizes[reductionDim] = rewriter.getIndexAttr(producerType.getDimSize(reductionDim));
   }
-  SmallVector<OpFoldResult> unitStrides(panelOffsets.size(),
-                                        rewriter.getIndexAttr(1));
-  auto panelType =
-      inferTensorTypeFromMixedSizes(panelSizes, producerType.getElementType());
-  Value panelInit = tensor::ExtractSliceOp::create(
-      rewriter, forallLoop.getLoc(), panelType, outerProducerArg, panelOffsets,
-      panelSizes, unitStrides);
+  SmallVector<OpFoldResult> unitStrides(panelOffsets.size(), rewriter.getIndexAttr(1));
+  auto panelType = inferTensorTypeFromMixedSizes(panelSizes, producerType.getElementType());
+  Value panelInit =
+      tensor::ExtractSliceOp::create(rewriter, forallLoop.getLoc(), panelType, outerProducerArg,
+                                     panelOffsets, panelSizes, unitStrides);
 
   auto reductionType = cast<RankedTensorType>(reductionInit.getType());
-  SmallVector<OpFoldResult> reductionOffsets = remapOpFoldResults(
-      rewriter, forallLoop.getLoc(),
-      dropAt(producerInsert.getMixedOffsets(), reductionDim), outerIvMapping);
-  SmallVector<OpFoldResult> reductionSizes =
-      dropAt(producerInsert.getMixedSizes(), reductionDim);
-  SmallVector<OpFoldResult> reductionStrides(reductionOffsets.size(),
-                                             rewriter.getIndexAttr(1));
-  auto reductionTileType = inferTensorTypeFromMixedSizes(
-      reductionSizes, reductionType.getElementType());
+  SmallVector<OpFoldResult> reductionOffsets =
+      remapOpFoldResults(rewriter, forallLoop.getLoc(),
+                         dropAt(producerInsert.getMixedOffsets(), reductionDim), outerIvMapping);
+  SmallVector<OpFoldResult> reductionSizes = dropAt(producerInsert.getMixedSizes(), reductionDim);
+  SmallVector<OpFoldResult> reductionStrides(reductionOffsets.size(), rewriter.getIndexAttr(1));
+  auto reductionTileType =
+      inferTensorTypeFromMixedSizes(reductionSizes, reductionType.getElementType());
   Value reductionTileInit = tensor::ExtractSliceOp::create(
-      rewriter, forallLoop.getLoc(), reductionTileType, outerReductionArg,
-      reductionOffsets, reductionSizes, reductionStrides);
+      rewriter, forallLoop.getLoc(), reductionTileType, outerReductionArg, reductionOffsets,
+      reductionSizes, reductionStrides);
 
   // Step 3. Create the inner sequential loop, clone the producer tile
   // computation into it, insert the producer tile into the local panel, and
   // thread the reduction state as an scf.for iter_arg.
-  auto innerFor =
-      scf::ForOp::create(rewriter, forallLoop.getLoc(), removedLb, removedUb,
-                         removedStep, ValueRange{panelInit, reductionTileInit});
+  auto innerFor = scf::ForOp::create(rewriter, forallLoop.getLoc(), removedLb, removedUb,
+                                     removedStep, ValueRange{panelInit, reductionTileInit});
   rewriter.setInsertionPointToStart(innerFor.getBody());
 
   IRMapping mapping;
@@ -443,40 +404,32 @@ DiagnosedSilenceableFailure LinalgExtFuseReductionConsumerIntoForallOp::apply(
   localPanelOffsets.reserve(panelOffsets.size());
   for (auto [dim, offset] : llvm::enumerate(producerInsert.getMixedOffsets())) {
     if (static_cast<int64_t>(dim) == reductionDim) {
-      localPanelOffsets.push_back(
-          remapOpFoldResult(rewriter, forallLoop.getLoc(), offset, removedIv,
-                            innerFor.getInductionVar()));
+      localPanelOffsets.push_back(remapOpFoldResult(rewriter, forallLoop.getLoc(), offset,
+                                                    removedIv, innerFor.getInductionVar()));
       continue;
     }
     localPanelOffsets.push_back(rewriter.getIndexAttr(0));
   }
-  SmallVector<OpFoldResult> tileStrides(localPanelOffsets.size(),
-                                        rewriter.getIndexAttr(1));
+  SmallVector<OpFoldResult> tileStrides(localPanelOffsets.size(), rewriter.getIndexAttr(1));
   auto updatedPanel = tensor::InsertSliceOp::create(
-      rewriter, forallLoop.getLoc(), mappedTile,
-      innerFor.getRegionIterArgs()[0], localPanelOffsets,
+      rewriter, forallLoop.getLoc(), mappedTile, innerFor.getRegionIterArgs()[0], localPanelOffsets,
       producerInsert.getMixedSizes(), tileStrides);
-  auto fusedReduction =
-      cloneGenericOnTile(rewriter, generic, mappedTile,
-                         innerFor.getRegionIterArgs()[1], generic.getLoc());
-  scf::YieldOp::create(
-      rewriter, forallLoop.getLoc(),
-      ValueRange{updatedPanel.getResult(), fusedReduction.getResult(0)});
+  auto fusedReduction = cloneGenericOnTile(rewriter, generic, mappedTile,
+                                           innerFor.getRegionIterArgs()[1], generic.getLoc());
+  scf::YieldOp::create(rewriter, forallLoop.getLoc(),
+                       ValueRange{updatedPanel.getResult(), fusedReduction.getResult(0)});
 
   // Step 4. Publish the completed producer panel and reduced tile once per
   // outer forall instance, then replace the old loop/result pair.
-  rewriter.setInsertionPointToEnd(
-      &newForall.getTerminator().getRegion().front());
-  tensor::ParallelInsertSliceOp::create(rewriter, forallLoop.getLoc(),
-                                        innerFor.getResult(0), outerProducerArg,
-                                        panelOffsets, panelSizes, unitStrides);
-  tensor::ParallelInsertSliceOp::create(
-      rewriter, forallLoop.getLoc(), innerFor.getResult(1), outerReductionArg,
-      reductionOffsets, reductionSizes, reductionStrides);
+  rewriter.setInsertionPointToEnd(&newForall.getTerminator().getRegion().front());
+  tensor::ParallelInsertSliceOp::create(rewriter, forallLoop.getLoc(), innerFor.getResult(0),
+                                        outerProducerArg, panelOffsets, panelSizes, unitStrides);
+  tensor::ParallelInsertSliceOp::create(rewriter, forallLoop.getLoc(), innerFor.getResult(1),
+                                        outerReductionArg, reductionOffsets, reductionSizes,
+                                        reductionStrides);
 
   rewriter.replaceOp(generic, newForall.getResults().back());
-  rewriter.replaceOp(forallLoop, newForall.getResults().take_front(
-                                     forallLoop.getNumResults()));
+  rewriter.replaceOp(forallLoop, newForall.getResults().take_front(forallLoop.getNumResults()));
 
   transformResults.set(getOperation()->getResult(0),
                        ArrayRef<Operation *>{fusedReduction.getOperation()});
