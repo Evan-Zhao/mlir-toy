@@ -21,22 +21,6 @@ module attributes {transform.with_named_sequence} {
     transform.yield %matched : !transform.any_op
   }
 
-  // Fuse the consumer `c` of an op `op` if `c` only reads from `op` and nothing else.
-  // Fails if there are zero or multiple such consumers.
-  transform.named_sequence @fuse_up_elemwise_consumer(
-      %producer_loop: !transform.any_op {transform.consumed}
-  ) -> (!transform.any_op, !transform.any_op) {
-    %consumers = transform.get_consumers_of_result %producer_loop[0]
-        : (!transform.any_op) -> !transform.any_op
-    %consumers_1 = transform.collect_matching @match_elemwise in %consumers
-        : (!transform.any_op) -> !transform.any_op
-    // Fail if there are zero or multiple such consumers.
-    %fused_consumer, %updated_loop =
-      transform.linalg_ext.fuse_elemwise_into_producer %consumers_1 into %producer_loop
-        : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
-    transform.yield %fused_consumer, %updated_loop : !transform.any_op, !transform.any_op
-  }
-
   transform.named_sequence @match_unary_reduction(
       %candidate: !transform.any_op {transform.readonly}
   ) -> !transform.any_op {
@@ -54,18 +38,10 @@ module attributes {transform.with_named_sequence} {
     transform.yield %matched : !transform.any_op
   }
 
-  transform.named_sequence @fuse_up_reduction_consumer(
-      %producer_loop: !transform.any_op {transform.consumed}
-  ) -> (!transform.any_op, !transform.any_op, !transform.any_op) {
-    %consumers = transform.get_consumers_of_result %producer_loop[0]
-        : (!transform.any_op) -> !transform.any_op
-    %consumers_1 = transform.collect_matching @match_unary_reduction in %consumers
-        : (!transform.any_op) -> !transform.any_op
-    %fused_consumer, %updated_loop, %inner_loop =
-      transform.linalg_ext.fuse_reduction_consumer_into_forall %consumers_1 into %producer_loop
-        : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
-    transform.yield %fused_consumer, %updated_loop, %inner_loop
-      : !transform.any_op, !transform.any_op, !transform.any_op
+  transform.named_sequence @return_matched(
+      %arg: !transform.any_op {transform.readonly}
+  ) -> !transform.any_op {
+    transform.yield %arg : !transform.any_op
   }
 
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
@@ -118,9 +94,14 @@ module attributes {transform.with_named_sequence} {
     // For attention, this op would be the score-scaling op, which we call `bscale`.
     // `bscale` will be fused under `forall_loop` (the outer loop nest we created by tiling).
     //   TVM: sch.reverse_compute_at(bscale, j0)
-    %bscale, %forall_loop_1 = transform.include @fuse_up_elemwise_consumer
-        failures(propagate) (%forall_loop) : (!transform.any_op)
-        -> (!transform.any_op, !transform.any_op)
+    %consumers = transform.get_consumers_of_result %forall_loop[0]
+        : (!transform.any_op) -> !transform.any_op
+    %_1, %bscale = transform.foreach_match restrict_root in %consumers
+        @match_elemwise -> @return_matched
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %fused_bscale, %forall_loop_1 =
+      transform.linalg_ext.fuse_elemwise_into_producer %bscale into %forall_loop
+        : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
     // Fusion can create redundant loop-carried values, so we apply canonicalization
     // to remove them.
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !transform.any_op
@@ -129,9 +110,14 @@ module attributes {transform.with_named_sequence} {
     // This would be the row-max op in attention softmax.
     // Because of how MLIR scf.for and linalg work, this fusion implicitly also rfactors the reduction.
     //   TVM: sch.reverse_compute_at(bsum, j0); sch.rfactor(...)
-    %bsum, %forall_loop_2, %j0_loop = transform.include @fuse_up_reduction_consumer
-        failures(propagate) (%forall_loop_1) : (!transform.any_op)
-        -> (!transform.any_op, !transform.any_op, !transform.any_op)
+    %consumers_1 = transform.get_consumers_of_result %forall_loop_1[0]
+        : (!transform.any_op) -> !transform.any_op
+    %_2, %bsum = transform.foreach_match restrict_root in %consumers_1
+        @match_unary_reduction -> @return_matched
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %fused_bsum, %forall_loop_2, %j0_loop =
+      transform.linalg_ext.fuse_reduction_consumer_into_forall %bsum into %forall_loop_1
+        : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !transform.any_op
 
     // Step 4. Prepare for rolling update. Rolling update can fuse two reductions together,
