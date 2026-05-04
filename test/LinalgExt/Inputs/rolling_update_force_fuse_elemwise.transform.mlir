@@ -10,7 +10,7 @@ module attributes {transform.with_named_sequence} {
     %loop_2 = transform.structured.match ops{["scf.for"]} in %func
         : (!transform.any_op) -> !transform.any_op
     %sidecar, %new_loop =
-      transform.linalg_ext.force_fuse_elemwise_chain_into_loop %elemwise into %loop_2
+      transform.linalg_ext.rolling_update_force_fuse_elemwise %elemwise into %loop_2
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
     transform.yield
   }

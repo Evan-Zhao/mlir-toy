@@ -98,13 +98,13 @@ def LinalgExtRollingUpdateNextReductionOp
   let assemblyFormat = "$producer_op attr-dict `:` functional-type(operands, results)";
 }
 
-def LinalgExtForceFuseElemwiseChainIntoLoopOp
+def LinalgExtRollingUpdateForceFuseElemwise
     : Op<Transform_Dialect,
-         "linalg_ext.force_fuse_elemwise_chain_into_loop",
+         "linalg_ext.rolling_update_force_fuse_elemwise",
          [FunctionalStyleTransformOpTrait,
           DeclareOpInterfaceMethods<TransformOpInterface>,
           MemoryEffectsOpInterface]> {
-  let summary = "Clone and force-fuse an ordered elementwise chain under a streaming loop";
+  let summary = "Clone and force-fuse an ordered list of elementwise operations under a streaming loop";
 
   let description = [{
     Takes an ordered handle of elementwise ops and a streaming `scf.for` loop,
