@@ -127,10 +127,13 @@ module attributes {transform.with_named_sequence} {
     %reduce, %elemwise =
       transform.match.linalg_ext.rolling_update_next_reduction %forall_loop_2
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %elemwise_1, %forall_loop_3 =
-      transform.linalg_ext.fuse_elemwise_into_producer %elemwise into %forall_loop_2
-        : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
-    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !transform.any_op
+    // rolling_update_force_fuse_elemwise fuses all element-wise ops under %forall_loop_2,
+    // then under %j0_loop.
+    %elemwise_sidecars, %forall_loop_3, %j0_loop_new =
+      transform.linalg_ext.rolling_update_force_fuse_elemwise %elemwise into %forall_loop_2, %j0_loop
+        : (!transform.any_op, !transform.any_op, !transform.any_op)
+        -> (!transform.any_op, !transform.any_op, !transform.any_op)
+    // Don't do canonicalization here -- we have intentionally unused results.
     transform.apply_cse to %func : !transform.any_op
 
     transform.yield
