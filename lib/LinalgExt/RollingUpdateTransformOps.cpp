@@ -1,12 +1,16 @@
 #include "LinalgExt/LinalgExtTransformOps.h"
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/TilingInterface.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include <deque>
@@ -92,15 +96,15 @@ struct SidecarValueInfo {
   SmallVector<OpFoldResult> tileOffsets, tileSizes;
 };
 
-using ResultsT = SmallVector<OpFoldResult>;
+using FoldResultsT = SmallVector<OpFoldResult>;
 
-std::variant<DiagnosedSilenceableFailure, std::tuple<TilingInterface, ResultsT, ResultsT>>
-createTiledSidecarOp(transform::TransformRewriter &rewriter,
-                     const transform::TransformOpInterface &transform,
-                     TilingInterface clonedConsumerOp, const SmallVectorImpl<Value> &originalInputs,
-                     scf::ForOp &currentLoop,
-                     const DenseMap<Value, SidecarValueInfo> &sidecarValueInfo,
-                     const DenseMap<unsigned, tensor::InsertSliceOp> &loopResultInserts) {
+std::variant<DiagnosedSilenceableFailure, std::tuple<TilingInterface, FoldResultsT, FoldResultsT>>
+createOneTiledSidecarOp(transform::TransformRewriter &rewriter,
+                        const transform::TransformOpInterface &transform,
+                        TilingInterface clonedConsumerOp,
+                        const SmallVectorImpl<Value> &originalInputs, scf::ForOp &currentLoop,
+                        const DenseMap<Value, SidecarValueInfo> &sidecarValueInfo,
+                        const DenseMap<unsigned, tensor::InsertSliceOp> &loopResultInserts) {
   SmallVector<unsigned> fusedOperandNumbers;
   SmallVector<SmallVector<OpFoldResult>> fusedOffsets;
   SmallVector<SmallVector<OpFoldResult>> fusedSizes;
@@ -160,88 +164,14 @@ createTiledSidecarOp(transform::TransformRewriter &rewriter,
   return std::make_tuple(tiledSidecarOp, resultOffsets, resultSizes);
 }
 
-} // namespace
-
-namespace mlir {
-namespace transform {
-
-DiagnosedSilenceableFailure
-LinalgExtRollingUpdateNextReductionOp::apply(transform::TransformRewriter &rewriter,
-                                             TransformResults &transformResults,
-                                             TransformState &state) {
-  auto transform = cast<TransformOpInterface>(getOperation());
-  auto producers = state.getPayloadOps(getProducerOp());
-  if (!llvm::hasSingleElement(producers))
-    return emitSilenceableFailure(
-        transform, "expected exactly one producer payload op in the transform handle");
-  Operation *producer = *producers.begin();
-
-  // Forward BFS: find the nearest reduction. `visited` doubles as the
-  // forward-reachable set for the backward walk below.
-  SmallPtrSet<Operation *, 16> visited({producer});
-  std::deque<Operation *> queue({producer});
-  Operation *reduce = nullptr;
-  while (!queue.empty()) {
-    Operation *current = queue.front();
-    queue.pop_front();
-    if (current != producer && isReductionLike(current)) {
-      reduce = current;
-      break;
-    }
-    for (Value result : current->getOpResults())
-      for (Operation *user : result.getUsers())
-        if (visited.insert(user).second)
-          queue.push_back(user);
-  }
-  if (!reduce)
-    return emitSilenceableFailure(transform, "no reduction reachable from producer op");
-
-  // Backward walk from `reduce`, bounded by `visited`. This isolates the ops that
-  // are strictly between `producer` and `reduce`, excluding side-path ops that are
-  // forward-reachable but not ancestors of `reduce`.
-  SmallVector<Operation *> elemwiseOps;
-  {
-    SmallPtrSet<Operation *, 16> bvisited({reduce});
-    std::deque<Operation *> bqueue({reduce});
-    while (!bqueue.empty()) {
-      Operation *current = bqueue.front();
-      bqueue.pop_front();
-      if (current != reduce) {
-        if (failed(verifyForceFusibleElementwiseOp(current)))
-          return emitSilenceableFailure(
-              transform, "expected all ops between producer_op and reduce_op to be elementwise");
-        elemwiseOps.push_back(current);
-      }
-      for (Value operand : current->getOperands()) {
-        Operation *defOp = operand.getDefiningOp();
-        if (defOp && defOp != producer && visited.contains(defOp))
-          if (bvisited.insert(defOp).second)
-            bqueue.push_back(defOp);
-      }
-    }
-  }
-  llvm::sort(elemwiseOps, [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
-
-  transformResults.set(getOperation()->getResult(0), {reduce});
-  transformResults.set(getOperation()->getResult(1), elemwiseOps);
-  return DiagnosedSilenceableFailure::success();
-}
-
-DiagnosedSilenceableFailure
-LinalgExtRollingUpdateForceFuseElemwise::apply(transform::TransformRewriter &rewriter,
-                                               TransformResults &transformResults,
-                                               TransformState &state) {
-  auto transform = cast<TransformOpInterface>(getOperation());
-  SmallVector<Operation *> elemwiseOps =
-      llvm::to_vector(state.getPayloadOps(getElemwiseChainOps()));
-  SmallVector<Operation *> loops = llvm::to_vector(state.getPayloadOps(getStreamingLoop()));
-
+/// Clone the given elementwise ops, tile them according to `currentLoop`, and fuse them into the
+/// loop body.
+std::variant<DiagnosedSilenceableFailure, std::pair<scf::ForOp, SmallVector<Operation *>>>
+createSidecarOpsInForLoop(transform::TransformRewriter &rewriter,
+                          const transform::TransformOpInterface &transform,
+                          ArrayRef<Operation *> elemwiseOps, scf::ForOp currentLoop) {
   if (elemwiseOps.empty())
     return emitSilenceableFailure(transform, "expected at least one elementwise payload op");
-  if (loops.size() != 1)
-    return emitSilenceableFailure(transform, "expected exactly one streaming loop payload op");
-
-  auto currentLoop = dyn_cast<scf::ForOp>(loops.front());
   if (!currentLoop)
     return emitSilenceableFailure(transform, "expected the streaming loop to be an scf.for");
 
@@ -331,8 +261,9 @@ LinalgExtRollingUpdateForceFuseElemwise::apply(transform::TransformRewriter &rew
       return emitSilenceableFailure(transform, "expected cloned elementwise op to implement "
                                                "TilingInterface");
 
-    auto tileOpResult = createTiledSidecarOp(rewriter, transform, clonedConsumerOp, originalInputs,
-                                             currentLoop, sidecarValueInfo, loopResultInserts);
+    auto tileOpResult =
+        createOneTiledSidecarOp(rewriter, transform, clonedConsumerOp, originalInputs, currentLoop,
+                                sidecarValueInfo, loopResultInserts);
     if (std::holds_alternative<DiagnosedSilenceableFailure>(tileOpResult))
       return std::get<DiagnosedSilenceableFailure>(std::move(tileOpResult));
     auto [tiledSidecarOp, resultOffsets, resultSizes] = std::get<1>(tileOpResult);
@@ -357,10 +288,145 @@ LinalgExtRollingUpdateForceFuseElemwise::apply(transform::TransformRewriter &rew
   SmallVector<Value> newYieldOperands = clonedYieldOperands;
   newYieldOperands.append(sidecarYieldOperands.begin(), sidecarYieldOperands.end());
   scf::YieldOp::create(rewriter, currentLoop.getLoc(), newYieldOperands);
-
   rewriter.replaceOp(currentLoop, newLoop.getResults().take_front(oldNumResults));
+  return std::make_pair(newLoop, sidecarOps);
+}
+
+} // namespace
+
+namespace mlir {
+namespace transform {
+
+DiagnosedSilenceableFailure
+LinalgExtRollingUpdateNextReductionOp::apply(transform::TransformRewriter &rewriter,
+                                             TransformResults &transformResults,
+                                             TransformState &state) {
+  auto transform = cast<TransformOpInterface>(getOperation());
+  auto producers = state.getPayloadOps(getProducerOp());
+  if (!llvm::hasSingleElement(producers))
+    return emitSilenceableFailure(
+        transform, "expected exactly one producer payload op in the transform handle");
+  Operation *producer = *producers.begin();
+
+  // Forward BFS: find the nearest reduction.
+  SmallPtrSet<Operation *, 16> visited({producer});
+  std::deque<Operation *> queue({producer});
+  Operation *reduce = nullptr;
+  while (!queue.empty()) {
+    Operation *current = queue.front();
+    queue.pop_front();
+    if (current != producer && isReductionLike(current)) {
+      reduce = current;
+      break;
+    }
+    for (Value result : current->getOpResults())
+      for (Operation *user : result.getUsers())
+        if (visited.insert(user).second)
+          queue.push_back(user);
+  }
+  if (!reduce)
+    return emitSilenceableFailure(transform, "no reduction reachable from producer op");
+
+  // Backward walk from `reduce`, bounded by `visited`.
+  SmallVector<Operation *> elemwiseOps;
+  {
+    SmallPtrSet<Operation *, 16> bvisited({reduce});
+    std::deque<Operation *> bqueue({reduce});
+    while (!bqueue.empty()) {
+      Operation *current = bqueue.front();
+      bqueue.pop_front();
+      if (current != reduce) {
+        if (failed(verifyForceFusibleElementwiseOp(current)))
+          return emitSilenceableFailure(
+              transform, "expected all ops between producer_op and reduce_op to be elementwise");
+        elemwiseOps.push_back(current);
+      }
+      for (Value operand : current->getOperands()) {
+        Operation *defOp = operand.getDefiningOp();
+        if (defOp && defOp != producer && visited.contains(defOp))
+          if (bvisited.insert(defOp).second)
+            bqueue.push_back(defOp);
+      }
+    }
+  }
+  llvm::sort(elemwiseOps, [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
+
+  transformResults.set(getOperation()->getResult(0), {reduce});
+  transformResults.set(getOperation()->getResult(1), elemwiseOps);
+  return DiagnosedSilenceableFailure::success();
+}
+
+void LinalgExtRollingUpdateForceFuseElemwise::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  consumesHandle(getElemwiseChainOpsMutable(), effects);
+
+  onlyReadsHandle(getOuterLoopMutable(), effects);
+  onlyReadsHandle(getInnerLoopMutable(), effects);
+
+  producesHandle(getOperation()->getOpResults(), effects);
+  modifiesPayload(effects);
+}
+
+#define CHECK_EXTRACT_UNIQUE_OP(getter, var_name, Type)                                            \
+  SmallVector<Operation *> var_name##Ops = llvm::to_vector(state.getPayloadOps(getter()));         \
+  if (!llvm::hasSingleElement(var_name##Ops))                                                      \
+    return emitSilenceableFailure(transform, "expected exactly one " #var_name                     \
+                                             " payload op, got " +                                 \
+                                                 std::to_string(var_name##Ops.size()));            \
+  auto(var_name) = dyn_cast<Type>(var_name##Ops.front());                                          \
+  if (!(var_name))                                                                                 \
+    return emitSilenceableFailure(transform, "expected " #var_name " to be a " #Type);
+
+DiagnosedSilenceableFailure
+LinalgExtRollingUpdateForceFuseElemwise::apply(transform::TransformRewriter &rewriter,
+                                               TransformResults &transformResults,
+                                               TransformState &state) {
+  auto transform = cast<TransformOpInterface>(getOperation());
+  SmallVector<Operation *> elemwiseOps =
+      llvm::to_vector(state.getPayloadOps(getElemwiseChainOps()));
+  if (elemwiseOps.empty())
+    return emitSilenceableFailure(transform, "expected at least one elementwise payload op");
+  CHECK_EXTRACT_UNIQUE_OP(getOuterLoop, outerLoop, scf::ForallOp);
+  CHECK_EXTRACT_UNIQUE_OP(getInnerLoop, innerLoop, scf::ForOp);
+
+  // Step 1. Fuse the elemwise consumer into the scf.forall using the same
+  //         logic as fuse_elemwise_into_producer (upstream tileAndFuseConsumer).
+  SmallVector<LoopLikeOpInterface> loopNest{outerLoop};
+  FailureOr<scf::SCFFuseConsumerOfSliceResult> fuseResult =
+      scf::tileAndFuseConsumer(rewriter, elemwiseOps.front(), loopNest);
+  if (failed(fuseResult))
+    return emitSilenceableFailure(transform,
+                                  "failed to fuse elementwise consumer into forall loop");
+  // loopNest[0] has been updated to the new forall by tileAndFuseConsumer.
+  // The inner for pointer (innerForOp) is still valid because mergeBlocks
+  // moved it (didn't clone) to the new forall body.
+  scf::ForallOp newOuterLoop = cast<scf::ForallOp>(loopNest[0].getOperation());
+
+  // Step 2. Apply canonicalization to unify redundant affine.apply ops.
+  auto parentFunc = newOuterLoop->getParentOfType<func::FuncOp>();
+  if (parentFunc) {
+    RewritePatternSet patterns(newOuterLoop->getContext());
+    affine::AffineApplyOp::getCanonicalizationPatterns(patterns, newOuterLoop->getContext());
+    FrozenRewritePatternSet frozen(std::move(patterns));
+    (void)applyPatternsGreedily(parentFunc.getBody(), frozen);
+  }
+
+  // Step 3. Verify the inner for is still inside the new forall.
+  if (innerLoop->getParentOp() != newOuterLoop.getOperation())
+    return emitDefiniteFailure(
+        "inner for-loop should have been moved to new forall via mergeBlocks");
+
+  // Step 4. Create sidecar ops for the tiled elemwise ops under the inner for.
+  auto sidecarResult =
+      createSidecarOpsInForLoop(rewriter, transform, fuseResult->tiledOps, innerLoop);
+  if (std::holds_alternative<DiagnosedSilenceableFailure>(sidecarResult))
+    return std::get<DiagnosedSilenceableFailure>(std::move(sidecarResult));
+  auto [updatedInnerFor, sidecarOps] = std::get<1>(std::move(sidecarResult));
+
+  // Step 5. Return all three results.
   transformResults.set(getOperation()->getResult(0), sidecarOps);
-  transformResults.set(getOperation()->getResult(1), ArrayRef<Operation *>{newLoop.getOperation()});
+  transformResults.set(getOperation()->getResult(1), {newOuterLoop.getOperation()});
+  transformResults.set(getOperation()->getResult(2), {updatedInnerFor.getOperation()});
   return DiagnosedSilenceableFailure::success();
 }
 

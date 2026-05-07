@@ -103,25 +103,34 @@ def LinalgExtRollingUpdateForceFuseElemwise
          "linalg_ext.rolling_update_force_fuse_elemwise",
          [FunctionalStyleTransformOpTrait,
           DeclareOpInterfaceMethods<TransformOpInterface>,
-          MemoryEffectsOpInterface]> {
-  let summary = "Clone and force-fuse an ordered list of elementwise operations under a streaming loop";
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Fuse elementwise into forall + inner for, returning new handles";
 
   let description = [{
-    Takes an ordered handle of elementwise ops and a streaming `scf.for` loop,
-    then rebuilds that loop to carry one sidecar tensor result per elementwise
-    op.
+    Fuse an elementwise consumer into a tiled loop nest.
 
-    Each elementwise op is cloned under the loop in the same order as the input
-    handle. The original out-of-loop chain remains live. The cloned sidecar
-    chain is intentionally incomplete and should be consumed later by a rolling
-    reduction repair transform.
+    Takes an elementwise op, an `scf.forall` outer loop, and an `scf.for` inner
+    loop. Performs:
+
+      1. Fuse the elementwise op into the `scf.forall` via upstream
+         `scf::tileAndFuseConsumer`.  The inner loop pointer remains valid
+         because `mergeBlocks` moves (not clones) the body.
+      2. Apply canonicalization to unify redundant `affine.apply` ops.
+      3. Clone the fused elementwise op into the inner `scf.for` as a sidecar.
+
+    Returns the sidecar ops, the new `scf.forall`, and the new inner `scf.for`.
+
+    The outer and inner loop handles are read-only — they are not consumed by
+    this op.  The caller is responsible for using the output handles instead.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$elemwise_chain_ops,
-                       TransformHandleTypeInterface:$streaming_loop);
+                       TransformHandleTypeInterface:$outer_loop,
+                       TransformHandleTypeInterface:$inner_loop);
   let results = (outs TransformHandleTypeInterface:$sidecar_chain_ops,
-                      TransformHandleTypeInterface:$new_streaming_loop);
+                      TransformHandleTypeInterface:$new_outer_loop,
+                      TransformHandleTypeInterface:$new_inner_loop);
 
-  let assemblyFormat = "$elemwise_chain_ops `into` $streaming_loop attr-dict "
+  let assemblyFormat = "$elemwise_chain_ops `into` $outer_loop `,` $inner_loop attr-dict "
                        " `:` functional-type(operands, results)";
 }
