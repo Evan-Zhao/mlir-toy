@@ -80,7 +80,7 @@ Use a layered matcher design:
 
     The detailed design for upward fusion is intentionally kept out of this
     document. At this level, the schedule only assumes a custom
-    `transform.linalg_ext.fuse_elemwise_into_producer` primitive that can move
+    `transform.loop.fuse_into_producer_op` primitive that can move
     score scaling under the tiled producer loop. See
     `docs/attention-upward-fusion-design.md`.
 
@@ -216,7 +216,7 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
 
     %scale_fused, %j_loop_1 =
-      transform.linalg_ext.fuse_elemwise_into_producer %scale into %j_loop
+      transform.loop.fuse_into_producer_op %scale into %j_loop
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
 
     %row_max_rf =
@@ -284,7 +284,7 @@ documented in `docs/attention-rolling-update-design.md`.
 3. **Add transform extension plumbing**
    Register a LinalgExt/Neptune transform dialect extension that defines:
     - `transform.match.linalg_ext.attention_pattern`,
-    - `transform.linalg_ext.fuse_elemwise_into_producer`,
+    - `transform.loop.fuse_into_producer_op`,
     - `transform.linalg_ext.rolling_update`,
     - optional cleanup pattern descriptors such as exp2-hoist-across-broadcast.
 

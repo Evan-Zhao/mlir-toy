@@ -7,10 +7,10 @@ module attributes {transform.with_named_sequence} {
     %inner_loop = transform.structured.match ops{["scf.for"]} in %func
         : (!transform.any_op) -> !transform.any_op
     %reduce, %elemwise =
-      transform.match.linalg_ext.rolling_update_next_reduction %forall_loop
+      transform.match.loop_ru.rolling_update_next_reduction %forall_loop
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     %sidecar, %new_forall, %new_inner =
-      transform.linalg_ext.rolling_update_force_fuse_elemwise %elemwise into %forall_loop, %inner_loop
+      transform.loop_ru.clone_fuse_elemwise %elemwise into %forall_loop, %inner_loop
         : (!transform.any_op, !transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
     transform.yield
   }

@@ -100,7 +100,7 @@ module attributes {transform.with_named_sequence} {
         @match_elemwise -> @return_matched
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     %fused_bscale, %forall_loop_1 =
-      transform.linalg_ext.fuse_elemwise_into_producer %bscale into %forall_loop
+      transform.loop.fuse_into_producer_op %bscale into %forall_loop
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
     // Fusion can create redundant loop-carried values and canonicalization removes them.
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !transform.any_op
@@ -115,7 +115,7 @@ module attributes {transform.with_named_sequence} {
         @match_unary_reduction -> @return_matched
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     %fused_bsum, %forall_loop_2, %j0_loop =
-      transform.linalg_ext.fuse_reduction_consumer_into_forall %bsum into %forall_loop_1
+      transform.loop.fuse_reduction_consumer_into_forall %bsum into %forall_loop_1
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
     // This CSE is actually required here so the next `fuse_elemwise_into_producer` can work
     // because it unifies identical affine map operations.
@@ -125,12 +125,12 @@ module attributes {transform.with_named_sequence} {
     // including all element-wise ops between them.
     // First use rolling_update_next_reduction to find the next reduction op.
     %reduce, %elemwise =
-      transform.match.linalg_ext.rolling_update_next_reduction %forall_loop_2
+      transform.match.loop_ru.rolling_update_next_reduction %forall_loop_2
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     // rolling_update_force_fuse_elemwise fuses all element-wise ops under %forall_loop_2,
     // then under %j0_loop.
     %elemwise_sidecars, %forall_loop_3, %j0_loop_new =
-      transform.linalg_ext.rolling_update_force_fuse_elemwise %elemwise into %forall_loop_2, %j0_loop
+      transform.loop_ru.clone_fuse_elemwise %elemwise into %forall_loop_2, %j0_loop
         : (!transform.any_op, !transform.any_op, !transform.any_op)
         -> (!transform.any_op, !transform.any_op, !transform.any_op)
     // Don't do canonicalization here -- we have intentionally unused results.

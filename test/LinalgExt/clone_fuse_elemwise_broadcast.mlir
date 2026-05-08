@@ -1,6 +1,6 @@
 // RUN: mlir-opt %s \
 // RUN:   --load-dialect-plugin=%neptune_linalg_ext_plugin \
-// RUN:   --transform-preload-library=transform-library-paths=%S/Inputs/rolling_update_force_fuse_elemwise_broadcast.transform.mlir \
+// RUN:   --transform-preload-library=transform-library-paths=%S/Inputs/clone_fuse_elemwise_broadcast.transform.mlir \
 // RUN:   --transform-interpreter | FileCheck %s
 //
 // Exercise the same broadcast access pattern from the attention softmax

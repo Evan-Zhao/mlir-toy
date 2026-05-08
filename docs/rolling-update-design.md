@@ -35,7 +35,7 @@ matching the shape of TVM's rolling update.
 
 ## Transform Split
 
-### `transform.match.linalg_ext.rolling_update_next_reduction`
+### `transform.match.loop_ru.rolling_update_next_reduction`
 
 Pure analysis. Uses `NavigationTransformOpTrait`, so the input handle is not
 consumed. Signature:
@@ -66,7 +66,7 @@ The op fails if no reduction is reachable from `producer_op`, or if any op
 between `producer_op` and the nearest reduction is not a supported elementwise
 (all-parallel `linalg.generic` or `linalg.map` with one result).
 
-### `transform.linalg_ext.force_fuse_elemwise_chain_into_loop`
+### `transform.loop_ru.clone_fuse_elemwise`
 
 This is the MLIR equivalent of the "naive fusion" in Neptune-TVM rolling update.
 The main difference is this version clones the element-wise operations
@@ -76,16 +76,12 @@ so technically no program semantic is violated.
 Signature:
 
 ```text
-(elemwise_chain_ops, streaming_loop) -> (sidecar_chain_ops, new_streaming_loop)
+(elemwise_ops, parallel_loop, streaming_loop)
+  -> (sidecar_ops, new_parallel_loop, new_streaming_loop)
 ```
 
-Given:
-
-- the ordered elementwise handle from `transform.match.linalg_ext.rolling_update_next_reduction`,
-- a streaming loop handle,
-
-the transform should clone each elementwise op, fuse it under the loop,
-and return the cloned sidecar ops in strictly the same order.
+The transform clones each elementwise op, fuses it under the loop,
+and returns the cloned sidecar ops in strictly the same order.
 
 The sidecar chain is intentionally incomplete at this point.
 It may compute values that are different from their out-of-loop counterparts.
@@ -136,7 +132,7 @@ For the current attention schedule, the intended flow is:
 1. Build the outer `scf.forall` over output tiles and the inner streaming loop
    over K/V blocks.
 2. Fuse QK and score scaling under that streaming loop.
-3. Run `transform.match.linalg_ext.rolling_update_next_reduction` starting from
+3. Run `transform.match.loop_ru.rolling_update_next_reduction` starting from
    the loop-local score tile. This finds the nearest reduction frontier and
    returns the ordered elementwise chain leading into it.
 4. Force-fuse that elementwise chain under the streaming loop as sidecar ops.
