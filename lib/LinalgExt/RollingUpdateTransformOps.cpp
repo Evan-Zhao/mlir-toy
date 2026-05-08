@@ -1,7 +1,5 @@
 #include "LinalgExt/LinalgExtTransformOps.h"
 
-#include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
@@ -10,7 +8,6 @@
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/TilingInterface.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include <deque>
@@ -402,28 +399,19 @@ LinalgExtRollingUpdateForceFuseElemwise::apply(transform::TransformRewriter &rew
   // moved it (didn't clone) to the new forall body.
   scf::ForallOp newOuterLoop = cast<scf::ForallOp>(loopNest[0].getOperation());
 
-  // Step 2. Apply canonicalization to unify redundant affine.apply ops.
-  auto parentFunc = newOuterLoop->getParentOfType<func::FuncOp>();
-  if (parentFunc) {
-    RewritePatternSet patterns(newOuterLoop->getContext());
-    affine::AffineApplyOp::getCanonicalizationPatterns(patterns, newOuterLoop->getContext());
-    FrozenRewritePatternSet frozen(std::move(patterns));
-    (void)applyPatternsGreedily(parentFunc.getBody(), frozen);
-  }
-
-  // Step 3. Verify the inner for is still inside the new forall.
+  // Step 2. Verify the inner for is still inside the new forall.
   if (innerLoop->getParentOp() != newOuterLoop.getOperation())
     return emitDefiniteFailure(
         "inner for-loop should have been moved to new forall via mergeBlocks");
 
-  // Step 4. Create sidecar ops for the tiled elemwise ops under the inner for.
+  // Step 3. Create sidecar ops for the tiled elemwise ops under the inner for.
   auto sidecarResult =
       createSidecarOpsInForLoop(rewriter, transform, fuseResult->tiledOps, innerLoop);
   if (std::holds_alternative<DiagnosedSilenceableFailure>(sidecarResult))
     return std::get<DiagnosedSilenceableFailure>(std::move(sidecarResult));
   auto [updatedInnerFor, sidecarOps] = std::get<1>(std::move(sidecarResult));
 
-  // Step 5. Return all three results.
+  // Step 4. Return all three results.
   transformResults.set(getOperation()->getResult(0), sidecarOps);
   transformResults.set(getOperation()->getResult(1), {newOuterLoop.getOperation()});
   transformResults.set(getOperation()->getResult(2), {updatedInnerFor.getOperation()});
