@@ -296,15 +296,10 @@ namespace mlir {
 namespace transform {
 
 DiagnosedSilenceableFailure
-LinalgExtRollingUpdateNextReductionOp::apply(transform::TransformRewriter &rewriter,
-                                             TransformResults &transformResults,
-                                             TransformState &state) {
+LoopRURollingUpdateNextReduction::apply(transform::TransformRewriter &rewriter,
+                                        TransformResults &transformResults, TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
-  auto producers = state.getPayloadOps(getProducerOp());
-  if (!llvm::hasSingleElement(producers))
-    return emitSilenceableFailure(
-        transform, "expected exactly one producer payload op in the transform handle");
-  Operation *producer = *producers.begin();
+  CHECK_EXTRACT_UNIQUE_OP(state, transform, getProducerOp, "producer", producer);
 
   // Forward BFS: find the nearest reduction.
   SmallPtrSet<Operation *, 16> visited({producer});
@@ -354,8 +349,7 @@ LinalgExtRollingUpdateNextReductionOp::apply(transform::TransformRewriter &rewri
   return DiagnosedSilenceableFailure::success();
 }
 
-void LinalgExtRollingUpdateForceFuseElemwise::getEffects(
-    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+void LoopRUCloneFuseElemwise::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   consumesHandle(getElemwiseChainOpsMutable(), effects);
 
   onlyReadsHandle(getOuterLoopMutable(), effects);
@@ -365,10 +359,9 @@ void LinalgExtRollingUpdateForceFuseElemwise::getEffects(
   modifiesPayload(effects);
 }
 
-DiagnosedSilenceableFailure
-LinalgExtRollingUpdateForceFuseElemwise::apply(transform::TransformRewriter &rewriter,
-                                               TransformResults &transformResults,
-                                               TransformState &state) {
+DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformRewriter &rewriter,
+                                                           TransformResults &transformResults,
+                                                           TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
   SmallVector<Operation *> elemwiseOps =
       llvm::to_vector(state.getPayloadOps(getElemwiseChainOps()));

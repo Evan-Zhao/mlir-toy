@@ -10,20 +10,20 @@ The intent is the same as TVM `reverse_compute_at`: move a consumer under the
 loop nest that already materializes tiles of its input. In MLIR, this is not a
 single general upstream primitive, so Neptune uses two narrow transform ops:
 
-- `transform.linalg_ext.fuse_elemwise_into_producer`
-- `transform.linalg_ext.fuse_reduction_consumer_into_forall`
+- `transform.loop.fuse_into_producer_op`
+- `transform.loop.fuse_reduction_consumer_into_forall`
 
 Both are specialized for fusing a Linalg consumer operation into an SCF loop nest.
 
 ## `fuse_elemwise_into_producer`
 
-`transform.linalg_ext.fuse_elemwise_into_producer` applies pointwise,
+`transform.loop.fuse_into_producer_op` applies pointwise,
 "upward" (consumer into producer) fusion. It takes:
 
 - an elementwise consumer, currently either:
-  - a single-result `linalg.map`, or
-  - a single-result, single-init `linalg.generic` with all-parallel loops and
-    projected-permutation indexing maps,
+    - a single-result `linalg.map`, or
+    - a single-result, single-init `linalg.generic` with all-parallel loops and
+      projected-permutation indexing maps,
 - a containing tiled loop nest rooted at `scf.for` or `scf.forall`.
 
 The implementation is intentionally thin. It delegates most of the real work to
@@ -42,7 +42,7 @@ that tile is written back.
 
 ## `fuse_reduction_consumer_into_forall`
 
-`transform.linalg_ext.fuse_reduction_consumer_into_forall` handles fusing a
+`transform.loop.fuse_reduction_consumer_into_forall` handles fusing a
 reduction consumer into a loop nest.
 
 It takes:

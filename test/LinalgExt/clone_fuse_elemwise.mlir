@@ -1,6 +1,6 @@
 // RUN: mlir-opt %s \
 // RUN:   --load-dialect-plugin=%neptune_linalg_ext_plugin \
-// RUN:   --transform-preload-library=transform-library-paths=%S/Inputs/rolling_update_force_fuse_elemwise.transform.mlir \
+// RUN:   --transform-preload-library=transform-library-paths=%S/Inputs/clone_fuse_elemwise.transform.mlir \
 // RUN:   --transform-interpreter 2>&1 | FileCheck %s
 
 // The forall tiles along i (rows). Both scores and rmax share the same i-tile

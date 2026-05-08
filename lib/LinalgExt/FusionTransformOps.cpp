@@ -199,13 +199,12 @@ linalg::GenericOp cloneGenericOnTile(RewriterBase &rewriter, linalg::GenericOp s
 namespace mlir {
 namespace transform {
 
-DiagnosedSilenceableFailure
-LinalgExtFuseElemwiseIntoProducerOp::apply(transform::TransformRewriter &rewriter,
-                                           TransformResults &transformResults,
-                                           TransformState &state) {
+DiagnosedSilenceableFailure LoopFuseIntoProducerOp::apply(transform::TransformRewriter &rewriter,
+                                                          TransformResults &transformResults,
+                                                          TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
   CHECK_EXTRACT_UNIQUE_OP(state, transform, getConsumerOp, "consumer", consumer);
-  CHECK_EXTRACT_UNIQUE_OP(state, transform, getContainingLoop, "containing loop", loop);
+  CHECK_EXTRACT_UNIQUE_OP(state, transform, getProducerLoop, "producer loop", loop);
 
   auto loopNest = collectLoopNestRootedAt(loop);
   if (failed(loopNest))
@@ -232,11 +231,10 @@ LinalgExtFuseElemwiseIntoProducerOp::apply(transform::TransformRewriter &rewrite
 }
 
 DiagnosedSilenceableFailure
-LinalgExtFuseReductionConsumerIntoForallOp::apply(transform::TransformRewriter &rewriter,
-                                                  TransformResults &transformResults,
-                                                  TransformState &state) {
+LoopFuseReduceConsumerIntoForall::apply(transform::TransformRewriter &rewriter,
+                                        TransformResults &transformResults, TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
-  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getContainingLoop, "loop", loop, scf::ForallOp);
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getForallLoop, "loop", loop, scf::ForallOp);
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getConsumerOp, "consumer", consumer,
                                linalg::GenericOp);
   if (failed(verifyUnarySingleReductionGeneric(consumer)))

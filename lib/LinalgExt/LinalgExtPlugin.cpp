@@ -16,10 +16,10 @@ void registerLinalgExtTransformExtension(mlir::DialectRegistry &registry) {
       using mlir::Dialect::addOperations;
     };
     static_cast<TransformDialectAccess *>(dialect)
-        ->addOperations<mlir::transform::LinalgExtFuseElemwiseIntoProducerOp,
-                        mlir::transform::LinalgExtFuseReductionConsumerIntoForallOp,
-                        mlir::transform::LinalgExtRollingUpdateNextReductionOp,
-                        mlir::transform::LinalgExtRollingUpdateForceFuseElemwise>();
+        ->addOperations<mlir::transform::LoopFuseIntoProducerOp,
+                        mlir::transform::LoopFuseReduceConsumerIntoForall,
+                        mlir::transform::LoopRURollingUpdateNextReduction,
+                        mlir::transform::LoopRUCloneFuseElemwise>();
   });
 }
 

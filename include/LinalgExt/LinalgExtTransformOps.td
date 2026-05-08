@@ -2,13 +2,11 @@ include "mlir/Dialect/Transform/IR/TransformDialect.td"
 include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
-def LinalgExtFuseElemwiseIntoProducerOp
-    : Op<Transform_Dialect,
-         "linalg_ext.fuse_elemwise_into_producer",
+def LoopFuseIntoProducerOp : Op<Transform_Dialect, "loop.fuse_into_producer_op",
          [FunctionalStyleTransformOpTrait,
           DeclareOpInterfaceMethods<TransformOpInterface>,
           MemoryEffectsOpInterface]> {
-  let summary = "Fuse a unary elementwise consumer into an scf.for tile loop";
+  let summary = "Fuse a consumer into an scf.for tile loop";
 
   let description = [{
     Fuses a single unary tensor `linalg.map` consumer into an `scf.for` or
@@ -33,22 +31,20 @@ def LinalgExtFuseElemwiseIntoProducerOp
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$consumer_op,
-                       TransformHandleTypeInterface:$containing_loop);
+                       TransformHandleTypeInterface:$producer_loop);
   let results = (outs TransformHandleTypeInterface:$fused_op,
-                      TransformHandleTypeInterface:$new_containing_loop);
+                      TransformHandleTypeInterface:$new_producer_loop);
 
-  let assemblyFormat = "$consumer_op `into` $containing_loop attr-dict "
+  let assemblyFormat = "$consumer_op `into` $producer_loop attr-dict "
                        " `:` functional-type(operands, results)";
 
 }
 
-def LinalgExtFuseReductionConsumerIntoForallOp
-    : Op<Transform_Dialect,
-         "linalg_ext.fuse_reduction_consumer_into_forall",
+def LoopFuseReduceConsumerIntoForall : Op<Transform_Dialect, "loop.fuse_reduction_consumer_into_forall",
          [FunctionalStyleTransformOpTrait,
           DeclareOpInterfaceMethods<TransformOpInterface>,
           MemoryEffectsOpInterface]> {
-  let summary = "Fuse a unary reduction consumer by sequentializing one forall dimension";
+  let summary = "Fuse a reduction consumer into a forall producer, sequentializing one forall dimension";
 
   let description = [{
     Fuses a single unary tensor reduction `linalg.generic` consumer into an
@@ -63,18 +59,17 @@ def LinalgExtFuseReductionConsumerIntoForallOp
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$consumer_op,
-                       TransformHandleTypeInterface:$containing_loop);
+                       TransformHandleTypeInterface:$forall_loop);
   let results = (outs TransformHandleTypeInterface:$fused_op,
-                      TransformHandleTypeInterface:$new_containing_loop,
+                      TransformHandleTypeInterface:$new_forall_loop,
                       TransformHandleTypeInterface:$new_inner_loop);
 
-  let assemblyFormat = "$consumer_op `into` $containing_loop attr-dict "
+  let assemblyFormat = "$consumer_op `into` $forall_loop attr-dict "
                        " `:` functional-type(operands, results)";
 }
 
-def LinalgExtRollingUpdateNextReductionOp
-    : Op<Transform_Dialect,
-         "match.linalg_ext.rolling_update_next_reduction",
+def LoopRURollingUpdateNextReduction
+    : Op<Transform_Dialect, "match.loop_ru.rolling_update_next_reduction",
          [NavigationTransformOpTrait,
           DeclareOpInterfaceMethods<TransformOpInterface>,
           MemoryEffectsOpInterface]> {
@@ -98,13 +93,11 @@ def LinalgExtRollingUpdateNextReductionOp
   let assemblyFormat = "$producer_op attr-dict `:` functional-type(operands, results)";
 }
 
-def LinalgExtRollingUpdateForceFuseElemwise
-    : Op<Transform_Dialect,
-         "linalg_ext.rolling_update_force_fuse_elemwise",
+def LoopRUCloneFuseElemwise : Op<Transform_Dialect, "loop_ru.clone_fuse_elemwise",
          [FunctionalStyleTransformOpTrait,
           DeclareOpInterfaceMethods<TransformOpInterface>,
           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
-  let summary = "Fuse elementwise into forall + inner for, returning new handles";
+  let summary = "Clone elementwise and force-fuse into forall + inner for, returning sidecar ops";
 
   let description = [{
     Fuse an elementwise consumer into a tiled loop nest.
