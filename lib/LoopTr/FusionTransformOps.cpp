@@ -1,6 +1,6 @@
-#include "LinalgExt/LinalgExtTransformOps.h"
+#include "LoopTr/LoopTransformOps.h"
 
-#include "LinalgExt/Utils.h"
+#include "LoopTr/Utils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"

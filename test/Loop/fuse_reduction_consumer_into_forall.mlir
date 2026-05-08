@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_linalg_ext_plugin %s --transform-interpreter | FileCheck %s
+// RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin %s --transform-interpreter | FileCheck %s
 
 // CHECK-LABEL: func.func @row_max_after_scale
 // CHECK: %[[FORALL:.*]]:2 = scf.forall (%[[I:.*]]) in (2) shared_outs(%[[SCORES:.*]] = %{{.*}}, %[[ROWS:.*]] = %{{.*}}) -> (tensor<128x128xf32>, tensor<128xf32>) {

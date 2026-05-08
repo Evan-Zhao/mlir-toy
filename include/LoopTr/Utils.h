@@ -1,5 +1,5 @@
-#ifndef LINALGEXT_UTILS_H
-#define LINALGEXT_UTILS_H
+#ifndef LOOPTR_UTILS_H
+#define LOOPTR_UTILS_H
 
 #include "mlir/Dialect/Transform/Utils/DiagnosedSilenceableFailure.h"
 #include "llvm/ADT/STLExtras.h"
@@ -19,4 +19,4 @@
   if (!(var_name))                                                                                 \
     return emitSilenceableFailure(transform, "expected " name_str " to be a " #Type);
 
-#endif // LINALGEXT_UTILS_H
+#endif // LOOPTR_UTILS_H
