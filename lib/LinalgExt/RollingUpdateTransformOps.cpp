@@ -1,5 +1,6 @@
 #include "LinalgExt/LinalgExtTransformOps.h"
 
+#include "LinalgExt/Utils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
@@ -364,16 +365,6 @@ void LinalgExtRollingUpdateForceFuseElemwise::getEffects(
   modifiesPayload(effects);
 }
 
-#define CHECK_EXTRACT_UNIQUE_OP(getter, var_name, Type)                                            \
-  SmallVector<Operation *> var_name##Ops = llvm::to_vector(state.getPayloadOps(getter()));         \
-  if (!llvm::hasSingleElement(var_name##Ops))                                                      \
-    return emitSilenceableFailure(transform, "expected exactly one " #var_name                     \
-                                             " payload op, got " +                                 \
-                                                 std::to_string(var_name##Ops.size()));            \
-  auto(var_name) = dyn_cast<Type>(var_name##Ops.front());                                          \
-  if (!(var_name))                                                                                 \
-    return emitSilenceableFailure(transform, "expected " #var_name " to be a " #Type);
-
 DiagnosedSilenceableFailure
 LinalgExtRollingUpdateForceFuseElemwise::apply(transform::TransformRewriter &rewriter,
                                                TransformResults &transformResults,
@@ -383,8 +374,9 @@ LinalgExtRollingUpdateForceFuseElemwise::apply(transform::TransformRewriter &rew
       llvm::to_vector(state.getPayloadOps(getElemwiseChainOps()));
   if (elemwiseOps.empty())
     return emitSilenceableFailure(transform, "expected at least one elementwise payload op");
-  CHECK_EXTRACT_UNIQUE_OP(getOuterLoop, outerLoop, scf::ForallOp);
-  CHECK_EXTRACT_UNIQUE_OP(getInnerLoop, innerLoop, scf::ForOp);
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getOuterLoop, "outer loop", outerLoop,
+                               scf::ForallOp);
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getInnerLoop, "inner loop", innerLoop, scf::ForOp);
 
   // Step 1. Fuse the elemwise consumer into the scf.forall using the same
   //         logic as fuse_elemwise_into_producer (upstream tileAndFuseConsumer).
