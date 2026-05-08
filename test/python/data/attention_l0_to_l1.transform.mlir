@@ -3,7 +3,7 @@
 //
 // Usage:
 //   mlir-opt test/python/data/attention_l0.mlir \
-//     --load-dialect-plugin=build/libLinalgExtTransform.so \
+//     --load-dialect-plugin=build/libLoopTransform.so \
 //     --transform-preload-library=transform-library-paths=test/python/data/attention_l0_to_l1.transform.mlir \
 //     --transform-interpreter
 

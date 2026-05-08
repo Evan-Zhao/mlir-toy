@@ -21,10 +21,10 @@ config.substitutions.append(("%PATH%", config.environment["PATH"]))
 config.substitutions.append(("%shlibext", config.llvm_shlib_ext))
 config.substitutions.append(
     (
-        "%neptune_linalg_ext_plugin",
+        "%neptune_loop_plugin",
         os.path.join(
             config.neptune_mlir_obj_root,
-            "libLinalgExtTransform" + config.neptune_mlir_shared_library_suffix,
+            "libLoopTransform" + config.neptune_mlir_shared_library_suffix,
         ),
     )
 )

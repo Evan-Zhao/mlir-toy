@@ -99,7 +99,7 @@ Use a layered matcher design:
 
     ```mlir
     %qk, %scale, %row_max, %exp, %row_sum, %norm =
-      transform.match.linalg_ext.attention_softmax_chain %func
+      transform.match.loop.attention_softmax_chain %func
         : (!transform.any_op)
        -> (!transform.any_op, !transform.any_op, !transform.any_op,
            !transform.any_op, !transform.any_op, !transform.any_op)
@@ -136,7 +136,7 @@ pattern:
 Add a custom matcher for rank-polymorphic einsum/einops structure:
 
 ```mlir
-%qk = transform.match.linalg_ext.einsum %func
+%qk = transform.match.loop.einsum %func
     {pattern = "...ik,...jk->...ij"}
   : (!transform.any_op) -> !transform.any_op
 ```
@@ -157,7 +157,7 @@ This matcher should compose with `transform.match.structured.body` or a custom
 contraction-body predicate:
 
 ```mlir
-%qk = transform.match.linalg_ext.einsum %func
+%qk = transform.match.loop.einsum %func
     {pattern = "...ik,...jk->...ij"}
   : (!transform.any_op) -> !transform.any_op
 
@@ -179,7 +179,7 @@ Longer term, generalize from einsum to einops-style operators by matching named
 axis expressions:
 
 ```mlir
-%pack = transform.match.linalg_ext.einops %func
+%pack = transform.match.loop.einops %func
     {pattern = "b h (m bm) d -> b h m bm d"}
   : (!transform.any_op) -> !transform.any_op
 ```
@@ -201,7 +201,7 @@ module attributes {transform.with_named_sequence} {
       : (!transform.any_op) -> !transform.any_op
 
     %qk, %scale, %row_max, %exp, %row_sum, %pv, %norm, %cast =
-      transform.match.linalg_ext.attention_pattern %func
+      transform.match.loop.attention_pattern %func
         : (!transform.any_op)
        -> (!transform.any_op, !transform.any_op, !transform.any_op,
            !transform.any_op, !transform.any_op, !transform.any_op,
@@ -220,17 +220,17 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
 
     %row_max_rf =
-      transform.linalg_ext.rolling_update %row_max into %j_loop_1
+      transform.loop.rolling_update %row_max into %j_loop_1
         {factor_axis = 0 : i64}
         : (!transform.any_op, !transform.any_op) -> !transform.any_op
 
     %row_sum_rf =
-      transform.linalg_ext.rolling_update %row_sum into %j_loop_1
+      transform.loop.rolling_update %row_sum into %j_loop_1
         {factor_axis = 0 : i64}
         : (!transform.any_op, !transform.any_op) -> !transform.any_op
 
     %pv_rf =
-      transform.linalg_ext.rolling_update %pv into %j_loop_1
+      transform.loop.rolling_update %pv into %j_loop_1
         {factor_axis = 0 : i64}
         : (!transform.any_op, !transform.any_op) -> !transform.any_op
 
@@ -282,10 +282,10 @@ documented in `docs/attention-rolling-update-design.md`.
     - final cast.
 
 3. **Add transform extension plumbing**
-   Register a LinalgExt/Neptune transform dialect extension that defines:
-    - `transform.match.linalg_ext.attention_pattern`,
+   Register a Neptune Loop transform dialect extension that defines:
+    - `transform.match.loop.attention_pattern`,
     - `transform.loop.fuse_into_producer_op`,
-    - `transform.linalg_ext.rolling_update`,
+    - `transform.loop.rolling_update`,
     - optional cleanup pattern descriptors such as exp2-hoist-across-broadcast.
 
 4. **Implement tiling and fusion without rolling update**

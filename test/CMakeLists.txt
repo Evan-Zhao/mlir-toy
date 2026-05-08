@@ -5,10 +5,7 @@ configure_lit_site_cfg(
   ${CMAKE_CURRENT_SOURCE_DIR}/lit.cfg.py
 )
 
-set(NEPTUNE_MLIR_LIT_TEST_DEPENDS
-  HTileDialect
-  LinalgExtTransform
-)
+set(NEPTUNE_MLIR_LIT_TEST_DEPENDS HTileDialect LoopTransform)
 
 add_lit_testsuite(check-neptune-mlir
   "Running Neptune MLIR regression tests"

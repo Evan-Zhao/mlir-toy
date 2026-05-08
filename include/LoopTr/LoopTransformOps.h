@@ -1,5 +1,5 @@
-#ifndef LINALGEXT_LINALGEXTTRANSFORMOPS_H
-#define LINALGEXT_LINALGEXTTRANSFORMOPS_H
+#ifndef LOOPTR_LOOPTRANSFORMOPS_H
+#define LOOPTR_LOOPTRANSFORMOPS_H
 
 #include "mlir/Dialect/Transform/IR/TransformDialect.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
@@ -7,6 +7,6 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #define GET_OP_CLASSES
-#include "LinalgExtTransformOps.h.inc"
+#include "LoopTransformOps.h.inc"
 
-#endif // LINALGEXT_LINALGEXTTRANSFORMOPS_H
+#endif // LOOPTR_LOOPTRANSFORMOPS_H

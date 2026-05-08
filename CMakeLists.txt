@@ -58,10 +58,10 @@ mlir_tablegen(HTileEnums.h.inc -gen-enum-decls)
 mlir_tablegen(HTileEnums.cpp.inc -gen-enum-defs)
 add_public_tablegen_target(HTileAttrsIncGen)
 
-set(LLVM_TARGET_DEFINITIONS include/LinalgExt/LinalgExtTransformOps.td)
-mlir_tablegen(LinalgExtTransformOps.h.inc -gen-op-decls)
-mlir_tablegen(LinalgExtTransformOps.cpp.inc -gen-op-defs)
-add_public_tablegen_target(LinalgExtTransformOpsIncGen)
+set(LLVM_TARGET_DEFINITIONS include/LoopTr/LoopTransformOps.td)
+mlir_tablegen(LoopTransformOps.h.inc -gen-op-decls)
+mlir_tablegen(LoopTransformOps.cpp.inc -gen-op-defs)
+add_public_tablegen_target(LoopTransformOpsIncGen)
 
 function(make_mlir_opt_plugin)
   cmake_parse_arguments(ARG "" "TARGET" "SOURCES;DEPS" ${ARGN})
@@ -114,12 +114,12 @@ make_mlir_opt_plugin(
   DEPS HTileOpsIncGen HTileAttrsIncGen
 )
 make_mlir_opt_plugin(
-  TARGET LinalgExtTransform
+  TARGET LoopTransform
   SOURCES
-    lib/LinalgExt/LinalgExtPlugin.cpp
-    lib/LinalgExt/FusionTransformOps.cpp
-    lib/LinalgExt/RollingUpdateTransformOps.cpp
-  DEPS LinalgExtTransformOpsIncGen
+    lib/LoopTr/LoopTransformPlugin.cpp
+    lib/LoopTr/FusionTransformOps.cpp
+    lib/LoopTr/RollingUpdateTransformOps.cpp
+    DEPS LoopTransformOpsIncGen
 )
 
 if(SKBUILD)
@@ -129,7 +129,7 @@ else()
 endif()
 
 install(
-  TARGETS HTileDialect LinalgExtTransform
+  TARGETS HTileDialect LoopTransform
   LIBRARY DESTINATION "${NEPTUNE_MLIR_PLUGIN_INSTALL_DIR}"
   RUNTIME DESTINATION "${NEPTUNE_MLIR_PLUGIN_INSTALL_DIR}"
   ARCHIVE DESTINATION "${NEPTUNE_MLIR_PLUGIN_INSTALL_DIR}"

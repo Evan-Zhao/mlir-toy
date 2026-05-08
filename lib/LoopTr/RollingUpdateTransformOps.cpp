@@ -1,6 +1,6 @@
-#include "LinalgExt/LinalgExtTransformOps.h"
+#include "LoopTr/LoopTransformOps.h"
 
-#include "LinalgExt/Utils.h"
+#include "LoopTr/Utils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
