@@ -1,7 +1,4 @@
-// RUN: mlir-opt %s \
-// RUN:   --load-dialect-plugin=%neptune_linalg_ext_plugin \
-// RUN:   --transform-preload-library=transform-library-paths=%S/Inputs/fuse_reduction_consumer_into_forall.transform.mlir \
-// RUN:   --transform-interpreter | FileCheck %s
+// RUN: mlir-opt --load-dialect-plugin=%neptune_linalg_ext_plugin %s --transform-interpreter | FileCheck %s
 
 // CHECK-LABEL: func.func @row_max_after_scale
 // CHECK: %[[FORALL:.*]]:2 = scf.forall (%[[I:.*]]) in (2) shared_outs(%[[SCORES:.*]] = %{{.*}}, %[[ROWS:.*]] = %{{.*}}) -> (tensor<128x128xf32>, tensor<128xf32>) {
@@ -19,7 +16,26 @@
 // CHECK: tensor.parallel_insert_slice %[[FOR]]#1 into %[[ROWS]][%{{.*}}] [64] [1] : tensor<64xf32> into tensor<128xf32>
 // CHECK: return %[[FORALL]]#0, %[[FORALL]]#1 : tensor<128x128xf32>, tensor<128xf32>
 
-module {
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %func = transform.structured.match ops{["func.func"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+
+    %scale = transform.structured.match ops{["linalg.map"]} in %func
+        : (!transform.any_op) -> !transform.any_op
+    %scale_tiled, %forall_loop =
+      transform.structured.tile_using_forall %scale tile_sizes [64, 64]
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+
+    %row_max = transform.structured.match ops{["linalg.generic"]} in %func
+        : (!transform.any_op) -> !transform.any_op
+    %fused, %new_forall, %new_for =
+      transform.loop.fuse_reduction_consumer_into_forall %row_max into %forall_loop
+        : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+
+    transform.yield
+  }
+
   func.func @row_max_after_scale(%arg0: tensor<128x128xf32>) -> (tensor<128x128xf32>, tensor<128xf32>) {
     %scale = arith.constant 5.000000e-01 : f32
     %neg_inf = arith.constant -3.40282347E+38 : f32
