@@ -1,7 +1,4 @@
-// RUN: mlir-opt %s \
-// RUN:   --load-dialect-plugin=%neptune_linalg_ext_plugin \
-// RUN:   --transform-preload-library=transform-library-paths=%S/Inputs/clone_fuse_elemwise_broadcast.transform.mlir \
-// RUN:   --transform-interpreter | FileCheck %s
+// RUN: mlir-opt --load-dialect-plugin=%neptune_linalg_ext_plugin %s --transform-interpreter | FileCheck %s
 //
 // Exercise the same broadcast access pattern from the attention softmax
 // pipeline: the forall loop produces two results (a 2D full tensor and a 1D
@@ -13,7 +10,23 @@
 //   row  = rowmax[b, h, :]        (1D, tile dim=0)
 //   elemwise(full, row)[i, j] = full[i, j] - row[i]
 
-module {
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %func = transform.structured.match ops{["func.func"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    %forall_loop = transform.structured.match ops{["scf.forall"]} in %func
+        : (!transform.any_op) -> !transform.any_op
+    %inner_loop = transform.structured.match ops{["scf.for"]} in %func
+        : (!transform.any_op) -> !transform.any_op
+    %reduce, %elemwise =
+      transform.match.loop_ru.rolling_update_next_reduction %forall_loop
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %sidecar, %new_forall, %new_inner =
+      transform.loop_ru.clone_fuse_elemwise %elemwise into %forall_loop, %inner_loop
+        : (!transform.any_op, !transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+    transform.yield
+  }
+
   func.func @toy(%arg0: tensor<8x8xf32>) -> tensor<8xf32> {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
