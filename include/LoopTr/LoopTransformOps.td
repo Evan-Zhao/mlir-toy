@@ -6,28 +6,17 @@ def LoopFuseIntoProducerOp : Op<Transform_Dialect, "loop.fuse_into_producer_op",
          [FunctionalStyleTransformOpTrait,
           DeclareOpInterfaceMethods<TransformOpInterface>,
           MemoryEffectsOpInterface]> {
-  let summary = "Fuse a consumer into an scf.for tile loop";
+  let summary = "Fuse a consumer into a producer that is also a loop";
 
   let description = [{
-    Fuses a single unary tensor `linalg.map` consumer into an `scf.for` or
-    `scf.forall` loop that materializes tiles of the consumer input.
+    Fuse a single consumer operation into a producer that implements LoopLikeOpInterface.
 
-    This is a deliberately narrow reverse-fusion primitive for the
-    FlashAttention score-scale epilogue:
-
-    ```
-    qk_tile = ...
-    score_tile = map(qk_tile)
-    insert_slice score_tile into loop result
-    ```
-
-    The op expects the containing loop result consumed by the map to be
-    materialized through either a `tensor.insert_slice` (`scf.for`) or a
-    `tensor.parallel_insert_slice` (`scf.forall`) whose source is the producer
-    tile. It clones the `linalg.map` body on that tile, rewires the insert
-    source to the mapped tile, replaces uses of the original full-tensor
-    consumer result with the producer container result, and erases the original
-    consumer when dead.
+    Delegates to upstream `scf::tileAndFuseConsumer`, which:
+    - identifies operands of `consumer` defined by the containing loop,
+    - locates the `tensor.insert_slice`/`tensor.parallel_insert_slice` that
+      produces each such operand from within the loop body,
+    - tiles the consumer to operate on those same slices in-place, and
+    - adds the tiled result as an additional loop-carried value.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$consumer_op,
@@ -47,15 +36,16 @@ def LoopFuseReduceConsumerIntoForall : Op<Transform_Dialect, "loop.fuse_reductio
   let summary = "Fuse a reduction consumer into a forall producer, sequentializing one forall dimension";
 
   let description = [{
-    Fuses a single unary tensor reduction `linalg.generic` consumer into an
-    `scf.forall` loop that materializes tiles of the consumer input.
+    Fuse a one-dimension reduction `linalg.generic` op into an `scf.forall`.
 
-    This is a narrow reverse-fusion primitive for the FlashAttention row-max
-    stage. It rewrites the target `scf.forall` by removing the tiled dimension
-    that corresponds to the reduction axis, introduces an inner sequential
-    `scf.for`, computes the producer tiles and reduction update inside that
-    loop, and publishes the completed producer slice and reduced tile once per
-    outer `scf.forall` instance.
+    Prerequisites:
+    - The forall must have exactly one result (the producer tile).
+    - The reduction consumer must take exactly one input, produced by the forall.
+
+    The op removes that reduction-tiled dimension from the forall, adds the
+    reduction result as a new shared_out, introduces an inner sequential
+    `scf.for`, and computes both the producer tile and the reduction update
+    inside that loop.  The outer forall issues only the final values.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$consumer_op,
@@ -76,14 +66,15 @@ def LoopRURollingUpdateNextReduction
   let summary = "Find the nearest reduction consumer from a producer op via forward BFS";
 
   let description = [{
-    Pure analysis op. Performs a forward BFS on the def-use graph starting from
-    `producer_op` (each edge has unit length) and locates the first
-    reduction-like op encountered — i.e., the reduction at minimum BFS distance.
+    Pure analysis op. Forward BFS from `producer_op` along def-use edges to find the nearest
+    `linalg.generic` with at least one reduction iterator. Once found, walk
+    backward from the reduction (bounded by the BFS visited set) to collect
+    the elementwise ops on the path.
 
-    Returns the located reduction op; and the elementwise ops between it and the producer,
-    sorted in def-to-use topological order.
+    Returns the reduction op and the elementwise chain (def-to-use order).
+    Fails if no reduction is reachable.
 
-    Fails if no reduction is reachable from `producer_op`.
+    This analysis is a part of a larger "rolling-update" fusion transformation.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$producer_op);
@@ -97,24 +88,16 @@ def LoopRUCloneFuseElemwise : Op<Transform_Dialect, "loop_ru.clone_fuse_elemwise
          [FunctionalStyleTransformOpTrait,
           DeclareOpInterfaceMethods<TransformOpInterface>,
           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
-  let summary = "Clone elementwise and force-fuse into forall + inner for, returning sidecar ops";
+  let summary = "Clone elementwise ops and force-fuse them into forall + inner for";
 
   let description = [{
-    Fuse an elementwise consumer into a tiled loop nest.
+    Create a duplicated version of each elementwise op (a "sidecar")
+    and fuse it under an `scf.forall` outer loop, and then under an `scf.for` inner loop.
+    Fusing into `scf.for` can change the semantics of the sidecar
+    (when the elemwise reads from a reduction), while the original op remains unchanged.
 
-    Takes an elementwise op, an `scf.forall` outer loop, and an `scf.for` inner
-    loop. Performs:
-
-      1. Fuse the elementwise op into the `scf.forall` via upstream
-         `scf::tileAndFuseConsumer`.  The inner loop pointer remains valid
-         because `mergeBlocks` moves (not clones) the body.
-      2. Apply canonicalization to unify redundant `affine.apply` ops.
-      3. Clone the fused elementwise op into the inner `scf.for` as a sidecar.
-
-    Returns the sidecar ops, the new `scf.forall`, and the new inner `scf.for`.
-
-    The outer and inner loop handles are read-only — they are not consumed by
-    this op.  The caller is responsible for using the output handles instead.
+    The outer/inner loop input handles are read-only (not consumed). The
+    caller should use the returned handles exclusively.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$elemwise_chain_ops,
