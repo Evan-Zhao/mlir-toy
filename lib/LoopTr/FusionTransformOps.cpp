@@ -15,42 +15,6 @@ using namespace mlir;
 
 namespace {
 
-FailureOr<SmallVector<LoopLikeOpInterface>> collectLoopNestRootedAt(Operation *root) {
-  if (auto forallOp = dyn_cast<scf::ForallOp>(root))
-    return SmallVector<LoopLikeOpInterface>{forallOp};
-
-  auto forOp = dyn_cast<scf::ForOp>(root);
-  if (!forOp)
-    return failure();
-
-  SmallVector<LoopLikeOpInterface> loops;
-  loops.push_back(forOp);
-
-  while (true) {
-    auto currentFor = cast<scf::ForOp>(loops.back().getOperation());
-    auto yieldOp = cast<scf::YieldOp>(currentFor.getBody()->getTerminator());
-
-    scf::ForOp nestedFor;
-    for (Value yielded : yieldOp.getOperands()) {
-      auto yieldedResult = dyn_cast<OpResult>(yielded);
-      if (!yieldedResult)
-        continue;
-      auto candidate = dyn_cast<scf::ForOp>(yieldedResult.getOwner());
-      if (!candidate || candidate->getBlock() != currentFor.getBody())
-        continue;
-      if (nestedFor && nestedFor != candidate)
-        return failure();
-      nestedFor = candidate;
-    }
-
-    if (!nestedFor)
-      break;
-    loops.push_back(nestedFor);
-  }
-
-  return loops;
-}
-
 LogicalResult verifyUnarySingleReductionGeneric(linalg::GenericOp generic) {
   if (generic.getInputs().size() != 1 || generic.getNumDpsInits() != 1)
     return failure();
@@ -206,14 +170,13 @@ DiagnosedSilenceableFailure LoopFuseIntoProducerOp::apply(transform::TransformRe
   CHECK_EXTRACT_UNIQUE_OP(state, transform, getConsumerOp, "consumer", consumer);
   CHECK_EXTRACT_UNIQUE_OP(state, transform, getProducerLoop, "producer loop", loop);
 
-  auto loopNest = collectLoopNestRootedAt(loop);
-  if (failed(loopNest))
-    return emitSilenceableFailure(transform,
-                                  "expected containing loop to be an scf.for/scf.forall root of a "
-                                  "supported tiled loop nest");
+  auto loopI = dyn_cast<LoopLikeOpInterface>(loop);
+  if (!loopI)
+    return emitSilenceableFailure(
+        transform, "expected the producer loop to implement the LoopLikeOpInterface");
 
   FailureOr<scf::SCFFuseConsumerOfSliceResult> fuseResult =
-      scf::tileAndFuseConsumer(rewriter, consumer, *loopNest);
+      scf::tileAndFuseConsumer(rewriter, consumer, {loopI});
   if (failed(fuseResult))
     return emitSilenceableFailure(transform,
                                   "failed to tile and fuse elementwise consumer into loop");
@@ -225,8 +188,7 @@ DiagnosedSilenceableFailure LoopFuseIntoProducerOp::apply(transform::TransformRe
     rewriter.eraseOp(consumer);
 
   transformResults.set(getOperation()->getResult(0), fuseResult->tiledOps);
-  transformResults.set(getOperation()->getResult(1),
-                       ArrayRef<Operation *>{loopNest->front().getOperation()});
+  transformResults.set(getOperation()->getResult(1), {loopI.getOperation()});
   return DiagnosedSilenceableFailure::success();
 }
 
