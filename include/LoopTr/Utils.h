@@ -2,8 +2,8 @@
 #define LOOPTR_UTILS_H
 
 #include "mlir/Dialect/Transform/Utils/DiagnosedSilenceableFailure.h"
-#include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/SmallVector.h"
+
+namespace mlir {
 
 #define CHECK_EXTRACT_UNIQUE_OP(state, transform, getter, name_str, var_name)                      \
   SmallVector<Operation *> var_name##Ops = llvm::to_vector(state.getPayloadOps(getter()));         \
@@ -18,5 +18,15 @@
   auto(var_name) = dyn_cast<Type>(var_name##1);                                                    \
   if (!(var_name))                                                                                 \
     return emitSilenceableFailure(transform, "expected " name_str " to be a " #Type);
+
+#define RETURN_DIAGNOSTICS_OR_BIND_VAL(OtherType, var, expr)                                       \
+  OtherType(var);                                                                                  \
+  {                                                                                                \
+    auto var##1 = expr;                                                                            \
+    if (std::holds_alternative<DiagnosedSilenceableFailure>(var##1))                               \
+      return std::get<DiagnosedSilenceableFailure>(std::move(var##1));                             \
+    (var) = std::get<OtherType>(var##1);                                                           \
+  }
+} // namespace mlir
 
 #endif // LOOPTR_UTILS_H
