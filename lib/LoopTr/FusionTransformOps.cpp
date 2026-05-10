@@ -60,35 +60,6 @@ FailureOr<uint64_t> matchUnarySingleReductionGeneric(linalg::GenericOp generic) 
   return *reductionDim;
 }
 
-/// Give one of the output values (`result`) that `loop` produces, returns the
-/// `tensor::ParallelInsertSliceOp` within `loop` that produces `result`.
-FailureOr<tensor::ParallelInsertSliceOp> getParallelInsertSliceForLoopResult(scf::ForallOp loop,
-                                                                             OpResult result) {
-  if (result.getOwner() != loop.getOperation())
-    return failure();
-  BlockArgument bbArg = loop.getTiedBlockArgument(result);
-  SmallVector<Operation *> combiningOps = loop.getCombiningOps(bbArg);
-  if (combiningOps.size() != 1)
-    return failure();
-  auto insertSlice = dyn_cast<tensor::ParallelInsertSliceOp>(combiningOps.front());
-  if (!insertSlice)
-    return failure();
-  return insertSlice;
-}
-
-std::variant<tensor::ParallelInsertSliceOp, DiagnosedSilenceableFailure>
-getParallelInsertSliceForLoopResult(TransformOpInterface transform, scf::ForallOp loop,
-                                    OpResult result) {
-  auto insertSliceOrFailure = getParallelInsertSliceForLoopResult(loop, result);
-  if (failed(insertSliceOrFailure)) {
-    loop->emitRemark("when analyzing this loop (scf.forall); result = ") << result;
-    return emitSilenceableFailure(transform,
-                                  "failed to find the tensor.parallel_insert_slice operation in "
-                                  "the loop that published a loop result");
-  }
-  return *insertSliceOrFailure;
-}
-
 /// Returns the index of the loop IV that directly defines `value`, or that
 /// feeds a trivial one-operand `affine.apply` producing `value`.
 ///
@@ -136,9 +107,14 @@ detectReductionForallSplit(const TransformOpInterface &transform, scf::ForallOp 
   if (!producerResult || producerResult.getOwner() != loop.getOperation())
     return emitSilenceableFailure(
         transform, "expected the reduction input to be produced by the target scf.forall");
-  RETURN_DIAGNOSTICS_OR_BIND_VAL(
-      tensor::ParallelInsertSliceOp, producerInsert,
-      getParallelInsertSliceForLoopResult(transform, loop, producerResult));
+  auto insertSliceF = getParallelInsertSliceForLoopResult(loop, producerResult);
+  if (failed(insertSliceF)) {
+    loop->emitRemark("when analyzing this loop (scf.forall); result = ") << producerResult;
+    return emitSilenceableFailure(transform,
+                                  "failed to find the tensor.parallel_insert_slice operation in "
+                                  "the loop that published a loop result");
+  }
+  tensor::ParallelInsertSliceOp producerInsert = *insertSliceF;
 
   // Step 2. Recover which producer tile dimension is reduced and confirm it
   // is controlled by a single forall IV.

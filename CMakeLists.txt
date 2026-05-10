@@ -119,6 +119,7 @@ make_mlir_opt_plugin(
     lib/LoopTr/LoopTransformPlugin.cpp
     lib/LoopTr/FusionTransformOps.cpp
     lib/LoopTr/RollingUpdateTransformOps.cpp
+    lib/LoopTr/Utils.cpp
     DEPS LoopTransformOpsIncGen
 )
 
