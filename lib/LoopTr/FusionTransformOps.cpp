@@ -145,29 +145,6 @@ FailureOr<SmallVector<OpFoldResult>> remapAffineIndices(RewriterBase &rewriter, 
   return std::move(values);
 }
 
-SmallVector<OpFoldResult> getUnitStrides(RewriterBase &rewriter, size_t rank) {
-  return SmallVector<OpFoldResult>(rank, rewriter.getIndexAttr(1));
-}
-
-Value createExtractSliceFromState(RewriterBase &rewriter, Location loc, Value fullTensor,
-                                  ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes,
-                                  ArrayRef<OpFoldResult> strides) {
-  auto tensorType = cast<RankedTensorType>(fullTensor.getType());
-  SmallVector<int64_t> shape;
-  shape.reserve(sizes.size());
-  for (OpFoldResult size : sizes) {
-    auto maybeConst = getConstantIntValue(size);
-    shape.push_back(maybeConst ? *maybeConst : ShapedType::kDynamic);
-  }
-  auto tileType = RankedTensorType::get(shape, tensorType.getElementType());
-  return tensor::ExtractSliceOp::create(rewriter, loc, tileType, fullTensor, offsets, sizes,
-                                        strides);
-}
-
-void pointRewriterToForallParallel(RewriterBase &rewriter, scf::ForallOp forall) {
-  rewriter.setInsertionPointToEnd(&forall.getTerminator().getRegion().front());
-}
-
 struct SplitForallIntoForResult {
   /// Slice metadata used to extract or publish a tile relative to a loop-carried tensor.
   struct TileSlice {
@@ -308,33 +285,6 @@ splitForallDimensionForReduction(TransformOpInterface transform, RewriterBase &r
                                   .reductionSlice = {.offsets = std::move(redTileOffsets),
                                                      .sizes = std::move(redTileSizes),
                                                      .strides = std::move(nMinus1DStrides)}};
-}
-
-void cloneSingleRegionBody(OpBuilder &builder, Location nestedLoc, Block &oldBlock,
-                           ValueRange newArgs) {
-  IRMapping mapping;
-  for (auto [oldArg, newArg] : llvm::zip_equal(oldBlock.getArguments(), newArgs))
-    mapping.map(oldArg, newArg);
-
-  for (Operation &op : oldBlock.without_terminator())
-    builder.clone(op, mapping);
-
-  auto oldYield = cast<linalg::YieldOp>(oldBlock.getTerminator());
-  SmallVector<Value> yielded;
-  yielded.reserve(oldYield.getValues().size());
-  for (Value value : oldYield.getValues())
-    yielded.push_back(mapping.lookup(value));
-  linalg::YieldOp::create(builder, nestedLoc, yielded);
-}
-
-linalg::GenericOp cloneGenericOnTile(RewriterBase &rewriter, linalg::GenericOp sourceGeneric,
-                                     Value inputTile, Value initTile, Location loc) {
-  return linalg::GenericOp::create(
-      rewriter, loc, TypeRange{initTile.getType()}, ValueRange{inputTile}, ValueRange{initTile},
-      sourceGeneric.getIndexingMapsArray(), sourceGeneric.getIteratorTypesArray(),
-      [&](OpBuilder &builder, Location nestedLoc, ValueRange newArgs) {
-        cloneSingleRegionBody(builder, nestedLoc, sourceGeneric->getRegion(0).front(), newArgs);
-      });
 }
 
 } // namespace

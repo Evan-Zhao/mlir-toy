@@ -5,6 +5,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Transform/Utils/DiagnosedSilenceableFailure.h"
+#include "mlir/IR/PatternMatch.h"
 #include <variant>
 
 namespace mlir {
@@ -68,6 +69,17 @@ getNestedLoopResultRelays(ArrayRef<Operation *> loops);
 /// Matches a one-input, one-result linalg.generic with exactly one reduction iterator.
 /// Returns the reduction iterator index on success.
 FailureOr<uint64_t> matchUnarySingleReductionGeneric(linalg::GenericOp generic);
+
+SmallVector<OpFoldResult> getUnitStrides(RewriterBase &rewriter, size_t rank);
+
+Value createExtractSliceFromState(RewriterBase &rewriter, Location loc, Value fullTensor,
+                                  ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes,
+                                  ArrayRef<OpFoldResult> strides);
+
+void pointRewriterToForallParallel(RewriterBase &rewriter, scf::ForallOp forall);
+
+linalg::GenericOp cloneGenericOnTile(RewriterBase &rewriter, linalg::GenericOp sourceGeneric,
+                                     Value inputTile, Value initTile, Location loc);
 
 } // namespace mlir
 
