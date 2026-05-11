@@ -294,10 +294,7 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
                                                            TransformResults &transformResults,
                                                            TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
-  SmallVector<Operation *> elemwiseOps =
-      llvm::to_vector(state.getPayloadOps(getElemwiseChainOps()));
-  if (elemwiseOps.empty())
-    return emitSilenceableFailure(transform, "expected at least one elementwise payload op");
+  CHECK_NON_EMPTY_OPS(state, transform, getElemwiseChainOps, "elementwise", elemwiseOps)
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getOuterLoop, "outer loop", outerLoop,
                                scf::ForallOp);
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getInnerLoop, "inner loop", innerLoop, scf::ForOp);
@@ -507,6 +504,32 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
   // updated by replacement tracking.
   transformResults.set(getOperation()->getResult(0), sidecarOps);
   return DiagnosedSilenceableFailure::success();
+}
+
+void LoopRURepairReductionFrontier::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  consumesHandle(getReduceMutable(), effects);
+  consumesHandle(getElemwiseOrigMutable(), effects);
+  consumesHandle(getElemwiseSidecarsMutable(), effects);
+
+  onlyReadsHandle(getOuterLoopMutable(), effects);
+  onlyReadsHandle(getInnerLoopMutable(), effects);
+
+  producesHandle(getOperation()->getOpResults(), effects);
+  modifiesPayload(effects);
+}
+
+DiagnosedSilenceableFailure
+LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
+                                     TransformResults &transformResults, TransformState &state) {
+  auto transform = cast<TransformOpInterface>(getOperation());
+  CHECK_EXTRACT_UNIQUE_OP(state, transform, getReduce, "reduce", reduce);
+  CHECK_NON_EMPTY_OPS(state, transform, getElemwiseOrig, "original elementwise", elemwiseOrig);
+  CHECK_NON_EMPTY_OPS(state, transform, getElemwiseSidecars, "sidecar elementwise",
+                      elemwiseSidecars);
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getOuterLoop, "outer loop", outerLoop,
+                               scf::ForallOp);
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getInnerLoop, "inner loop", innerLoop, scf::ForOp);
 }
 
 } // namespace transform

@@ -19,7 +19,8 @@ void registerLoopTransformExtension(mlir::DialectRegistry &registry) {
         ->addOperations<mlir::transform::LoopFuseIntoProducerOp,
                         mlir::transform::LoopFuseReduceConsumerIntoForall,
                         mlir::transform::LoopRURollingUpdateNextReduction,
-                        mlir::transform::LoopRUCloneFuseElemwise>();
+                        mlir::transform::LoopRUCloneFuseElemwise,
+                        mlir::transform::LoopRURepairReductionFrontier>();
   });
 }
 
