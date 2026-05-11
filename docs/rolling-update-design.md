@@ -77,11 +77,15 @@ Signature:
 
 ```text
 (elemwise_ops, parallel_loop, streaming_loop)
-  -> (sidecar_ops, new_parallel_loop, new_streaming_loop)
+  -> (sidecar_ops)
 ```
 
 The transform clones each elementwise op, fuses it under the loop,
 and returns the cloned sidecar ops in strictly the same order.
+
+The input loop handles are preserved rather than consumed. If the transform
+rebuilds either loop, transform tracking remaps the existing handles to the
+replacement loops.
 
 The sidecar chain is intentionally incomplete at this point.
 It may compute values that are different from their out-of-loop counterparts.

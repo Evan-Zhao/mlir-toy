@@ -14,9 +14,9 @@ module attributes {transform.with_named_sequence} {
     %reduce, %elemwise =
       transform.match.loop_ru.rolling_update_next_reduction %forall_loop
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %sidecar, %new_forall, %new_inner =
+    %sidecar =
       transform.loop_ru.clone_fuse_elemwise %elemwise into %forall_loop, %inner_loop
-        : (!transform.any_op, !transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+        : (!transform.any_op, !transform.any_op, !transform.any_op) -> !transform.any_op
     transform.yield
   }
 

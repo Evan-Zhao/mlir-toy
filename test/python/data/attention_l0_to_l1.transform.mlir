@@ -99,9 +99,9 @@ module attributes {transform.with_named_sequence} {
     %_1, %bscale = transform.foreach_match restrict_root in %consumers
         @match_elemwise -> @return_matched
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %fused_bscale, %forall_loop_1 =
+    %fused_bscale =
       transform.loop.fuse_into_producer_op %bscale into %forall_loop
-        : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
+        : (!transform.any_op, !transform.any_op) -> !transform.any_op
     // Fusion can create redundant loop-carried values and canonicalization removes them.
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !transform.any_op
 
@@ -109,14 +109,14 @@ module attributes {transform.with_named_sequence} {
     // This would be the row-max op in attention softmax.
     // Because of how MLIR scf.for and linalg work, this fusion implicitly also rfactors the reduction.
     //   TVM: sch.reverse_compute_at(bsum, j0); sch.rfactor(...)
-    %consumers_1 = transform.get_consumers_of_result %forall_loop_1[0]
+    %consumers_1 = transform.get_consumers_of_result %forall_loop[0]
         : (!transform.any_op) -> !transform.any_op
     %_2, %bsum = transform.foreach_match restrict_root in %consumers_1
         @match_unary_reduction -> @return_matched
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %fused_bsum, %forall_loop_2, %j0_loop =
-      transform.loop.fuse_reduction_consumer_into_forall %bsum into %forall_loop_1
-        : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op, !transform.any_op)
+    %fused_bsum, %j0_loop =
+      transform.loop.fuse_reduction_consumer_into_forall %bsum into %forall_loop
+        : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
     // This CSE is actually required here so the next `fuse_elemwise_into_producer` can work
     // because it unifies identical affine map operations.
     transform.apply_cse to %func : !transform.any_op
@@ -125,14 +125,13 @@ module attributes {transform.with_named_sequence} {
     // including all element-wise ops between them.
     // First use rolling_update_next_reduction to find the next reduction op.
     %reduce, %elemwise =
-      transform.match.loop_ru.rolling_update_next_reduction %forall_loop_2
+      transform.match.loop_ru.rolling_update_next_reduction %forall_loop
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    // rolling_update_force_fuse_elemwise fuses all element-wise ops under %forall_loop_2,
+    // rolling_update_force_fuse_elemwise fuses all element-wise ops under %forall_loop,
     // then under %j0_loop.
-    %elemwise_sidecars, %forall_loop_3, %j0_loop_new =
-      transform.loop_ru.clone_fuse_elemwise %elemwise into %forall_loop_2, %j0_loop
-        : (!transform.any_op, !transform.any_op, !transform.any_op)
-        -> (!transform.any_op, !transform.any_op, !transform.any_op)
+    %elemwise_sidecars =
+      transform.loop_ru.clone_fuse_elemwise %elemwise into %forall_loop, %j0_loop
+        : (!transform.any_op, !transform.any_op, !transform.any_op) -> !transform.any_op
     // Don't do canonicalization here -- we have intentionally unused results.
     transform.apply_cse to %func : !transform.any_op
 

@@ -5,7 +5,7 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 def LoopFuseIntoProducerOp : Op<Transform_Dialect, "loop.fuse_into_producer_op",
          [FunctionalStyleTransformOpTrait,
           DeclareOpInterfaceMethods<TransformOpInterface>,
-          MemoryEffectsOpInterface]> {
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Fuse a consumer into a producer that is also a loop";
 
   let description = [{
@@ -17,12 +17,14 @@ def LoopFuseIntoProducerOp : Op<Transform_Dialect, "loop.fuse_into_producer_op",
       produces each such operand from within the loop body,
     - tiles the consumer to operate on those same slices in-place, and
     - adds the tiled result as an additional loop-carried value.
+
+    The `producer_loop` handle is preserved and remapped to the rewritten loop.
+    The `consumer_op` handle is consumed.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$consumer_op,
                        TransformHandleTypeInterface:$producer_loop);
-  let results = (outs TransformHandleTypeInterface:$fused_op,
-                      TransformHandleTypeInterface:$new_producer_loop);
+  let results = (outs TransformHandleTypeInterface:$fused_op);
 
   let assemblyFormat = "$consumer_op `into` $producer_loop attr-dict "
                        " `:` functional-type(operands, results)";
@@ -32,7 +34,7 @@ def LoopFuseIntoProducerOp : Op<Transform_Dialect, "loop.fuse_into_producer_op",
 def LoopFuseReduceConsumerIntoForall : Op<Transform_Dialect, "loop.fuse_reduction_consumer_into_forall",
          [FunctionalStyleTransformOpTrait,
           DeclareOpInterfaceMethods<TransformOpInterface>,
-          MemoryEffectsOpInterface]> {
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Fuse a reduction consumer into a forall producer, sequentializing one forall dimension";
 
   let description = [{
@@ -46,12 +48,15 @@ def LoopFuseReduceConsumerIntoForall : Op<Transform_Dialect, "loop.fuse_reductio
     reduction result as a new shared_out, introduces an inner sequential
     `scf.for`, and computes both the producer tile and the reduction update
     inside that loop.  The outer forall issues only the final values.
+
+    The `forall_loop` handle is preserved and remapped to the rewritten loop.
+    The `consumer_op` handle is consumed. The new inner `scf.for` is returned
+    explicitly because it did not exist before the transformation.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$consumer_op,
                        TransformHandleTypeInterface:$forall_loop);
   let results = (outs TransformHandleTypeInterface:$fused_op,
-                      TransformHandleTypeInterface:$new_forall_loop,
                       TransformHandleTypeInterface:$new_inner_loop);
 
   let assemblyFormat = "$consumer_op `into` $forall_loop attr-dict "
@@ -96,16 +101,16 @@ def LoopRUCloneFuseElemwise : Op<Transform_Dialect, "loop_ru.clone_fuse_elemwise
     Fusing into `scf.for` can change the semantics of the sidecar
     (when the elemwise reads from a reduction), while the original op remains unchanged.
 
-    The outer/inner loop input handles are read-only (not consumed). The
-    caller should use the returned handles exclusively.
+    All the three input handles are read-only (not consumed). The loops are changed (actually
+    cloned and replaces the old ones) during fusion, and these handles are remapped to point
+    to the new loops. The `elemwise_chain_ops` handle is preserved because the elemwise ops
+    before fusion are just unchanged.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$elemwise_chain_ops,
                        TransformHandleTypeInterface:$outer_loop,
                        TransformHandleTypeInterface:$inner_loop);
-  let results = (outs TransformHandleTypeInterface:$sidecar_chain_ops,
-                      TransformHandleTypeInterface:$new_outer_loop,
-                      TransformHandleTypeInterface:$new_inner_loop);
+  let results = (outs TransformHandleTypeInterface:$sidecar_chain_ops);
 
   let assemblyFormat = "$elemwise_chain_ops `into` $outer_loop `,` $inner_loop attr-dict "
                        " `:` functional-type(operands, results)";
