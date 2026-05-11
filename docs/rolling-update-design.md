@@ -99,7 +99,7 @@ elementwise chain. The sidecar values are published as additional loop results,
 but they are not yet substituted into the original computation except by the
 later repair step.
 
-### Reduction Checkpoint And Repair
+### `transform.loop_ru.repair_reduction_frontier`
 
 This is the atomic step where rolling update becomes semantically complete.
 

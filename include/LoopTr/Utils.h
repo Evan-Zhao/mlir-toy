@@ -5,19 +5,23 @@
 
 namespace mlir {
 
-#define CHECK_EXTRACT_UNIQUE_OP(state, transform, getter, name_str, var_name)                      \
-  SmallVector<Operation *> var_name##Ops = llvm::to_vector(state.getPayloadOps(getter()));         \
-  if (!llvm::hasSingleElement(var_name##Ops))                                                      \
-    return emitSilenceableFailure(transform, "expected exactly one " name_str                      \
-                                             " payload op, got " +                                 \
-                                                 std::to_string(var_name##Ops.size()));            \
-  auto(var_name) = var_name##Ops.front();
+#define CHECK_NON_EMPTY_OPS(state, transform, getter, nameStr, varName)                            \
+  SmallVector<Operation *> varName = llvm::to_vector((state).getPayloadOps(getter()));             \
+  if ((varName).empty())                                                                           \
+    return emitSilenceableFailure(transform, "expected at least one " nameStr " payload op");
 
-#define CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getter, name_str, var_name, Type)           \
-  CHECK_EXTRACT_UNIQUE_OP(state, transform, getter, name_str, var_name##1);                        \
-  auto(var_name) = dyn_cast<Type>(var_name##1);                                                    \
-  if (!(var_name))                                                                                 \
-    return emitSilenceableFailure(transform, "expected " name_str " to be a " #Type);
+#define CHECK_EXTRACT_UNIQUE_OP(state, transform, getter, nameStr, varName)                        \
+  SmallVector<Operation *> varName##Ops = llvm::to_vector((state).getPayloadOps(getter()));        \
+  if (!llvm::hasSingleElement(varName##Ops))                                                       \
+    return emitSilenceableFailure(transform, "expected exactly one " nameStr " payload op, got " + \
+                                                 std::to_string(varName##Ops.size()));             \
+  auto(varName) = varName##Ops.front();
+
+#define CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getter, nameStr, varName, Type)             \
+  CHECK_EXTRACT_UNIQUE_OP(state, transform, getter, nameStr, varName##1);                          \
+  auto(varName) = dyn_cast<Type>(varName##1);                                                      \
+  if (!(varName))                                                                                  \
+    return emitSilenceableFailure(transform, "expected " nameStr " to be a " #Type);
 
 #define RETURN_DIAGNOSTICS_OR_BIND_VAL(OtherType, var, expr)                                       \
   OtherType(var);                                                                                  \

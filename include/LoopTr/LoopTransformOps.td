@@ -120,3 +120,37 @@ def LoopRUCloneFuseElemwise : Op<Transform_Dialect, "loop_ru.clone_fuse_elemwise
   let assemblyFormat = "$elemwise_chain_ops `into` $outer_loop `,` $inner_loop attr-dict "
                        " `:` functional-type(operands, results)";
 }
+
+def LoopRURepairReductionFrontier
+    : Op<Transform_Dialect, "loop_ru.repair_reduction_frontier",
+         [FunctionalStyleTransformOpTrait,
+          DeclareOpInterfaceMethods<TransformOpInterface>,
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Repair a reduction frontier using fused sidecar ops under a streaming loop";
+
+  let description = [{
+    Atomic rolling-update step that rebuilds a reduction frontier as a repaired
+    loop-carried recurrence.
+
+    Takes the frontier reduction, the ordered sidecar chain already fused under
+    the streaming loop, the enclosing `scf.forall`, and the refreshed inner
+    `scf.for`. The intended implementation will convert the frontier into
+    loop-carried state, derive the repair term implied by the sidecar chain,
+    and rewrite the frontier and sidecar users to the repaired recurrence.
+
+    The current implementation is a stub: it returns refreshed handles while
+    leaving the payload IR unchanged.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$reduce,
+                       TransformHandleTypeInterface:$elemwise_orig,
+                       TransformHandleTypeInterface:$elemwise_sidecars,
+                       TransformHandleTypeInterface:$outer_loop,
+                       TransformHandleTypeInterface:$inner_loop);
+  let results = (outs TransformHandleTypeInterface:$repaired_reduce,
+                      TransformHandleTypeInterface:$repaired_sidecars);
+
+  let assemblyFormat = "$reduce `and` $elemwise_orig `as` $elemwise_sidecars `into` "
+                       "$outer_loop `,` $inner_loop attr-dict "
+                       " `:` functional-type(operands, results)";
+}

@@ -129,7 +129,13 @@ module attributes {transform.with_named_sequence} {
     %elemwise_sidecars =
       transform.loop_ru.clone_fuse_elemwise %elemwise into %forall_loop, %j0_loop
         : (!transform.any_op, !transform.any_op, !transform.any_op) -> !transform.any_op
-    // Don't do canonicalization here -- we have intentionally unused results.
+    transform.print %func : !transform.any_op
+    %reduce_r, %elemwise_r =
+      transform.loop_ru.repair_reduction_frontier %reduce and %elemwise as %elemwise_sidecars
+        into %forall_loop, %j0_loop
+        : (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)
+        -> (!transform.any_op, !transform.any_op)
+    // Doing canonicalization earlier than here would undo some of the cloning done above.
     transform.apply_cse to %func : !transform.any_op
     transform.print %elemwise : !transform.any_op
     transform.print %elemwise_sidecars : !transform.any_op
