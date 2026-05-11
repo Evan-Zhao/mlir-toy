@@ -1,4 +1,5 @@
 #include "LoopTr/Utils.h"
+#include "mlir/IR/IRMapping.h"
 
 namespace mlir {
 
@@ -55,6 +56,23 @@ FailureOr<SmallVector<LoopResultRelay>> getLoopResultRelays(LoopOp loop) {
     relays.push_back(*resultRelay);
   }
   return relays;
+}
+
+void cloneSingleRegionBody(OpBuilder &builder, Location nestedLoc, Block &oldBlock,
+                           ValueRange newArgs) {
+  IRMapping mapping;
+  for (auto [oldArg, newArg] : llvm::zip_equal(oldBlock.getArguments(), newArgs))
+    mapping.map(oldArg, newArg);
+
+  for (Operation &op : oldBlock.without_terminator())
+    builder.clone(op, mapping);
+
+  auto oldYield = cast<linalg::YieldOp>(oldBlock.getTerminator());
+  SmallVector<Value> yielded;
+  yielded.reserve(oldYield.getValues().size());
+  for (Value value : oldYield.getValues())
+    yielded.push_back(mapping.lookup(value));
+  linalg::YieldOp::create(builder, nestedLoc, yielded);
 }
 
 } // namespace
@@ -133,6 +151,39 @@ FailureOr<uint64_t> matchUnarySingleReductionGeneric(linalg::GenericOp generic) 
       return failure();
   }
   return *reductionDim;
+}
+
+SmallVector<OpFoldResult> getUnitStrides(RewriterBase &rewriter, size_t rank) {
+  return SmallVector<OpFoldResult>(rank, rewriter.getIndexAttr(1));
+}
+
+Value createExtractSliceFromState(RewriterBase &rewriter, Location loc, Value fullTensor,
+                                  ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes,
+                                  ArrayRef<OpFoldResult> strides) {
+  auto tensorType = cast<RankedTensorType>(fullTensor.getType());
+  SmallVector<int64_t> shape;
+  shape.reserve(sizes.size());
+  for (OpFoldResult size : sizes) {
+    auto maybeConst = getConstantIntValue(size);
+    shape.push_back(maybeConst ? *maybeConst : ShapedType::kDynamic);
+  }
+  auto tileType = RankedTensorType::get(shape, tensorType.getElementType());
+  return tensor::ExtractSliceOp::create(rewriter, loc, tileType, fullTensor, offsets, sizes,
+                                        strides);
+}
+
+void pointRewriterToForallParallel(RewriterBase &rewriter, scf::ForallOp forall) {
+  rewriter.setInsertionPointToEnd(&forall.getTerminator().getRegion().front());
+}
+
+linalg::GenericOp cloneGenericOnTile(RewriterBase &rewriter, linalg::GenericOp sourceGeneric,
+                                     Value inputTile, Value initTile, Location loc) {
+  return linalg::GenericOp::create(
+      rewriter, loc, TypeRange{initTile.getType()}, ValueRange{inputTile}, ValueRange{initTile},
+      sourceGeneric.getIndexingMapsArray(), sourceGeneric.getIteratorTypesArray(),
+      [&](OpBuilder &builder, Location nestedLoc, ValueRange newArgs) {
+        cloneSingleRegionBody(builder, nestedLoc, sourceGeneric->getRegion(0).front(), newArgs);
+      });
 }
 
 } // namespace mlir

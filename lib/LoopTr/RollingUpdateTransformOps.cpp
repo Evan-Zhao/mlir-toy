@@ -8,17 +8,21 @@
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/IRMapping.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/TilingInterface.h"
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include <deque>
 #include <optional>
 #include <variant>
 
-using namespace mlir;
+#define BAIL(message) return emitSilenceableFailure(transform, message);
 
 namespace {
+
+using namespace mlir;
+using linalg::GenericOp;
+using scf::ForallOp;
+using scf::ForOp;
+using transform::TransformOpInterface;
 
 bool isReductionLike(Operation *op) {
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
@@ -37,7 +41,7 @@ LogicalResult verifyElementwiseMap(linalg::MapOp map) {
   return success();
 }
 
-LogicalResult verifyElementwiseGeneric(linalg::GenericOp generic) {
+LogicalResult verifyElementwiseGeneric(GenericOp generic) {
   if (generic.getNumDpsInits() != 1)
     return failure();
   if (generic->getNumResults() != 1)
@@ -57,7 +61,7 @@ LogicalResult verifyElementwiseGeneric(linalg::GenericOp generic) {
 LogicalResult verifyForceFusibleElementwiseOp(Operation *op) {
   if (auto map = dyn_cast<linalg::MapOp>(op))
     return verifyElementwiseMap(map);
-  if (auto generic = dyn_cast<linalg::GenericOp>(op))
+  if (auto generic = dyn_cast<GenericOp>(op))
     return verifyElementwiseGeneric(generic);
   return failure();
 }
@@ -65,9 +69,11 @@ LogicalResult verifyForceFusibleElementwiseOp(Operation *op) {
 SmallVector<Value> getElementwiseInputs(Operation *op) {
   if (auto map = dyn_cast<linalg::MapOp>(op))
     return llvm::to_vector(map.getInputs());
-  return llvm::to_vector(cast<linalg::GenericOp>(op).getInputs());
+  return llvm::to_vector(cast<GenericOp>(op).getInputs());
 }
 
+/// Creates a fresh tensor.empty whose shape and element type match `likeValue`.
+/// This is used to seed new loop-carried tensors when cloning sidecar chains.
 FailureOr<Value> createDestinationLikeValueAtInsertionPoint(RewriterBase &rewriter,
                                                             Value likeValue) {
   auto tensorType = dyn_cast<RankedTensorType>(likeValue.getType());
@@ -78,16 +84,49 @@ FailureOr<Value> createDestinationLikeValueAtInsertionPoint(RewriterBase &rewrit
   mixedSizes.reserve(tensorType.getRank());
   for (auto [index, size] : llvm::enumerate(tensorType.getShape())) {
     if (ShapedType::isDynamic(size)) {
-      mixedSizes.push_back(
-          tensor::DimOp::create(rewriter, likeValue.getLoc(), likeValue, index).getResult());
-      continue;
+      auto dimOp = tensor::DimOp::create(rewriter, likeValue.getLoc(), likeValue,
+                                         static_cast<int64_t>(index));
+      mixedSizes.push_back(dimOp.getResult());
+    } else {
+      mixedSizes.push_back(rewriter.getIndexAttr(size));
     }
-    mixedSizes.push_back(rewriter.getIndexAttr(size));
   }
 
   return tensor::EmptyOp::create(rewriter, likeValue.getLoc(), mixedSizes,
                                  tensorType.getElementType())
       .getResult();
+}
+
+/// Clones the defining chain of `value` only as far as needed to make it dominate
+/// the current insertion point. Existing dominating definitions are reused.
+FailureOr<Value> cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Value value,
+                                                    IRMapping &mapping) {
+  if (Value mapped = mapping.lookupOrNull(value))
+    return mapped;
+
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return value;
+
+  Block *insertBlock = rewriter.getInsertionBlock();
+  auto insertPoint = rewriter.getInsertionPoint();
+  Operation *insertPointOp = insertPoint == insertBlock->end() ? nullptr : &*insertPoint;
+  if (!insertPointOp || def->getBlock() != insertBlock || def->isBeforeInBlock(insertPointOp))
+    return value;
+
+  IRMapping localMapping = mapping;
+  for (Value operand : def->getOperands()) {
+    FailureOr<Value> remappedOperand =
+        cloneValueDefChainAtInsertionPoint(rewriter, operand, mapping);
+    if (failed(remappedOperand))
+      return failure();
+    localMapping.map(operand, *remappedOperand);
+  }
+
+  Operation *cloned = rewriter.clone(*def, localMapping);
+  for (auto [oldResult, newResult] : llvm::zip_equal(def->getResults(), cloned->getResults()))
+    mapping.map(oldResult, newResult);
+  return mapping.lookup(value);
 }
 
 struct SidecarValueInfo {
@@ -108,10 +147,12 @@ bool canRepresentSidecarResult(Value candidate, OpResult result) {
          candidateType.getElementType() == resultType.getElementType();
 }
 
+/// For each outer-loop result consumed by the elementwise chain, record which
+/// inner-loop result number feeds it through a tensor.parallel_insert_slice.
 std::variant<DiagnosedSilenceableFailure, DenseMap<Value, unsigned>>
 getSeededLoopResultIndices(transform::TransformOpInterface transform,
-                           ArrayRef<Operation *> elemwiseOps, scf::ForallOp outerLoop,
-                           scf::ForOp currentLoop) {
+                           ArrayRef<Operation *> elemwiseOps, ForallOp outerLoop,
+                           ForOp currentLoop) {
   DenseMap<Value, unsigned> seededLoopResults;
   llvm::SmallDenseSet<Value> neededInputs;
   for (Operation *elemwiseOp : elemwiseOps)
@@ -148,11 +189,13 @@ getSeededLoopResultIndices(transform::TransformOpInterface transform,
 
 using FoldResultsT = SmallVector<OpFoldResult>;
 
+/// Re-tile one cloned sidecar op from loop-local producer tiles, then report
+/// the tiled op together with the slice position of its result in the full tensor.
 std::variant<DiagnosedSilenceableFailure, std::tuple<TilingInterface, FoldResultsT, FoldResultsT>>
 createOneTiledSidecarOp(transform::TransformRewriter &rewriter,
                         const transform::TransformOpInterface &transform,
                         TilingInterface clonedConsumerOp,
-                        const SmallVectorImpl<Value> &originalInputs, scf::ForOp &currentLoop,
+                        const SmallVectorImpl<Value> &originalInputs, ForOp &currentLoop,
                         const DenseMap<Value, unsigned> &seededLoopResults,
                         const DenseMap<Value, SidecarValueInfo> &sidecarValueInfo,
                         const DenseMap<unsigned, tensor::InsertSliceOp> &loopResultInserts) {
@@ -222,8 +265,10 @@ createOneTiledSidecarOp(transform::TransformRewriter &rewriter,
   return std::make_tuple(tiledSidecarOp, resultOffsets, resultSizes);
 }
 
-FailureOr<DenseMap<Operation *, OpResult>> getOpToLoopResultMap(scf::ForallOp outerLoop,
-                                                                scf::ForOp innerLoop) {
+/// Builds a map from in-loop producer operations in `innerLoop` to the
+/// corresponding relayed result of `outerLoop`.
+FailureOr<DenseMap<Operation *, OpResult>> getOpToLoopResultMap(ForallOp outerLoop,
+                                                                ForOp innerLoop) {
   auto loopResultRelaysF = getNestedLoopResultRelays({outerLoop, innerLoop});
   if (failed(loopResultRelaysF))
     return failure();
@@ -254,6 +299,137 @@ FailureOr<DenseMap<Operation *, OpResult>> getOpToLoopResultMap(scf::ForallOp ou
       innerBodyToOuterRet.try_emplace(innerBody.getDefiningOp(), outerRet);
   }
   return innerBodyToOuterRet;
+}
+
+DiagnosedSilenceableFailure fuseReduceInLoopNest(TransformOpInterface transform,
+                                                 RewriterBase &rewriter, ForallOp &outerLoop,
+                                                 ForOp &innerLoop, GenericOp &reduce, size_t redDim,
+                                                 SmallVector<Operation *> &elemwiseOrig,
+                                                 SmallVector<Operation *> &elemwiseSidecars) {
+  // Step 1. Find the elementwise ops that the reduction reads. For each elementwise `e_i`, there is
+  // a cloned "sidecar" version `s_i` under the nested loop. `s_i` computes a tile of result at a
+  // time, which accumulates over the loop iterations, so the outer loop has a corresponding result
+  // `r_j`. The following chunk of code finds this `j` (which is `resultNumber` below).
+  auto opToLoopResultMap = getOpToLoopResultMap(outerLoop, innerLoop);
+  if (failed(opToLoopResultMap))
+    BAIL("failed to map loop return values to in-loop operations that produce them");
+  SmallVector<std::pair<Operation *, unsigned>> sidecarsUsedByReduce;
+  for (auto [elemwiseOp, sidecarOp] : llvm::zip_equal(elemwiseOrig, elemwiseSidecars)) {
+    Value originalResult = elemwiseOp->getResult(0);
+    bool usedByReduce = llvm::any_of(originalResult.getUses(),
+                                     [&](OpOperand &use) { return use.getOwner() == reduce; });
+    if (!usedByReduce)
+      continue;
+    auto it = opToLoopResultMap->find(sidecarOp);
+    if (it == opToLoopResultMap->end()) {
+      sidecarOp->emitRemark("this sidecar op");
+      BAIL("cannot trace the output of a sidecar operation to an output of the outer loop");
+    }
+    sidecarsUsedByReduce.emplace_back(sidecarOp, it->second.getResultNumber());
+  }
+  if (size_t size = sidecarsUsedByReduce.size(); size != 1) {
+    reduce->emitRemark("this reduction:");
+    BAIL("expected the reduction to consume exactly one elementwise result; got " +
+         std::to_string(size) + " results");
+  }
+  auto [sidecarOp, resultNumber] = sidecarsUsedByReduce.front();
+
+  // Step 2. Add a fresh reduction slot to the outer forall, recover the sidecar
+  // slice geometry from the chosen relayed result, and seed the inner reduction tile.
+  unsigned oldNumOuterResults = outerLoop.getNumResults();
+  rewriter.setInsertionPoint(outerLoop);
+  IRMapping reductionInitMapping;
+  FailureOr<Value> reductionInit = cloneValueDefChainAtInsertionPoint(
+      rewriter, reduce.getDpsInits().front(), reductionInitMapping);
+  if (failed(reductionInit))
+    BAIL("failed to clone a dominating init tensor for the fused reduction");
+  SmallVector<Value> newOuterOutputs = llvm::to_vector(outerLoop.getOutputs());
+  newOuterOutputs.push_back(*reductionInit);
+  auto newOuterLoop =
+      ForallOp::create(rewriter, outerLoop.getLoc(), outerLoop.getMixedLowerBound(),
+                       outerLoop.getMixedUpperBound(), outerLoop.getMixedStep(), newOuterOutputs,
+                       outerLoop.getMapping(), [](OpBuilder &, Location, ValueRange) {});
+  Block *oldOuterBody = outerLoop.getBody();
+  Block *newOuterBody = newOuterLoop.getBody();
+  rewriter.mergeBlocks(oldOuterBody, newOuterBody,
+                       newOuterBody->getArguments().take_front(oldOuterBody->getNumArguments()));
+
+  auto producerOuterResult = cast<OpResult>(newOuterLoop->getResult(resultNumber));
+  auto producerOuterInsertF =
+      getParallelInsertSliceForLoopResult(newOuterLoop, producerOuterResult);
+  if (failed(producerOuterInsertF))
+    BAIL("failed to find the outer-loop relay for the reduction producer sidecar");
+  auto producerOuterInsert = *producerOuterInsertF;
+
+  auto dropAt = [](SmallVector<OpFoldResult> values, uint64_t index) {
+    values.erase(values.begin() + index);
+    return values;
+  };
+  SmallVector<OpFoldResult> reductionOffsets =
+      dropAt(producerOuterInsert.getMixedOffsets(), redDim);
+  SmallVector<OpFoldResult> reductionSizes = dropAt(producerOuterInsert.getMixedSizes(), redDim);
+  SmallVector<OpFoldResult> reductionStrides = getUnitStrides(rewriter, reductionOffsets.size());
+
+  // Step 3. Rebuild the inner loop with one extra iter_arg/result for the fused
+  // reduction, then relay that new result through the rebuilt outer forall.
+  unsigned oldNumInnerResults = innerLoop.getNumResults();
+  rewriter.setInsertionPoint(innerLoop);
+  Value reductionTileInit = createExtractSliceFromState(
+      rewriter, reduce.getLoc(), newOuterLoop.getRegionIterArgs().back(), reductionOffsets,
+      reductionSizes, reductionStrides);
+  SmallVector<Value> newInnerInitArgs = llvm::to_vector(innerLoop.getInitArgs());
+  newInnerInitArgs.push_back(reductionTileInit);
+  auto newInnerLoop =
+      ForOp::create(rewriter, innerLoop.getLoc(), innerLoop.getLowerBound(),
+                    innerLoop.getUpperBound(), innerLoop.getStep(), newInnerInitArgs);
+
+  auto *newInnerBody = newInnerLoop.getBody();
+  IRMapping mapping;
+  mapping.map(innerLoop.getInductionVar(), newInnerLoop.getInductionVar());
+  for (auto [index, oldArg] : llvm::enumerate(innerLoop.getRegionIterArgs()))
+    mapping.map(oldArg, newInnerLoop.getRegionIterArgs()[index]);
+
+  rewriter.setInsertionPointToEnd(newInnerBody);
+  for (Operation &op : innerLoop.getBody()->without_terminator())
+    rewriter.clone(op, mapping);
+
+  auto oldYield = cast<scf::YieldOp>(innerLoop.getBody()->getTerminator());
+  SmallVector<Value> newYieldOperands;
+  newYieldOperands.reserve(oldYield.getNumOperands() + 1);
+  for (Value operand : oldYield.getOperands())
+    newYieldOperands.push_back(mapping.lookupOrDefault(operand));
+
+  auto clonedSidecarResult = dyn_cast<OpResult>(mapping.lookupOrDefault(sidecarOp->getResult(0)));
+  if (!clonedSidecarResult)
+    BAIL("failed to remap the sidecar op result into the rebuilt inner loop");
+  rewriter.setInsertionPointToEnd(newInnerBody);
+  auto fusedReduction =
+      cloneGenericOnTile(rewriter, reduce, clonedSidecarResult,
+                         newInnerLoop.getRegionIterArgs().back(), reduce.getLoc());
+  newYieldOperands.push_back(fusedReduction.getResult(0));
+  scf::YieldOp::create(rewriter, innerLoop.getLoc(), newYieldOperands);
+  rewriter.replaceOp(innerLoop, newInnerLoop.getResults().take_front(oldNumInnerResults));
+
+  pointRewriterToForallParallel(rewriter, newOuterLoop);
+  tensor::ParallelInsertSliceOp::create(rewriter, reduce.getLoc(), newInnerLoop.getResults().back(),
+                                        newOuterLoop.getRegionIterArgs().back(), reductionOffsets,
+                                        reductionSizes, reductionStrides);
+  rewriter.replaceOp(outerLoop, newOuterLoop.getResults().take_front(oldNumOuterResults));
+  rewriter.replaceOp(reduce, newOuterLoop.getResults().back());
+
+  // Step 4. Remap operations to their cloned counterparts, since the original ops were erased
+  // during the rebuild.
+  reduce = fusedReduction;
+  outerLoop = newOuterLoop;
+  innerLoop = newInnerLoop;
+  // For elemwise ops (no need to update original elemwise, because they weren't changed)
+  for (size_t i = 0; i < elemwiseSidecars.size(); ++i) {
+    elemwiseSidecars[i] = dyn_cast_if_present<GenericOp>(
+        mapping.lookupOrDefault(elemwiseSidecars[i]->getResult(0)).getDefiningOp());
+    if (!elemwiseSidecars[i])
+      BAIL("failed to remap elemwise (sidecars) ops after fusing reduction into the loop nest");
+  }
+  return DiagnosedSilenceableFailure::success();
 }
 
 } // namespace
@@ -329,9 +505,8 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
                                                            TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
   CHECK_NON_EMPTY_OPS(state, transform, getElemwiseChainOps, "elementwise", elemwiseOps)
-  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getOuterLoop, "outer loop", outerLoop,
-                               scf::ForallOp);
-  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getInnerLoop, "inner loop", innerLoop, scf::ForOp);
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getOuterLoop, "outer loop", outerLoop, ForallOp);
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getInnerLoop, "inner loop", innerLoop, ForOp);
 
   for (Operation *elemwiseOp : elemwiseOps)
     if (failed(verifyForceFusibleElementwiseOp(elemwiseOp))) {
@@ -345,9 +520,8 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
     return std::get<DiagnosedSilenceableFailure>(std::move(seededLoopResults));
   const auto &seededLoopResultsMap = std::get<1>(seededLoopResults);
 
-  // Step 1. Each elemwise op to fuse may introduce extra loop-carried values. Rebuild the streaming
-  // loop once with extra iter_arg needed to hold these values.
-  // 1.1. Enlist these values and clone the loop.
+  // Step 1. Rebuild the inner streaming loop with one extra iter_arg/result
+  // per sidecar tensor that will be materialized under the loop.
   unsigned oldNumResults = innerLoop.getNumResults();
   rewriter.setInsertionPoint(innerLoop);
   SmallVector<Value> newInitArgs = llvm::to_vector(innerLoop.getInitArgs());
@@ -387,24 +561,21 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
     panelizedResultValues[elemwiseOp->getResult(0)] = *destination;
     outerRelayInfo[elemwiseOp->getResult(0)] = OuterRelayInfo{*representativeOuterResultNumber};
   }
-  auto newLoop = scf::ForOp::create(rewriter, innerLoop.getLoc(), innerLoop.getLowerBound(),
-                                    innerLoop.getUpperBound(), innerLoop.getStep(), newInitArgs);
+  auto newLoop = ForOp::create(rewriter, innerLoop.getLoc(), innerLoop.getLowerBound(),
+                               innerLoop.getUpperBound(), innerLoop.getStep(), newInitArgs);
 
-  // 1.2. Set up old value to new value mapping for the loop induction variable
-  // and region iter args.
+  // Clone the old loop body under the replacement loop.
   auto *newBody = newLoop.getBody();
   IRMapping mapping;
   mapping.map(innerLoop.getInductionVar(), newLoop.getInductionVar());
   for (auto [index, oldArg] : llvm::enumerate(innerLoop.getRegionIterArgs()))
     mapping.map(oldArg, newLoop.getRegionIterArgs()[index]);
 
-  // 1.3. Clone the loop body except the yield operation.
   rewriter.setInsertionPointToEnd(newBody);
   for (Operation &op : innerLoop.getBody()->without_terminator())
     rewriter.clone(op, mapping);
 
-  // 1.4. Build cloned yield operands and a map from loop result index to the
-  // cloned tensor.insert_slice that produces it.
+  // Recover the cloned loop-carried tensors and the insert_slice ops that update them.
   auto oldYield = cast<scf::YieldOp>(innerLoop.getBody()->getTerminator());
   SmallVector<Value> clonedYieldOperands;
   clonedYieldOperands.reserve(oldYield.getNumOperands());
@@ -417,9 +588,8 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
   }
   rewriter.setInsertionPointToEnd(newBody);
 
-  // Step 2. Clone each elementwise op under the rebuilt loop in the original
-  // producer-to-consumer order, using previously cloned sidecar tiles when the
-  // chain depends on earlier elementwise results.
+  // Step 2. Clone the elementwise chain under the rebuilt loop, tile each op
+  // from loop-local producer tiles, and append the new sidecar tensors to the yield.
   DenseMap<Value, Value> loopResultValues;
   for (auto [index, result] : llvm::enumerate(innerLoop.getResults()))
     loopResultValues[result] = newLoop.getRegionIterArgs()[index];
@@ -482,9 +652,8 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
   scf::YieldOp::create(rewriter, innerLoop.getLoc(), newYieldOperands);
   rewriter.replaceOp(innerLoop, newLoop.getResults().take_front(oldNumResults));
 
-  // Step 4. Relay the additional inner-loop results through the outer forall as
-  // extra shared_outs/results, using the same parallel-insert tiling pattern as
-  // the representative seeded outer result.
+  // Step 3. Relay the new inner-loop results through the outer forall using the
+  // same slice pattern as the already-relayed producer tensors.
   unsigned oldNumOuterResults = outerLoop.getNumResults();
   rewriter.setInsertionPoint(outerLoop);
   SmallVector<Value> newOuterOutputs = llvm::to_vector(outerLoop.getOutputs());
@@ -499,10 +668,10 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
     newOuterOutputs.push_back(*outerInit);
   }
 
-  auto newOuterLoop = scf::ForallOp::create(
-      rewriter, outerLoop.getLoc(), outerLoop.getMixedLowerBound(), outerLoop.getMixedUpperBound(),
-      outerLoop.getMixedStep(), newOuterOutputs, outerLoop.getMapping(),
-      [](OpBuilder &, Location, ValueRange) {});
+  auto newOuterLoop =
+      ForallOp::create(rewriter, outerLoop.getLoc(), outerLoop.getMixedLowerBound(),
+                       outerLoop.getMixedUpperBound(), outerLoop.getMixedStep(), newOuterOutputs,
+                       outerLoop.getMapping(), [](OpBuilder &, Location, ValueRange) {});
   Block *oldOuterBody = outerLoop.getBody();
   Block *newOuterBody = newOuterLoop.getBody();
   rewriter.mergeBlocks(oldOuterBody, newOuterBody,
@@ -534,8 +703,6 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
   }
   rewriter.replaceOp(outerLoop, newOuterLoop.getResults().take_front(oldNumOuterResults));
 
-  // Step 5. Return the cloned sidecar chain. The loop handles are preserved and
-  // updated by replacement tracking.
   transformResults.set(getOperation()->getResult(0), sidecarOps);
   return DiagnosedSilenceableFailure::success();
 }
@@ -556,51 +723,33 @@ void LoopRURepairReductionFrontier::getEffects(
 DiagnosedSilenceableFailure
 LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
                                      TransformResults &transformResults, TransformState &state) {
+  // Do some basic validation.
   auto transform = cast<TransformOpInterface>(getOperation());
-  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getReduce, "reduce", reduce, linalg::GenericOp);
-  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getOuterLoop, "outer loop", outerLoop,
-                               scf::ForallOp);
-  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getInnerLoop, "inner loop", innerLoop, scf::ForOp);
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getReduce, "reduce", reduce, GenericOp);
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getOuterLoop, "outer loop", outerLoop, ForallOp);
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getInnerLoop, "inner loop", innerLoop, ForOp);
   CHECK_NON_EMPTY_OPS(state, transform, getElemwiseOrig, "original elementwise", elemwiseOrig);
   CHECK_NON_EMPTY_OPS(state, transform, getElemwiseSidecars, "sidecar elementwise",
                       elemwiseSidecars);
   if (elemwiseOrig.size() != elemwiseSidecars.size())
-    return emitSilenceableFailure(
-        transform, "expected the original and sidecar elementwise chains to have the same size");
+    BAIL("expected the original and sidecar elementwise chains to have the same size");
 
+  // Get the reduce axis of the reduction.
   auto redDimOrF = matchUnarySingleReductionGeneric(reduce);
   if (failed(redDimOrF))
-    return emitSilenceableFailure(transform,
-                                  "expected reduce to be a unary single-reduction linalg.generic");
+    BAIL("expected reduce to be a unary single-reduction linalg.generic");
   auto redDim = *redDimOrF;
 
-  auto opToLoopResultMap = getOpToLoopResultMap(outerLoop, innerLoop);
-  if (failed(opToLoopResultMap))
-    return emitSilenceableFailure(
-        transform, "failed to map loop return values to in-loop operations that produce them");
+  // Fuse the reduce operation into the loop nest, changing its input from `elemwiseOrig` to
+  // `elemwiseSidecars`. This function takes `elemwiseOrig`, `outerLoop`, etc. by reference,
+  // and updates them to point to new operations.
+  auto fuseResult = fuseReduceInLoopNest(transform, rewriter, outerLoop, innerLoop, reduce, redDim,
+                                         elemwiseOrig, elemwiseSidecars);
+  if (!fuseResult.succeeded())
+    return fuseResult;
 
-  SmallVector<Operation *> sidecarsUsedByReduce;
-  for (auto [elemwiseOp, sidecarOp] : llvm::zip_equal(elemwiseOrig, elemwiseSidecars)) {
-    Value originalResult = elemwiseOp->getResult(0);
-    bool usedByReduce = llvm::any_of(originalResult.getUses(),
-                                     [&](OpOperand &use) { return use.getOwner() == reduce; });
-    if (!usedByReduce)
-      continue;
-
-    auto it = opToLoopResultMap->find(sidecarOp);
-    if (it == opToLoopResultMap->end()) {
-      sidecarOp->emitRemark("this sidecar op");
-      return emitSilenceableFailure(
-          transform,
-          "cannot trace the output of a sidecar operation to an output of the outer loop");
-    }
-    sidecarsUsedByReduce.push_back(sidecarOp);
-    originalResult.replaceUsesWithIf(it->second,
-                                     [&](OpOperand &use) { return use.getOwner() == reduce; });
-  }
-
-  transformResults.set(getOperation()->getResult(0), {reduce});
-  transformResults.set(getOperation()->getResult(1), sidecarsUsedByReduce);
+  transformResults.set(getOperation()->getResult(0), {reduce.getOperation()});
+  transformResults.set(getOperation()->getResult(1), elemwiseSidecars);
   return DiagnosedSilenceableFailure::success();
 }
 
