@@ -1,7 +1,7 @@
 // RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin %s --transform-interpreter 2>&1 | FileCheck %s
 
-// The forall tiles along i (rows). Both scores and rmax share the same i-tile
-// offset. The consumer scores - rmax broadcasts rmax across the j dimension.
+// Two elemwise consumers A and B both read directly from the loop results.
+// This exercises the case where the fused sidecars are independent siblings.
 
 module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
@@ -11,16 +11,18 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %inner_loop = transform.structured.match ops{["scf.for"]} in %func
         : (!transform.any_op) -> !transform.any_op
-    %reduce, %elemwise =
-      transform.match.loop_ru.rolling_update_next_reduction %forall_loop
-        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %a = transform.structured.match ops{["linalg.generic"]} attributes {fuse0} in %func
+        : (!transform.any_op) -> !transform.any_op
+    %b = transform.structured.match ops{["linalg.generic"]} attributes {fuse1} in %func
+        : (!transform.any_op) -> !transform.any_op
+    %elemwise = transform.merge_handles %a, %b : !transform.any_op
     %sidecar =
       transform.loop_ru.clone_fuse_elemwise %elemwise into %forall_loop, %inner_loop
         : (!transform.any_op, !transform.any_op, !transform.any_op) -> !transform.any_op
     transform.yield
   }
 
-  func.func @toy(%arg0: tensor<8x8xf32>) -> tensor<8xf32> {
+  func.func @toy(%arg0: tensor<8x8xf32>) -> tensor<8x8xf32> {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index
@@ -36,8 +38,6 @@ module attributes {transform.with_named_sequence} {
         shared_outs(%arg2 = %scores_init, %arg3 = %rm_fill)
         -> (tensor<8x8xf32>, tensor<8xf32>) {
       %off = affine.apply affine_map<(d0) -> (d0 * 4)>(%arg1)
-
-      // Both panels are extracted at the same i-offset
       %scores_panel = tensor.extract_slice %arg2[%off, 0] [4, 8] [1, 1]
           : tensor<8x8xf32> to tensor<4x8xf32>
       %rm_panel = tensor.extract_slice %arg3[%off] [4] [1]
@@ -72,42 +72,38 @@ module attributes {transform.with_named_sequence} {
       }
     }
 
-    // One elemwise op consuming both forall results (broadcast rmax across j)
-    %shift_init = tensor.empty() : tensor<8x8xf32>
-    %shift = linalg.generic {
+    %sub_init = tensor.empty() : tensor<8x8xf32>
+    %sub = linalg.generic {fuse0,
         indexing_maps = [affine_map<(i, j) -> (i, j)>,
                          affine_map<(i, j) -> (i)>,
                          affine_map<(i, j) -> (i, j)>],
         iterator_types = ["parallel", "parallel"]}
         ins(%scores, %rmax : tensor<8x8xf32>, tensor<8xf32>)
-        outs(%shift_init : tensor<8x8xf32>) {
-      ^bb0(%in: f32, %m: f32, %out: f32):
-        %shifted = arith.subf %in, %m : f32
-        linalg.yield %shifted : f32
+        outs(%sub_init : tensor<8x8xf32>) {
+      ^bb0(%a: f32, %b: f32, %out: f32):
+        %x = arith.subf %a, %b : f32
+        linalg.yield %x : f32
     } -> tensor<8x8xf32>
 
-    // Reduction
-    %sum_init_e = tensor.empty() : tensor<8xf32>
-    %zero = arith.constant 0.0 : f32
-    %sum_init = linalg.fill ins(%zero : f32)
-        outs(%sum_init_e : tensor<8xf32>) -> tensor<8xf32>
-    %sum = linalg.generic {
+    %mul_init = tensor.empty() : tensor<8x8xf32>
+    %mul = linalg.generic {fuse1,
         indexing_maps = [affine_map<(i, j) -> (i, j)>,
-                         affine_map<(i, j) -> (i)>],
-        iterator_types = ["parallel", "reduction"]}
-        ins(%shift : tensor<8x8xf32>) outs(%sum_init : tensor<8xf32>) {
-      ^bb0(%in: f32, %out: f32):
-        %next = arith.addf %in, %out : f32
-        linalg.yield %next : f32
-    } -> tensor<8xf32>
-    return %sum : tensor<8xf32>
+                         affine_map<(i, j) -> (i)>,
+                         affine_map<(i, j) -> (i, j)>],
+        iterator_types = ["parallel", "parallel"]}
+        ins(%scores, %rmax : tensor<8x8xf32>, tensor<8xf32>)
+        outs(%mul_init : tensor<8x8xf32>) {
+      ^bb0(%a: f32, %b: f32, %out: f32):
+        %x = arith.mulf %a, %b : f32
+        linalg.yield %x : f32
+    } -> tensor<8x8xf32>
+    return %mul : tensor<8x8xf32>
   }
 }
 
-// The forall should now have 3 shared_outs.
-// CHECK: scf.forall {{.*}} shared_outs({{.*}}, {{.*}}, {{.*}})
-// After fusion, the inner for should have a 3rd iter_arg for the sidecar.
-// CHECK: scf.for {{.*}} iter_args({{.*}}, {{.*}}, {{.*}}) -> (tensor<4x8xf32>, tensor<4xf32>, tensor<4x8xf32>)
+// CHECK: %{{.*}}:4 = scf.forall
+// CHECK-SAME: shared_outs({{[^)]*}}, {{[^)]*}}, {{[^)]*}}, {{[^)]*}}) -> (tensor<8x8xf32>, tensor<8xf32>, tensor<8x8xf32>, tensor<8x8xf32>)
+// CHECK: scf.for {{.*}} iter_args({{.*}}, {{.*}}, {{.*}}, {{.*}}) -> (tensor<4x8xf32>, tensor<4xf32>, tensor<4x8xf32>, tensor<4x8xf32>)
 // CHECK: arith.subf
-// CHECK: tensor.insert_slice
+// CHECK: arith.mulf
 // CHECK: scf.yield

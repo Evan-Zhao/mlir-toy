@@ -117,9 +117,6 @@ module attributes {transform.with_named_sequence} {
     %fused_bsum, %j0_loop =
       transform.loop.fuse_reduction_consumer_into_forall %bsum into %forall_loop
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
-    // This CSE is actually required here so the next `fuse_elemwise_into_producer` can work
-    // because it unifies identical affine map operations.
-    transform.apply_cse to %func : !transform.any_op
 
     // Step 4. Prepare for rolling update. Rolling update can fuse two reductions together,
     // including all element-wise ops between them.
@@ -134,6 +131,8 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op, !transform.any_op, !transform.any_op) -> !transform.any_op
     // Don't do canonicalization here -- we have intentionally unused results.
     transform.apply_cse to %func : !transform.any_op
+    transform.print %elemwise : !transform.any_op
+    transform.print %elemwise_sidecars : !transform.any_op
 
     transform.yield
   }
