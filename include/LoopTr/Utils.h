@@ -1,6 +1,7 @@
 #ifndef LOOPTR_UTILS_H
 #define LOOPTR_UTILS_H
 
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Transform/Utils/DiagnosedSilenceableFailure.h"
@@ -14,17 +15,24 @@ namespace mlir {
     return emitSilenceableFailure(transform, "expected at least one " nameStr " payload op");
 
 #define CHECK_EXTRACT_UNIQUE_OP(state, transform, getter, nameStr, varName)                        \
-  SmallVector<Operation *> varName##Ops = llvm::to_vector((state).getPayloadOps(getter()));        \
-  if (!llvm::hasSingleElement(varName##Ops))                                                       \
-    return emitSilenceableFailure(transform, "expected exactly one " nameStr " payload op, got " + \
-                                                 std::to_string(varName##Ops.size()));             \
-  auto(varName) = varName##Ops.front();
+  Operation *(varName);                                                                            \
+  {                                                                                                \
+    SmallVector<Operation *> varName##Ops = llvm::to_vector((state).getPayloadOps(getter()));      \
+    if (!llvm::hasSingleElement(varName##Ops))                                                     \
+      return emitSilenceableFailure(transform, "expected exactly one " nameStr                     \
+                                               " payload op, got " +                               \
+                                                   std::to_string(varName##Ops.size()));           \
+    (varName) = varName##Ops.front();                                                              \
+  }
 
 #define CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getter, nameStr, varName, Type)             \
-  CHECK_EXTRACT_UNIQUE_OP(state, transform, getter, nameStr, varName##1);                          \
-  auto(varName) = dyn_cast<Type>(varName##1);                                                      \
-  if (!(varName))                                                                                  \
-    return emitSilenceableFailure(transform, "expected " nameStr " to be a " #Type);
+  Type(varName);                                                                                   \
+  {                                                                                                \
+    CHECK_EXTRACT_UNIQUE_OP(state, transform, getter, nameStr, varName##1);                        \
+    (varName) = dyn_cast<Type>(varName##1);                                                        \
+    if (!(varName))                                                                                \
+      return emitSilenceableFailure(transform, "expected " nameStr " to be a " #Type);             \
+  }
 
 #define RETURN_DIAGNOSTICS_OR_BIND_VAL(OtherType, var, expr)                                       \
   OtherType(var);                                                                                  \
@@ -56,6 +64,10 @@ struct LoopResultRelay {
 /// produce the j-th result of loops[i].
 FailureOr<SmallVector<SmallVector<LoopResultRelay>>>
 getNestedLoopResultRelays(ArrayRef<Operation *> loops);
+
+/// Matches a one-input, one-result linalg.generic with exactly one reduction iterator.
+/// Returns the reduction iterator index on success.
+FailureOr<uint64_t> matchUnarySingleReductionGeneric(linalg::GenericOp generic);
 
 } // namespace mlir
 

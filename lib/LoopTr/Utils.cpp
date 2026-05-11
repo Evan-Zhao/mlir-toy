@@ -93,4 +93,46 @@ getNestedLoopResultRelays(ArrayRef<Operation *> loops) {
   return relaysByLoop;
 }
 
+FailureOr<uint64_t> matchUnarySingleReductionGeneric(linalg::GenericOp generic) {
+  if (generic.getInputs().size() != 1 || generic.getNumDpsInits() != 1)
+    return failure();
+  if (generic->getNumResults() != 1)
+    return failure();
+
+  auto inputType = dyn_cast<RankedTensorType>(generic.getInputs().front().getType());
+  auto resultType = dyn_cast<RankedTensorType>(generic.getResults().front().getType());
+  if (!inputType || !resultType || inputType.getRank() != resultType.getRank() + 1)
+    return failure();
+
+  AffineMap inputMap = generic.getIndexingMapsArray().front();
+  if (!inputMap.isIdentity())
+    return failure();
+
+  SmallVector<utils::IteratorType> iteratorTypes = llvm::to_vector(generic.getIteratorTypesArray());
+  std::optional<uint64_t> reductionDim;
+  for (auto [index, iteratorType] : llvm::enumerate(iteratorTypes)) {
+    if (iteratorType != utils::IteratorType::reduction)
+      continue;
+    if (reductionDim.has_value())
+      return failure();
+    reductionDim = index;
+  }
+  if (!reductionDim.has_value())
+    return failure();
+
+  AffineMap outputMap = generic.getIndexingMapsArray().back();
+  if (outputMap.getNumResults() != resultType.getRank())
+    return failure();
+  int64_t reductionDimI64 = static_cast<int64_t>(*reductionDim);
+  for (int64_t dim = 0, outIdx = 0, e = inputType.getRank(); dim < e; ++dim) {
+    if (dim == reductionDimI64)
+      continue;
+    auto expr = outputMap.getResult(outIdx++);
+    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+    if (!dimExpr || dimExpr.getPosition() != dim)
+      return failure();
+  }
+  return *reductionDim;
+}
+
 } // namespace mlir

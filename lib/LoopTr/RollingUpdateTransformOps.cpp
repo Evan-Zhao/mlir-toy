@@ -8,11 +8,11 @@
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/TilingInterface.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include <deque>
-#include <mlir/Interfaces/SideEffectInterfaces.h>
 #include <optional>
 #include <variant>
 
@@ -220,6 +220,40 @@ createOneTiledSidecarOp(transform::TransformRewriter &rewriter,
                                   "failed to get result tile position for sidecar elementwise op");
 
   return std::make_tuple(tiledSidecarOp, resultOffsets, resultSizes);
+}
+
+FailureOr<DenseMap<Operation *, OpResult>> getOpToLoopResultMap(scf::ForallOp outerLoop,
+                                                                scf::ForOp innerLoop) {
+  auto loopResultRelaysF = getNestedLoopResultRelays({outerLoop, innerLoop});
+  if (failed(loopResultRelaysF))
+    return failure();
+  // loopResultRelays[i][j] refers to the j-th result of the i-th loop
+  // and describes where that result comes from, so we'll need to chain it over every i.
+  const auto &loopResultRelays = *loopResultRelaysF;
+  assert(loopResultRelays.size() == 2);
+  // This is a chained map that maps from loop-i returned result to innermost body result.
+  DenseMap<OpResult, OpResult> chainedMap;
+  // First populate it with inner loop return -> body entries
+  for (auto relay : loopResultRelays[1]) {
+    chainedMap.try_emplace(relay.loopReturnResult, relay.inLoopResult);
+  }
+  // Then chain it with outer loop return -> body, where outer loop's body result is the inner
+  // loop's returned result.
+  for (auto relay : loopResultRelays[0]) {
+    auto it = chainedMap.find(relay.inLoopResult);
+    if (it != chainedMap.end()) {
+      auto mappedValue = it->second;
+      chainedMap.erase(it);
+      chainedMap.try_emplace(relay.loopReturnResult, mappedValue);
+    }
+  }
+  // Flip the map to get what we want to return.
+  DenseMap<Operation *, OpResult> innerBodyToOuterRet;
+  for (auto &[outerRet, innerBody] : chainedMap) {
+    if (outerRet.getDefiningOp() == outerLoop)
+      innerBodyToOuterRet.try_emplace(innerBody.getDefiningOp(), outerRet);
+  }
+  return innerBodyToOuterRet;
 }
 
 } // namespace
@@ -523,13 +557,51 @@ DiagnosedSilenceableFailure
 LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
                                      TransformResults &transformResults, TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
-  CHECK_EXTRACT_UNIQUE_OP(state, transform, getReduce, "reduce", reduce);
-  CHECK_NON_EMPTY_OPS(state, transform, getElemwiseOrig, "original elementwise", elemwiseOrig);
-  CHECK_NON_EMPTY_OPS(state, transform, getElemwiseSidecars, "sidecar elementwise",
-                      elemwiseSidecars);
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getReduce, "reduce", reduce, linalg::GenericOp);
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getOuterLoop, "outer loop", outerLoop,
                                scf::ForallOp);
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getInnerLoop, "inner loop", innerLoop, scf::ForOp);
+  CHECK_NON_EMPTY_OPS(state, transform, getElemwiseOrig, "original elementwise", elemwiseOrig);
+  CHECK_NON_EMPTY_OPS(state, transform, getElemwiseSidecars, "sidecar elementwise",
+                      elemwiseSidecars);
+  if (elemwiseOrig.size() != elemwiseSidecars.size())
+    return emitSilenceableFailure(
+        transform, "expected the original and sidecar elementwise chains to have the same size");
+
+  auto redDimOrF = matchUnarySingleReductionGeneric(reduce);
+  if (failed(redDimOrF))
+    return emitSilenceableFailure(transform,
+                                  "expected reduce to be a unary single-reduction linalg.generic");
+  auto redDim = *redDimOrF;
+
+  auto opToLoopResultMap = getOpToLoopResultMap(outerLoop, innerLoop);
+  if (failed(opToLoopResultMap))
+    return emitSilenceableFailure(
+        transform, "failed to map loop return values to in-loop operations that produce them");
+
+  SmallVector<Operation *> sidecarsUsedByReduce;
+  for (auto [elemwiseOp, sidecarOp] : llvm::zip_equal(elemwiseOrig, elemwiseSidecars)) {
+    Value originalResult = elemwiseOp->getResult(0);
+    bool usedByReduce = llvm::any_of(originalResult.getUses(),
+                                     [&](OpOperand &use) { return use.getOwner() == reduce; });
+    if (!usedByReduce)
+      continue;
+
+    auto it = opToLoopResultMap->find(sidecarOp);
+    if (it == opToLoopResultMap->end()) {
+      sidecarOp->emitRemark("this sidecar op");
+      return emitSilenceableFailure(
+          transform,
+          "cannot trace the output of a sidecar operation to an output of the outer loop");
+    }
+    sidecarsUsedByReduce.push_back(sidecarOp);
+    originalResult.replaceUsesWithIf(it->second,
+                                     [&](OpOperand &use) { return use.getOwner() == reduce; });
+  }
+
+  transformResults.set(getOperation()->getResult(0), {reduce});
+  transformResults.set(getOperation()->getResult(1), sidecarsUsedByReduce);
+  return DiagnosedSilenceableFailure::success();
 }
 
 } // namespace transform
