@@ -408,6 +408,14 @@ linalg::GenericOp cloneGenericOnTile(RewriterBase &rewriter, linalg::GenericOp s
 namespace mlir {
 namespace transform {
 
+void LoopFuseIntoProducerOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  consumesHandle(getConsumerOpMutable(), effects);
+  onlyReadsHandle(getProducerLoopMutable(), effects);
+
+  producesHandle(getOperation()->getOpResults(), effects);
+  modifiesPayload(effects);
+}
+
 DiagnosedSilenceableFailure LoopFuseIntoProducerOp::apply(transform::TransformRewriter &rewriter,
                                                           TransformResults &transformResults,
                                                           TransformState &state) {
@@ -437,8 +445,16 @@ DiagnosedSilenceableFailure LoopFuseIntoProducerOp::apply(transform::TransformRe
     rewriter.eraseOp(consumer);
 
   transformResults.set(getOperation()->getResult(0), fuseResult->tiledOps);
-  transformResults.set(getOperation()->getResult(1), {loopI.getOperation()});
   return DiagnosedSilenceableFailure::success();
+}
+
+void LoopFuseReduceConsumerIntoForall::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  consumesHandle(getConsumerOpMutable(), effects);
+  onlyReadsHandle(getForallLoopMutable(), effects);
+
+  producesHandle(getOperation()->getOpResults(), effects);
+  modifiesPayload(effects);
 }
 
 DiagnosedSilenceableFailure
@@ -484,8 +500,7 @@ LoopFuseReduceConsumerIntoForall::apply(transform::TransformRewriter &rewriter,
   rewriter.replaceOp(loop, split.newForall.getResults().take_front(loop.getNumResults()));
 
   transformResults.set(getOperation()->getResult(0), {fusedReduction.getOperation()});
-  transformResults.set(getOperation()->getResult(1), {split.newForall.getOperation()});
-  transformResults.set(getOperation()->getResult(2), {split.innerFor.getOperation()});
+  transformResults.set(getOperation()->getResult(1), {split.innerFor.getOperation()});
   return DiagnosedSilenceableFailure::success();
 }
 

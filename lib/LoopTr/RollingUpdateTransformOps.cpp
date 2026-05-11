@@ -12,6 +12,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include <deque>
+#include <mlir/Interfaces/SideEffectInterfaces.h>
 #include <optional>
 #include <variant>
 
@@ -350,8 +351,7 @@ LoopRURollingUpdateNextReduction::apply(transform::TransformRewriter &rewriter,
 }
 
 void LoopRUCloneFuseElemwise::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  consumesHandle(getElemwiseChainOpsMutable(), effects);
-
+  onlyReadsHandle(getElemwiseChainOpsMutable(), effects);
   onlyReadsHandle(getOuterLoopMutable(), effects);
   onlyReadsHandle(getInnerLoopMutable(), effects);
 
@@ -363,10 +363,8 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
                                                            TransformResults &transformResults,
                                                            TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
-  SmallVector<Operation *> elemwiseOps =
-      llvm::to_vector(state.getPayloadOps(getElemwiseChainOps()));
-  if (elemwiseOps.empty())
-    return emitSilenceableFailure(transform, "expected at least one elementwise payload op");
+  CHECK_EXTRACT_UNIQUE_OP(state, transform, getElemwiseChainOps, "elementwise payload op",
+                          elemwiseOp);
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getOuterLoop, "outer loop", outerLoop,
                                scf::ForallOp);
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getInnerLoop, "inner loop", innerLoop, scf::ForOp);
@@ -375,7 +373,7 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
   //         logic as fuse_elemwise_into_producer (upstream tileAndFuseConsumer).
   SmallVector<LoopLikeOpInterface> loopNest{outerLoop};
   FailureOr<scf::SCFFuseConsumerOfSliceResult> fuseResult =
-      scf::tileAndFuseConsumer(rewriter, elemwiseOps.front(), loopNest);
+      scf::tileAndFuseConsumer(rewriter, elemwiseOp, loopNest);
   if (failed(fuseResult))
     return emitSilenceableFailure(transform,
                                   "failed to fuse elementwise consumer into forall loop");
@@ -395,11 +393,16 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
   if (std::holds_alternative<DiagnosedSilenceableFailure>(sidecarResult))
     return std::get<DiagnosedSilenceableFailure>(std::move(sidecarResult));
   auto [updatedInnerFor, sidecarOps] = std::get<1>(std::move(sidecarResult));
+  // Since fuseResult->tiledOps are now fused into the inner for, they are no longer
+  // needed and can be cleared.
+  for (auto *op : fuseResult->tiledOps) {
+    if (isOpTriviallyDead(op))
+      op->erase();
+  }
 
-  // Step 4. Return all three results.
+  // Step 4. Return the cloned sidecar chain. The loop handles are preserved and
+  // updated by replacement tracking.
   transformResults.set(getOperation()->getResult(0), sidecarOps);
-  transformResults.set(getOperation()->getResult(1), {newOuterLoop.getOperation()});
-  transformResults.set(getOperation()->getResult(2), {updatedInnerFor.getOperation()});
   return DiagnosedSilenceableFailure::success();
 }
 
