@@ -118,25 +118,26 @@ module attributes {transform.with_named_sequence} {
       transform.loop.fuse_reduction_consumer_into_forall %bsum into %forall_loop
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
 
-    // Step 4. Prepare for rolling update. Rolling update can fuse two reductions together,
-    // including all element-wise ops between them.
-    // First use rolling_update_next_reduction to find the next reduction op.
+    // Step 4. Prepare for rolling update. First find the nearest reduction
+    // frontier reachable from the loop-local value, together with the ordered
+    // elementwise chain between them.
     %reduce, %elemwise =
       transform.match.loop_ru.rolling_update_next_reduction %forall_loop
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    // rolling_update_force_fuse_elemwise fuses all element-wise ops under %forall_loop,
-    // then under %j0_loop.
+    // Clone and fuse that elementwise chain under %forall_loop and %j0_loop,
+    // publishing the sidecar tensors as extra loop results.
     %elemwise_sidecars =
       transform.loop_ru.clone_fuse_elemwise %elemwise into %forall_loop, %j0_loop
         : (!transform.any_op, !transform.any_op, !transform.any_op) -> !transform.any_op
-    transform.print %elemwise : !transform.any_op
-    transform.print %elemwise_sidecars : !transform.any_op
+    // Repair the first reduction frontier by turning it into loop-carried state
+    // driven by the relayed sidecar value.
     %reduce_r, %elemwise_r =
       transform.loop_ru.repair_reduction_frontier %reduce and %elemwise as %elemwise_sidecars
         into %forall_loop, %j0_loop
         : (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)
         -> (!transform.any_op, !transform.any_op)
     // Doing canonicalization earlier than here would undo some of the cloning done above.
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %func : !transform.any_op
 
     transform.yield
