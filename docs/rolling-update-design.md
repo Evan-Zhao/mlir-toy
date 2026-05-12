@@ -76,8 +76,7 @@ so technically no program semantic is violated.
 Signature:
 
 ```text
-(elemwise_ops, parallel_loop, streaming_loop)
-  -> (sidecar_ops)
+(elemwise_ops, parallel_loop, streaming_loop) -> (sidecar_ops)
 ```
 
 The transform clones each elementwise op, fuses it under the loop,
@@ -87,9 +86,18 @@ The input loop handles are preserved rather than consumed. If the transform
 rebuilds either loop, transform tracking remaps the existing handles to the
 replacement loops.
 
-The sidecar chain is intentionally incomplete at this point.
-It may compute values that are different from their out-of-loop counterparts.
-That is acceptable as long as those sidecar values are not published to the original users yet.
+The transform rebuilds both loops:
+
+- the inner `scf.for` gets one extra iter_arg/result per sidecar tensor,
+- the outer `scf.forall` gets matching extra shared_out/result slots.
+
+Each sidecar op is cloned under the inner loop, tiled from loop-local producer tiles,
+inserted into its full-tensor sidecar destination, and relayed through the outer loop.
+
+Crucially, this still does not change the uses of the original out-of-loop
+elementwise chain. The sidecar values are published as additional loop results,
+but they are not yet substituted into the original computation except by the
+later repair step.
 
 ### Reduction Checkpoint And Repair
 

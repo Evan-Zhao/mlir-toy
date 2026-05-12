@@ -101,6 +101,11 @@ def LoopRUCloneFuseElemwise : Op<Transform_Dialect, "loop_ru.clone_fuse_elemwise
     Fusing into `scf.for` can change the semantics of the sidecar
     (when the elemwise reads from a reduction), while the original op remains unchanged.
 
+    The transform also rebuilds both loops to carry and publish the full-tensor
+    sidecar results as additional loop outputs. Those new loop results are not
+    wired into the original users yet; they are only made available for a later
+    repair step at the reduction frontier.
+
     All the three input handles are read-only (not consumed). The loops are changed (actually
     cloned and replaces the old ones) during fusion, and these handles are remapped to point
     to the new loops. The `elemwise_chain_ops` handle is preserved because the elemwise ops
