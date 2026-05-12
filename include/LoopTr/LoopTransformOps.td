@@ -129,17 +129,19 @@ def LoopRURepairReductionFrontier
   let summary = "Repair a reduction frontier using fused sidecar ops under a streaming loop";
 
   let description = [{
-    Atomic rolling-update step that rebuilds a reduction frontier as a repaired
-    loop-carried recurrence.
+    First reduction-frontier repair step for rolling update.
 
     Takes the frontier reduction, the ordered sidecar chain already fused under
     the streaming loop, the enclosing `scf.forall`, and the refreshed inner
-    `scf.for`. The intended implementation will convert the frontier into
-    loop-carried state, derive the repair term implied by the sidecar chain,
-    and rewrite the frontier and sidecar users to the repaired recurrence.
+    `scf.for`. The current implementation supports unary single-result
+    `linalg.generic` reductions that consume exactly one value from the
+    original elementwise chain.
 
-    The current implementation is a stub: it returns refreshed handles while
-    leaving the payload IR unchanged.
+    It rewires that reduction use to the matching relayed sidecar result,
+    rebuilds the outer `scf.forall` with one extra shared_out/result,
+    rebuilds the inner `scf.for` with one extra iter_arg/result, clones the
+    reduction under the inner loop on the sidecar tile, and relays the new
+    reduction state through the rebuilt outer loop.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$reduce,
