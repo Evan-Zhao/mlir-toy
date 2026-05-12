@@ -2,6 +2,7 @@
 
 #include "LoopTr/Utils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -747,6 +748,39 @@ LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
                                          elemwiseOrig, elemwiseSidecars);
   if (!fuseResult.succeeded())
     return fuseResult;
+
+  // Fuse sidecar ops into `reduce` and other sidecar ops, in a TVM "compute_inline" manner.
+  SmallPtrSet<Operation *, 4> sidecarSet(elemwiseSidecars.begin(), elemwiseSidecars.end());
+  // MLIR "compute-inlining" is provided by `linalg::fuseElementwiseOps`, which takes only an
+  // operand on the consumer side, and "pulls in" the producers.
+  // We figure out which operand of the consumer is provided by one of the sidecar ops.
+  // Returning the operand number because OpOperand is not copyable.
+  auto findFusableOperand =
+      [&sidecarSet](Operation *consumer) -> std::optional<std::pair<Operation *, unsigned>> {
+    for (auto &operand : consumer->getOpOperands()) {
+      auto producer = operand.get().getDefiningOp();
+      if (producer && sidecarSet.count(producer)) {
+        return std::make_pair(producer, operand.getOperandNumber());
+      }
+    }
+    return std::nullopt;
+  };
+
+  rewriter.setInsertionPointAfter(thisRed);
+  Operation *consumer = reduce;
+  while (auto nextFusionTarget = findFusableOperand(consumer)) {
+    // `producer` is guaranteed to be a sidecar op.
+    auto [producer, consumerOpndNum] = *nextFusionTarget;
+    FailureOr<linalg::ElementwiseOpFusionResult> fusionResult =
+        linalg::fuseElementwiseOps(rewriter, &consumer->getOpOperand(consumerOpndNum));
+    if (failed(fusionResult)) {
+      producer->emitError("when fusing this op...");
+      consumer->emitError("into this op...");
+      BAIL("failed to fuse sidecar and reduce ops");
+    }
+    consumer = fusionResult->fusedOp;
+  }
+  llvm::errs() << "Fusion succeeded and produced " << *consumer << "\n";
 
   transformResults.set(getOperation()->getResult(0), {reduce.getOperation()});
   transformResults.set(getOperation()->getResult(1), elemwiseSidecars);
