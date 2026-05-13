@@ -721,10 +721,10 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
 
 void LoopRURepairReductionFrontier::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  consumesHandle(getReduceMutable(), effects);
-  consumesHandle(getElemwiseOrigMutable(), effects);
-  consumesHandle(getElemwiseSidecarsMutable(), effects);
-
+  onlyReadsHandle(getProducerReducesMutable(), effects);
+  consumesHandle(getThisReduceMutable(), effects);
+  onlyReadsHandle(getElemwiseOrigMutable(), effects);
+  onlyReadsHandle(getElemwiseSidecarsMutable(), effects);
   onlyReadsHandle(getOuterLoopMutable(), effects);
   onlyReadsHandle(getInnerLoopMutable(), effects);
 
@@ -737,7 +737,9 @@ LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
                                      TransformResults &transformResults, TransformState &state) {
   // Do some basic validation.
   auto transform = cast<TransformOpInterface>(getOperation());
-  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getReduce, "reduce", reduce, GenericOp);
+  CHECK_NON_EMPTY_OPS(state, transform, getProducerReduces, "producer reductions", producerReds);
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getThisReduce, "this reduction", thisRed,
+                               GenericOp);
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getOuterLoop, "outer loop", outerLoop, ForallOp);
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getInnerLoop, "inner loop", innerLoop, ForOp);
   CHECK_NON_EMPTY_OPS(state, transform, getElemwiseOrig, "original elementwise", elemwiseOrig);
@@ -747,7 +749,7 @@ LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
     BAIL("expected the original and sidecar elementwise chains to have the same size");
 
   // Get the reduce axis of the reduction.
-  auto redDimOrF = matchUnarySingleReductionGeneric(reduce);
+  auto redDimOrF = matchUnarySingleReductionGeneric(thisRed);
   if (failed(redDimOrF))
     BAIL("expected reduce to be a unary single-reduction linalg.generic");
   auto redDim = *redDimOrF;
@@ -755,7 +757,7 @@ LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
   // Fuse the reduce operation into the loop nest, changing its input from `elemwiseOrig` to
   // `elemwiseSidecars`. This function takes `elemwiseOrig`, `outerLoop`, etc. by reference,
   // and updates them to point to new operations.
-  auto fuseResult = fuseReduceInLoopNest(transform, rewriter, outerLoop, innerLoop, reduce, redDim,
+  auto fuseResult = fuseReduceInLoopNest(transform, rewriter, outerLoop, innerLoop, thisRed, redDim,
                                          elemwiseOrig, elemwiseSidecars);
   if (!fuseResult.succeeded())
     return fuseResult;
@@ -778,7 +780,7 @@ LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
   };
 
   rewriter.setInsertionPointAfter(thisRed);
-  Operation *consumer = reduce;
+  Operation *consumer = thisRed;
   while (auto nextFusionTarget = findFusableOperand(consumer)) {
     // `producer` is guaranteed to be a sidecar op.
     auto [producer, consumerOpndNum] = *nextFusionTarget;
@@ -793,8 +795,7 @@ LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
   }
   llvm::errs() << "Fusion succeeded and produced " << *consumer << "\n";
 
-  transformResults.set(getOperation()->getResult(0), {reduce.getOperation()});
-  transformResults.set(getOperation()->getResult(1), elemwiseSidecars);
+  transformResults.set(getOperation()->getResult(0), {thisRed.getOperation()});
   return DiagnosedSilenceableFailure::success();
 }
 
