@@ -2,6 +2,25 @@ include "mlir/Dialect/Transform/IR/TransformDialect.td"
 include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
+def ApplyLoopTensorSubsetCanonicalizationPatternsOp
+    : Op<Transform_Dialect, "apply_patterns.loop.tensor_subset_canonicalization",
+         [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
+  let summary = "Apply a narrow subset of tensor subset canonicalizations";
+
+  let description = [{
+    Applies a narrow subset of tensor subset canonicalization patterns without
+    enabling the broader canonicalizer. In particular, this forwards matching
+    `tensor.extract_slice(tensor.insert_slice(...))` and
+    `tensor.insert_slice(tensor.extract_slice(...))` pairs.
+
+    This is useful when the payload should keep unrelated dead code intact,
+    while still simplifying direct tensor subset round trips created by earlier
+    structural transforms.
+  }];
+
+  let assemblyFormat = "attr-dict";
+}
+
 def LoopFuseIntoProducerOp : Op<Transform_Dialect, "loop.fuse_into_producer_op",
          [FunctionalStyleTransformOpTrait,
           DeclareOpInterfaceMethods<TransformOpInterface>,

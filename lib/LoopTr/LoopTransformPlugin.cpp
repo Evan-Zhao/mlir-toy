@@ -16,7 +16,8 @@ void registerLoopTransformExtension(mlir::DialectRegistry &registry) {
       using mlir::Dialect::addOperations;
     };
     static_cast<TransformDialectAccess *>(dialect)
-        ->addOperations<mlir::transform::LoopFuseIntoProducerOp,
+        ->addOperations<mlir::transform::ApplyLoopTensorSubsetCanonicalizationPatternsOp,
+                        mlir::transform::LoopFuseIntoProducerOp,
                         mlir::transform::LoopFuseReduceConsumerIntoForall,
                         mlir::transform::LoopRURollingUpdateNextReduction,
                         mlir::transform::LoopRUCloneFuseElemwise,
