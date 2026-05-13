@@ -6,9 +6,11 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Tensor/Utils/Utils.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/TilingInterface.h"
 #include "llvm/ADT/STLExtras.h"
 #include <deque>
@@ -245,9 +247,29 @@ createOneTiledSidecarOp(transform::TransformRewriter &rewriter,
                                   "failed to tile sidecar elementwise op from operand tiles");
 
   auto tiledSidecarOp = cast<TilingInterface>(tiledSidecar->tiledOps[0]);
+  llvm::SmallPtrSet<Operation *, 4> deadOperandProducers;
   for (auto [fusedOperandNum, fusedTile] : llvm::zip_equal(fusedOperandNumbers, fusedTiles)) {
-    rewriter.replaceAllUsesWith(tiledSidecarOp->getOperand(fusedOperandNum), fusedTile);
+    Value oldOperand = tiledSidecarOp->getOperand(fusedOperandNum);
+    if (oldOperand == fusedTile)
+      continue;
+    Operation *oldProducer = oldOperand.getDefiningOp();
+    tiledSidecarOp->setOperand(fusedOperandNum, fusedTile);
+    if (oldProducer && isOpTriviallyDead(oldProducer))
+      deadOperandProducers.insert(oldProducer);
   }
+  for (OpOperand &operand : tiledSidecarOp->getOpOperands()) {
+    auto extractSlice = operand.get().getDefiningOp<tensor::ExtractSliceOp>();
+    if (!extractSlice || !tensor::isCastLikeExtractSliceOp(extractSlice))
+      continue;
+    Value source = extractSlice.getSource();
+    if (source.getType() != extractSlice.getType())
+      continue;
+    operand.set(source);
+    if (isOpTriviallyDead(extractSlice))
+      deadOperandProducers.insert(extractSlice);
+  }
+  for (Operation *deadProducer : deadOperandProducers)
+    rewriter.eraseOp(deadProducer);
   rewriter.eraseOp(clonedConsumerOp);
 
   SmallVector<OpFoldResult> iterDomainOffsets, iterDomainSizes;
@@ -592,8 +614,13 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
   // Step 2. Clone the elementwise chain under the rebuilt loop, tile each op
   // from loop-local producer tiles, and append the new sidecar tensors to the yield.
   DenseMap<Value, Value> loopResultValues;
+  DenseMap<Value, Value> latestLoopStateValues;
   for (auto [index, result] : llvm::enumerate(innerLoop.getResults()))
     loopResultValues[result] = newLoop.getRegionIterArgs()[index];
+  for (auto [index, iterArg] : llvm::enumerate(innerLoop.getRegionIterArgs())) {
+    latestLoopStateValues[iterArg] = clonedYieldOperands[index];
+    latestLoopStateValues[innerLoop.getResult(index)] = clonedYieldOperands[index];
+  }
   SmallVector<Operation *> sidecarOps;
   sidecarOps.reserve(elemwiseOps.size());
   SmallVector<Value> sidecarYieldOperands;
@@ -606,9 +633,12 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
     for (Value &input : remappedFullInputs) {
       if (auto mapped = sidecarValueInfo.find(input); mapped != sidecarValueInfo.end()) {
         input = mapped->second.fullValue;
+      } else if (auto latest = latestLoopStateValues.find(input);
+                 latest != latestLoopStateValues.end()) {
+        input = latest->second;
       } else if (auto seeded = seededLoopResultsMap.find(input);
                  seeded != seededLoopResultsMap.end()) {
-        input = loopResultValues[innerLoop.getResult(seeded->second)];
+        input = latestLoopStateValues[innerLoop.getResult(seeded->second)];
       } else if (auto mapped = loopResultValues.find(input); mapped != loopResultValues.end()) {
         input = mapped->second;
       }
@@ -651,6 +681,17 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
   SmallVector<Value> newYieldOperands = clonedYieldOperands;
   newYieldOperands.append(sidecarYieldOperands.begin(), sidecarYieldOperands.end());
   scf::YieldOp::create(rewriter, innerLoop.getLoc(), newYieldOperands);
+
+  // Notify the rewriter about the operation replacements. This allows all handles in the same
+  // transform-dialect program to stay valid.
+  // The `rewriter.replaceOp` step next will not update sub-operations recursively, so we'll need to
+  // do this ourselves.
+  for (auto &[k, v] : mapping.getOperationMap()) {
+    // This fails when `k` is not tracked by any handle, and that is not a problem.
+    if (failed(rewriter.notifyPayloadOperationReplaced(k, v)))
+      continue;
+  }
+  // Update the loop.
   rewriter.replaceOp(innerLoop, newLoop.getResults().take_front(oldNumResults));
 
   // Step 3. Relay the new inner-loop results through the outer forall using the
@@ -710,10 +751,10 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
 
 void LoopRURepairReductionFrontier::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  consumesHandle(getReduceMutable(), effects);
-  consumesHandle(getElemwiseOrigMutable(), effects);
-  consumesHandle(getElemwiseSidecarsMutable(), effects);
-
+  onlyReadsHandle(getProducerReducesMutable(), effects);
+  consumesHandle(getThisReduceMutable(), effects);
+  onlyReadsHandle(getElemwiseOrigMutable(), effects);
+  onlyReadsHandle(getElemwiseSidecarsMutable(), effects);
   onlyReadsHandle(getOuterLoopMutable(), effects);
   onlyReadsHandle(getInnerLoopMutable(), effects);
 
@@ -726,7 +767,9 @@ LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
                                      TransformResults &transformResults, TransformState &state) {
   // Do some basic validation.
   auto transform = cast<TransformOpInterface>(getOperation());
-  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getReduce, "reduce", reduce, GenericOp);
+  CHECK_NON_EMPTY_OPS(state, transform, getProducerReduces, "producer reductions", producerReds);
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getThisReduce, "this reduction", thisRed,
+                               GenericOp);
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getOuterLoop, "outer loop", outerLoop, ForallOp);
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getInnerLoop, "inner loop", innerLoop, ForOp);
   CHECK_NON_EMPTY_OPS(state, transform, getElemwiseOrig, "original elementwise", elemwiseOrig);
@@ -736,7 +779,7 @@ LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
     BAIL("expected the original and sidecar elementwise chains to have the same size");
 
   // Get the reduce axis of the reduction.
-  auto redDimOrF = matchUnarySingleReductionGeneric(reduce);
+  auto redDimOrF = matchUnarySingleReductionGeneric(thisRed);
   if (failed(redDimOrF))
     BAIL("expected reduce to be a unary single-reduction linalg.generic");
   auto redDim = *redDimOrF;
@@ -744,7 +787,7 @@ LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
   // Fuse the reduce operation into the loop nest, changing its input from `elemwiseOrig` to
   // `elemwiseSidecars`. This function takes `elemwiseOrig`, `outerLoop`, etc. by reference,
   // and updates them to point to new operations.
-  auto fuseResult = fuseReduceInLoopNest(transform, rewriter, outerLoop, innerLoop, reduce, redDim,
+  auto fuseResult = fuseReduceInLoopNest(transform, rewriter, outerLoop, innerLoop, thisRed, redDim,
                                          elemwiseOrig, elemwiseSidecars);
   if (!fuseResult.succeeded())
     return fuseResult;
@@ -767,7 +810,7 @@ LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
   };
 
   rewriter.setInsertionPointAfter(thisRed);
-  Operation *consumer = reduce;
+  Operation *consumer = thisRed;
   while (auto nextFusionTarget = findFusableOperand(consumer)) {
     // `producer` is guaranteed to be a sidecar op.
     auto [producer, consumerOpndNum] = *nextFusionTarget;
@@ -781,9 +824,9 @@ LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
     consumer = fusionResult->fusedOp;
   }
   llvm::errs() << "Fusion succeeded and produced " << *consumer << "\n";
+  llvm::errs() << "The function: " << *outerLoop->getParentOp() << "\n";
 
-  transformResults.set(getOperation()->getResult(0), {reduce.getOperation()});
-  transformResults.set(getOperation()->getResult(1), elemwiseSidecars);
+  transformResults.set(getOperation()->getResult(0), {thisRed.getOperation()});
   return DiagnosedSilenceableFailure::success();
 }
 

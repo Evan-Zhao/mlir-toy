@@ -108,20 +108,20 @@ module attributes {transform.with_named_sequence} {
     // Step 3. Match a reduction op that is a consumer of bscale.
     // This would be the row-max op in attention softmax.
     // Because of how MLIR scf.for and linalg work, this fusion implicitly also rfactors the reduction.
-    //   TVM: sch.reverse_compute_at(bsum, j0); sch.rfactor(...)
+    //   TVM: sch.reverse_compute_at(bmax, j0); sch.rfactor(...)
     %consumers_1 = transform.get_consumers_of_result %forall_loop[0]
         : (!transform.any_op) -> !transform.any_op
-    %_2, %bsum = transform.foreach_match restrict_root in %consumers_1
+    %_2, %bmax = transform.foreach_match restrict_root in %consumers_1
         @match_unary_reduction -> @return_matched
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %fused_bsum, %j0_loop =
-      transform.loop.fuse_reduction_consumer_into_forall %bsum into %forall_loop
+    %fused_bmax, %j0_loop =
+      transform.loop.fuse_reduction_consumer_into_forall %bmax into %forall_loop
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
 
     // Step 4. Prepare for rolling update. First find the nearest reduction
     // frontier reachable from the loop-local value, together with the ordered
     // elementwise chain between them.
-    %reduce, %elemwise =
+    %bsum, %elemwise =
       transform.match.loop_ru.rolling_update_next_reduction %forall_loop
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     // Clone and fuse that elementwise chain under %forall_loop and %j0_loop,
@@ -131,11 +131,11 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op, !transform.any_op, !transform.any_op) -> !transform.any_op
     // Repair the first reduction frontier by turning it into loop-carried state
     // driven by the relayed sidecar value.
-    %reduce_r, %elemwise_r =
-      transform.loop_ru.repair_reduction_frontier %reduce and %elemwise as %elemwise_sidecars
-        into %forall_loop, %j0_loop
-        : (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op)
-        -> (!transform.any_op, !transform.any_op)
+    transform.print %fused_bmax : !transform.any_op
+    %reduce_r = transform.loop_ru.repair_reduction_frontier
+        (%fused_bmax, %bsum) and (%elemwise, %elemwise_sidecars) into %forall_loop, %j0_loop
+        : (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op,
+        !transform.any_op, !transform.any_op) -> !transform.any_op
     // Doing canonicalization earlier than here would undo some of the cloning done above.
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %func : !transform.any_op
