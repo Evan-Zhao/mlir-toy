@@ -651,6 +651,17 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
   SmallVector<Value> newYieldOperands = clonedYieldOperands;
   newYieldOperands.append(sidecarYieldOperands.begin(), sidecarYieldOperands.end());
   scf::YieldOp::create(rewriter, innerLoop.getLoc(), newYieldOperands);
+
+  // Notify the rewriter about the operation replacements. This allows all handles in the same
+  // transform-dialect program to stay valid.
+  // The `rewriter.replaceOp` step next will not update sub-operations recursively, so we'll need to
+  // do this ourselves.
+  for (auto &[k, v] : mapping.getOperationMap()) {
+    // This fails when `k` is not tracked by any handle, and that is not a problem.
+    if (failed(rewriter.notifyPayloadOperationReplaced(k, v)))
+      continue;
+  }
+  // Update the loop.
   rewriter.replaceOp(innerLoop, newLoop.getResults().take_front(oldNumResults));
 
   // Step 3. Relay the new inner-loop results through the outer forall using the
