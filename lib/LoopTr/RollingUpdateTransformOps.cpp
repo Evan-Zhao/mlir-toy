@@ -6,9 +6,11 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Tensor/Utils/Utils.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/TilingInterface.h"
 #include "llvm/ADT/STLExtras.h"
 #include <deque>
@@ -245,9 +247,29 @@ createOneTiledSidecarOp(transform::TransformRewriter &rewriter,
                                   "failed to tile sidecar elementwise op from operand tiles");
 
   auto tiledSidecarOp = cast<TilingInterface>(tiledSidecar->tiledOps[0]);
+  llvm::SmallPtrSet<Operation *, 4> deadOperandProducers;
   for (auto [fusedOperandNum, fusedTile] : llvm::zip_equal(fusedOperandNumbers, fusedTiles)) {
-    rewriter.replaceAllUsesWith(tiledSidecarOp->getOperand(fusedOperandNum), fusedTile);
+    Value oldOperand = tiledSidecarOp->getOperand(fusedOperandNum);
+    if (oldOperand == fusedTile)
+      continue;
+    Operation *oldProducer = oldOperand.getDefiningOp();
+    tiledSidecarOp->setOperand(fusedOperandNum, fusedTile);
+    if (oldProducer && isOpTriviallyDead(oldProducer))
+      deadOperandProducers.insert(oldProducer);
   }
+  for (OpOperand &operand : tiledSidecarOp->getOpOperands()) {
+    auto extractSlice = operand.get().getDefiningOp<tensor::ExtractSliceOp>();
+    if (!extractSlice || !tensor::isCastLikeExtractSliceOp(extractSlice))
+      continue;
+    Value source = extractSlice.getSource();
+    if (source.getType() != extractSlice.getType())
+      continue;
+    operand.set(source);
+    if (isOpTriviallyDead(extractSlice))
+      deadOperandProducers.insert(extractSlice);
+  }
+  for (Operation *deadProducer : deadOperandProducers)
+    rewriter.eraseOp(deadProducer);
   rewriter.eraseOp(clonedConsumerOp);
 
   SmallVector<OpFoldResult> iterDomainOffsets, iterDomainSizes;
@@ -592,8 +614,13 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
   // Step 2. Clone the elementwise chain under the rebuilt loop, tile each op
   // from loop-local producer tiles, and append the new sidecar tensors to the yield.
   DenseMap<Value, Value> loopResultValues;
+  DenseMap<Value, Value> latestLoopStateValues;
   for (auto [index, result] : llvm::enumerate(innerLoop.getResults()))
     loopResultValues[result] = newLoop.getRegionIterArgs()[index];
+  for (auto [index, iterArg] : llvm::enumerate(innerLoop.getRegionIterArgs())) {
+    latestLoopStateValues[iterArg] = clonedYieldOperands[index];
+    latestLoopStateValues[innerLoop.getResult(index)] = clonedYieldOperands[index];
+  }
   SmallVector<Operation *> sidecarOps;
   sidecarOps.reserve(elemwiseOps.size());
   SmallVector<Value> sidecarYieldOperands;
@@ -606,9 +633,12 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
     for (Value &input : remappedFullInputs) {
       if (auto mapped = sidecarValueInfo.find(input); mapped != sidecarValueInfo.end()) {
         input = mapped->second.fullValue;
+      } else if (auto latest = latestLoopStateValues.find(input);
+                 latest != latestLoopStateValues.end()) {
+        input = latest->second;
       } else if (auto seeded = seededLoopResultsMap.find(input);
                  seeded != seededLoopResultsMap.end()) {
-        input = loopResultValues[innerLoop.getResult(seeded->second)];
+        input = latestLoopStateValues[innerLoop.getResult(seeded->second)];
       } else if (auto mapped = loopResultValues.find(input); mapped != loopResultValues.end()) {
         input = mapped->second;
       }
@@ -766,7 +796,7 @@ LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
     return std::nullopt;
   };
 
-  rewriter.setInsertionPointAfter(thisRed);
+  rewriter.setInsertionPointAfter(reduce);
   Operation *consumer = reduce;
   while (auto nextFusionTarget = findFusableOperand(consumer)) {
     // `producer` is guaranteed to be a sidecar op.
