@@ -5,7 +5,6 @@
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/IRMapping.h"
@@ -33,153 +32,47 @@ bool isReductionLike(Operation *op) {
   });
 }
 
-/// Builds a map from in-loop producer operations in `innerLoop` to the
-/// corresponding relayed result of `outerLoop`.
-FailureOr<DenseMap<Operation *, OpResult>> getOpToLoopResultMap(ForallOp outerLoop,
-                                                                ForOp innerLoop) {
-  auto chainedMapF = getChainedLoopResultMap({outerLoop, innerLoop});
-  if (failed(chainedMapF))
-    return failure();
-
-  DenseMap<Operation *, OpResult> innerBodyToOuterRet;
-  for (const auto &[outerRet, relays] : *chainedMapF) {
-    assert(!relays.empty());
-    if (outerRet.getDefiningOp() != outerLoop)
-      continue;
-    if (Operation *innerProducer = relays.front().inLoopResult.getDefiningOp())
-      innerBodyToOuterRet.try_emplace(innerProducer, outerRet);
-  }
-  return innerBodyToOuterRet;
-}
-
 DiagnosedSilenceableFailure fuseReduceInLoopNest(TransformOpInterface transform,
                                                  RewriterBase &rewriter, ForallOp &outerLoop,
-                                                 ForOp &innerLoop, GenericOp &reduce, size_t redDim,
+                                                 ForOp &innerLoop, GenericOp &reduce,
                                                  SmallVector<Operation *> &elemwiseOrig,
                                                  SmallVector<Operation *> &elemwiseSidecars) {
-  // Step 1. Find the elementwise ops that the reduction reads. For each elementwise `e_i`, there is
-  // a cloned "sidecar" version `s_i` under the nested loop. `s_i` computes a tile of result at a
-  // time, which accumulates over the loop iterations, so the outer loop has a corresponding result
-  // `r_j`. The following chunk of code finds this `j` (which is `resultNumber` below).
-  auto opToLoopResultMap = getOpToLoopResultMap(outerLoop, innerLoop);
-  if (failed(opToLoopResultMap))
+  // Step 1. Build a value map that rewires the original elementwise chain to the corresponding
+  // sidecar values relayed by the outer loop.
+  auto chainedMapR = getChainedLoopResultMap({outerLoop, innerLoop});
+  if (failed(chainedMapR))
     BAIL("failed to map loop return values to in-loop operations that produce them");
-  SmallVector<std::pair<Operation *, unsigned>> sidecarsUsedByReduce;
+  DenseMap<Operation *, SmallVector<OpResult>> opToLoopResultMap;
+  for (const auto &[outerRet, relays] : *chainedMapR) {
+    assert(!relays.empty());
+    if (Operation *innerProducer = relays.front().inLoopResult.getDefiningOp())
+      opToLoopResultMap[innerProducer].push_back(outerRet);
+  }
+  IRMapping stagedReductionMapping;
   for (auto [elemwiseOp, sidecarOp] : llvm::zip_equal(elemwiseOrig, elemwiseSidecars)) {
-    Value originalResult = elemwiseOp->getResult(0);
-    bool usedByReduce = llvm::any_of(originalResult.getUses(),
-                                     [&](OpOperand &use) { return use.getOwner() == reduce; });
-    if (!usedByReduce)
-      continue;
-    auto it = opToLoopResultMap->find(sidecarOp);
-    if (it == opToLoopResultMap->end()) {
+    auto it = opToLoopResultMap.find(sidecarOp);
+    if (it == opToLoopResultMap.end()) {
       sidecarOp->emitRemark("this sidecar op");
       BAIL("cannot trace the output of a sidecar operation to an output of the outer loop");
     }
-    sidecarsUsedByReduce.emplace_back(sidecarOp, it->second.getResultNumber());
+    for (auto [opResult, loopResult] : llvm::zip_equal(elemwiseOp->getResults(), it->second))
+      stagedReductionMapping.map(opResult, loopResult);
   }
-  if (size_t size = sidecarsUsedByReduce.size(); size != 1) {
-    reduce->emitRemark("this reduction:");
-    BAIL("expected the reduction to consume exactly one elementwise result; got " +
-         std::to_string(size) + " results");
-  }
-  auto [sidecarOp, resultNumber] = sidecarsUsedByReduce.front();
 
-  // Step 2. Add a fresh reduction slot to the outer forall, recover the sidecar
-  // slice geometry from the chosen relayed result, and seed the inner reduction tile.
-  unsigned oldNumOuterResults = outerLoop.getNumResults();
-  rewriter.setInsertionPoint(outerLoop);
-  IRMapping reductionInitMapping;
-  FailureOr<Value> reductionInit = cloneValueDefChainAtInsertionPoint(
-      rewriter, reduce.getDpsInits().front(), reductionInitMapping);
-  if (failed(reductionInit))
-    BAIL("failed to clone a dominating init tensor for the fused reduction");
-  SmallVector<Value> newOuterOutputs = llvm::to_vector(outerLoop.getOutputs());
-  newOuterOutputs.push_back(*reductionInit);
-  auto newOuterLoop =
-      ForallOp::create(rewriter, outerLoop.getLoc(), outerLoop.getMixedLowerBound(),
-                       outerLoop.getMixedUpperBound(), outerLoop.getMixedStep(), newOuterOutputs,
-                       outerLoop.getMapping(), [](OpBuilder &, Location, ValueRange) {});
-  Block *oldOuterBody = outerLoop.getBody();
-  Block *newOuterBody = newOuterLoop.getBody();
-  rewriter.mergeBlocks(oldOuterBody, newOuterBody,
-                       newOuterBody->getArguments().take_front(oldOuterBody->getNumArguments()));
-
-  auto producerOuterResult = cast<OpResult>(newOuterLoop->getResult(resultNumber));
-  auto producerOuterInsertF =
-      getParallelInsertSliceForLoopResult(newOuterLoop, producerOuterResult);
-  if (failed(producerOuterInsertF))
-    BAIL("failed to find the outer-loop relay for the reduction producer sidecar");
-  auto producerOuterInsert = *producerOuterInsertF;
-
-  auto dropAt = [](SmallVector<OpFoldResult> values, uint64_t index) {
-    values.erase(values.begin() + index);
-    return values;
-  };
-  SmallVector<OpFoldResult> reductionOffsets =
-      dropAt(producerOuterInsert.getMixedOffsets(), redDim);
-  SmallVector<OpFoldResult> reductionSizes = dropAt(producerOuterInsert.getMixedSizes(), redDim);
-  SmallVector<OpFoldResult> reductionStrides = getUnitStrides(rewriter, reductionOffsets.size());
-
-  // Step 3. Rebuild the inner loop with one extra iter_arg/result for the fused
-  // reduction, then relay that new result through the rebuilt outer forall.
-  unsigned oldNumInnerResults = innerLoop.getNumResults();
-  rewriter.setInsertionPoint(innerLoop);
-  Value reductionTileInit = createExtractSliceFromState(
-      rewriter, reduce.getLoc(), newOuterLoop.getRegionIterArgs().back(), reductionOffsets,
-      reductionSizes, reductionStrides);
-  SmallVector<Value> newInnerInitArgs = llvm::to_vector(innerLoop.getInitArgs());
-  newInnerInitArgs.push_back(reductionTileInit);
-  auto newInnerLoop =
-      ForOp::create(rewriter, innerLoop.getLoc(), innerLoop.getLowerBound(),
-                    innerLoop.getUpperBound(), innerLoop.getStep(), newInnerInitArgs);
-
-  auto *newInnerBody = newInnerLoop.getBody();
-  IRMapping mapping;
-  mapping.map(innerLoop.getInductionVar(), newInnerLoop.getInductionVar());
-  for (auto [index, oldArg] : llvm::enumerate(innerLoop.getRegionIterArgs()))
-    mapping.map(oldArg, newInnerLoop.getRegionIterArgs()[index]);
-
-  rewriter.setInsertionPointToEnd(newInnerBody);
-  for (Operation &op : innerLoop.getBody()->without_terminator())
-    rewriter.clone(op, mapping);
-
-  auto oldYield = cast<scf::YieldOp>(innerLoop.getBody()->getTerminator());
-  SmallVector<Value> newYieldOperands;
-  newYieldOperands.reserve(oldYield.getNumOperands() + 1);
-  for (Value operand : oldYield.getOperands())
-    newYieldOperands.push_back(mapping.lookupOrDefault(operand));
-
-  auto clonedSidecarResult = dyn_cast<OpResult>(mapping.lookupOrDefault(sidecarOp->getResult(0)));
-  if (!clonedSidecarResult)
-    BAIL("failed to remap the sidecar op result into the rebuilt inner loop");
-  rewriter.setInsertionPointToEnd(newInnerBody);
-  auto fusedReduction =
-      cloneGenericOnTile(rewriter, reduce, clonedSidecarResult,
-                         newInnerLoop.getRegionIterArgs().back(), reduce.getLoc());
-  newYieldOperands.push_back(fusedReduction.getResult(0));
-  scf::YieldOp::create(rewriter, innerLoop.getLoc(), newYieldOperands);
-  rewriter.replaceOp(innerLoop, newInnerLoop.getResults().take_front(oldNumInnerResults));
-
-  pointRewriterToForallParallel(rewriter, newOuterLoop);
-  tensor::ParallelInsertSliceOp::create(rewriter, reduce.getLoc(), newInnerLoop.getResults().back(),
-                                        newOuterLoop.getRegionIterArgs().back(), reductionOffsets,
-                                        reductionSizes, reductionStrides);
-  rewriter.replaceOp(outerLoop, newOuterLoop.getResults().take_front(oldNumOuterResults));
-  rewriter.replaceOp(reduce, newOuterLoop.getResults().back());
-
-  // Step 4. Remap operations to their cloned counterparts, since the original ops were erased
-  // during the rebuild.
-  reduce = fusedReduction;
-  outerLoop = newOuterLoop;
-  innerLoop = newInnerLoop;
-  // For elemwise ops (no need to update original elemwise, because they weren't changed)
-  for (size_t i = 0; i < elemwiseSidecars.size(); ++i) {
-    elemwiseSidecars[i] = dyn_cast_if_present<GenericOp>(
-        mapping.lookupOrDefault(elemwiseSidecars[i]->getResult(0)).getDefiningOp());
-    if (!elemwiseSidecars[i])
-      BAIL("failed to remap elemwise (sidecars) ops after fusing reduction into the loop nest");
-  }
+  // Step 2. Stage the reduction as a normal consumer of the sidecar loop result, then delegate the
+  // outer+inner loop fusion mechanics to the shared helper.
+  rewriter.setInsertionPoint(reduce);
+  auto stagedReduce = rewriter.clone(*reduce, stagedReductionMapping);
+  // This cloning may have inserted some operations after the outer loop, which prevents the
+  // fusion from working. We'll try and move them before the inner loop.
+  if (failed(recursiveMoveOperandsBeforeOp(*stagedReduce, rewriter, *outerLoop)))
+    BAIL("failed to move operands before the outer loop");
+  auto fused = tileAndFuseConsumerIntoDoubleLoops(rewriter, outerLoop, innerLoop, *stagedReduce);
+  if (failed(fused))
+    BAIL("failed to fuse staged reduction into the loop nest");
+  auto [fusedOuterLoop, fusedInnerLoop] = *fused;
+  rewriter.eraseOp(stagedReduce);
+  rewriter.eraseOp(fusedOuterLoop);
   return DiagnosedSilenceableFailure::success();
 }
 
@@ -272,12 +165,11 @@ LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
   auto redDimOrF = matchUnarySingleReductionGeneric(reduce);
   if (failed(redDimOrF))
     BAIL("expected reduce to be a unary single-reduction linalg.generic");
-  auto redDim = *redDimOrF;
 
   // Fuse the reduce operation into the loop nest, changing its input from `elemwiseOrig` to
   // `elemwiseSidecars`. This function takes `elemwiseOrig`, `outerLoop`, etc. by reference,
   // and updates them to point to new operations.
-  auto fuseResult = fuseReduceInLoopNest(transform, rewriter, outerLoop, innerLoop, reduce, redDim,
+  auto fuseResult = fuseReduceInLoopNest(transform, rewriter, outerLoop, innerLoop, reduce,
                                          elemwiseOrig, elemwiseSidecars);
   if (!fuseResult.succeeded())
     return fuseResult;

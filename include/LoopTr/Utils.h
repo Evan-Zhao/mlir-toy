@@ -3,10 +3,10 @@
 
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Transform/Utils/DiagnosedSilenceableFailure.h"
 #include "mlir/IR/PatternMatch.h"
-#include <variant>
 
 namespace mlir {
 
@@ -48,11 +48,13 @@ namespace mlir {
 /// Supports linalg.map and linalg.generic operations.
 LogicalResult isSingleOutputElemwiseLinalgOp(Operation *op);
 
+/// Matches a one-input, one-result linalg.generic with exactly one reduction iterator.
+/// Returns the reduction iterator index on success.
+FailureOr<uint64_t> matchUnarySingleReductionGeneric(linalg::GenericOp generic);
+
 /// Returns the unique tensor.parallel_insert_slice in `loop` that publishes `result`.
 FailureOr<tensor::ParallelInsertSliceOp> getParallelInsertSliceForLoopResult(scf::ForallOp loop,
                                                                              OpResult result);
-
-using LoopResultMediator = std::variant<tensor::ParallelInsertSliceOp, tensor::InsertSliceOp>;
 
 struct LoopResultRelay {
   OpResult inLoopResult;
@@ -75,18 +77,25 @@ using LoopResultRelaysT = SmallVector<LoopResultRelay>;
 FailureOr<DenseMap<OpResult, LoopResultRelaysT>>
 getChainedLoopResultMap(ArrayRef<Operation *> loops);
 
-/// Matches a one-input, one-result linalg.generic with exactly one reduction iterator.
-/// Returns the reduction iterator index on success.
-FailureOr<uint64_t> matchUnarySingleReductionGeneric(linalg::GenericOp generic);
-
 SmallVector<OpFoldResult> getUnitStrides(RewriterBase &rewriter, size_t rank);
 
 SmallVector<OpFoldResult> getMixedTensorSizes(RewriterBase &rewriter, Location loc, Value tensor);
 
-/// Clones the defining chain of `value` only as far as needed to make it dominate
-/// the current insertion point. Existing dominating definitions are reused.
-FailureOr<Value> cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Value value,
-                                                    IRMapping &mapping);
+/// A wrapper around `cloneValueDefChainAtInsertionPoint` that applies to all operands of
+/// `toMoveOperands`.
+LogicalResult recursiveMoveOperandsBeforeOp(Operation &toMoveOperands, RewriterBase &rewriter,
+                                            Operation &moveBefore);
+
+/// Run `scf::tileAndFuseConsumerOfSlice` and print internal detailed error when it fails.
+FailureOr<scf::SCFFuseConsumerOfSliceResult>
+tileAndFuseConsumerWithDebug(RewriterBase &rewriter, Operation &consumer,
+                             MutableArrayRef<LoopLikeOpInterface> loops);
+
+/// Tiles and fuses `operation` into a double loop structure, in two steps.
+/// Returns the results of these two fusions as a pair.
+FailureOr<std::pair<Operation *, Operation *>>
+tileAndFuseConsumerIntoDoubleLoops(RewriterBase &rewriter, scf::ForallOp &outerLoop,
+                                   scf::ForOp &innerLoop, Operation &operation);
 
 Value createExtractSliceFromState(RewriterBase &rewriter, Location loc, Value fullTensor,
                                   ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes,
