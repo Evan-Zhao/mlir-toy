@@ -131,11 +131,11 @@ def LoopRURepairReductionFrontier
   let description = [{
     First reduction-frontier repair step for rolling update.
 
-    Takes the frontier reduction, the ordered sidecar chain already fused under
-    the streaming loop, the enclosing `scf.forall`, and the refreshed inner
-    `scf.for`. The current implementation supports unary single-result
-    `linalg.generic` reductions that consume exactly one value from the
-    original elementwise chain.
+    Takes the producer reduction frontier, the frontier reduction, the ordered
+    sidecar chain already fused under the streaming loop, the enclosing
+    `scf.forall`, and the refreshed inner `scf.for`. The current
+    implementation supports unary single-result `linalg.generic` reductions
+    that consume exactly one value from the original elementwise chain.
 
     It rewires that reduction use to the matching relayed sidecar result,
     rebuilds the outer `scf.forall` with one extra shared_out/result,
@@ -144,15 +144,16 @@ def LoopRURepairReductionFrontier
     reduction state through the rebuilt outer loop.
   }];
 
-  let arguments = (ins TransformHandleTypeInterface:$reduce,
+  let arguments = (ins TransformHandleTypeInterface:$producer_reduces,
+                       TransformHandleTypeInterface:$this_reduce,
                        TransformHandleTypeInterface:$elemwise_orig,
                        TransformHandleTypeInterface:$elemwise_sidecars,
                        TransformHandleTypeInterface:$outer_loop,
                        TransformHandleTypeInterface:$inner_loop);
-  let results = (outs TransformHandleTypeInterface:$repaired_reduce,
-                      TransformHandleTypeInterface:$repaired_sidecars);
+  let results = (outs TransformHandleTypeInterface:$repaired_reduce);
 
-  let assemblyFormat = "$reduce `and` $elemwise_orig `as` $elemwise_sidecars `into` "
+  let assemblyFormat = "`(` $producer_reduces `,` $this_reduce `)` `and` "
+                       "`(` $elemwise_orig `,` $elemwise_sidecars `)` `into` "
                        "$outer_loop `,` $inner_loop attr-dict "
                        " `:` functional-type(operands, results)";
 }

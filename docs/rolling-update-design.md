@@ -106,12 +106,13 @@ This is the step that makes a chosen rolling-update frontier semantically correc
 Signature:
 
 ```text
-(reduce_op, elemwise_orig_ops, sidecar_chain_ops, outer_loop, inner_loop)
+(producer_reduce_ops, reduce_op, elemwise_orig_ops, sidecar_chain_ops, outer_loop, inner_loop)
   -> (repaired_reduce_op, repaired_sidecar_chain_ops)
 ```
 
 Inputs:
 
+- the producer reductions feeding the chosen frontier,
 - the frontier reduction,
 - the original ordered elementwise chain outside the loop,
 - the ordered sidecar chain already fused under the loop,
