@@ -16,7 +16,7 @@ namespace mlir {
     return emitSilenceableFailure(transform, "expected at least one " nameStr " payload op");
 
 #define CHECK_EXTRACT_UNIQUE_OP(state, transform, getter, nameStr, varName)                        \
-  Operation *(varName);                                                                            \
+  Operation *varName;                                                                              \
   {                                                                                                \
     SmallVector<Operation *> varName##Ops = llvm::to_vector((state).getPayloadOps(getter()));      \
     if (!llvm::hasSingleElement(varName##Ops))                                                     \
@@ -27,7 +27,7 @@ namespace mlir {
   }
 
 #define CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getter, nameStr, varName, Type)             \
-  Type(varName);                                                                                   \
+  Type varName;                                                                                    \
   {                                                                                                \
     CHECK_EXTRACT_UNIQUE_OP(state, transform, getter, nameStr, varName##1);                        \
     (varName) = dyn_cast<Type>(varName##1);                                                        \
@@ -36,7 +36,7 @@ namespace mlir {
   }
 
 #define RETURN_DIAGNOSTICS_OR_BIND_VAL(OtherType, var, expr)                                       \
-  OtherType(var);                                                                                  \
+  OtherType var;                                                                                   \
   {                                                                                                \
     auto var##1 = expr;                                                                            \
     if (std::holds_alternative<DiagnosedSilenceableFailure>(var##1))                               \
