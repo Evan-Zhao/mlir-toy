@@ -141,9 +141,16 @@ make_mlir_opt_plugin(
     lib/LoopTr/FuseElemwise.cpp
     lib/LoopTr/FuseReduce.cpp
     lib/LoopTr/LoopTransformPlugin.cpp
+    lib/LoopTr/PythonSolver.cpp
     lib/LoopTr/RollingUpdateTransformOps.cpp
     lib/LoopTr/Utils.cpp
     DEPS LoopTransformOpsIncGen
+)
+target_link_libraries(LoopTransform PRIVATE pybind11::embed)
+set_source_files_properties(
+  lib/LoopTr/PythonSolver.cpp
+  PROPERTIES
+    COMPILE_OPTIONS "-frtti;-fexceptions"
 )
 
 add_executable(PythonHello lib/PythonHello.cpp)
