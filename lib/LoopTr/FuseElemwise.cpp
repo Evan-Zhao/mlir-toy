@@ -2,12 +2,9 @@
 #include "LoopTr/Utils.h"
 
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/Dialect/Tensor/Transforms/Transforms.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 namespace mlir::transform {
 
@@ -115,14 +112,7 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
 
   // Fold some tensor.{insert|extract}_slice operations because scf::tileAndFuseConsumer
   // can introduce a lot of them.
-  RewritePatternSet patterns(getContext());
-  tensor::populateMergeConsecutiveInsertExtractSlicePatterns(patterns);
-  SmallVector<Operation *> ops;
-  outerLoop->walk([&](Operation *op) {
-    if (isa<tensor::ExtractSliceOp, tensor::InsertSliceOp>(op))
-      ops.push_back(op);
-  });
-  if (failed(applyOpPatternsGreedily(ops, std::move(patterns))))
+  if (failed(foldRewriteTensorExtractInserts(rewriter, *outerLoop)))
     BAIL("failed to apply merge consecutive insert/extract_slice patterns");
 
   // Just return elemwiseOps because we've updated that vector inplace.

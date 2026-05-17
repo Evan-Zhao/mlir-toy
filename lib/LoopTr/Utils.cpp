@@ -1,6 +1,7 @@
 #include "LoopTr/Utils.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/ScopeExit.h"
 
 namespace mlir {
@@ -393,6 +394,17 @@ tileAndFuseConsumerIntoDoubleLoops(RewriterBase &rewriter, scf::ForallOp &outerL
   innerLoop = cast<scf::ForOp>(innerLoops[0]);
   auto *innerFusedOp = fusedIntoFor->tiledOps[0];
   return std::make_pair(outerFusedOp, innerFusedOp);
+}
+
+LogicalResult foldRewriteTensorExtractInserts(RewriterBase &rewriter, Operation &op) {
+  RewritePatternSet patterns(rewriter.getContext());
+  tensor::populateMergeConsecutiveInsertExtractSlicePatterns(patterns);
+  SmallVector<Operation *> ops;
+  op.walk([&](Operation *op) {
+    if (isa<tensor::ExtractSliceOp, tensor::InsertSliceOp>(op))
+      ops.push_back(op);
+  });
+  return applyOpPatternsGreedily(ops, std::move(patterns));
 }
 
 Value createExtractSliceFromState(RewriterBase &rewriter, Location loc, Value fullTensor,

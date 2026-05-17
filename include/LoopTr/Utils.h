@@ -97,6 +97,10 @@ FailureOr<std::pair<Operation *, Operation *>>
 tileAndFuseConsumerIntoDoubleLoops(RewriterBase &rewriter, scf::ForallOp &outerLoop,
                                    scf::ForOp &innerLoop, Operation &operation);
 
+/// Apply a pattern set to fold some tensor.{insert|extract}_slice operations
+/// Useful because scf::tileAndFuseConsumer can introduce a lot of them.
+LogicalResult foldRewriteTensorExtractInserts(RewriterBase &rewriter, Operation &op);
+
 Value createExtractSliceFromState(RewriterBase &rewriter, Location loc, Value fullTensor,
                                   ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes,
                                   ArrayRef<OpFoldResult> strides);
