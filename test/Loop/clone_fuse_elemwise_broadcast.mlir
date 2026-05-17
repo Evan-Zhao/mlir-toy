@@ -79,7 +79,9 @@ module attributes {transform.with_named_sequence} {
         } -> tensor<4xf32>
         %new_full = tensor.insert_slice %updated_full into %acc[0, %j] [4, 4] [1, 1]
             : tensor<4x4xf32> into tensor<4x8xf32>
-        scf.yield %new_full, %updated_row : tensor<4x8xf32>, tensor<4xf32>
+        %new_row = tensor.insert_slice %updated_row into %row_acc[0] [4] [1]
+            : tensor<4xf32> into tensor<4xf32>
+        scf.yield %new_full, %new_row : tensor<4x8xf32>, tensor<4xf32>
       }
       scf.forall.in_parallel {
         tensor.parallel_insert_slice %panel_upd#0 into %arg2[%off, 0] [4, 8] [1, 1]

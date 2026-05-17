@@ -238,7 +238,7 @@ FailureOr<Value> cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Valu
   Block *insertBlock = rewriter.getInsertionBlock();
   auto insertPoint = rewriter.getInsertionPoint();
   Operation *insertPointOp = insertPoint == insertBlock->end() ? nullptr : &*insertPoint;
-  if (!insertPointOp || def->getBlock() != insertBlock || def->isBeforeInBlock(insertPointOp))
+  if (!insertPointOp || def->getBlock() != insertBlock || !insertPointOp->isBeforeInBlock(def))
     return value;
 
   IRMapping localMapping = mapping;
