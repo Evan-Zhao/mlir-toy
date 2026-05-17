@@ -226,6 +226,21 @@ SmallVector<OpFoldResult> getUnitStrides(RewriterBase &rewriter, size_t rank) {
   return SmallVector<OpFoldResult>(rank, rewriter.getIndexAttr(1));
 }
 
+SmallVector<OpFoldResult> getMixedTensorSizes(RewriterBase &rewriter, Location loc, Value tensor) {
+  auto tensorType = cast<RankedTensorType>(tensor.getType());
+  SmallVector<OpFoldResult> sizes;
+  sizes.reserve(tensorType.getRank());
+  for (auto [dim, size] : llvm::enumerate(tensorType.getShape())) {
+    if (ShapedType::isDynamic(size)) {
+      sizes.push_back(
+          tensor::DimOp::create(rewriter, loc, tensor, static_cast<unsigned>(dim)).getResult());
+    } else {
+      sizes.push_back(rewriter.getIndexAttr(size));
+    }
+  }
+  return sizes;
+}
+
 FailureOr<Value> cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Value value,
                                                     IRMapping &mapping) {
   if (Value mapped = mapping.lookupOrNull(value))

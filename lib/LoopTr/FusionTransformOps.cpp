@@ -224,16 +224,8 @@ splitForallDimensionForReduction(TransformOpInterface transform, RewriterBase &r
   // Tile size: expand the size of the tensor on the reduction dimension back to the full size,
   // because we're no longer tiling along it.
   SmallVector<OpFoldResult> outerTileSizes = plan.producerInsert.getMixedSizes();
-  auto producerType = cast<RankedTensorType>(plan.producerResult.getType());
-  if (producerType.isDynamicDim(plan.reductionDim)) {
-    outerTileSizes[plan.reductionDim] =
-        tensor::DimOp::create(rewriter, loc, plan.producerResult,
-                              static_cast<int64_t>(plan.reductionDim))
-            .getResult();
-  } else {
-    outerTileSizes[plan.reductionDim] =
-        rewriter.getIndexAttr(producerType.getDimSize(plan.reductionDim));
-  }
+  outerTileSizes[plan.reductionDim] =
+      getMixedTensorSizes(rewriter, loc, plan.producerResult)[plan.reductionDim];
   SmallVector<OpFoldResult> nDUnitStrides = getUnitStrides(rewriter, outerTileOffsets.size());
   Value tileInit = createExtractSliceFromState(rewriter, loc, outerProducerArg, outerTileOffsets,
                                                outerTileSizes, nDUnitStrides);
@@ -369,8 +361,16 @@ LoopFuseReduceConsumerIntoForall::apply(transform::TransformRewriter &rewriter,
   auto fusedReduction =
       cloneGenericOnTile(rewriter, consumer, split.outerTile, split.innerFor.getRegionIterArgs()[1],
                          consumer.getLoc());
+  Value reductionTile = fusedReduction.getResult(0);
+  auto reductionTileType = cast<RankedTensorType>(reductionTile.getType());
+  SmallVector<OpFoldResult> reductionOffsets(reductionTileType.getRank(), rewriter.getIndexAttr(0));
+  SmallVector<OpFoldResult> reductionSizes =
+      getMixedTensorSizes(rewriter, loop.getLoc(), reductionTile);
+  auto insertedReduction = tensor::InsertSliceOp::create(
+      rewriter, loop.getLoc(), reductionTile, split.innerFor.getRegionIterArgs()[1],
+      reductionOffsets, reductionSizes, getUnitStrides(rewriter, reductionTileType.getRank()));
   scf::YieldOp::create(rewriter, loop.getLoc(),
-                       ValueRange{split.innerTile, fusedReduction.getResult(0)});
+                       ValueRange{split.innerTile, insertedReduction.getResult()});
 
   // Step 4. Publish the completed reduced tile once per outer forall instance, then replace the old
   // loop/result pair.

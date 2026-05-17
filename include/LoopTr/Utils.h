@@ -81,6 +81,8 @@ FailureOr<uint64_t> matchUnarySingleReductionGeneric(linalg::GenericOp generic);
 
 SmallVector<OpFoldResult> getUnitStrides(RewriterBase &rewriter, size_t rank);
 
+SmallVector<OpFoldResult> getMixedTensorSizes(RewriterBase &rewriter, Location loc, Value tensor);
+
 /// Clones the defining chain of `value` only as far as needed to make it dominate
 /// the current insertion point. Existing dominating definitions are reused.
 FailureOr<Value> cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Value value,

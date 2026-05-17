@@ -10,7 +10,8 @@
 // CHECK: %[[MAPPED:.*]] = linalg.map
 // CHECK: %[[INSERTED:.*]] = tensor.insert_slice %[[MAPPED]] into %[[PANEL_ARG]][0, %{{.*}}] [64, 64] [1, 1] : tensor<64x64xf32> into tensor<64x128xf32>
 // CHECK: %[[RED:.*]] = linalg.generic
-// CHECK: scf.yield %[[INSERTED]], %[[RED]] : tensor<64x128xf32>, tensor<64xf32>
+// CHECK: %[[INSERTED2:.*]] = tensor.insert_slice %[[RED]] into %[[ROW_ARG]][0] [64] [1] : tensor<64xf32> into tensor<64xf32>
+// CHECK: scf.yield %[[INSERTED]], %[[INSERTED2]] : tensor<64x128xf32>, tensor<64xf32>
 // CHECK: scf.forall.in_parallel {
 // CHECK: tensor.parallel_insert_slice %[[FOR]]#0 into %[[SCORES]][%[[I_OFF]], %{{.*}}] [64, 128] [1, 1] : tensor<64x128xf32> into tensor<128x128xf32>
 // CHECK: tensor.parallel_insert_slice %[[FOR]]#1 into %[[ROWS]][%{{.*}}] [64] [1] : tensor<64xf32> into tensor<128xf32>
