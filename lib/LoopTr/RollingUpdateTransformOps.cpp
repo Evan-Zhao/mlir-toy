@@ -270,34 +270,17 @@ createOneTiledSidecarOp(transform::TransformRewriter &rewriter,
 /// corresponding relayed result of `outerLoop`.
 FailureOr<DenseMap<Operation *, OpResult>> getOpToLoopResultMap(ForallOp outerLoop,
                                                                 ForOp innerLoop) {
-  auto loopResultRelaysF = getNestedLoopResultRelays({outerLoop, innerLoop});
-  if (failed(loopResultRelaysF))
+  auto chainedMapF = getChainedLoopResultMap({outerLoop, innerLoop});
+  if (failed(chainedMapF))
     return failure();
-  // loopResultRelays[i][j] refers to the j-th result of the i-th loop
-  // and describes where that result comes from, so we'll need to chain it over every i.
-  const auto &loopResultRelays = *loopResultRelaysF;
-  assert(loopResultRelays.size() == 2);
-  // This is a chained map that maps from loop-i returned result to innermost body result.
-  DenseMap<OpResult, OpResult> chainedMap;
-  // First populate it with inner loop return -> body entries
-  for (auto relay : loopResultRelays[1]) {
-    chainedMap.try_emplace(relay.loopReturnResult, relay.inLoopResult);
-  }
-  // Then chain it with outer loop return -> body, where outer loop's body result is the inner
-  // loop's returned result.
-  for (auto relay : loopResultRelays[0]) {
-    auto it = chainedMap.find(relay.inLoopResult);
-    if (it != chainedMap.end()) {
-      auto mappedValue = it->second;
-      chainedMap.erase(it);
-      chainedMap.try_emplace(relay.loopReturnResult, mappedValue);
-    }
-  }
-  // Flip the map to get what we want to return.
+
   DenseMap<Operation *, OpResult> innerBodyToOuterRet;
-  for (auto &[outerRet, innerBody] : chainedMap) {
-    if (outerRet.getDefiningOp() == outerLoop)
-      innerBodyToOuterRet.try_emplace(innerBody.getDefiningOp(), outerRet);
+  for (const auto &[outerRet, relays] : *chainedMapF) {
+    assert(!relays.empty());
+    if (outerRet.getDefiningOp() != outerLoop)
+      continue;
+    if (Operation *innerProducer = relays.front().inLoopResult.getDefiningOp())
+      innerBodyToOuterRet.try_emplace(innerProducer, outerRet);
   }
   return innerBodyToOuterRet;
 }

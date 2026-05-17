@@ -59,12 +59,17 @@ struct LoopResultRelay {
   Operation *mediator;
 };
 
-/// Returns loop-result relay information for each loop in `loops`, in the same order.
-/// `loops` must be nested outer-to-inner such that loops[i + 1]->getParentOp() == loops[i].
-/// The j-th entry of the i-th subvector describes the in-loop OpResult and mediator op that
-/// produce the j-th result of loops[i].
-FailureOr<SmallVector<SmallVector<LoopResultRelay>>>
-getNestedLoopResultRelays(ArrayRef<Operation *> loops);
+using LoopResultRelaysT = SmallVector<LoopResultRelay>;
+
+/// Builds relay chains for a loop nest ordered outer-to-inner, where
+/// `loops[i + 1]->getParentOp() == loops[i]`.
+///
+/// The returned map is keyed by results of the outermost loop. Each value contains the full
+/// relay chain for that loop result, ordered inner-to-outer, and each relay records the in-loop
+/// OpResult, the loop result it feeds, and the mediator op connecting them. Only loop results
+/// whose relays continue all the way to the innermost loop are included.
+FailureOr<DenseMap<OpResult, LoopResultRelaysT>>
+getChainedLoopResultMap(ArrayRef<Operation *> loops);
 
 /// Matches a one-input, one-result linalg.generic with exactly one reduction iterator.
 /// Returns the reduction iterator index on success.

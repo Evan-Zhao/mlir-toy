@@ -58,6 +58,26 @@ FailureOr<SmallVector<LoopResultRelay>> getLoopResultRelays(LoopOp loop) {
   return relays;
 }
 
+FailureOr<SmallVector<SmallVector<LoopResultRelay>>>
+getNestedLoopResultRelays(ArrayRef<Operation *> loops) {
+  SmallVector<SmallVector<LoopResultRelay>> relaysByLoop;
+  relaysByLoop.reserve(loops.size());
+  for (auto [index, loop] : llvm::enumerate(loops)) {
+    if (index + 1 < loops.size() && loops[index + 1]->getParentOp() != loop)
+      return failure();
+    FailureOr<SmallVector<LoopResultRelay>> relays = failure();
+    if (auto forall = dyn_cast<scf::ForallOp>(loop)) {
+      relays = getLoopResultRelays(forall);
+    } else if (auto forOp = dyn_cast<scf::ForOp>(loop)) {
+      relays = getLoopResultRelays(forOp);
+    }
+    if (failed(relays))
+      return failure();
+    relaysByLoop.push_back(*relays);
+  }
+  return relaysByLoop;
+}
+
 void cloneSingleRegionBody(OpBuilder &builder, Location nestedLoc, Block &oldBlock,
                            ValueRange newArgs) {
   IRMapping mapping;
@@ -91,24 +111,40 @@ FailureOr<tensor::ParallelInsertSliceOp> getParallelInsertSliceForLoopResult(scf
   return insertSlice;
 }
 
-FailureOr<SmallVector<SmallVector<LoopResultRelay>>>
-getNestedLoopResultRelays(ArrayRef<Operation *> loops) {
-  SmallVector<SmallVector<LoopResultRelay>> relaysByLoop;
-  relaysByLoop.reserve(loops.size());
-  for (auto [index, loop] : llvm::enumerate(loops)) {
-    if (index + 1 < loops.size() && loops[index + 1]->getParentOp() != loop)
-      return failure();
-    FailureOr<SmallVector<LoopResultRelay>> relays = failure();
-    if (auto forall = dyn_cast<scf::ForallOp>(loop)) {
-      relays = getLoopResultRelays(forall);
-    } else if (auto forOp = dyn_cast<scf::ForOp>(loop)) {
-      relays = getLoopResultRelays(forOp);
-    }
-    if (failed(relays))
-      return failure();
-    relaysByLoop.push_back(*relays);
+FailureOr<DenseMap<OpResult, LoopResultRelaysT>>
+getChainedLoopResultMap(ArrayRef<Operation *> loops) {
+  auto loopResultRelaysF = getNestedLoopResultRelays(loops);
+  if (failed(loopResultRelaysF))
+    return failure();
+  const auto &loopResultRelays = *loopResultRelaysF;
+  if (loopResultRelays.empty())
+    return {};
+
+  // Start from the innermost loop: each of its returned results is directly
+  // associated with the in-loop OpResult that computes it.
+  DenseMap<OpResult, LoopResultRelaysT> chainedMap;
+  for (const LoopResultRelay &relay : loopResultRelays.back()) {
+    chainedMap.try_emplace(relay.loopReturnResult, SmallVector<LoopResultRelay>{relay});
   }
-  return relaysByLoop;
+
+  // Walk outward and keep only those relays that continue the chain all the
+  // way to the innermost loop. After processing loop i, `chainedMap` is keyed
+  // by results of loops[i].
+  for (auto relayIt = loopResultRelays.rbegin() + 1; relayIt != loopResultRelays.rend();
+       ++relayIt) {
+    DenseMap<OpResult, LoopResultRelaysT> nextMap;
+    for (const LoopResultRelay &relay : *relayIt) {
+      auto cMapIt = chainedMap.find(relay.inLoopResult);
+      if (cMapIt == chainedMap.end())
+        continue;
+      // Safe to move because each key is visited at most once.
+      auto nextRelays = cMapIt->second;
+      nextRelays.push_back(relay);
+      nextMap.try_emplace(relay.loopReturnResult, std::move(nextRelays));
+    }
+    chainedMap = std::move(nextMap);
+  }
+  return chainedMap;
 }
 
 FailureOr<uint64_t> matchUnarySingleReductionGeneric(linalg::GenericOp generic) {
