@@ -116,6 +116,7 @@ make_mlir_opt_plugin(
 make_mlir_opt_plugin(
   TARGET LoopTransform
   SOURCES
+    lib/LoopTr/CloneFuseElemwise.cpp
     lib/LoopTr/LoopTransformPlugin.cpp
     lib/LoopTr/FusionTransformOps.cpp
     lib/LoopTr/RollingUpdateTransformOps.cpp

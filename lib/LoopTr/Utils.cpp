@@ -5,6 +5,31 @@ namespace mlir {
 
 namespace {
 
+LogicalResult isElementwiseMap(linalg::MapOp map) {
+  if (map.getNumDpsInits() != 1)
+    return failure();
+  if (map->getNumResults() != 1)
+    return failure();
+  return success();
+}
+
+LogicalResult isElementwiseGeneric(linalg::GenericOp generic) {
+  if (generic.getNumDpsInits() != 1)
+    return failure();
+  if (generic->getNumResults() != 1)
+    return failure();
+  if (!generic.isAllParallelLoops())
+    return failure();
+  if (!generic.hasPureTensorSemantics())
+    return failure();
+  if (!llvm::all_of(generic.getIndexingMapsArray(),
+                    [](AffineMap map) { return map.isProjectedPermutation(); }))
+    return failure();
+  if (!generic.getIndexingMapsArray().back().isIdentity())
+    return failure();
+  return success();
+}
+
 /// Dispatch to the appropriate loop result mediator getter based on the loop type.
 template <typename LoopOp> struct GetLoopResults;
 
@@ -96,6 +121,14 @@ void cloneSingleRegionBody(OpBuilder &builder, Location nestedLoc, Block &oldBlo
 }
 
 } // namespace
+
+LogicalResult isSingleOutputElemwiseLinalgOp(Operation *op) {
+  if (auto map = dyn_cast<linalg::MapOp>(op))
+    return isElementwiseMap(map);
+  if (auto generic = dyn_cast<linalg::GenericOp>(op))
+    return isElementwiseGeneric(generic);
+  return failure();
+}
 
 FailureOr<tensor::ParallelInsertSliceOp> getParallelInsertSliceForLoopResult(scf::ForallOp loop,
                                                                              OpResult result) {
@@ -191,6 +224,36 @@ FailureOr<uint64_t> matchUnarySingleReductionGeneric(linalg::GenericOp generic) 
 
 SmallVector<OpFoldResult> getUnitStrides(RewriterBase &rewriter, size_t rank) {
   return SmallVector<OpFoldResult>(rank, rewriter.getIndexAttr(1));
+}
+
+FailureOr<Value> cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Value value,
+                                                    IRMapping &mapping) {
+  if (Value mapped = mapping.lookupOrNull(value))
+    return mapped;
+
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return value;
+
+  Block *insertBlock = rewriter.getInsertionBlock();
+  auto insertPoint = rewriter.getInsertionPoint();
+  Operation *insertPointOp = insertPoint == insertBlock->end() ? nullptr : &*insertPoint;
+  if (!insertPointOp || def->getBlock() != insertBlock || def->isBeforeInBlock(insertPointOp))
+    return value;
+
+  IRMapping localMapping = mapping;
+  for (Value operand : def->getOperands()) {
+    FailureOr<Value> remappedOperand =
+        cloneValueDefChainAtInsertionPoint(rewriter, operand, mapping);
+    if (failed(remappedOperand))
+      return failure();
+    localMapping.map(operand, *remappedOperand);
+  }
+
+  Operation *cloned = rewriter.clone(*def, localMapping);
+  for (auto [oldResult, newResult] : llvm::zip_equal(def->getResults(), cloned->getResults()))
+    mapping.map(oldResult, newResult);
+  return mapping.lookup(value);
 }
 
 Value createExtractSliceFromState(RewriterBase &rewriter, Location loc, Value fullTensor,

@@ -44,6 +44,10 @@ namespace mlir {
     (var) = std::get<OtherType>(var##1);                                                           \
   }
 
+/// Verifies that `op` is an elementwise linalg operation with a single output.
+/// Supports linalg.map and linalg.generic operations.
+LogicalResult isSingleOutputElemwiseLinalgOp(Operation *op);
+
 /// Returns the unique tensor.parallel_insert_slice in `loop` that publishes `result`.
 FailureOr<tensor::ParallelInsertSliceOp> getParallelInsertSliceForLoopResult(scf::ForallOp loop,
                                                                              OpResult result);
@@ -76,6 +80,11 @@ getChainedLoopResultMap(ArrayRef<Operation *> loops);
 FailureOr<uint64_t> matchUnarySingleReductionGeneric(linalg::GenericOp generic);
 
 SmallVector<OpFoldResult> getUnitStrides(RewriterBase &rewriter, size_t rank);
+
+/// Clones the defining chain of `value` only as far as needed to make it dominate
+/// the current insertion point. Existing dominating definitions are reused.
+FailureOr<Value> cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Value value,
+                                                    IRMapping &mapping);
 
 Value createExtractSliceFromState(RewriterBase &rewriter, Location loc, Value fullTensor,
                                   ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes,
