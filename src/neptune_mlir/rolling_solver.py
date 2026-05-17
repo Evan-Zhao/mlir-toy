@@ -302,6 +302,15 @@ def _expr_type(expr: JsonExpr) -> str:
     return type_value
 
 
+def _expr_args(expr: JsonExpr, expected: int | None = None) -> list[JsonExpr]:
+    args = expr.get("args")
+    if not isinstance(args, list):
+        raise ValueError(f"expected expression node to have list args: {expr}")
+    if expected is not None and len(args) != expected:
+        raise ValueError(f"expected {expected} args for {expr.get('op')}, got {len(args)}: {expr}")
+    return [cast(JsonExpr, arg) for arg in args]
+
+
 def _json_expr_to_sympy(expr: JsonExpr, symtab: dict[str, Symbol]) -> Expr:
     op = expr.get("op")
     if not isinstance(op, str):
@@ -323,8 +332,9 @@ def _json_expr_to_sympy(expr: JsonExpr, symtab: dict[str, Symbol]) -> Expr:
         raise ValueError(f"unsupported const value: {expr}")
 
     if op in {"add", "sub", "mul", "div"}:
-        lhs = _json_expr_to_sympy(cast(JsonExpr, expr["lhs"]), symtab)
-        rhs = _json_expr_to_sympy(cast(JsonExpr, expr["rhs"]), symtab)
+        lhs_expr, rhs_expr = _expr_args(expr, 2)
+        lhs = _json_expr_to_sympy(lhs_expr, symtab)
+        rhs = _json_expr_to_sympy(rhs_expr, symtab)
         if op == "add":
             return cast(Expr, lhs + rhs)
         if op == "sub":
@@ -334,7 +344,8 @@ def _json_expr_to_sympy(expr: JsonExpr, symtab: dict[str, Symbol]) -> Expr:
         return cast(Expr, lhs / rhs)
 
     if op in {"exp", "exp2", "log", "sqrt", "rsqrt", "abs"}:
-        arg = _json_expr_to_sympy(cast(JsonExpr, expr["arg"]), symtab)
+        (arg_expr,) = _expr_args(expr, 1)
+        arg = _json_expr_to_sympy(arg_expr, symtab)
         if op == "exp":
             return cast(Expr, sp.exp(arg))
         if op == "exp2":
@@ -348,18 +359,19 @@ def _json_expr_to_sympy(expr: JsonExpr, symtab: dict[str, Symbol]) -> Expr:
         return cast(Expr, sp.Abs(arg))
 
     if op == "pow":
-        base = _json_expr_to_sympy(cast(JsonExpr, expr["base"]), symtab)
-        exponent = _json_expr_to_sympy(cast(JsonExpr, expr["exponent"]), symtab)
+        base_expr, exponent_expr = _expr_args(expr, 2)
+        base = _json_expr_to_sympy(base_expr, symtab)
+        exponent = _json_expr_to_sympy(exponent_expr, symtab)
         return cast(Expr, sp.Pow(base, exponent))
     if op == "max":
-        args = [_json_expr_to_sympy(cast(JsonExpr, arg), symtab) for arg in expr["args"]]
+        args = [_json_expr_to_sympy(arg, symtab) for arg in _expr_args(expr)]
         return cast(Expr, sp.Max(*args))
 
     raise ValueError(f"unsupported JSON expression op: {op}")
 
 
 def _sympy_to_json_expr(expr: sp.Expr, dtype: str) -> JsonExpr:
-    expr = cast(Expr, sp.simplify(expr))
+    expr = sp.simplify(expr)
     if isinstance(expr, Symbol):
         return {"op": "var", "name": expr.name, "type": dtype}
     if isinstance(expr, sp.Integer):
@@ -371,14 +383,13 @@ def _sympy_to_json_expr(expr: sp.Expr, dtype: str) -> JsonExpr:
 
     if isinstance(expr, sp.Add):
         args = list(expr.args)
-        result = _sympy_to_json_expr(cast(Expr, args[0]), dtype)
+        result = _sympy_to_json_expr(args[0], dtype)
         for arg in args[1:]:
-            is_negative, positive_arg = _split_negative_term(cast(Expr, arg))
+            is_negative, positive_arg = _split_negative_term(arg)
             result = {
                 "op": "sub" if is_negative else "add",
                 "type": dtype,
-                "lhs": result,
-                "rhs": _sympy_to_json_expr(positive_arg, dtype),
+                "args": [result, _sympy_to_json_expr(positive_arg, dtype)],
             }
         return result
 
@@ -392,39 +403,66 @@ def _sympy_to_json_expr(expr: sp.Expr, dtype: str) -> JsonExpr:
             result = {
                 "op": "mul",
                 "type": dtype,
-                "lhs": result,
-                "rhs": _sympy_to_json_expr(cast(Expr, factor), dtype),
+                "args": [result, _sympy_to_json_expr(cast(Expr, factor), dtype)],
             }
         return result
 
     if isinstance(expr, sp.Pow):
         base, exponent = expr.args
         if base == 2:
-            return {"op": "exp2", "type": dtype, "arg": _sympy_to_json_expr(cast(Expr, exponent), dtype)}
+            return {
+                "op": "exp2",
+                "type": dtype,
+                "args": [_sympy_to_json_expr(exponent, dtype)],
+            }
         if exponent == sp.Rational(1, 2):
-            return {"op": "sqrt", "type": dtype, "arg": _sympy_to_json_expr(cast(Expr, base), dtype)}
+            return {
+                "op": "sqrt",
+                "type": dtype,
+                "args": [_sympy_to_json_expr(base, dtype)],
+            }
         if exponent == -sp.Rational(1, 2):
-            return {"op": "rsqrt", "type": dtype, "arg": _sympy_to_json_expr(cast(Expr, base), dtype)}
+            return {
+                "op": "rsqrt",
+                "type": dtype,
+                "args": [_sympy_to_json_expr(base, dtype)],
+            }
         if exponent == -1:
             return {
                 "op": "div",
                 "type": dtype,
-                "lhs": {"op": "const", "value": 1, "type": dtype},
-                "rhs": _sympy_to_json_expr(cast(Expr, base), dtype),
+                "args": [
+                    {"op": "const", "value": 1, "type": dtype},
+                    _sympy_to_json_expr(base, dtype),
+                ],
             }
         return {
             "op": "pow",
             "type": dtype,
-            "base": _sympy_to_json_expr(cast(Expr, base), dtype),
-            "exponent": _sympy_to_json_expr(cast(Expr, exponent), dtype),
+            "args": [
+                _sympy_to_json_expr(base, dtype),
+                _sympy_to_json_expr(exponent, dtype),
+            ],
         }
 
     if expr.func == sp.exp:
-        return {"op": "exp", "type": dtype, "arg": _sympy_to_json_expr(cast(Expr, expr.args[0]), dtype)}
+        return {
+            "op": "exp",
+            "type": dtype,
+            "args": [_sympy_to_json_expr(cast(Expr, expr.args[0]), dtype)],
+        }
     if expr.func == sp.log:
-        return {"op": "log", "type": dtype, "arg": _sympy_to_json_expr(cast(Expr, expr.args[0]), dtype)}
+        return {
+            "op": "log",
+            "type": dtype,
+            "args": [_sympy_to_json_expr(cast(Expr, expr.args[0]), dtype)],
+        }
     if expr.func == sp.Abs:
-        return {"op": "abs", "type": dtype, "arg": _sympy_to_json_expr(cast(Expr, expr.args[0]), dtype)}
+        return {
+            "op": "abs",
+            "type": dtype,
+            "args": [_sympy_to_json_expr(cast(Expr, expr.args[0]), dtype)],
+        }
     if isinstance(expr, sp.Max):
         return {
             "op": "max",
@@ -438,7 +476,7 @@ def _sympy_to_json_expr(expr: sp.Expr, dtype: str) -> JsonExpr:
 def _split_negative_term(expr: Expr) -> tuple[bool, Expr]:
     coeff, terms = expr.as_coeff_mul()
     if coeff == -1:
-        return True, cast(Expr, sp.Mul(*terms))
+        return True, sp.Mul(*terms)
     if coeff < 0:
-        return True, cast(Expr, sp.Mul(-coeff, *terms))
+        return True, sp.Mul(-coeff, *terms)
     return False, expr

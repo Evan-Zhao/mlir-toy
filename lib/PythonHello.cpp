@@ -33,13 +33,15 @@ void runPythonHello() {
   llvm::json::Value gExpr = llvm::json::Object{
       {"op", "exp"},
       {"type", "f32"},
-      {"arg",
-       llvm::json::Object{
-           {"op", "sub"},
-           {"type", "f32"},
-           {"lhs", llvm::json::Object{{"op", "var"}, {"name", "c"}, {"type", "f32"}}},
-           {"rhs", llvm::json::Object{{"op", "var"}, {"name", "r"}, {"type", "f32"}}},
-       }},
+      {"args", llvm::json::Array{llvm::json::Object{
+                   {"op", "sub"},
+                   {"type", "f32"},
+                   {"args",
+                    llvm::json::Array{
+                        llvm::json::Object{{"op", "var"}, {"name", "c"}, {"type", "f32"}},
+                        llvm::json::Object{{"op", "var"}, {"name", "r"}, {"type", "f32"}},
+                    }},
+               }}},
   };
   py::module_ json = py::module_::import("json");
   py::object gExprPy = json.attr("loads")(toString(gExpr));
