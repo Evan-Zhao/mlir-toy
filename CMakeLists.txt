@@ -146,6 +146,9 @@ make_mlir_opt_plugin(
     DEPS LoopTransformOpsIncGen
 )
 
+add_executable(PythonHello lib/PythonHello.cpp)
+target_link_libraries(PythonHello PRIVATE pybind11::embed)
+
 if(SKBUILD)
   set(NEPTUNE_MLIR_PLUGIN_INSTALL_DIR "neptune_mlir/_native")
 else()
