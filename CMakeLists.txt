@@ -9,9 +9,31 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 set(CMAKE_CXX_EXTENSIONS NO)
 
+# Find Python3 if not defined. When building from pip, scikit-build will set this variable.
+find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+
+# Set pybind11_DIR if not defined, by directly querying the Python interpreter.
+if(NOT DEFINED pybind11_DIR)
+  execute_process(
+    COMMAND "${Python3_EXECUTABLE}" -c "import pybind11; print(pybind11.get_cmake_dir())"
+    OUTPUT_VARIABLE pybind11_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _NEPTUNE_MLIR_PYBIND11_QUERY_RESULT
+    ERROR_VARIABLE _NEPTUNE_MLIR_PYBIND11_QUERY_ERROR
+  )
+  if(NOT _NEPTUNE_MLIR_PYBIND11_QUERY_RESULT EQUAL 0)
+    message(FATAL_ERROR
+      "Failed to locate pybind11 using Python interpreter '${Python3_EXECUTABLE}': "
+      "${_NEPTUNE_MLIR_PYBIND11_QUERY_ERROR}")
+  endif()
+endif()
+find_package(pybind11 CONFIG REQUIRED)
+
 find_package(LLVM REQUIRED CONFIG)
 find_package(MLIR REQUIRED CONFIG)
 
+message(STATUS "Using Python3: ${Python3_EXECUTABLE}")
+message(STATUS "Using pybind11 CMake package in: ${pybind11_DIR}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
 
@@ -119,9 +141,15 @@ make_mlir_opt_plugin(
     lib/LoopTr/FuseElemwise.cpp
     lib/LoopTr/FuseReduce.cpp
     lib/LoopTr/LoopTransformPlugin.cpp
+    lib/LoopTr/PythonSolver.cpp
     lib/LoopTr/RollingUpdateTransformOps.cpp
     lib/LoopTr/Utils.cpp
     DEPS LoopTransformOpsIncGen
+)
+target_link_libraries(LoopTransform PRIVATE pybind11::embed)
+set_source_files_properties(
+  lib/LoopTr/PythonSolver.cpp
+  PROPERTIES COMPILE_OPTIONS "-frtti;-fexceptions"
 )
 
 if(SKBUILD)
