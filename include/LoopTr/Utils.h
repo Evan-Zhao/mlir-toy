@@ -96,9 +96,10 @@ FailureOr<std::pair<Operation *, Operation *>>
 tileAndFuseConsumerIntoDoubleLoops(RewriterBase &rewriter, scf::ForallOp &outerLoop,
                                    scf::ForOp &innerLoop, Operation &operation);
 
-/// Apply a pattern set to fold some tensor.{insert|extract}_slice operations
-/// Useful because scf::tileAndFuseConsumer can introduce a lot of them.
-LogicalResult foldRewriteTensorExtractInserts(RewriterBase &rewriter, Operation &op);
+/// Run a narrow local CSE over `op` and its nested regions. This is useful for
+/// deduplicating loop-index affine.apply ops introduced by tiling/fusion
+/// without running broad canonicalization that may disturb loop-result relays.
+void eliminateLocalCommonSubexpressions(RewriterBase &rewriter, Operation *op);
 
 Value createExtractSliceFromState(RewriterBase &rewriter, Location loc, Value fullTensor,
                                   ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes,

@@ -108,12 +108,12 @@ DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformR
     rewriter.eraseOp(outerFusedOp);
     // Update elemwiseOps inplace.
     elemwiseOp = innerFusedOp;
-  }
 
-  // Fold some tensor.{insert|extract}_slice operations because scf::tileAndFuseConsumer
-  // can introduce a lot of them.
-  if (failed(foldRewriteTensorExtractInserts(rewriter, *outerLoop)))
-    BAIL("failed to apply merge consecutive insert/extract_slice patterns");
+    // Upstream tile-and-fuse requires structurally identical offsets/sizes
+    // across operand slices. Deduplicate the affine.apply scaffolding we just
+    // introduced before attempting to fuse the next elemwise consumer.
+    eliminateLocalCommonSubexpressions(rewriter, outerLoop.getOperation());
+  }
 
   // Just return elemwiseOps because we've updated that vector inplace.
   transformResults.set(getOperation()->getResult(0), elemwiseOps);

@@ -1,7 +1,8 @@
 #include "LoopTr/Utils.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Transforms/CSE.h"
 #include "llvm/ADT/ScopeExit.h"
 
 namespace mlir {
@@ -378,15 +379,9 @@ tileAndFuseConsumerIntoDoubleLoops(RewriterBase &rewriter, scf::ForallOp &outerL
   return std::make_pair(outerFusedOp, innerFusedOp);
 }
 
-LogicalResult foldRewriteTensorExtractInserts(RewriterBase &rewriter, Operation &op) {
-  RewritePatternSet patterns(rewriter.getContext());
-  tensor::populateMergeConsecutiveInsertExtractSlicePatterns(patterns);
-  SmallVector<Operation *> ops;
-  op.walk([&](Operation *op) {
-    if (isa<tensor::ExtractSliceOp, tensor::InsertSliceOp>(op))
-      ops.push_back(op);
-  });
-  return applyOpPatternsGreedily(ops, std::move(patterns));
+void eliminateLocalCommonSubexpressions(RewriterBase &rewriter, Operation *op) {
+  DominanceInfo domInfo(op);
+  eliminateCommonSubExpressions(rewriter, domInfo, op);
 }
 
 Value createExtractSliceFromState(RewriterBase &rewriter, Location loc, Value fullTensor,

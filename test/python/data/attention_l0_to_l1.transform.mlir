@@ -137,9 +137,6 @@ module attributes {transform.with_named_sequence} {
         (%fused_bmax, %bsum) and (%elemwise, %elemwise_sidecars) into %forall_loop, %j0_loop
         : (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op,
            !transform.any_op, !transform.any_op) -> !transform.any_op
-    // Doing canonicalization earlier than here would undo some of the cloning done above.
-    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !transform.any_op
-    transform.apply_cse to %func : !transform.any_op
 
     // Step 5. Apply rolling update again, this time with the second matmul being the reduction.
     %mm2, %elemwise_1 =

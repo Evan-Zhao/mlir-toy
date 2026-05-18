@@ -403,8 +403,6 @@ LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
                                          llvm::zip_equal(elemwiseOrig, elemwiseSidecars));
   if (!fuseResult.succeeded())
     return fuseResult;
-  if (failed(foldRewriteTensorExtractInserts(rewriter, *outerLoop)))
-    BAIL("failed to apply merge consecutive insert/extract_slice patterns");
 
   // Extract scalar expressions that describe the reduction and its producers, then send them to the
   // solver to get a repair term (h-expression).
