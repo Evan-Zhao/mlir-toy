@@ -40,7 +40,7 @@ FailureOr<DeserializedValueExpr> deserializeMLIRExprFromJSON(const llvm::json::V
 /// Calls the Python rolling-update solver on the `g` expression (serialized) and returns the
 /// result as a JSON value (that can be deserialized next).
 llvm::Expected<llvm::json::Value>
-solveRollingUpdaterWithPython(const llvm::json::Value &gExpr,
+solveRollingUpdaterWithPython(const llvm::json::Value &fExpr, const llvm::json::Value &gExpr,
                               llvm::ArrayRef<std::string> rVariables, llvm::StringRef accVar);
 
 } // namespace mlir

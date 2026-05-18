@@ -403,7 +403,8 @@ FailureOr<DeserializedValueExpr> deserializeMLIRExprFromJSON(const json::Value &
   };
 }
 
-llvm::Expected<json::Value> solveRollingUpdaterWithPython(const json::Value &gExpr,
+llvm::Expected<json::Value> solveRollingUpdaterWithPython(const json::Value &fExpr,
+                                                          const json::Value &gExpr,
                                                           ArrayRef<std::string> rVariables,
                                                           StringRef accVar) {
   static std::once_flag initOnce;
@@ -428,12 +429,13 @@ llvm::Expected<json::Value> solveRollingUpdaterWithPython(const json::Value &gEx
 
   try {
     py::gil_scoped_acquire gil;
+    py::object fExprPy = jsonModule.attr("loads")(stringifyJSON(fExpr));
     py::object gExprPy = jsonModule.attr("loads")(stringifyJSON(gExpr));
     py::list rVariablesPy;
     for (const std::string &name : rVariables)
       rVariablesPy.append(name);
-    py::object hExprPy =
-        solverModule.attr("solve_rolling_updater_json")(gExprPy, rVariablesPy, accVar.str());
+    py::object hExprPy = solverModule.attr("solve_rolling_updater_json")(
+        fExprPy, gExprPy, rVariablesPy, accVar.str());
     std::string hExprText = py::str(jsonModule.attr("dumps")(hExprPy, py::arg("sort_keys") = true));
     return json::parse(hExprText);
   } catch (const py::error_already_set &e) {

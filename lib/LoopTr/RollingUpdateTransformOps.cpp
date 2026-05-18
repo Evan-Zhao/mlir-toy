@@ -409,7 +409,8 @@ LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
     BAIL("failed to extract reducer/elemwise expressions from the program");
   auto redVars = llvm::to_vector(
       llvm::map_range(solverInputR->reductionVars, [](const auto &it) { return it.second; }));
-  auto hExpr = solveRollingUpdaterWithPython(solverInputR->gExpr, redVars, "acc");
+  auto hExpr =
+      solveRollingUpdaterWithPython(solverInputR->fExpr, solverInputR->gExpr, redVars, "acc");
   if (!hExpr)
     BAIL("failed to solve rolling updater with Python: " + llvm::toString(hExpr.takeError()));
 

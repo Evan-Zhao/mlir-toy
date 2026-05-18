@@ -21,10 +21,11 @@ def _free_vars_symbols(expr: sp.Basic) -> set[Symbol]:
 
 
 def solve_rolling_updater_json(
-    g_expr: JsonExpr, r_var_names: list[str], acc_var_name: str
+    f_expr: JsonExpr, g_expr: JsonExpr, r_var_names: list[str], acc_var_name: str
 ) -> JsonExpr:
     """Typed expression interface for the MLIR integration path."""
     symtab: dict[str, Symbol] = {}
+    f = _json_expr_to_sympy(f_expr, symtab)
     g = _json_expr_to_sympy(g_expr, symtab)
     acc = symtab.setdefault(acc_var_name, sp.Symbol(acc_var_name, real=True, nonzero=True))
     r_var_name_set = set(r_var_names)
@@ -42,6 +43,7 @@ def solve_rolling_updater_json(
             f"`H`: attempt to solve produced expression {h_expr} with remaining "
             f"`c`-variables: {c_variables}"
         )
+    _prove_repair_term_distribute(h_expr, f, acc)
     return _sympy_to_json_expr(h_expr, _expr_type(g_expr))
 
 
@@ -68,12 +70,29 @@ def sympy_solve_rolling_updater(
     return _prefer_quotient_power_form(h_expr)
 
 
-def prove(lhs: str, rhs: str, cmp: str = "eq") -> bool:
-    """Conservatively prove a relation between two string expressions."""
-    locals_ = _default_sympify_locals(lhs, rhs)
-    lhs_expr = _simplify_for_proof(cast(Expr, sp.sympify(lhs, locals=locals_)))
-    rhs_expr = _simplify_for_proof(cast(Expr, sp.sympify(rhs, locals=locals_)))
-    return _prove_expr(lhs_expr, rhs_expr, cmp)
+def _prove_repair_term_distribute(h_expr: Expr, f_expr: Expr, acc: Symbol) -> None:
+    f_free_vars = sorted(_free_vars_symbols(f_expr), key=lambda sym: sym.name)
+    other_vars = [sym for sym in f_free_vars if sym != acc]
+    if len(other_vars) != 1:
+        raise ValueError(
+            "Cannot validate the rolling-update updater function `H`: expected `f_expr` "
+            f"to depend on exactly one non-accumulator variable, got {other_vars} in {f_expr}"
+        )
+    reduce_var = other_vars[0]
+    y1 = sp.Symbol("y1", real=True)
+    y2 = sp.Symbol("y2", real=True)
+    reducer_expr = sp.simplify(f_expr.subs({acc: y1, reduce_var: y2}))
+
+    def h_subst(acc_value: Expr) -> Expr:
+        return sp.simplify(h_expr.subs({acc: acc_value}))
+
+    lhs = _simplify_for_proof(h_subst(reducer_expr))
+    rhs = _simplify_for_proof(f_expr.subs({acc: h_subst(y1), reduce_var: h_subst(y2)}))
+    if not _prove_expr(lhs, rhs, "eq"):
+        raise ValueError(
+            "Cannot prove the correctness of the global updater `H`: "
+            f"failed to prove {lhs} == {rhs}"
+        )
 
 
 def separate_vars(
@@ -247,27 +266,6 @@ def _simplify_for_proof(expr: sp.Expr) -> sp.Expr:
     expr = _simplify_abs_sqrt(expr)
     expr = _pull_common_nonnegative_max_factor(expr)
     return sp.simplify(expr)
-
-
-def _default_sympify_locals(*exprs: str) -> dict[str, object]:
-    names = set()
-    for expr in exprs:
-        names.update(str(sym) for sym in sp.sympify(expr).free_symbols)
-    locals_: dict[str, object] = {name: sp.Symbol(name, real=True) for name in names}
-    locals_.update(
-        {
-            "exp": sp.exp,
-            "exp2": lambda x: 2**x,
-            "log": sp.log,
-            "sqrt": sp.sqrt,
-            "rsqrt": lambda x: 1 / sp.sqrt(x),
-            "pow": sp.Pow,
-            "abs": sp.Abs,
-            "Max": sp.Max,
-            "max": sp.Max,
-        }
-    )
-    return locals_
 
 
 def _expr_type(expr: JsonExpr) -> str:
