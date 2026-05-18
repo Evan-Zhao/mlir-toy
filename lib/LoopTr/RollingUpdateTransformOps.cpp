@@ -297,6 +297,9 @@ fuseReduceInLoopNest(TransformOpInterface transform, RewriterBase &rewriter, For
   auto [fusedOuter, fusedInner] = *fused;
   rewriter.eraseOp(stagedReduce);
   rewriter.eraseOp(fusedOuter);
+  // Replace the old out-of-loop reduction with the results of the outer loop (which carries the
+  // result of the fused reduction).
+  rewriter.replaceOp(reduce, outerLoop->getResults().take_back(reduce->getNumResults()));
   reduce = cast<GenericOp>(fusedInner);
   return DiagnosedSilenceableFailure::success();
 }
@@ -423,7 +426,7 @@ LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
   IRMapping repairedReduceMapping;
   repairedReduceMapping.map(thisRed.getDpsInitOperand(0)->get(), repairUpdateOp->getResult(0));
   auto repairedReduceOp = cast<GenericOp>(rewriter.clone(*thisRed, repairedReduceMapping));
-  rewriter.replaceOp(thisRed, repairedReduceOp->getResults());
+  rewriter.replaceOp(thisRed, repairedReduceOp);
 
   transformResults.set(getOperation()->getResult(0), {repairedReduceOp.getOperation()});
   return DiagnosedSilenceableFailure::success();
