@@ -343,8 +343,10 @@ LoopRURollingUpdateNextReduction::apply(transform::TransformRewriter &rewriter,
       Operation *current = bqueue.front();
       bqueue.pop_front();
       if (current != reduce) {
-        if (failed(isSingleOutputElemwiseLinalgOp(current)))
+        if (failed(isSingleOutputElemwiseLinalgOp(current))) {
+          current->emitRemark("this op is not a single-output elementwise linalg op");
           BAIL("expected all ops between producer_op and reduce_op to be elementwise");
+        }
         elemwiseOps.push_back(current);
       }
       for (Value operand : current->getOperands()) {

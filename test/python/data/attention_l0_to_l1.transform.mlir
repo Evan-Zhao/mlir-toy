@@ -45,14 +45,16 @@ module attributes {transform.with_named_sequence} {
   }
 
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
-    %func = transform.structured.match ops{["func.func"]} in %module
+  // Step 0. Decompose softmax into linalg ops, and non-linalg elemwise ops
+  // (like arith.truncf) to linalg ops too.
+    %func0 = transform.structured.match ops{["func.func"]} in %module
         : (!transform.any_op) -> !transform.any_op
-
-    // Step 0. Decompose softmax into linalg ops.
+    %func = transform.apply_registered_pass "convert-elementwise-to-linalg" to %func0
+        : (!transform.any_op) -> !transform.any_op
     %softmax = transform.structured.match ops{["linalg.softmax"]} in %func
-      : (!transform.any_op) -> !transform.any_op
+        : (!transform.any_op) -> !transform.any_op
     %decomposed = transform.structured.decompose_interface %softmax
-      : (!transform.any_op) -> !transform.any_op
+        : (!transform.any_op) -> !transform.any_op
 
     // Step 1. Pattern match a matmul to find "matmul1" in attention,
     // then tile its outer iteration space.
@@ -139,6 +141,12 @@ module attributes {transform.with_named_sequence} {
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !transform.any_op
     transform.apply_cse to %func : !transform.any_op
 
+    // Step 5. Apply rolling update again, this time with the second matmul being the reduction.
+    %mm2, %elemwise_1 =
+      transform.match.loop_ru.rolling_update_next_reduction %forall_loop
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.print %mm2 : !transform.any_op
+    transform.print %elemwise_1 : !transform.any_op
     transform.yield
   }
 }
