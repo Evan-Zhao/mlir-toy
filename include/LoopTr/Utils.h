@@ -44,8 +44,7 @@ namespace mlir {
     (var) = std::get<OtherType>(var##1);                                                           \
   }
 
-/// Verifies that `op` is an elementwise linalg operation with a single output.
-/// Supports linalg.map and linalg.generic operations.
+/// Verifies that `op` is an elementwise linalg.generic operation with a single output.
 LogicalResult isSingleOutputElemwiseLinalgOp(Operation *op);
 
 /// Matches a one-input, one-result linalg.generic with exactly one reduction iterator.

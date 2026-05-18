@@ -8,31 +8,6 @@ namespace mlir {
 
 namespace {
 
-LogicalResult isElementwiseMap(linalg::MapOp map) {
-  if (map.getNumDpsInits() != 1)
-    return failure();
-  if (map->getNumResults() != 1)
-    return failure();
-  return success();
-}
-
-LogicalResult isElementwiseGeneric(linalg::GenericOp generic) {
-  if (generic.getNumDpsInits() != 1)
-    return failure();
-  if (generic->getNumResults() != 1)
-    return failure();
-  if (!generic.isAllParallelLoops())
-    return failure();
-  if (!generic.hasPureTensorSemantics())
-    return failure();
-  if (!llvm::all_of(generic.getIndexingMapsArray(),
-                    [](AffineMap map) { return map.isProjectedPermutation(); }))
-    return failure();
-  if (!generic.getIndexingMapsArray().back().isIdentity())
-    return failure();
-  return success();
-}
-
 /// Dispatch to the appropriate loop result mediator getter based on the loop type.
 template <typename LoopOp> struct GetLoopResults;
 
@@ -197,11 +172,18 @@ LogicalResult sinkYieldInsertSlices(RewriterBase &rewriter, scf::ForOp loop) {
 } // namespace
 
 LogicalResult isSingleOutputElemwiseLinalgOp(Operation *op) {
-  if (auto map = dyn_cast<linalg::MapOp>(op))
-    return isElementwiseMap(map);
-  if (auto generic = dyn_cast<linalg::GenericOp>(op))
-    return isElementwiseGeneric(generic);
-  return failure();
+  auto generic = dyn_cast<linalg::GenericOp>(op);
+  if (!generic)
+    return failure();
+  if (generic->getNumResults() != 1 || !generic.isAllParallelLoops() ||
+      !generic.hasPureTensorSemantics())
+    return failure();
+  if (!llvm::all_of(generic.getIndexingMapsArray(),
+                    [](AffineMap map) { return map.isProjectedPermutation(); }))
+    return failure();
+  if (!generic.getIndexingMapsArray().back().isIdentity())
+    return failure();
+  return success();
 }
 
 FailureOr<tensor::ParallelInsertSliceOp> getParallelInsertSliceForLoopResult(scf::ForallOp loop,
