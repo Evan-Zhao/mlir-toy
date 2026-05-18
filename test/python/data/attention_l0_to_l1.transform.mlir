@@ -145,8 +145,10 @@ module attributes {transform.with_named_sequence} {
     %mm2, %elemwise_1 =
       transform.match.loop_ru.rolling_update_next_reduction %forall_loop
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    transform.print %mm2 : !transform.any_op
-    transform.print %elemwise_1 : !transform.any_op
+    %elemwise_sidecars_1 =
+      transform.loop_ru.clone_fuse_elemwise %elemwise_1 into %forall_loop, %j0_loop
+        : (!transform.any_op, !transform.any_op, !transform.any_op) -> !transform.any_op
+
     transform.yield
   }
 }

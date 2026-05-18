@@ -138,6 +138,10 @@ out      = acc_final / l_final
   while loop handles are read-only inputs remapped to rebuilt loops.
 - Ordered multi-op handles are part of the contract: the elementwise chain is
   not treated as an unordered set.
+- TODO: upstream `scf::tileAndFuseConsumer` expects loop results to be
+  published through `tensor.insert_slice` / `tensor.parallel_insert_slice`.
+  If canonicalization removes those relays, rebuild minimal slices just before
+  fusion or call `tileAndFuseConsumerOfSlices` with explicit slices.
 
 ## Testing
 

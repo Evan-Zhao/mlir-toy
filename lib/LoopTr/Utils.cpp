@@ -341,10 +341,10 @@ tileAndFuseConsumerWithDebug(RewriterBase &rewriter, Operation &consumer,
 FailureOr<std::pair<Operation *, Operation *>>
 tileAndFuseConsumerIntoDoubleLoops(RewriterBase &rewriter, scf::ForallOp &outerLoop,
                                    scf::ForOp &innerLoop, Operation &operation) {
-#define BAIL_AND_POINT(msg, loop)                                                                  \
+#define BAIL_AND_POINT(msg)                                                                        \
   {                                                                                                \
     operation.emitError() << (msg);                                                                \
-    (loop).emitRemark() << #loop ":";                                                              \
+    operation.getParentOp()->emitRemark() << "outer scope:";                                       \
     return failure();                                                                              \
   }
 
@@ -354,14 +354,14 @@ tileAndFuseConsumerIntoDoubleLoops(RewriterBase &rewriter, scf::ForallOp &outerL
   FailureOr<scf::SCFFuseConsumerOfSliceResult> fusedIntoForall =
       tileAndFuseConsumerWithDebug(rewriter, operation, outerLoops);
   if (failed(fusedIntoForall))
-    BAIL_AND_POINT("failed to fuse this operation into the outer loop", outerLoop);
+    BAIL_AND_POINT("failed to fuse this operation into the outer loop");
   outerLoop = cast<scf::ForallOp>(outerLoops[0]);
   auto *outerFusedOp = fusedIntoForall->tiledOps[0];
 
   // Similarly, this first fusion may have inserted some operations after the inner loop, and we
   // move them before the inner loop.
   if (failed(recursiveMoveOperandsBeforeOp(*outerFusedOp, rewriter, *innerLoop)))
-    BAIL_AND_POINT("failed to move operands before the inner loop", innerLoop);
+    BAIL_AND_POINT("failed to move operands before the inner loop");
   if (failed(sinkYieldInsertSlices(rewriter, innerLoop))) {
     innerLoop.emitError() << "failed to sink inner-loop insert_slice yield operands";
     return failure();
@@ -372,7 +372,7 @@ tileAndFuseConsumerIntoDoubleLoops(RewriterBase &rewriter, scf::ForallOp &outerL
   FailureOr<scf::SCFFuseConsumerOfSliceResult> fusedIntoFor =
       tileAndFuseConsumerWithDebug(rewriter, *outerFusedOp, innerLoops);
   if (failed(fusedIntoFor))
-    BAIL_AND_POINT("failed to fuse this operation into the inner loop", innerLoop);
+    BAIL_AND_POINT("failed to fuse this operation into the inner loop");
   innerLoop = cast<scf::ForOp>(innerLoops[0]);
   auto *innerFusedOp = fusedIntoFor->tiledOps[0];
   return std::make_pair(outerFusedOp, innerFusedOp);
