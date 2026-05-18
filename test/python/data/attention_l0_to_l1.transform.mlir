@@ -133,7 +133,7 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op, !transform.any_op, !transform.any_op) -> !transform.any_op
     // Repair the first reduction frontier by turning it into loop-carried state
     // driven by the relayed sidecar value.
-    %reduce_r = transform.loop_ru.repair_reduction_frontier
+    %fused_bsum = transform.loop_ru.repair_reduction_frontier
         (%fused_bmax, %bsum) and (%elemwise, %elemwise_sidecars) into %forall_loop, %j0_loop
         : (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op,
            !transform.any_op, !transform.any_op) -> !transform.any_op
@@ -145,6 +145,10 @@ module attributes {transform.with_named_sequence} {
     %elemwise_sidecars_1 =
       transform.loop_ru.clone_fuse_elemwise %elemwise_1 into %forall_loop, %j0_loop
         : (!transform.any_op, !transform.any_op, !transform.any_op) -> !transform.any_op
+    %reduce_r = transform.loop_ru.repair_reduction_frontier
+        (%fused_bsum, %mm2) and (%elemwise_1, %elemwise_sidecars_1) into %forall_loop, %j0_loop
+        : (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op,
+           !transform.any_op, !transform.any_op) -> !transform.any_op
 
     transform.yield
   }
