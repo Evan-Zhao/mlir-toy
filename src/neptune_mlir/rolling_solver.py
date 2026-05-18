@@ -7,47 +7,6 @@ from sympy import Expr, Symbol
 JsonExpr = dict[str, Any]
 
 
-def solve_rolling_updater(g_expr: str, old_var: str, new_var: str, acc_var: str) -> str:
-    """Derive a rolling-update repair expression.
-
-    The interface is intentionally string-based so the MLIR side can serialize a
-    scalar expression without exposing MLIR objects to Python. The current public
-    wrapper handles the common one-old-var API, while the implementation below
-    mirrors TVM's more general SymPy solver.
-    """
-    old = sp.Symbol(old_var, real=True)
-    new = sp.Symbol(new_var, real=True)
-    acc = sp.Symbol(acc_var, real=True, nonzero=True)
-
-    locals_ = {
-        old_var: old,
-        new_var: new,
-        acc_var: acc,
-        "c": sp.Symbol("c", real=True),
-        "exp": sp.exp,
-        "exp2": lambda x: 2**x,
-        "log": sp.log,
-        "sqrt": sp.sqrt,
-        "rsqrt": lambda x: 1 / sp.sqrt(x),
-        "pow": sp.Pow,
-        "abs": sp.Abs,
-        "Max": sp.Max,
-        "max": sp.Max,
-    }
-    g = cast(Expr, sp.sympify(g_expr, locals=locals_))
-    c_vars = sorted(g.free_symbols - {old}, key=lambda sym: sym.name)
-
-    h_expr = sympy_solve_rolling_updater(g, {old: new}, c_vars, acc)
-    c_variables = set(c_vars).intersection(h_expr.free_symbols)
-    if c_variables:
-        raise ValueError(
-            "Cannot find a valid solution for the rolling-update updater function "
-            f"`H`: attempt to solve produced expression {h_expr} with remaining "
-            f"`c`-variables: {c_variables}"
-        )
-    return str(h_expr)
-
-
 def solve_rolling_updater_json(
     g_expr: JsonExpr,
     old_var: str,

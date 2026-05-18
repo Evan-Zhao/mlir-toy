@@ -149,12 +149,8 @@ make_mlir_opt_plugin(
 target_link_libraries(LoopTransform PRIVATE pybind11::embed)
 set_source_files_properties(
   lib/LoopTr/PythonSolver.cpp
-  PROPERTIES
-    COMPILE_OPTIONS "-frtti;-fexceptions"
+  PROPERTIES COMPILE_OPTIONS "-frtti;-fexceptions"
 )
-
-add_executable(PythonHello lib/PythonHello.cpp)
-target_link_libraries(PythonHello PRIVATE pybind11::embed LLVMSupport)
 
 if(SKBUILD)
   set(NEPTUNE_MLIR_PLUGIN_INSTALL_DIR "neptune_mlir/_native")
