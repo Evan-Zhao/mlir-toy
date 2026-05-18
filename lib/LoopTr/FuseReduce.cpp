@@ -19,6 +19,40 @@ namespace {
 
 using transform::TransformOpInterface;
 
+FailureOr<uint64_t> matchUnarySingleReductionGeneric(linalg::GenericOp generic) {
+  if (generic.getInputs().size() != 1 || generic.getNumDpsInits() != 1)
+    return failure();
+  if (generic->getNumResults() != 1)
+    return failure();
+
+  auto inputType = dyn_cast<RankedTensorType>(generic.getInputs().front().getType());
+  auto resultType = dyn_cast<RankedTensorType>(generic.getResults().front().getType());
+  if (!inputType || !resultType || inputType.getRank() != resultType.getRank() + 1)
+    return failure();
+
+  AffineMap inputMap = generic.getIndexingMapsArray().front();
+  if (!inputMap.isIdentity())
+    return failure();
+
+  auto reductionDim = getReductionIteratorIndex(generic);
+  if (failed(reductionDim))
+    return failure();
+
+  AffineMap outputMap = generic.getIndexingMapsArray().back();
+  if (outputMap.getNumResults() != resultType.getRank())
+    return failure();
+  int64_t reductionDimI64 = static_cast<int64_t>(*reductionDim);
+  for (int64_t dim = 0, outIdx = 0, e = inputType.getRank(); dim < e; ++dim) {
+    if (dim == reductionDimI64)
+      continue;
+    auto expr = outputMap.getResult(outIdx++);
+    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+    if (!dimExpr || dimExpr.getPosition() != dim)
+      return failure();
+  }
+  return *reductionDim;
+}
+
 /// Returns the index of the loop IV that directly defines `value`, or that
 /// feeds a trivial one-operand `affine.apply` producing `value`.
 ///
@@ -301,7 +335,8 @@ LoopFuseReduceConsumerIntoForall::apply(transform::TransformRewriter &rewriter,
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getForallLoop, "loop", loop, scf::ForallOp);
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getConsumerOp, "consumer", consumer,
                                linalg::GenericOp);
-  FailureOr<uint64_t> reductionDim = matchUnarySingleReductionGeneric(consumer);
+  FailureOr<uint64_t> reductionDim =
+      matchUnarySingleReductionGeneric(consumer);
   if (failed(reductionDim))
     return emitSilenceableFailure(transform,
                                   "expected a unary single-reduction linalg.generic consumer");

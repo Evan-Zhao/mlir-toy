@@ -47,9 +47,8 @@ namespace mlir {
 /// Verifies that `op` is an elementwise linalg.generic operation with a single output.
 LogicalResult isSingleOutputElemwiseLinalgOp(Operation *op);
 
-/// Matches a one-input, one-result linalg.generic with exactly one reduction iterator.
-/// Returns the reduction iterator index on success.
-FailureOr<uint64_t> matchUnarySingleReductionGeneric(linalg::GenericOp generic);
+/// Check that `generic` has a single reduction iterator, and return its index.
+FailureOr<uint64_t> getReductionIteratorIndex(linalg::GenericOp generic);
 
 /// Returns the unique tensor.parallel_insert_slice in `loop` that publishes `result`.
 FailureOr<tensor::ParallelInsertSliceOp> getParallelInsertSliceForLoopResult(scf::ForallOp loop,
