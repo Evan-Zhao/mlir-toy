@@ -44,9 +44,25 @@ module attributes {transform.with_named_sequence} {
     transform.yield %arg : !transform.any_op
   }
 
+  // Fuses all elementwise consumers of a given producer op into the producer.
+  transform.named_sequence @fuse_elemwise_consumer_of_result0(
+      %producer: !transform.any_op {transform.readonly}
+  ) -> (!transform.any_op) {
+    %consumers = transform.get_consumers_of_result %producer[0]
+        : (!transform.any_op) -> !transform.any_op
+    %_1, %elemwise_consumers = transform.foreach_match restrict_root in %consumers
+        @match_elemwise -> @return_matched
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.print %elemwise_consumers : !transform.any_op
+    %fused_consumers =
+      transform.loop.fuse_into_producer_op %elemwise_consumers into %producer
+        : (!transform.any_op, !transform.any_op) -> !transform.any_op
+    transform.yield %fused_consumers : !transform.any_op
+  }
+
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
-  // Step 0. Decompose softmax into linalg ops, and non-linalg elemwise ops
-  // (like arith.truncf) to linalg ops too.
+    // Step 0. Decompose softmax into linalg ops, and non-linalg elemwise ops
+    // (like arith.truncf) to linalg ops too.
     %func0 = transform.structured.match ops{["func.func"]} in %module
         : (!transform.any_op) -> !transform.any_op
     %func = transform.apply_registered_pass "convert-elementwise-to-linalg" to %func0
@@ -96,14 +112,8 @@ module attributes {transform.with_named_sequence} {
     // For attention, this op would be the score-scaling op, which we call `bscale`.
     // `bscale` will be fused under `forall_loop` (the outer loop nest we created by tiling).
     //   TVM: sch.reverse_compute_at(bscale, j0)
-    %consumers = transform.get_consumers_of_result %forall_loop[0]
-        : (!transform.any_op) -> !transform.any_op
-    %_1, %bscale = transform.foreach_match restrict_root in %consumers
-        @match_elemwise -> @return_matched
-        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
-    %fused_bscale =
-      transform.loop.fuse_into_producer_op %bscale into %forall_loop
-        : (!transform.any_op, !transform.any_op) -> !transform.any_op
+    %fused_bscale = transform.include @fuse_elemwise_consumer_of_result0 failures(propagate)
+        (%forall_loop) : (!transform.any_op) -> (!transform.any_op)
     // Fusion can create redundant loop-carried values and canonicalization removes them.
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !transform.any_op
 
@@ -149,6 +159,14 @@ module attributes {transform.with_named_sequence} {
         (%fused_bsum, %mm2) and (%elemwise_1, %elemwise_sidecars_1) into %forall_loop, %j0_loop
         : (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op,
            !transform.any_op, !transform.any_op) -> !transform.any_op
+
+    // Step 6. Fuse the trailing FP32->FP16 cast into the forall loop (but outside the for loop).
+    // Canonicalize first to reduce the number of outputs from the forall loop.
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !transform.any_op
+    %fused_trunc = transform.include @fuse_elemwise_consumer_of_result0 failures(propagate)
+        (%forall_loop) : (!transform.any_op) -> (!transform.any_op)
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !transform.any_op
+    transform.apply_cse to %func : !transform.any_op
 
     transform.yield
   }
