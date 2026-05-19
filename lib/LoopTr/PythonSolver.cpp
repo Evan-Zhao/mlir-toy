@@ -196,6 +196,12 @@ FailureOr<json::Value> serializeMLIRExprValueToJSON(Value value, SerializationSt
     return buildUnaryExpr("sqrt", sqrt, state);
   if (auto rsqrt = dyn_cast<math::RsqrtOp>(def))
     return buildUnaryExpr("rsqrt", rsqrt, state);
+  // The Python solver works over real-valued expressions. For now, ignore
+  // precision-changing casts during extraction and treat them as transparent.
+  if (auto truncf = dyn_cast<arith::TruncFOp>(def))
+    return serializeMLIRExprValueToJSON(truncf.getIn(), state);
+  if (auto extf = dyn_cast<arith::ExtFOp>(def))
+    return serializeMLIRExprValueToJSON(extf.getIn(), state);
 
   def->emitError("unsupported operation while serializing expression");
   return failure();
@@ -222,9 +228,15 @@ FailureOr<TypedAttr> parseJSONConstAttr(const json::Object &object, Type type,
   Attribute attr;
   if (auto str = value->getAsString())
     attr = parseAttribute(*str, context, type);
-  else if (auto intValue = value->getAsInteger())
-    attr = parseAttribute(std::to_string(*intValue), context, type);
-  else if (auto doubleValue = value->getAsNumber()) {
+  else if (auto intValue = value->getAsInteger()) {
+    std::string printed = std::to_string(*intValue);
+    Type elementType = type;
+    if (auto shapedType = dyn_cast<ShapedType>(type))
+      elementType = shapedType.getElementType();
+    if (isa<FloatType>(elementType))
+      printed += ".0";
+    attr = parseAttribute(printed, context, type);
+  } else if (auto doubleValue = value->getAsNumber()) {
     std::string printed;
     llvm::raw_string_ostream os(printed);
     os << *doubleValue;
