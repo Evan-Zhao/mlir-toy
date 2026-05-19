@@ -30,6 +30,25 @@ bool isReductionLike(Operation *op) {
   });
 }
 
+static FailureOr<AffineMap> dropDomainDim(AffineMap map, unsigned droppedDim) {
+  MLIRContext *ctx = map.getContext();
+  unsigned oldNumDims = map.getNumDims();
+  if (droppedDim >= oldNumDims)
+    return failure();
+
+  // Verify dropped dim was not referenced.
+  for (AffineExpr expr : map.getResults()) {
+    if (expr.isFunctionOfDim(droppedDim))
+      return failure();
+  }
+  // First create a (d0, d1, ..., d{n-1}) vector, then insert a placeholder `0` at `droppedDim`.
+  SmallVector<AffineExpr> dimRepls = llvm::to_vector(llvm::map_range(
+      llvm::index_range(0, oldNumDims), [&](size_t i) { return getAffineDimExpr(i, ctx); }));
+  dimRepls.insert(dimRepls.begin() + droppedDim, getAffineConstantExpr(0, ctx));
+
+  return map.replaceDimsAndSymbols(dimRepls, map.getResults(), oldNumDims - 1, map.getNumSymbols());
+}
+
 struct SelfReductionMatch {
   BlockArgument accumulatorArg;
   Value yieldValue;
@@ -66,9 +85,18 @@ FailureOr<SelfReductionMatch> matchSelfReductionConsumer(GenericOp reduceOp, OpR
   };
 }
 
+struct LinalgProvenance {
+  OpResult tileValue;
+  AffineMap indexMap;
+  std::string varName;
+};
+
+// TODO: better name for this struct. Not all fields are used by the solver only. `reductionVars`
+// provides tensor-value provenance for scalar variables in the g expression, which is used when
+// reconstructing a linalg.generic from the h-expression after the solver is done.
 struct RollingUpdateSolverInput {
-  DenseMap<OpResult, std::string> reductionVars;
-  std::string accumulatorVar;
+  SmallVector<LinalgProvenance> varProvenances;
+  std::string accVarName;
   json::Value fExpr, gExpr;
 };
 
@@ -135,9 +163,10 @@ extractRepairInputExprs(RewriterBase &rewriter, ArrayRef<Operation *> producingR
   size_t nInputs = currentOp.getNumDpsInputs();
   size_t rCounter = 0, cCounter = 0;
   DenseMap<Value, std::string> gExprVarNames;
-  DenseMap<OpResult, std::string> reductionVarNames;
+  SmallVector<LinalgProvenance> reductionVars;
   for (size_t i = 0; i < nInputs; ++i) {
     Value operand = currentOp.getOperand(i);
+    AffineMap indexMap = currentOp.getIndexingMapsArray()[i];
     BlockArgument blkArg = genericBodyBlk->getArgument(i);
     if (prodRedResults.contains(operand)) {
       // This operand is produced by one of the producing reductions. Name it "r{i}".
@@ -145,7 +174,7 @@ extractRepairInputExprs(RewriterBase &rewriter, ArrayRef<Operation *> producingR
       gExprVarNames[blkArg] = rName;
       // Map from the producer reduction result to the variable name. This will be useful when we
       // build a program from the h-expression later.
-      reductionVarNames[cast<OpResult>(operand)] = rName;
+      reductionVars.emplace_back(cast<OpResult>(operand), indexMap, rName);
     } else {
       // This operand is not produced by the reductions. Name it "c{i}".
       gExprVarNames[blkArg] = "c" + std::to_string(cCounter++);
@@ -154,12 +183,15 @@ extractRepairInputExprs(RewriterBase &rewriter, ArrayRef<Operation *> producingR
 
   // Step 4. Extract the g expression from reduceOperand upwards.
   auto gExpr = serializeMLIRExprToJSON(match->reduceOperand, gExprVarNames, currentOp);
-  if (failed(gExpr))
+  if (failed(gExpr)) {
+    currentOp->emitRemark("this is the compute operation we're extracting from");
     return failure();
+  }
   // Step 5. Similarly extract the f expression from yieldValue upwards (which should stop soon
   // because there is only one operation to extract)
+  static const std::string accVarName = "acc";
   DenseMap<Value, std::string> fExprVarNames{
-      {match->accumulatorArg, "acc"},
+      {match->accumulatorArg, accVarName},
       {match->reduceOperand, "x"},
   };
   auto fExpr = serializeMLIRExprToJSON(match->yieldValue, fExprVarNames, currentOp);
@@ -167,8 +199,8 @@ extractRepairInputExprs(RewriterBase &rewriter, ArrayRef<Operation *> producingR
     return failure();
 
   return RollingUpdateSolverInput{
-      .reductionVars = std::move(reductionVarNames),
-      .accumulatorVar = "acc",
+      .varProvenances = std::move(reductionVars),
+      .accVarName = accVarName,
       .fExpr = std::move(*fExpr),
       .gExpr = std::move(*gExpr),
   };
@@ -176,7 +208,7 @@ extractRepairInputExprs(RewriterBase &rewriter, ArrayRef<Operation *> producingR
 
 /// Make an elemwise linalg.generic op that applies the repair term found by the solver.
 FailureOr<GenericOp> buildLinalgFromRepairTerm(RewriterBase &rewriter, const json::Value &hExpr,
-                                               GenericOp sourceReduce,
+                                               GenericOp sourceReduce, size_t reduceDim,
                                                const RollingUpdateSolverInput &solverInput) {
   auto loc = sourceReduce.getLoc();
   if (sourceReduce.getNumResults() != 1)
@@ -195,57 +227,65 @@ FailureOr<GenericOp> buildLinalgFromRepairTerm(RewriterBase &rewriter, const jso
     deserialized = *std::move(deserializedR);
   }
 
+  auto dpsInit = sourceReduce.getDpsInitOperand(0)->get();
+  // Since we checked there is only one result, this is the indexing map for the output tensor.
+  auto resultMap = sourceReduce.getIndexingMapsArray()[sourceReduce.getNumDpsInputs() + 0];
+
   // Start building a linalg.generic around the scalar code in the scratch block.
   // We need to find the input operands to use for this generic.
-  auto *sourceInitOperand = sourceReduce.getDpsInitOperand(0);
-  if (!sourceInitOperand)
-    return failure();
-  Value outputTensor = sourceInitOperand->get();
-  llvm::StringMap<Value> inputBindingsByName;
-  inputBindingsByName[solverInput.accumulatorVar] = outputTensor;
-  for (const auto &[opResult, varName] : solverInput.reductionVars) {
+  llvm::StringMap<std::pair<Value, AffineMap>> varNameToValue;
+  varNameToValue[solverInput.accVarName] = {dpsInit, resultMap};
+  for (const auto &[opResult, sourceMap, varName] : solverInput.varProvenances) {
     auto producerOp = dyn_cast<DestinationStyleOpInterface>(opResult.getDefiningOp());
     if (!producerOp)
       return failure();
     // Map the variable for the new result (with a prime, like r0') to `opResult`,
     // This prime thing is a convension assumed by the solver.
-    inputBindingsByName[varName + "'"] = opResult;
+    varNameToValue[varName + "'"] = {opResult, sourceMap};
     // and map the variable for the old result (e.g. r0) to the init value of the producer
     // reduction, which is the "previous iteration" value of this reduction.
     auto initValue = producerOp.getDpsInitOperand(opResult.getResultNumber());
-    inputBindingsByName[varName] = initValue->get();
+    varNameToValue[varName] = {initValue->get(), sourceMap};
   }
 
-  // Start building the linalg.generic. Get a list of inputs sorted by variable names.
+  // Get a list of scalar variables for inputs, sorted by variable name.
   auto sortedVars =
       llvm::to_vector(llvm::map_range(deserialized.variablesByName, [](const auto &it) {
         return std::make_pair(it.getKey().str(), it.getValue());
       }));
   llvm::sort(sortedVars, [](const auto &a, const auto &b) { return a.first < b.first; });
-  // Look up each input in `inputBindingsByName`.
+  // Look up each variable name in `varNameToProv`, and build a list of operands for the linalg op,
+  // and their corresponding indexing maps.
   SmallVector<Value> inputTensors;
   inputTensors.reserve(sortedVars.size());
+  SmallVector<AffineMap> indexingMaps;
+  indexingMaps.reserve(sortedVars.size() + 1);
   for (const auto &[name, _] : sortedVars) {
-    auto it = inputBindingsByName.find(name);
-    if (it == inputBindingsByName.end()) {
+    auto it = varNameToValue.find(name);
+    if (it == varNameToValue.end()) {
       llvm::errs() << "no tensor binding provided for symbolic variable `" << name << "`\n";
       return failure();
     }
-    inputTensors.push_back(it->second);
+    inputTensors.push_back(it->second.first);
+    indexingMaps.push_back(it->second.second);
   }
-  // We also need indexing maps. We're assuming this op will be elemwise, so all the maps are just
-  // identities. N for inputs and one for output.
-  auto sourceOutType = dyn_cast<RankedTensorType>(sourceReduce.getResult(0).getType());
-  if (!sourceOutType)
-    return failure();
-  unsigned outRank = sourceOutType.getRank();
-  AffineMap identityMap = AffineMap::getMultiDimIdentityMap(outRank, rewriter.getContext());
-  SmallVector<AffineMap> indexingMaps(sortedVars.size() + 1, identityMap);
-  SmallVector<utils::IteratorType> iteratorTypes(sortedVars.size(), utils::IteratorType::parallel);
+  // One more for the DPS init operand.
+  indexingMaps.push_back(resultMap);
+  // Drop the reduction dimension from the domain of each indexing map, since we're creating an
+  // elemwise op here.
+  for (auto &map : indexingMaps) {
+    auto trimmedIndexMap = dropDomainDim(map, reduceDim);
+    if (failed(trimmedIndexMap))
+      return failure();
+    map = *trimmedIndexMap;
+  }
 
+  // This op is elementwise, so all iterators are parallel.
+  SmallVector<utils::IteratorType> iteratorTypes(indexingMaps.back().getNumDims(),
+                                                 utils::IteratorType::parallel);
   return linalg::GenericOp::create(
-      rewriter, loc, TypeRange{outputTensor.getType()}, inputTensors, ValueRange{outputTensor},
-      indexingMaps, iteratorTypes, [&](OpBuilder &builder, Location nestedLoc, ValueRange newArgs) {
+      rewriter, loc, TypeRange{dpsInit.getType()}, inputTensors, ValueRange{dpsInit}, indexingMaps,
+      iteratorTypes, [&](OpBuilder &builder, Location nestedLoc, ValueRange newArgs) {
         IRMapping mapping;
         for (auto [pair, arg] :
              llvm::zip_equal(sortedVars, newArgs.take_front(inputTensors.size())))
@@ -392,8 +432,8 @@ LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
                       elemwiseSidecars);
   if (elemwiseOrig.size() != elemwiseSidecars.size())
     BAIL("expected the original and sidecar elementwise chains to have the same size");
-  auto redDimOrF = matchUnarySingleReductionGeneric(thisRed);
-  if (failed(redDimOrF))
+  auto redDimR = matchUnarySingleReductionGeneric(thisRed);
+  if (failed(redDimR))
     BAIL("expected reduce to be a unary single-reduction linalg.generic");
 
   // Fuse the reduce operation into the loop nest, changing its input from `elemwiseOrig` to
@@ -410,15 +450,16 @@ LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
   auto solverInputR = extractRepairInputExprs(rewriter, producerReds, thisRed, elemwiseSidecars);
   if (failed(solverInputR))
     BAIL("failed to extract reducer/elemwise expressions from the program");
-  auto redVars = llvm::to_vector(
-      llvm::map_range(solverInputR->reductionVars, [](const auto &it) { return it.second; }));
+  auto redVars = llvm::to_vector(llvm::map_range(
+      solverInputR->varProvenances, [](const LinalgProvenance &prov) { return prov.varName; }));
   auto hExpr =
       solveRollingUpdaterWithPython(solverInputR->fExpr, solverInputR->gExpr, redVars, "acc");
   if (!hExpr)
     BAIL("failed to solve rolling updater with Python: " + llvm::toString(hExpr.takeError()));
 
   // Build a new linalg.generic that applies the repair term.
-  auto repairUpdateOp = buildLinalgFromRepairTerm(rewriter, *hExpr, thisRed, *solverInputR);
+  auto repairUpdateOp =
+      buildLinalgFromRepairTerm(rewriter, *hExpr, thisRed, *redDimR, *solverInputR);
   if (failed(repairUpdateOp))
     BAIL("failed to build linalg.generic around the h-expression returned by the solver");
 
