@@ -49,11 +49,12 @@ module attributes {transform.with_named_sequence} {
     %consumers = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
     %_2, %bmax = transform.foreach_match restrict_root in %consumers
         @match_2d_1d_reduction -> @return_matched : (!any) -> (!any, !any)
-    // TODO: this doesn't work because the "row-max" in the input program has two outputs:
-    // the max value and the index of the max value. This pass currently only allows single-output
-    // reductions.
-    // %fused_bmax, %j0_loop = transform.loop.fuse_reduction_consumer_into_forall
-    //     %bmax into %forall_loop : (!any, !any) -> (!any, !any)
+    // The "row-max" in the input program has two outputs: the max value and the argmax.
+    // The subsequent fusion only supports single-output ops, so we remove the unused argmax
+    // output before fusion.
+    transform.loop.erase_unused_operands_and_results %bmax : !any
+    %fused_bmax, %j0_loop = transform.loop.fuse_reduction_consumer_into_forall
+        %bmax into %forall_loop : (!any, !any) -> (!any, !any)
 
     transform.yield
   }
