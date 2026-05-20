@@ -6,6 +6,7 @@ which tile-level recurrences are carried across loops. It does not record GPU
 hierarchy, memory spaces, layouts, warp roles, async copies, or barriers.
 
 The intended contract is:
+
 - Tile sizes and grid structure are explicit.
 - Parallel output tiles are explicit.
 - Sequential reduction or streaming loops are explicit.
@@ -13,7 +14,7 @@ The intended contract is:
 - Tile bodies remain structured tensor computations.
 - Hardware placement is still absent.
 
-The canonical example is `tests/data/flash_attention_l1.mlir`. It describes a
+The canonical example is `test/python/data/flash_attention_l1.mlir`. It describes a
 FlashAttention schedule in a form that is close to Triton, while still leaving
 room for later lowering to more hardware-specific languages.
 
@@ -24,6 +25,7 @@ Tile values are plain `tensor<...>` values, and tile bodies use upstream ops
 such as `linalg`, `arith`, `math`, and `tensor`.
 
 Tile structure is encoded directly in tensor and loop operations:
+
 - `tensor.extract_slice` forms input tiles.
 - Static slice sizes define tile shapes.
 - Loop bounds define the tile grid.
@@ -38,6 +40,7 @@ Triton, TileLang, CuTe, ThunderKittens, or GPU-specific lowering.
 ## FlashAttention Shape
 
 The FlashAttention L1 example makes these schedule decisions explicit:
+
 - The output is partitioned into `(B, H, M-block)` tiles with
   `scf.forall (%b, %h, %i_block) in (1, 32, 32)`.
 - Each parallel instance computes one `128 x 128` output tile.
@@ -99,6 +102,7 @@ attributes such as `tileir.pipeline_stages` over unqualified attributes.
 ## Loop Operator Rule
 
 Level 1 normally uses two iterator-defining ops:
+
 - `scf.forall` for the outer parallel grid that produces disjoint output tiles.
 - `affine.for` for static, regular sequential loops that carry tile state.
 
@@ -110,16 +114,17 @@ Avoid `affine.parallel` for the main output grid in value-based tensor IR.
 `affine.parallel` models reduction-style aggregation, not destination-passing
 parallel insertion of disjoint tensor slices.
 
-| Loop kind in the IR                                                         | Op           | Reason                                                                                             |
-| --------------------------------------------------------------------------- | ------------ | -------------------------------------------------------------------------------------------------- |
-| Outer parallel grid producing disjoint output tiles                         | `scf.forall` | Supports `shared_outs` and `tensor.parallel_insert_slice`.                                         |
-| Static sequential reduction or streaming loop carrying tile state           | `affine.for` | Supports `iter_args`; affine bounds keep tile-level scheduling passes available.                    |
-| Sequential loop with non-affine bounds                                      | `scf.for`    | Same basic recurrence shape as `affine.for`, without affine validity constraints.                   |
-| Reduction-only parallel loop                                                | `affine.parallel` | Useful in general MLIR, but not the default for L1 output-tile decomposition.                  |
+| Loop kind in the IR                                               | Op                | Reason                                                                            |
+| ----------------------------------------------------------------- | ----------------- | --------------------------------------------------------------------------------- |
+| Outer parallel grid producing disjoint output tiles               | `scf.forall`      | Supports `shared_outs` and `tensor.parallel_insert_slice`.                        |
+| Static sequential reduction or streaming loop carrying tile state | `affine.for`      | Supports `iter_args`; affine bounds keep tile-level scheduling passes available.  |
+| Sequential loop with non-affine bounds                            | `scf.for`         | Same basic recurrence shape as `affine.for`, without affine validity constraints. |
+| Reduction-only parallel loop                                      | `affine.parallel` | Useful in general MLIR, but not the default for L1 output-tile decomposition.     |
 
 ## What L1 Does Not Encode
 
 The FlashAttention L1 example deliberately does not encode:
+
 - GPU blocks, warps, lanes, warpgroups, or thread mappings.
 - Shared/register/fragment memory spaces.
 - Tile layouts, swizzles, MMA operand layouts, or vector register shapes.
@@ -137,6 +142,7 @@ body legible to polyhedral analysis: dependence checking, loop tiling, fusion,
 interchange, vectorization, software pipelining, and unroll-and-jam.
 
 The cost is restriction:
+
 - The step must be a positive integer constant.
 - Bounds must be affine maps over valid affine operands.
 - SSA index values from non-affine sources cannot directly drive affine
@@ -149,6 +155,7 @@ makes affine analyses sound.
 
 For static, regular sequential loops such as the K/V streaming loop in
 FlashAttention, `affine.for` is a strict upgrade over `scf.for`:
+
 - `iter_args` work for tensors, scalars, and other SSA values.
 - The body can still contain non-affine ops such as `linalg`, `arith`, `math`,
   and `tensor`.

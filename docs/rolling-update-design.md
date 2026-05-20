@@ -49,6 +49,10 @@ consumed). It returns:
 The op fails if no reduction is reachable or if any op on the path is not a
 supported single-result elementwise op.
 
+- The later rolling-update steps are implemented to only support `linalg.generic`,
+  so tensor `arith` / `math` elementwise ops are not supported even though they may pass this step.
+  They can be normalized first, e.g. with `convert-elementwise-to-linalg`.
+
 ### `transform.loop_ru.clone_fuse_elemwise`
 
 Signature:
@@ -89,9 +93,11 @@ It performs the following steps:
     - `f_expr` from the `reduce_op`, which should be a simple reduction combiner, such as `a + b`
     - `g_expr` from the non-accumulator side of the reduction combiner,
       which should coinside with the combined computation of `elemwise_sidecar_ops`.
-1. Call the Python/SymPy solver on these two expressions to derive a repair term `H`.
-1. Apply the solution `H` to produce a new `linalg.generic` operation to fix the result.
-   This operation updates the accumulator of `reduce_op` before `reduce_op` runs.
+1. Call the Python/SymPy solver on these two expressions to derive a repair term `H`,
+   and prove that `H` is valid for the combiner `f`.
+1. Materialize `H` as an elementwise `linalg.generic` (call it `update_op`),
+   which updates the DPS init argument of `reduce_op`;
+   then clone `reduce_op` with its DPS init remapped to the output of `update_op`.
 
 The result is a repaired reduction whose accumulator is no longer the original
 partial state, but the repaired state computed from `H`.
@@ -100,14 +106,11 @@ partial state, but the repaired state computed from `H`.
 
 The current implementation assumes:
 
-- a unary single-result `linalg.generic` reduction frontier,
+- a single-result, single-init, one-reduction-dim `linalg.generic` frontier,
+- the frontier can be fused under the inner loop,
 - the fused frontier still matches a self-reduction `out = f(out, g(...))`,
-- producer reductions are destination-style ops whose previous value is their
-  init operand,
-- the solved repair term eliminates all `c*` variables before
-  re-materialization,
-- the repaired init tensor is pointwise on the reduction-result domain, so the
-  accumulator and producer reductions agree on that result shape.
+- producer reductions are destination-style ops whose previous value is their init operand,
+- the solved repair term eliminates all `c*` variables before re-materialization.
 
 ## Attention Example
 

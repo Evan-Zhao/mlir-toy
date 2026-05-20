@@ -47,7 +47,8 @@ reduction consumer into a loop nest.
 
 It takes:
 
-- a unary single-reduction `linalg.generic` consumer,
+- a single-result, single-dimension `linalg.generic` reduction consumer
+  whose reduced input is produced by the target `scf.forall`,
 - a containing `scf.forall` whose result is the reduction input.
 
 More precisely, the current implementation requires:
