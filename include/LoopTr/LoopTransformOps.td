@@ -2,6 +2,43 @@ include "mlir/Dialect/Transform/IR/TransformDialect.td"
 include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
+def LoopEraseUnusedOperandsAndResultsOp
+    : Op<Transform_Dialect, "loop.erase_unused_operands_and_results",
+         [TransformOpInterface,
+          TransformEachOpTrait,
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+          ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Remove unused operands and dead results from linalg.generic";
+
+  let description = [{
+    Apply the same upstream cleanup set that `-linalg-fuse-elementwise-ops`
+    uses to remove dead outputs and redundant operands of `linalg.generic`.
+
+    Concretely, this wraps
+    `linalg::populateEraseUnusedOperandsAndResultsPatterns(...)`, which includes:
+    - `RemoveUnusedCycleInGenericOp`
+    - `DeduplicateAndRemoveDeadOperandsAndResults`
+
+    The transform is applied directly to the targeted op with
+    `applyOpPatternsGreedily`, so the target operation itself may be rewritten.
+    This transform reads the target handle and modifies the payload. It does not
+    return a handle; rematch if you need the rewritten op.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$target);
+  let results = (outs);
+
+  let assemblyFormat = "$target attr-dict `:` type($target)";
+
+  let extraClassDeclaration = [{
+    ::mlir::DiagnosedSilenceableFailure applyToOne(
+        ::mlir::transform::TransformRewriter &rewriter,
+        ::mlir::Operation *target,
+        ::mlir::transform::ApplyToEachResultList &results,
+        ::mlir::transform::TransformState &state);
+  }];
+}
+
 def LoopFuseIntoProducerOp : Op<Transform_Dialect, "loop.fuse_into_producer_op",
          [FunctionalStyleTransformOpTrait,
           DeclareOpInterfaceMethods<TransformOpInterface>,

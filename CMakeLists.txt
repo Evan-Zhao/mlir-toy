@@ -140,6 +140,7 @@ make_mlir_opt_plugin(
   SOURCES
     lib/LoopTr/FuseElemwise.cpp
     lib/LoopTr/FuseReduce.cpp
+    lib/LoopTr/LinalgPatterns.cpp
     lib/LoopTr/LoopTransformPlugin.cpp
     lib/LoopTr/PythonSolver.cpp
     lib/LoopTr/RollingUpdateTransformOps.cpp

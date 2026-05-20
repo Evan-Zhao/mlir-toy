@@ -49,11 +49,35 @@ module attributes {transform.with_named_sequence} {
     %consumers = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
     %_2, %bmax = transform.foreach_match restrict_root in %consumers
         @match_2d_1d_reduction -> @return_matched : (!any) -> (!any, !any)
-    // TODO: this doesn't work because the "row-max" in the input program has two outputs:
-    // the max value and the index of the max value. This pass currently only allows single-output
-    // reductions.
-    // %fused_bmax, %j0_loop = transform.loop.fuse_reduction_consumer_into_forall
-    //     %bmax into %forall_loop : (!any, !any) -> (!any, !any)
+    // The "row-max" in the input program has two outputs: the max value and the argmax.
+    // The subsequent fusion only supports single-output ops, so we remove the unused argmax
+    // output before fusion.
+    transform.loop.erase_unused_operands_and_results %bmax : !any
+    %fused_bmax, %j0_loop = transform.loop.fuse_reduction_consumer_into_forall
+        %bmax into %forall_loop : (!any, !any) -> (!any, !any)
+
+    %bsum, %elemwise = transform.match.loop_ru.rolling_update_next_reduction
+        %forall_loop : (!any) -> (!any, !any)
+    %elemwise_sidecars = transform.loop_ru.clone_fuse_elemwise
+        %elemwise into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
+    %fused_bsum = transform.loop_ru.repair_reduction_frontier
+        (%fused_bmax, %bsum) and (%elemwise, %elemwise_sidecars) into %forall_loop, %j0_loop
+        : (!any, !any, !any, !any, !any, !any) -> !any
+
+    %bmm1, %elemwise_1 = transform.match.loop_ru.rolling_update_next_reduction
+        %forall_loop : (!any) -> (!any, !any)
+    %elemwise_sidecars_1 = transform.loop_ru.clone_fuse_elemwise
+        %elemwise_1 into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
+    // Spell this bmm out too -- repair_reduction_frontier only supports linalg.generic operations.
+    %bmm1_1 = transform.structured.generalize %bmm1 : (!any) -> !any
+    %reduce_r = transform.loop_ru.repair_reduction_frontier
+        (%fused_bsum, %bmm1_1) and (%elemwise_1, %elemwise_sidecars_1) into %forall_loop, %j0_loop
+        : (!any, !any, !any, !any, !any, !any) -> !any
+
+    %trunc = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
+    %fused_trunc = transform.loop.fuse_into_producer_op %trunc into %forall_loop : (!any, !any) -> !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+    transform.apply_cse to %func : !any
 
     transform.yield
   }
