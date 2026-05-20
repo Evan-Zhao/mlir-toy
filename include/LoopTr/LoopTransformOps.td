@@ -39,6 +39,78 @@ def LoopEraseUnusedOperandsAndResultsOp
   }];
 }
 
+def LoopFoldExpandingReshapeOp : Op<Transform_Dialect, "loop.fold_expanding_reshape",
+         [TransformOpInterface,
+          TransformEachOpTrait,
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+          ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Apply linalg's expanding reshape folding patterns directly to a target op";
+
+  let description = [{
+    Apply `linalg::populateFoldReshapeOpsByExpansionPatterns(...)`
+    directly to the targeted payload op with `applyOpPatternsGreedily`.
+
+    This transform reads the target handle and modifies the payload.
+    The handle should still be valid and point to the modified op.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$target);
+  let results = (outs);
+
+  let assemblyFormat = "$target attr-dict `:` type($target)";
+
+  let extraClassDeclaration = [{
+    ::mlir::DiagnosedSilenceableFailure applyToOne(
+        ::mlir::transform::TransformRewriter &rewriter,
+        ::mlir::Operation *target,
+        ::mlir::transform::ApplyToEachResultList &results,
+        ::mlir::transform::TransformState &state);
+  }];
+}
+
+def LoopInlineElementwiseOp : Op<Transform_Dialect, "loop.inline_elementwise",
+         [FunctionalStyleTransformOpTrait,
+          MemoryEffectsOpInterface,
+          TransformOpInterface,
+          TransformEachOpTrait,
+          ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Inline elementwise producers into a linalg.generic consumer";
+
+  let description = [{
+    Thin transform-level wrapper around upstream `linalg::fuseElementwiseOps`.
+
+    For each targeted `linalg.generic`, this op repeatedly:
+    - folds producer reshape ops into the consumer when possible, and
+    - inlines one producer of an input operand into the consumer.
+
+    If `operand_number` is present, only that operand is considered for both
+    reshape folding and inlining. Otherwise, operands are tried from left
+    to right and the first eligible operand is inlined. The transform keeps
+    iterating until neither rewrite can make further progress, then returns a
+    handle to the final `linalg.generic`.
+
+    #### Return modes
+
+    This op produces a silenceable failure if the target is not a
+    `linalg.generic`, if `operand_number` is out of range, or if neither
+    reshape folding nor inlining can make progress.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$target,
+                       OptionalAttr<I64Attr>:$operand_number);
+  let results = (outs TransformHandleTypeInterface:$fused_op);
+
+  let assemblyFormat = "$target attr-dict `:` functional-type(operands, results)";
+
+  let extraClassDeclaration = [{
+    ::mlir::DiagnosedSilenceableFailure applyToOne(
+        ::mlir::transform::TransformRewriter &rewriter,
+        ::mlir::Operation *target,
+        ::mlir::transform::ApplyToEachResultList &results,
+        ::mlir::transform::TransformState &state);
+  }];
+}
+
 def LoopFuseIntoProducerOp : Op<Transform_Dialect, "loop.fuse_into_producer_op",
          [FunctionalStyleTransformOpTrait,
           DeclareOpInterfaceMethods<TransformOpInterface>,
