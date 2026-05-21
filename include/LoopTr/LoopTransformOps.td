@@ -39,6 +39,45 @@ def LoopEraseUnusedOperandsAndResultsOp
   }];
 }
 
+def LoopFoldZeroIndexedUnitDimsOp
+    : Op<Transform_Dialect, "loop.fold_zero_indexed_unit_dims",
+         [TransformOpInterface,
+          TransformEachOpTrait,
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+          ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Drop only linalg.generic unit dims implicated by zero-valued indexing-map results";
+
+  let description = [{
+    Apply a narrow `linalg.generic` cleanup directly to the targeted payload op.
+
+    The rewrite reuses upstream `linalg::dropUnitDims(...)`, but restricts the
+    candidate loop dimensions to those that are implicated by `0`-valued
+    indexing map results, e.g. maps like `(d0, d1, d2, d3) -> (d0, d1, d2, 0)`.
+    This is intended for keepdim-style softmax patterns where broad unit-extent
+    folding would also erase unrelated leading batch dimensions.
+
+    The implementation mirrors the upstream `-linalg-fold-unit-extent-dims`
+    structure: a walk-based fold phase followed by the usual canonicalization
+    cleanup, but with the narrower control function above.
+
+    This transform reads the target handle and modifies the payload. It does not
+    return a handle; rematch if you need rewritten nested ops.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$target);
+  let results = (outs);
+
+  let assemblyFormat = "$target attr-dict `:` type($target)";
+
+  let extraClassDeclaration = [{
+    ::mlir::DiagnosedSilenceableFailure applyToOne(
+        ::mlir::transform::TransformRewriter &rewriter,
+        ::mlir::Operation *target,
+        ::mlir::transform::ApplyToEachResultList &results,
+        ::mlir::transform::TransformState &state);
+  }];
+}
+
 def LoopFuseIntoProducerOp : Op<Transform_Dialect, "loop.fuse_into_producer_op",
          [FunctionalStyleTransformOpTrait,
           DeclareOpInterfaceMethods<TransformOpInterface>,
