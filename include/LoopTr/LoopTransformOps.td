@@ -4,8 +4,7 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 
 def LoopEraseUnusedOperandsAndResultsOp
     : Op<Transform_Dialect, "loop.erase_unused_operands_and_results",
-         [TransformOpInterface,
-          TransformEachOpTrait,
+         [TransformOpInterface, TransformEachOpTrait,
           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
           ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Remove unused operands and dead results from linalg.generic";
@@ -40,10 +39,9 @@ def LoopEraseUnusedOperandsAndResultsOp
 }
 
 def LoopFoldExpandingReshapeOp : Op<Transform_Dialect, "loop.fold_expanding_reshape",
-         [TransformOpInterface,
-          TransformEachOpTrait,
-          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
-          ReportTrackingListenerFailuresOpTrait]> {
+                                    [TransformOpInterface, TransformEachOpTrait,
+                                     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+                                     ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Apply linalg's expanding reshape folding patterns directly to a target op";
 
   let description = [{
@@ -68,12 +66,10 @@ def LoopFoldExpandingReshapeOp : Op<Transform_Dialect, "loop.fold_expanding_resh
   }];
 }
 
-def LoopLocalizeScratchTensorsOp
-    : Op<Transform_Dialect, "loop.localize_scratch_tensors",
-         [TransformOpInterface,
-          TransformEachOpTrait,
-          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
-          ReportTrackingListenerFailuresOpTrait]> {
+def LoopLocalizeScratchTensorsOp : Op<Transform_Dialect, "loop.localize_scratch_tensors",
+                                      [TransformOpInterface, TransformEachOpTrait,
+                                       DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+                                       ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Localize overwrite-only scratch tensors in loops and run cleanup";
 
   let description = [{
@@ -115,12 +111,10 @@ def LoopLocalizeScratchTensorsOp
   }];
 }
 
-def LoopInlineElementwiseOp : Op<Transform_Dialect, "loop.inline_elementwise",
-         [FunctionalStyleTransformOpTrait,
-          MemoryEffectsOpInterface,
-          TransformOpInterface,
-          TransformEachOpTrait,
-          ReportTrackingListenerFailuresOpTrait]> {
+def LoopInlineElementwiseOp
+    : Op<Transform_Dialect, "loop.inline_elementwise",
+         [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface, TransformOpInterface,
+          TransformEachOpTrait, ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Inline elementwise producers into a linalg.generic consumer";
 
   let description = [{
@@ -143,8 +137,7 @@ def LoopInlineElementwiseOp : Op<Transform_Dialect, "loop.inline_elementwise",
     reshape folding nor inlining can make progress.
   }];
 
-  let arguments = (ins TransformHandleTypeInterface:$target,
-                       OptionalAttr<I64Attr>:$operand_number);
+  let arguments = (ins TransformHandleTypeInterface:$target, OptionalAttr<I64Attr>:$operand_number);
   let results = (outs TransformHandleTypeInterface:$fused_op);
 
   let assemblyFormat = "$target attr-dict `:` functional-type(operands, results)";
@@ -158,12 +151,10 @@ def LoopInlineElementwiseOp : Op<Transform_Dialect, "loop.inline_elementwise",
   }];
 }
 
-def LoopFoldZeroIndexedUnitDimsOp
-    : Op<Transform_Dialect, "loop.fold_zero_indexed_unit_dims",
-         [TransformOpInterface,
-          TransformEachOpTrait,
-          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
-          ReportTrackingListenerFailuresOpTrait]> {
+def LoopFoldZeroIndexedUnitDimsOp : Op<Transform_Dialect, "loop.fold_zero_indexed_unit_dims",
+                                       [TransformOpInterface, TransformEachOpTrait,
+                                        DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+                                        ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Drop only linalg.generic unit dims implicated by zero-valued indexing-map results";
 
   let description = [{
@@ -197,9 +188,9 @@ def LoopFoldZeroIndexedUnitDimsOp
   }];
 }
 
-def LoopFuseIntoProducerOp : Op<Transform_Dialect, "loop.fuse_into_producer_op",
-         [FunctionalStyleTransformOpTrait,
-          DeclareOpInterfaceMethods<TransformOpInterface>,
+def LoopFuseIntoProducerOp
+    : Op<Transform_Dialect, "loop.fuse_into_producer_op",
+         [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Fuse a consumer into a producer that is also a loop";
 
@@ -218,19 +209,19 @@ def LoopFuseIntoProducerOp : Op<Transform_Dialect, "loop.fuse_into_producer_op",
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$consumer_op,
-                       TransformHandleTypeInterface:$producer_loop);
+      TransformHandleTypeInterface:$producer_loop);
   let results = (outs TransformHandleTypeInterface:$fused_op);
 
   let assemblyFormat = "$consumer_op `into` $producer_loop attr-dict "
                        " `:` functional-type(operands, results)";
-
 }
 
-def LoopFuseReduceConsumerIntoForall : Op<Transform_Dialect, "loop.fuse_reduction_consumer_into_forall",
-         [FunctionalStyleTransformOpTrait,
-          DeclareOpInterfaceMethods<TransformOpInterface>,
+def LoopFuseReduceConsumerIntoForall
+    : Op<Transform_Dialect, "loop.fuse_reduction_consumer_into_forall",
+         [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
-  let summary = "Fuse a reduction consumer into a forall producer, sequentializing one forall dimension";
+  let summary =
+      "Fuse a reduction consumer into a forall producer, sequentializing one forall dimension";
 
   let description = [{
     Fuse a one-dimension reduction `linalg.generic` op into an `scf.forall`.
@@ -250,9 +241,9 @@ def LoopFuseReduceConsumerIntoForall : Op<Transform_Dialect, "loop.fuse_reductio
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$consumer_op,
-                       TransformHandleTypeInterface:$forall_loop);
+      TransformHandleTypeInterface:$forall_loop);
   let results = (outs TransformHandleTypeInterface:$fused_op,
-                      TransformHandleTypeInterface:$new_inner_loop);
+      TransformHandleTypeInterface:$new_inner_loop);
 
   let assemblyFormat = "$consumer_op `into` $forall_loop attr-dict "
                        " `:` functional-type(operands, results)";
@@ -260,8 +251,7 @@ def LoopFuseReduceConsumerIntoForall : Op<Transform_Dialect, "loop.fuse_reductio
 
 def LoopRURollingUpdateNextReduction
     : Op<Transform_Dialect, "match.loop_ru.rolling_update_next_reduction",
-         [NavigationTransformOpTrait,
-          DeclareOpInterfaceMethods<TransformOpInterface>,
+         [NavigationTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
           MemoryEffectsOpInterface]> {
   let summary = "Find the nearest reduction consumer from a producer op via forward BFS";
 
@@ -279,14 +269,14 @@ def LoopRURollingUpdateNextReduction
 
   let arguments = (ins TransformHandleTypeInterface:$producer_op);
   let results = (outs TransformHandleTypeInterface:$next_reduce_op,
-                      TransformHandleTypeInterface:$elemwise_ops);
+      TransformHandleTypeInterface:$elemwise_ops);
 
   let assemblyFormat = "$producer_op attr-dict `:` functional-type(operands, results)";
 }
 
-def LoopRUCloneFuseElemwise : Op<Transform_Dialect, "loop_ru.clone_fuse_elemwise",
-         [FunctionalStyleTransformOpTrait,
-          DeclareOpInterfaceMethods<TransformOpInterface>,
+def LoopRUCloneFuseElemwise
+    : Op<Transform_Dialect, "loop_ru.clone_fuse_elemwise",
+         [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Clone elementwise ops and force-fuse them into forall + inner for";
 
@@ -308,8 +298,7 @@ def LoopRUCloneFuseElemwise : Op<Transform_Dialect, "loop_ru.clone_fuse_elemwise
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$elemwise_chain_ops,
-                       TransformHandleTypeInterface:$outer_loop,
-                       TransformHandleTypeInterface:$inner_loop);
+      TransformHandleTypeInterface:$outer_loop, TransformHandleTypeInterface:$inner_loop);
   let results = (outs TransformHandleTypeInterface:$sidecar_chain_ops);
 
   let assemblyFormat = "$elemwise_chain_ops `into` $outer_loop `,` $inner_loop attr-dict "
@@ -318,8 +307,7 @@ def LoopRUCloneFuseElemwise : Op<Transform_Dialect, "loop_ru.clone_fuse_elemwise
 
 def LoopRURepairReductionFrontier
     : Op<Transform_Dialect, "loop_ru.repair_reduction_frontier",
-         [FunctionalStyleTransformOpTrait,
-          DeclareOpInterfaceMethods<TransformOpInterface>,
+         [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Repair a reduction frontier using fused sidecar ops under a streaming loop";
 
@@ -340,11 +328,9 @@ def LoopRURepairReductionFrontier
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$producer_reduces,
-                       TransformHandleTypeInterface:$this_reduce,
-                       TransformHandleTypeInterface:$elemwise_orig,
-                       TransformHandleTypeInterface:$elemwise_sidecars,
-                       TransformHandleTypeInterface:$outer_loop,
-                       TransformHandleTypeInterface:$inner_loop);
+      TransformHandleTypeInterface:$this_reduce, TransformHandleTypeInterface:$elemwise_orig,
+      TransformHandleTypeInterface:$elemwise_sidecars, TransformHandleTypeInterface:$outer_loop,
+      TransformHandleTypeInterface:$inner_loop);
   let results = (outs TransformHandleTypeInterface:$repaired_reduce);
 
   let assemblyFormat = "`(` $producer_reduces `,` $this_reduce `)` `and` "

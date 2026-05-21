@@ -2,10 +2,9 @@ include "HTile/HTileDialect.td"
 include "mlir/IR/AttrTypeBase.td"
 include "mlir/IR/EnumAttr.td"
 
-def HTile_Placement : I32EnumAttr<"Placement", "tile data placement", [
-  I32EnumAttrCase<"Shared", 0, "shared">,
-  I32EnumAttrCase<"Local", 1, "local">
-]> {
+def HTile_Placement
+    : I32EnumAttr<"Placement", "tile data placement",
+                  [I32EnumAttrCase<"Shared", 0, "shared">, I32EnumAttrCase<"Local", 1, "local">]> {
   let genSpecializedAttr = 0;
   let cppNamespace = "::htile";
 }

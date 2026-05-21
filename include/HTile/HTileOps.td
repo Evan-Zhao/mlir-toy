@@ -1,17 +1,19 @@
 // Neptune HTile IR operators.
 // Some operators may have semantic alikes in other dialects, but may be redefined here anyways
 // for clarity.
-// Tensor shape, placement (e.g. SMEM vs. registers), and layout are represented on the result tensor,
-// not as arguments to the op.
+// Tensor shape, placement (e.g. SMEM vs. registers), and layout are represented on the result
+// tensor, not as arguments to the op.
 
 include "HTile/HTileDialect.td"
 include "mlir/IR/CommonTypeConstraints.td"
 include "mlir/IR/CommonAttrConstraints.td"
 
-def HTile_WarpPolicyAttr : Attr<And<[
-  StrAttr.predicate,
-  CPred<"([](::mlir::Attribute attr) { auto value = ::llvm::cast<::mlir::StringAttr>(attr).getValue(); return value == \"square\" || value == \"full_row\" || value == \"full_col\"; })($_self)">
-]>, "TileLang GEMM warp policy string attribute"> {
+def HTile_WarpPolicyAttr
+    : Attr<And<[StrAttr.predicate,
+                CPred<"([](::mlir::Attribute attr) { auto value = "
+                      "::llvm::cast<::mlir::StringAttr>(attr).getValue(); return value == "
+                      "\"square\" || value == \"full_row\" || value == \"full_col\"; })($_self)">]>,
+           "TileLang GEMM warp policy string attribute"> {
   let storageType = "::mlir::StringAttr";
   let returnType = "::mlir::StringAttr";
   let convertFromStorage = "$_self";
@@ -42,19 +44,13 @@ def HTile_DotOp : Op<HTile_Dialect, "dot"> {
     `full_col`.
   }];
 
-  let arguments = (ins
-    AnyRankedTensor:$lhs,
-    AnyRankedTensor:$rhs,
-    Optional<AnyRankedTensor>:$acc,
-    UnitAttr:$transpose_a,
-    UnitAttr:$transpose_b,
-    OptionalAttr<HTile_WarpPolicyAttr>:$warp_policy
-  );
+  let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs, Optional<AnyRankedTensor>:$acc,
+      UnitAttr:$transpose_a, UnitAttr:$transpose_b,
+      OptionalAttr<HTile_WarpPolicyAttr>:$warp_policy);
   let results = (outs AnyRankedTensor:$result);
 
-  let assemblyFormat =
-    "$lhs `,` $rhs (`,` $acc^)? attr-dict `:` "
-    "type($lhs) `,` type($rhs) (`,` type($acc)^)? `->` type($result)";
+  let assemblyFormat = "$lhs `,` $rhs (`,` $acc^)? attr-dict `:` "
+                       "type($lhs) `,` type($rhs) (`,` type($acc)^)? `->` type($result)";
 }
 
 def HTile_ReduceOp : Op<HTile_Dialect, "reduce"> {
@@ -64,15 +60,11 @@ def HTile_ReduceOp : Op<HTile_Dialect, "reduce"> {
     `sum`, `max`, or `min`.
   }];
 
-  let arguments = (ins
-    AnyRankedTensor:$input,
-    I64Attr:$axis,
-    StrAttr:$kind
-  );
+  let arguments = (ins AnyRankedTensor:$input, I64Attr:$axis, StrAttr:$kind);
   let results = (outs AnyRankedTensor:$result);
 
   let assemblyFormat =
-    "$input `axis` $axis `kind` $kind attr-dict `:` type($input) `->` type($result)";
+      "$input `axis` $axis `kind` $kind attr-dict `:` type($input) `->` type($result)";
 }
 
 def HTile_FullOp : Op<HTile_Dialect, "full"> {
@@ -109,14 +101,10 @@ def HTile_UnsqueezeOp : Op<HTile_Dialect, "unsqueeze"> {
     and `false` means the dimension is backed by the next input dimension.
   }];
 
-  let arguments = (ins
-    AnyRankedTensor:$input,
-    DenseBoolArrayAttr:$mask
-  );
+  let arguments = (ins AnyRankedTensor:$input, DenseBoolArrayAttr:$mask);
   let results = (outs AnyRankedTensor:$result);
 
-  let assemblyFormat =
-    "$input `mask` $mask attr-dict `:` type($input) `->` type($result)";
+  let assemblyFormat = "$input `mask` $mask attr-dict `:` type($input) `->` type($result)";
 }
 
 def HTile_PermuteOp : Op<HTile_Dialect, "permute"> {
@@ -125,14 +113,11 @@ def HTile_PermuteOp : Op<HTile_Dialect, "permute"> {
     Permutes tile dimensions according to the `permutation` attribute.
   }];
 
-  let arguments = (ins
-    AnyRankedTensor:$input,
-    DenseI64ArrayAttr:$permutation
-  );
+  let arguments = (ins AnyRankedTensor:$input, DenseI64ArrayAttr:$permutation);
   let results = (outs AnyRankedTensor:$result);
 
   let assemblyFormat =
-    "$input `permutation` $permutation attr-dict `:` type($input) `->` type($result)";
+      "$input `permutation` $permutation attr-dict `:` type($input) `->` type($result)";
 }
 
 def HTile_GatherNdOp : Op<HTile_Dialect, "gather_nd"> {
@@ -145,15 +130,11 @@ def HTile_GatherNdOp : Op<HTile_Dialect, "gather_nd"> {
     have the result tile shape.
   }];
 
-  let arguments = (ins
-    AnyType:$source,
-    Variadic<AnyRankedTensor>:$indices
-  );
+  let arguments = (ins AnyType:$source, Variadic<AnyRankedTensor>:$indices);
   let results = (outs AnyRankedTensor:$result);
 
-  let assemblyFormat =
-    "$source `[` $indices `]` attr-dict `:` type($source) `,` "
-    "type($indices) `->` type($result)";
+  let assemblyFormat = "$source `[` $indices `]` attr-dict `:` type($source) `,` "
+                       "type($indices) `->` type($result)";
 }
 
 def HTile_LoadOp : Op<HTile_Dialect, "load"> {
@@ -167,14 +148,10 @@ def HTile_LoadOp : Op<HTile_Dialect, "load"> {
     `cache_modifier`, `eviction_policy`, or TMA/block-pointer metadata.
   }];
 
-  let arguments = (ins
-    AnyType:$source,
-    Variadic<Index>:$offsets
-  );
+  let arguments = (ins AnyType:$source, Variadic<Index>:$offsets);
   let results = (outs AnyRankedTensor:$result);
 
-  let assemblyFormat =
-    "$source `[` $offsets `]` attr-dict `:` type($source) `->` type($result)";
+  let assemblyFormat = "$source `[` $offsets `]` attr-dict `:` type($source) `->` type($result)";
 }
 
 def HTile_CopyOp : Op<HTile_Dialect, "copy"> {
@@ -191,8 +168,7 @@ def HTile_CopyOp : Op<HTile_Dialect, "copy"> {
   let arguments = (ins AnyRankedTensor:$input);
   let results = (outs AnyRankedTensor:$result);
 
-  let assemblyFormat =
-    "$input attr-dict `:` type($input) `->` type($result)";
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
 }
 
 def HTile_StoreOp : Op<HTile_Dialect, "store"> {
@@ -206,12 +182,8 @@ def HTile_StoreOp : Op<HTile_Dialect, "store"> {
     `cache_modifier`, `eviction_policy`, or TMA/block-pointer metadata.
   }];
 
-  let arguments = (ins
-    AnyRankedTensor:$value,
-    AnyType:$dest,
-    Variadic<Index>:$offsets
-  );
+  let arguments = (ins AnyRankedTensor:$value, AnyType:$dest, Variadic<Index>:$offsets);
 
   let assemblyFormat =
-    "$value `,` $dest `[` $offsets `]` attr-dict `:` type($value) `,` type($dest)";
+      "$value `,` $dest `[` $offsets `]` attr-dict `:` type($value) `,` type($dest)";
 }
