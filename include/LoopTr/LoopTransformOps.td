@@ -68,6 +68,53 @@ def LoopFoldExpandingReshapeOp : Op<Transform_Dialect, "loop.fold_expanding_resh
   }];
 }
 
+def LoopLocalizeScratchTensorsOp
+    : Op<Transform_Dialect, "loop.localize_scratch_tensors",
+         [TransformOpInterface,
+          TransformEachOpTrait,
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+          ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Localize overwrite-only scratch tensors in loops and run cleanup";
+
+  let description = [{
+    Apply a function-level cleanup aimed at fused loop nests that carry large
+    tensor values only as destination scaffolding.
+
+    The transform first rewrites overwrite-only `tensor.extract_slice` uses of
+    `scf.for` iter_args and `scf.forall` shared_out block arguments to local
+    `tensor.empty` values. This is only done when:
+    - the corresponding loop result has no uses outside the loop, and
+    - the extracted slice is used purely as a DPS destination whose value is
+      not read by the payload.
+
+    After that rewrite, the transform reuses upstream cleanup utilities on the
+    enclosing isolated op:
+    - `linalg::populateSwapExtractSliceWithFillPatterns(...)`
+    - `tensor::populateFoldTensorEmptyPatterns(...)`
+    - `tensor::populateReassociativeReshapeFoldingPatterns(...)`
+    - `scf::populateSCFForLoopCanonicalizationPatterns(...)`
+    - the `remove-dead-values` pass
+    - canonicalization
+
+    In practice, this pushes scratch `tensor.empty` values down into loop
+    bodies when possible and removes loop-carried full-tensor assembly state
+    that is not observed outside the loop nest.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$target);
+  let results = (outs);
+
+  let assemblyFormat = "$target attr-dict `:` type($target)";
+
+  let extraClassDeclaration = [{
+    ::mlir::DiagnosedSilenceableFailure applyToOne(
+        ::mlir::transform::TransformRewriter &rewriter,
+        ::mlir::Operation *target,
+        ::mlir::transform::ApplyToEachResultList &results,
+        ::mlir::transform::TransformState &state);
+  }];
+}
+
 def LoopInlineElementwiseOp : Op<Transform_Dialect, "loop.inline_elementwise",
          [FunctionalStyleTransformOpTrait,
           MemoryEffectsOpInterface,

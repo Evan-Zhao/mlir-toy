@@ -17,6 +17,7 @@ void registerLoopTransformExtension(mlir::DialectRegistry &registry) {
     };
     static_cast<TransformDialectAccess *>(dialect)
         ->addOperations<mlir::transform::LoopFoldExpandingReshapeOp,
+                        mlir::transform::LoopLocalizeScratchTensorsOp,
                         mlir::transform::LoopFoldZeroIndexedUnitDimsOp,
                         mlir::transform::LoopEraseUnusedOperandsAndResultsOp,
                         mlir::transform::LoopInlineElementwiseOp,

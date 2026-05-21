@@ -80,12 +80,9 @@ module attributes {transform.with_named_sequence} {
 
     %trunc = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
     %fused_trunc = transform.loop.fuse_into_producer_op %trunc into %forall_loop : (!any, !any) -> !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
-    %func_1 = transform.apply_registered_pass "remove-dead-values" to %func : (!any) -> !any
-    transform.apply_patterns to %func_1 {
-      transform.apply_patterns.canonicalization
-      transform.apply_patterns.tensor.fold_tensor_empty
-    } : !any
+    transform.loop.localize_scratch_tensors %func : !transform.any_op
 
     transform.yield
   }
