@@ -6,6 +6,7 @@
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Transforms/WalkPatternRewriteDriver.h"
 
 namespace mlir::transform {
 
@@ -41,6 +42,40 @@ FailureOr<Operation *> tryDirectElementwiseFusion(RewriterBase &rewriter,
   replaceUsesAfterElementwiseFusion(rewriter, *fusionResult, producer);
   rewriter.eraseOp(linalgTarget);
   return fusionResult->fusedOp;
+}
+
+static SmallVector<unsigned> getLoopDimsWithZeroIndexedMaps(linalg::GenericOp genericOp) {
+  SmallVector<unsigned> allowedDims;
+  llvm::SmallBitVector seen(genericOp.getNumLoops(), false);
+
+  for (AffineMap map : genericOp.getIndexingMapsArray()) {
+    bool hasZeroResult = llvm::any_of(map.getResults(), [](AffineExpr expr) {
+      auto constantExpr = dyn_cast<AffineConstantExpr>(expr);
+      return constantExpr && constantExpr.getValue() == 0;
+    });
+    if (!hasZeroResult)
+      continue;
+
+    for (unsigned loopDim = 0, e = genericOp.getNumLoops(); loopDim != e; ++loopDim) {
+      if (seen.test(loopDim) || map.isFunctionOfDim(loopDim))
+        continue;
+      seen.set(loopDim);
+      allowedDims.push_back(loopDim);
+    }
+  }
+
+  return allowedDims;
+}
+
+static linalg::ControlDropUnitDims makeZeroIndexedUnitDimsOptions() {
+  linalg::ControlDropUnitDims options;
+  options.controlFn = [](Operation *op) -> SmallVector<unsigned> {
+    auto genericOp = dyn_cast<linalg::GenericOp>(op);
+    if (!genericOp)
+      return {};
+    return getLoopDimsWithZeroIndexedMaps(genericOp);
+  };
+  return options;
 }
 
 } // namespace
@@ -140,6 +175,38 @@ DiagnosedSilenceableFailure LoopInlineElementwiseOp::applyToOne(TransformRewrite
   if (!changed)
     BAIL("no eligible elementwise inlining or reshape folding");
   results.push_back(currentOp);
+  return DiagnosedSilenceableFailure::success();
+}
+
+void LoopFoldZeroIndexedUnitDimsOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  onlyReadsHandle(getTargetMutable(), effects);
+  modifiesPayload(effects);
+}
+
+DiagnosedSilenceableFailure
+LoopFoldZeroIndexedUnitDimsOp::applyToOne(TransformRewriter &rewriter, Operation *target,
+                                          ApplyToEachResultList &results, TransformState &state) {
+  (void)results;
+  (void)state;
+
+  linalg::ControlDropUnitDims options = makeZeroIndexedUnitDimsOptions();
+
+  {
+    RewritePatternSet patterns(getContext());
+    linalg::populateFoldUnitExtentDimsPatterns(patterns, options);
+    walkAndApplyPatterns(target, FrozenRewritePatternSet(std::move(patterns)),
+                         static_cast<RewriterBase::Listener *>(rewriter.getListener()));
+  }
+  {
+    RewritePatternSet patterns(getContext());
+    linalg::populateMoveInitOperandsToInputPattern(patterns);
+    linalg::populateFoldUnitExtentDimsCanonicalizationPatterns(patterns, options);
+    if (failed(applyPatternsGreedily(target, std::move(patterns)))) {
+      return emitDefiniteFailure()
+             << "fold-zero-indexed-unit-dims canonicalization did not converge";
+    }
+  }
   return DiagnosedSilenceableFailure::success();
 }
 
