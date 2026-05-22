@@ -3,7 +3,7 @@
 ## Goal
 
 Implement an MLIR Transform dialect schedule that lowers the algorithm-only
-attention form in `test/python/data/attention_l0.mlir` into the scheduled tile-level
+attention form in `test/Loop/torch_mlir_attention.mlir` into the scheduled tile-level
 FlashAttention form in `test/python/data/flash_attention_l1.mlir`.
 
 The implementation should be a real structural transformation, not a
@@ -13,7 +13,7 @@ Here, "L0" means a "math-like" algorithmic program:
 the whole computation is spelled directly in terms of linalg operations,
 (elementwise, reduction, etc.).
 No tiling, no explicit streaming loop, and no online-softmax recurrence.
-The example in `attention_l0.mlir` is exactly this form.
+The payload in `test/Loop/torch_mlir_attention.mlir` is exactly this form.
 
 "L1" means the scheduled, target-independent tile form used by the rest of the project:
 output tiling is explicit, the outer parallel grid and inner sequential streaming loop are explicit,
@@ -82,7 +82,7 @@ The useful constraints here are:
    shapes such as `...ik,...jk->...ij`.
 
 For an established example of this strategy, see the
-[schedule for attention](test/python/data/attention_l0_to_l1.transform.mlir) in the codebase.
+[integrated attention transform test](../test/Loop/torch_mlir_attention.mlir) in the codebase.
 
 ## Upward Fusion
 
@@ -118,8 +118,8 @@ The transform stack now has the main custom pieces needed for this schedule:
 
 - custom upward fusion for pointwise and reduction consumers,
 - rolling-update analysis plus repair for the softmax and `P @ V` frontiers,
-- a working attention transform script in
-  [test/python/data/attention_l0_to_l1.transform.mlir](test/python/data/attention_l0_to_l1.transform.mlir).
+- a working integrated attention transform test in
+  [test/Loop/torch_mlir_attention.mlir](../test/Loop/torch_mlir_attention.mlir).
 
 The remaining work is mostly cleanup and generalization to new computation patterns.
 
@@ -129,7 +129,8 @@ Use layered tests:
 
 1. Small synthetic tests for upward fusion and rolling update, especially on
    max, sum, and matmul-like reductions.
-2. End-to-end structural tests from `attention_l0.mlir` to the scheduled L1 shape:
+2. End-to-end structural tests from the payload in
+   `test/Loop/torch_mlir_attention.mlir` to the scheduled L1 shape:
    - contains `scf.forall`,
    - contains `scf.for` with `iter_args`,
    - contains repaired row max and row sum recurrences,

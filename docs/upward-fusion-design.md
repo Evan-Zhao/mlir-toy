@@ -3,8 +3,7 @@
 ## Goal
 
 This note documents the custom upward-fusion primitives used by the attention
-L0-to-L1 schedule in
-`test/python/data/attention_l0_to_l1.transform.mlir`.
+L0-to-L1 schedule in `test/Loop/torch_mlir_attention.mlir`.
 
 The intent is the same as TVM `reverse_compute_at`: move a consumer under the
 loop nest that already materializes tiles of its input. In MLIR, this is not a
@@ -21,9 +20,9 @@ Both are specialized for fusing a Linalg consumer operation into an SCF loop nes
 "upward" (consumer into producer) fusion. It takes:
 
 - an elementwise consumer, currently either:
-    - a single-result `linalg.map`, or
-    - a single-result, single-init `linalg.generic` with all-parallel loops and
-      projected-permutation indexing maps,
+  - a single-result `linalg.map`, or
+  - a single-result, single-init `linalg.generic` with all-parallel loops and
+    projected-permutation indexing maps,
 - a containing tiled loop nest rooted at `scf.for` or `scf.forall`.
 
 The implementation is intentionally thin. It delegates most of the real work to

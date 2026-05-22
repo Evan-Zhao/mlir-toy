@@ -1,7 +1,7 @@
 # Attention Rolling Update Design
 
 This note describes the rolling-update operator fusion transformation in its current MLIR form.
-An example of it applied to Attention is in `test/python/data/attention_l0_to_l1.transform.mlir`.
+An integrated attention example using it is in `test/Loop/torch_mlir_attention.mlir`.
 
 Rolling update is a generalized form of operator fusion that can put pairs of reductions together
 under the same loop. Since that breaks the usual producer-consumer dependencies,
