@@ -15,7 +15,7 @@ module attributes {transform.with_named_sequence} {
     %elemwise = transform.structured.match ops{["linalg.generic"]} attributes {fuse} in %func
         : (!transform.any_op) -> !transform.any_op
     %sidecar =
-      transform.loop_ru.clone_fuse_elemwise %elemwise into %forall_loop, %inner_loop
+      transform.fusion.clone_fuse_elemwise %elemwise into %forall_loop, %inner_loop
         : (!transform.any_op, !transform.any_op, !transform.any_op) -> !transform.any_op
     transform.yield
   }

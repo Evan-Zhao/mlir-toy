@@ -2,8 +2,8 @@ include "mlir/Dialect/Transform/IR/TransformDialect.td"
 include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
-def LoopEraseUnusedOperandsAndResultsOp
-    : Op<Transform_Dialect, "loop.erase_unused_operands_and_results",
+def LinalgEraseUnusedOperandsAndResultsOp
+    : Op<Transform_Dialect, "linalg.erase_unused_operands_and_results",
          [TransformOpInterface, TransformEachOpTrait,
           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
           ReportTrackingListenerFailuresOpTrait]> {
@@ -38,10 +38,10 @@ def LoopEraseUnusedOperandsAndResultsOp
   }];
 }
 
-def LoopFoldExpandingReshapeOp : Op<Transform_Dialect, "loop.fold_expanding_reshape",
-                                    [TransformOpInterface, TransformEachOpTrait,
-                                     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
-                                     ReportTrackingListenerFailuresOpTrait]> {
+def LinalgFoldExpandingReshapeOp : Op<Transform_Dialect, "linalg.fold_expanding_reshape",
+                                      [TransformOpInterface, TransformEachOpTrait,
+                                       DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+                                       ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Apply linalg's expanding reshape folding patterns directly to a target op";
 
   let description = [{
@@ -66,10 +66,87 @@ def LoopFoldExpandingReshapeOp : Op<Transform_Dialect, "loop.fold_expanding_resh
   }];
 }
 
-def LoopLocalizeScratchTensorsOp : Op<Transform_Dialect, "loop.localize_scratch_tensors",
-                                      [TransformOpInterface, TransformEachOpTrait,
-                                       DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
-                                       ReportTrackingListenerFailuresOpTrait]> {
+def LinalgInlineElementwiseOp
+    : Op<Transform_Dialect, "linalg.inline_elementwise",
+         [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface, TransformOpInterface,
+          TransformEachOpTrait, ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Inline elementwise producers into a linalg.generic consumer";
+
+  let description = [{
+    Thin transform-level wrapper around upstream `linalg::fuseElementwiseOps`.
+
+    For each targeted `linalg.generic`, this op repeatedly:
+    - folds producer reshape ops into the consumer when possible, and
+    - inlines one producer of an input operand into the consumer.
+
+    If `operand_number` is present, only that operand is considered for both
+    reshape folding and inlining. Otherwise, operands are tried from left
+    to right and the first eligible operand is inlined. The transform keeps
+    iterating until neither rewrite can make further progress, then returns a
+    handle to the final `linalg.generic`.
+
+    #### Return modes
+
+    This op produces a silenceable failure if the target is not a
+    `linalg.generic`, if `operand_number` is out of range, or if neither
+    reshape folding nor inlining can make progress.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$target, OptionalAttr<I64Attr>:$operand_number);
+  let results = (outs TransformHandleTypeInterface:$fused_op);
+
+  let assemblyFormat = "$target attr-dict `:` functional-type(operands, results)";
+
+  let extraClassDeclaration = [{
+    ::mlir::DiagnosedSilenceableFailure applyToOne(
+        ::mlir::transform::TransformRewriter &rewriter,
+        ::mlir::Operation *target,
+        ::mlir::transform::ApplyToEachResultList &results,
+        ::mlir::transform::TransformState &state);
+  }];
+}
+
+def LinalgFoldZeroIndexedUnitDimsOp : Op<Transform_Dialect, "linalg.fold_zero_indexed_unit_dims",
+                                         [TransformOpInterface, TransformEachOpTrait,
+                                          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+                                          ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Drop only linalg.generic unit dims implicated by zero-valued indexing-map results";
+
+  let description = [{
+    Apply a narrow `linalg.generic` cleanup directly to the targeted payload op.
+
+    The rewrite reuses upstream `linalg::dropUnitDims(...)`, but restricts the
+    candidate loop dimensions to those that are implicated by `0`-valued
+    indexing map results, e.g. maps like `(d0, d1, d2, d3) -> (d0, d1, d2, 0)`.
+    This is intended for keepdim-style softmax patterns where broad unit-extent
+    folding would also erase unrelated leading batch dimensions.
+
+    The implementation mirrors the upstream `-linalg-fold-unit-extent-dims`
+    structure: a walk-based fold phase followed by the usual canonicalization
+    cleanup, but with the narrower control function above.
+
+    This transform reads the target handle and modifies the payload. It does not
+    return a handle; rematch if you need rewritten nested ops.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$target);
+  let results = (outs);
+
+  let assemblyFormat = "$target attr-dict `:` type($target)";
+
+  let extraClassDeclaration = [{
+    ::mlir::DiagnosedSilenceableFailure applyToOne(
+        ::mlir::transform::TransformRewriter &rewriter,
+        ::mlir::Operation *target,
+        ::mlir::transform::ApplyToEachResultList &results,
+        ::mlir::transform::TransformState &state);
+  }];
+}
+
+def ScfLocalizeScratchTensorsOp : Op<Transform_Dialect, "scf.localize_scratch_tensors",
+                                     [TransformOpInterface, TransformEachOpTrait,
+                                      DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+                                      ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Localize overwrite-only scratch tensors in loops and run cleanup";
 
   let description = [{
@@ -111,113 +188,8 @@ def LoopLocalizeScratchTensorsOp : Op<Transform_Dialect, "loop.localize_scratch_
   }];
 }
 
-def LoopInlineElementwiseOp
-    : Op<Transform_Dialect, "loop.inline_elementwise",
-         [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface, TransformOpInterface,
-          TransformEachOpTrait, ReportTrackingListenerFailuresOpTrait]> {
-  let summary = "Inline elementwise producers into a linalg.generic consumer";
-
-  let description = [{
-    Thin transform-level wrapper around upstream `linalg::fuseElementwiseOps`.
-
-    For each targeted `linalg.generic`, this op repeatedly:
-    - folds producer reshape ops into the consumer when possible, and
-    - inlines one producer of an input operand into the consumer.
-
-    If `operand_number` is present, only that operand is considered for both
-    reshape folding and inlining. Otherwise, operands are tried from left
-    to right and the first eligible operand is inlined. The transform keeps
-    iterating until neither rewrite can make further progress, then returns a
-    handle to the final `linalg.generic`.
-
-    #### Return modes
-
-    This op produces a silenceable failure if the target is not a
-    `linalg.generic`, if `operand_number` is out of range, or if neither
-    reshape folding nor inlining can make progress.
-  }];
-
-  let arguments = (ins TransformHandleTypeInterface:$target, OptionalAttr<I64Attr>:$operand_number);
-  let results = (outs TransformHandleTypeInterface:$fused_op);
-
-  let assemblyFormat = "$target attr-dict `:` functional-type(operands, results)";
-
-  let extraClassDeclaration = [{
-    ::mlir::DiagnosedSilenceableFailure applyToOne(
-        ::mlir::transform::TransformRewriter &rewriter,
-        ::mlir::Operation *target,
-        ::mlir::transform::ApplyToEachResultList &results,
-        ::mlir::transform::TransformState &state);
-  }];
-}
-
-def LoopFoldZeroIndexedUnitDimsOp : Op<Transform_Dialect, "loop.fold_zero_indexed_unit_dims",
-                                       [TransformOpInterface, TransformEachOpTrait,
-                                        DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
-                                        ReportTrackingListenerFailuresOpTrait]> {
-  let summary = "Drop only linalg.generic unit dims implicated by zero-valued indexing-map results";
-
-  let description = [{
-    Apply a narrow `linalg.generic` cleanup directly to the targeted payload op.
-
-    The rewrite reuses upstream `linalg::dropUnitDims(...)`, but restricts the
-    candidate loop dimensions to those that are implicated by `0`-valued
-    indexing map results, e.g. maps like `(d0, d1, d2, d3) -> (d0, d1, d2, 0)`.
-    This is intended for keepdim-style softmax patterns where broad unit-extent
-    folding would also erase unrelated leading batch dimensions.
-
-    The implementation mirrors the upstream `-linalg-fold-unit-extent-dims`
-    structure: a walk-based fold phase followed by the usual canonicalization
-    cleanup, but with the narrower control function above.
-
-    This transform reads the target handle and modifies the payload. It does not
-    return a handle; rematch if you need rewritten nested ops.
-  }];
-
-  let arguments = (ins TransformHandleTypeInterface:$target);
-  let results = (outs);
-
-  let assemblyFormat = "$target attr-dict `:` type($target)";
-
-  let extraClassDeclaration = [{
-    ::mlir::DiagnosedSilenceableFailure applyToOne(
-        ::mlir::transform::TransformRewriter &rewriter,
-        ::mlir::Operation *target,
-        ::mlir::transform::ApplyToEachResultList &results,
-        ::mlir::transform::TransformState &state);
-  }];
-}
-
-def LoopFuseIntoProducerOp
-    : Op<Transform_Dialect, "loop.fuse_into_producer_op",
-         [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
-          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
-  let summary = "Fuse a consumer into a producer that is also a loop";
-
-  let description = [{
-    Fuse a single consumer operation into a producer that implements LoopLikeOpInterface.
-
-    Delegates to upstream `scf::tileAndFuseConsumer`, which:
-    - identifies operands of `consumer` defined by the containing loop,
-    - locates the `tensor.insert_slice`/`tensor.parallel_insert_slice` that
-      produces each such operand from within the loop body,
-    - tiles the consumer to operate on those same slices in-place, and
-    - adds the tiled result as an additional loop-carried value.
-
-    The `producer_loop` handle is preserved and remapped to the rewritten loop.
-    The `consumer_op` handle is consumed.
-  }];
-
-  let arguments = (ins TransformHandleTypeInterface:$consumer_op,
-      TransformHandleTypeInterface:$producer_loop);
-  let results = (outs TransformHandleTypeInterface:$fused_op);
-
-  let assemblyFormat = "$consumer_op `into` $producer_loop attr-dict "
-                       " `:` functional-type(operands, results)";
-}
-
-def LoopFuseReduceConsumerIntoForall
-    : Op<Transform_Dialect, "loop.fuse_reduction_consumer_into_forall",
+def ScfFuseReductionIntoForallOp
+    : Op<Transform_Dialect, "scf.fuse_reduction_into_forall",
          [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary =
@@ -249,8 +221,36 @@ def LoopFuseReduceConsumerIntoForall
                        " `:` functional-type(operands, results)";
 }
 
-def LoopRURollingUpdateNextReduction
-    : Op<Transform_Dialect, "match.loop_ru.rolling_update_next_reduction",
+def FusionIntoProducerOp
+    : Op<Transform_Dialect, "fusion.into_producer",
+         [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Fuse a consumer into a producer that is also a loop";
+
+  let description = [{
+    Fuse a single consumer operation into a producer that implements LoopLikeOpInterface.
+
+    Delegates to upstream `scf::tileAndFuseConsumer`, which:
+    - identifies operands of `consumer` defined by the containing loop,
+    - locates the `tensor.insert_slice`/`tensor.parallel_insert_slice` that
+      produces each such operand from within the loop body,
+    - tiles the consumer to operate on those same slices in-place, and
+    - adds the tiled result as an additional loop-carried value.
+
+    The `producer_loop` handle is preserved and remapped to the rewritten loop.
+    The `consumer_op` handle is consumed.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$consumer_op,
+      TransformHandleTypeInterface:$producer_loop);
+  let results = (outs TransformHandleTypeInterface:$fused_op);
+
+  let assemblyFormat = "$consumer_op `into` $producer_loop attr-dict "
+                       " `:` functional-type(operands, results)";
+}
+
+def FusionFindNextReductionOp
+    : Op<Transform_Dialect, "fusion.find_next_reduction",
          [NavigationTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
           MemoryEffectsOpInterface]> {
   let summary = "Find the nearest reduction consumer from a producer op via forward BFS";
@@ -274,8 +274,8 @@ def LoopRURollingUpdateNextReduction
   let assemblyFormat = "$producer_op attr-dict `:` functional-type(operands, results)";
 }
 
-def LoopRUCloneFuseElemwise
-    : Op<Transform_Dialect, "loop_ru.clone_fuse_elemwise",
+def FusionCloneFuseElemwiseOp
+    : Op<Transform_Dialect, "fusion.clone_fuse_elemwise",
          [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Clone elementwise ops and force-fuse them into forall + inner for";
@@ -305,8 +305,8 @@ def LoopRUCloneFuseElemwise
                        " `:` functional-type(operands, results)";
 }
 
-def LoopRURepairReductionFrontier
-    : Op<Transform_Dialect, "loop_ru.repair_reduction_frontier",
+def FusionRepairReductionFrontierOp
+    : Op<Transform_Dialect, "fusion.repair_reduction_frontier",
          [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Repair a reduction frontier using fused sidecar ops under a streaming loop";

@@ -17,7 +17,7 @@ module attributes {transform.with_named_sequence} {
 
   transform.named_sequence @__transform_main(%module: !any) {
     %func = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
-    transform.loop.fold_zero_indexed_unit_dims %func : !transform.any_op
+    transform.linalg.fold_zero_indexed_unit_dims %func : !transform.any_op
 
     // TorchMLIR attention describes 4D matmuls with linalg.batch_matmul, which only supports
     // exactly one batch dimension, by fusing the batch dims together.
@@ -26,17 +26,17 @@ module attributes {transform.with_named_sequence} {
     // Do that for the transpose op first (there should be exactly one for the QK^T matmul).
     %transposes = transform.structured.match ops{["linalg.transpose"]} in %func : (!any) -> !any
     %transposes_lg = transform.structured.generalize %transposes : (!any) -> !any
-    transform.loop.fold_expanding_reshape %transposes_lg : !any
+    transform.linalg.fold_expanding_reshape %transposes_lg : !any
     // Then do batch matmul ops.
     %bmms = transform.structured.match ops{["linalg.batch_matmul"]} in %func : (!any) -> !any
     %bmms_lg = transform.structured.generalize %bmms : (!any) -> !any
-    transform.loop.fold_expanding_reshape %bmms_lg : !any
+    transform.linalg.fold_expanding_reshape %bmms_lg : !any
 
     // Take the first batch matmul `bmm0`.
     // Inline elementwise ops before bmm0 (in this case, should be F16->F32 casts) into it.
     %bmm0, %_0 = transform.split_handle %bmms_lg : (!any) -> (!any, !any)
-    %bmm0_1 = transform.loop.inline_elementwise %bmm0: (!any) -> !any
-    transform.loop.erase_unused_operands_and_results %bmm0_1 : !any
+    %bmm0_1 = transform.linalg.inline_elementwise %bmm0: (!any) -> !any
+    transform.linalg.erase_unused_operands_and_results %bmm0_1 : !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     // Tile all parallel dimensions of mm0 (b, h, i, j) into a scf.forall loop.
     %_1, %forall_loop = transform.structured.tile_using_forall
@@ -44,7 +44,7 @@ module attributes {transform.with_named_sequence} {
 
     // Match an element-wise op that is a consumer of mm0, and fuse it into mm0.
     %bscale = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
-    %fused_bscale = transform.loop.fuse_into_producer_op %bscale into %forall_loop : (!any, !any) -> !any
+    %fused_bscale = transform.fusion.into_producer %bscale into %forall_loop : (!any, !any) -> !any
     // Fusion can create redundant loop-carried values and canonicalization removes them.
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
@@ -55,34 +55,34 @@ module attributes {transform.with_named_sequence} {
     // The "row-max" in the input program has two outputs: the max value and the argmax.
     // The subsequent fusion only supports single-output ops, so we remove the unused argmax
     // output before fusion.
-    transform.loop.erase_unused_operands_and_results %bmax : !any
-    %fused_bmax, %j0_loop = transform.loop.fuse_reduction_consumer_into_forall
+    transform.linalg.erase_unused_operands_and_results %bmax : !any
+    %fused_bmax, %j0_loop = transform.scf.fuse_reduction_into_forall
         %bmax into %forall_loop : (!any, !any) -> (!any, !any)
 
-    %bsum, %elemwise = transform.match.loop_ru.rolling_update_next_reduction
+    %bsum, %elemwise = transform.fusion.find_next_reduction
         %forall_loop : (!any) -> (!any, !any)
-    %elemwise_sidecars = transform.loop_ru.clone_fuse_elemwise
+    %elemwise_sidecars = transform.fusion.clone_fuse_elemwise
         %elemwise into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
-    %fused_bsum = transform.loop_ru.repair_reduction_frontier
+    %fused_bsum = transform.fusion.repair_reduction_frontier
         (%fused_bmax, %bsum) and (%elemwise, %elemwise_sidecars) into %forall_loop, %j0_loop
         : (!any, !any, !any, !any, !any, !any) -> !any
 
-    %bmm1, %elemwise_1 = transform.match.loop_ru.rolling_update_next_reduction
+    %bmm1, %elemwise_1 = transform.fusion.find_next_reduction
         %forall_loop : (!any) -> (!any, !any)
-    %bmm1_1 = transform.loop.inline_elementwise %bmm1 { operand_number = 1 }: (!any) -> !any
-    transform.loop.erase_unused_operands_and_results %bmm1_1 : !any
-    %elemwise_sidecars_1 = transform.loop_ru.clone_fuse_elemwise
+    %bmm1_1 = transform.linalg.inline_elementwise %bmm1 { operand_number = 1 }: (!any) -> !any
+    transform.linalg.erase_unused_operands_and_results %bmm1_1 : !any
+    %elemwise_sidecars_1 = transform.fusion.clone_fuse_elemwise
         %elemwise_1 into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
-    %_3 = transform.loop_ru.repair_reduction_frontier
+    %_3 = transform.fusion.repair_reduction_frontier
         (%fused_bsum, %bmm1_1) and (%elemwise_1, %elemwise_sidecars_1) into %forall_loop, %j0_loop
         : (!any, !any, !any, !any, !any, !any) -> !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     %trunc = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
-    %fused_trunc = transform.loop.fuse_into_producer_op %trunc into %forall_loop : (!any, !any) -> !any
+    %fused_trunc = transform.fusion.into_producer %trunc into %forall_loop : (!any, !any) -> !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
-    transform.loop.localize_scratch_tensors %func : !transform.any_op
+    transform.scf.localize_scratch_tensors %func : !transform.any_op
 
     transform.yield
   }

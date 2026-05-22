@@ -24,7 +24,7 @@ module attributes {transform.with_named_sequence} {
     %bias = transform.structured.match ops{["linalg.generic"]} attributes {bias} in %func
         : (!transform.any_op) -> !transform.any_op
     %fused =
-      transform.loop.fuse_into_producer_op %bias into %forall_loop
+      transform.fusion.into_producer %bias into %forall_loop
         : (!transform.any_op, !transform.any_op) -> !transform.any_op
 
     transform.yield

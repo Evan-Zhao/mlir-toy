@@ -18,7 +18,7 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %elemwise = transform.merge_handles %a, %b : !transform.any_op
     %sidecar =
-      transform.loop_ru.clone_fuse_elemwise %elemwise into %forall_loop, %inner_loop
+      transform.fusion.clone_fuse_elemwise %elemwise into %forall_loop, %inner_loop
         : (!transform.any_op, !transform.any_op, !transform.any_op) -> !transform.any_op
     transform.yield
   }

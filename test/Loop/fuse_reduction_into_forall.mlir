@@ -31,7 +31,7 @@ module attributes {transform.with_named_sequence} {
     %row_max = transform.structured.match ops{["linalg.generic"]} in %func
         : (!transform.any_op) -> !transform.any_op
     %fused, %new_for =
-      transform.loop.fuse_reduction_consumer_into_forall %row_max into %forall_loop
+      transform.scf.fuse_reduction_into_forall %row_max into %forall_loop
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
 
     transform.yield

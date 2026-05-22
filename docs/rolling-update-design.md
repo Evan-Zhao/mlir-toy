@@ -11,17 +11,17 @@ rolling update performs extra _repair_ steps to restore correctness.
 
 The current MLIR pipeline has three steps:
 
-1. `transform.match.loop_ru.rolling_update_next_reduction`
+1. `transform.fusion.find_next_reduction`
    Starting from a loop-local producer, run a forward BFS on the def-use graph
    and return the nearest reduction plus the ordered elementwise chain between
    the producer and that reduction.
 
-2. `transform.loop_ru.clone_fuse_elemwise`
+2. `transform.fusion.clone_fuse_elemwise`
    Clone that elementwise chain into a sidecar chain, fuse it under the
    streaming loop, and publish the sidecar tensors as extra loop results. The
    original out-of-loop chain is left untouched.
 
-3. `transform.loop_ru.repair_reduction_frontier`
+3. `transform.fusion.repair_reduction_frontier`
    Repair the chosen reduction frontier by deriving a repair term `H`,
    materializing it as a pointwise tensor update, and rebuilding the frontier
    reduction to use that repaired init tensor.
@@ -31,7 +31,7 @@ matching the shape of TVM's rolling update.
 
 ## Transform Details
 
-### `transform.match.loop_ru.rolling_update_next_reduction`
+### `transform.fusion.find_next_reduction`
 
 Signature:
 
@@ -53,7 +53,7 @@ supported single-result elementwise op.
   so tensor `arith` / `math` elementwise ops are not supported even though they may pass this step.
   They can be normalized first, e.g. with `convert-elementwise-to-linalg`.
 
-### `transform.loop_ru.clone_fuse_elemwise`
+### `transform.fusion.clone_fuse_elemwise`
 
 Signature:
 
@@ -70,7 +70,7 @@ and returns the cloned sidecar ops in the same order. It rebuilds both loops:
 The loop handles are preserved and remapped to the rebuilt loops. The original elementwise
 chain remains unchanged until a later repair step rewires a specific reduction use.
 
-### `transform.loop_ru.repair_reduction_frontier`
+### `transform.fusion.repair_reduction_frontier`
 
 Signature:
 

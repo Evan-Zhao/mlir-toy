@@ -10,14 +10,14 @@ The intent is the same as TVM `reverse_compute_at`: move a consumer under the
 loop nest that already materializes tiles of its input. In MLIR, this is not a
 single general upstream primitive, so Neptune uses two narrow transform ops:
 
-- `transform.loop.fuse_into_producer_op`
-- `transform.loop.fuse_reduction_consumer_into_forall`
+- `transform.fusion.into_producer`
+- `transform.scf.fuse_reduction_into_forall`
 
 Both are specialized for fusing a Linalg consumer operation into an SCF loop nest.
 
-## `fuse_elemwise_into_producer`
+## `fusion.into_producer`
 
-`transform.loop.fuse_into_producer_op` applies pointwise,
+`transform.fusion.into_producer` applies pointwise,
 "upward" (consumer into producer) fusion. It takes:
 
 - an elementwise consumer, currently either:
@@ -40,9 +40,9 @@ score = scale(qk)
 After tiling `qk`, the scale map is fused directly onto each `qk` tile before
 that tile is written back.
 
-## `fuse_reduction_consumer_into_forall`
+## `scf.fuse_reduction_into_forall`
 
-`transform.loop.fuse_reduction_consumer_into_forall` handles fusing a
+`transform.scf.fuse_reduction_into_forall` handles fusing a
 reduction consumer into a loop nest.
 
 It takes:
@@ -119,8 +119,8 @@ row_max = reduce_max(score, dim = j)
 the schedule uses the two ops in order:
 
 1. tile the `qk` producer,
-2. fuse `scale` upward with `fuse_elemwise_into_producer`,
-3. fuse `row_max` upward with `fuse_reduction_consumer_into_forall`.
+2. fuse `scale` upward with `fusion.into_producer`,
+3. fuse `row_max` upward with `scf.fuse_reduction_into_forall`.
 
 After the reduction fusion, the relevant loop shape is:
 

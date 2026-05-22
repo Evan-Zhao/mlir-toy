@@ -12,7 +12,7 @@ module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
     %func = transform.structured.match ops{["func.func"]} in %module
         : (!transform.any_op) -> !transform.any_op
-    transform.loop.fold_zero_indexed_unit_dims %func : !transform.any_op
+    transform.linalg.fold_zero_indexed_unit_dims %func : !transform.any_op
     transform.yield
   }
 

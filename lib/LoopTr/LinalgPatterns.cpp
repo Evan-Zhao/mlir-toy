@@ -80,13 +80,13 @@ static linalg::ControlDropUnitDims makeZeroIndexedUnitDimsOptions() {
 
 } // namespace
 
-void LoopEraseUnusedOperandsAndResultsOp::getEffects(
+void LinalgEraseUnusedOperandsAndResultsOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   onlyReadsHandle(getTargetMutable(), effects);
   modifiesPayload(effects);
 }
 
-DiagnosedSilenceableFailure LoopEraseUnusedOperandsAndResultsOp::applyToOne(
+DiagnosedSilenceableFailure LinalgEraseUnusedOperandsAndResultsOp::applyToOne(
     transform::TransformRewriter &rewriter, Operation *target,
     transform::ApplyToEachResultList &results, transform::TransformState &state) {
   (void)results;
@@ -107,16 +107,16 @@ DiagnosedSilenceableFailure LoopEraseUnusedOperandsAndResultsOp::applyToOne(
   return DiagnosedSilenceableFailure::success();
 }
 
-void LoopFoldExpandingReshapeOp::getEffects(
+void LinalgFoldExpandingReshapeOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   onlyReadsHandle(getTargetMutable(), effects);
   modifiesPayload(effects);
 }
 
 DiagnosedSilenceableFailure
-LoopFoldExpandingReshapeOp::applyToOne(transform::TransformRewriter &rewriter, Operation *target,
-                                       transform::ApplyToEachResultList &results,
-                                       transform::TransformState &state) {
+LinalgFoldExpandingReshapeOp::applyToOne(transform::TransformRewriter &rewriter, Operation *target,
+                                         transform::ApplyToEachResultList &results,
+                                         transform::TransformState &state) {
   (void)results;
   (void)state;
 
@@ -135,10 +135,10 @@ LoopFoldExpandingReshapeOp::applyToOne(transform::TransformRewriter &rewriter, O
   return DiagnosedSilenceableFailure::success();
 }
 
-DiagnosedSilenceableFailure LoopInlineElementwiseOp::applyToOne(TransformRewriter &rewriter,
-                                                                Operation *target,
-                                                                ApplyToEachResultList &results,
-                                                                TransformState &state) {
+DiagnosedSilenceableFailure LinalgInlineElementwiseOp::applyToOne(TransformRewriter &rewriter,
+                                                                  Operation *target,
+                                                                  ApplyToEachResultList &results,
+                                                                  TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
   auto genericOp = dyn_cast<linalg::GenericOp>(target);
   if (!genericOp) {
@@ -178,15 +178,15 @@ DiagnosedSilenceableFailure LoopInlineElementwiseOp::applyToOne(TransformRewrite
   return DiagnosedSilenceableFailure::success();
 }
 
-void LoopFoldZeroIndexedUnitDimsOp::getEffects(
+void LinalgFoldZeroIndexedUnitDimsOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   onlyReadsHandle(getTargetMutable(), effects);
   modifiesPayload(effects);
 }
 
 DiagnosedSilenceableFailure
-LoopFoldZeroIndexedUnitDimsOp::applyToOne(TransformRewriter &rewriter, Operation *target,
-                                          ApplyToEachResultList &results, TransformState &state) {
+LinalgFoldZeroIndexedUnitDimsOp::applyToOne(TransformRewriter &rewriter, Operation *target,
+                                            ApplyToEachResultList &results, TransformState &state) {
   (void)results;
   (void)state;
 

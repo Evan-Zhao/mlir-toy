@@ -13,7 +13,7 @@ namespace mlir::transform {
 using scf::ForallOp;
 using scf::ForOp;
 
-void LoopFuseIntoProducerOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+void FusionIntoProducerOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   consumesHandle(getConsumerOpMutable(), effects);
   onlyReadsHandle(getProducerLoopMutable(), effects);
 
@@ -21,9 +21,9 @@ void LoopFuseIntoProducerOp::getEffects(SmallVectorImpl<MemoryEffects::EffectIns
   modifiesPayload(effects);
 }
 
-DiagnosedSilenceableFailure LoopFuseIntoProducerOp::apply(transform::TransformRewriter &rewriter,
-                                                          TransformResults &transformResults,
-                                                          TransformState &state) {
+DiagnosedSilenceableFailure FusionIntoProducerOp::apply(transform::TransformRewriter &rewriter,
+                                                        TransformResults &transformResults,
+                                                        TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
 
   // Step 1. Resolve the payload ops and check that the producer is loop-like.
@@ -50,7 +50,8 @@ DiagnosedSilenceableFailure LoopFuseIntoProducerOp::apply(transform::TransformRe
   return DiagnosedSilenceableFailure::success();
 }
 
-void LoopRUCloneFuseElemwise::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+void FusionCloneFuseElemwiseOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   onlyReadsHandle(getElemwiseChainOpsMutable(), effects);
   onlyReadsHandle(getOuterLoopMutable(), effects);
   onlyReadsHandle(getInnerLoopMutable(), effects);
@@ -59,9 +60,9 @@ void LoopRUCloneFuseElemwise::getEffects(SmallVectorImpl<MemoryEffects::EffectIn
   modifiesPayload(effects);
 }
 
-DiagnosedSilenceableFailure LoopRUCloneFuseElemwise::apply(transform::TransformRewriter &rewriter,
-                                                           TransformResults &transformResults,
-                                                           TransformState &state) {
+DiagnosedSilenceableFailure FusionCloneFuseElemwiseOp::apply(transform::TransformRewriter &rewriter,
+                                                             TransformResults &transformResults,
+                                                             TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
   CHECK_NON_EMPTY_OPS(state, transform, getElemwiseChainOps, "elementwise", elemwiseOps)
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getOuterLoop, "outer loop", outerLoop, ForallOp);

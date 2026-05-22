@@ -169,13 +169,13 @@ LogicalResult runPassCleanup(Operation *isolatedTarget) {
 
 } // namespace
 
-void LoopLocalizeScratchTensorsOp::getEffects(
+void ScfLocalizeScratchTensorsOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   onlyReadsHandle(getTargetMutable(), effects);
   modifiesPayload(effects);
 }
 
-DiagnosedSilenceableFailure LoopLocalizeScratchTensorsOp::applyToOne(
+DiagnosedSilenceableFailure ScfLocalizeScratchTensorsOp::applyToOne(
     transform::TransformRewriter &rewriter, Operation *target,
     transform::ApplyToEachResultList &results, transform::TransformState &state) {
   (void)results;

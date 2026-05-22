@@ -55,7 +55,7 @@ transform.named_sequence @__transform_main(%module: !transform.any_op) {
       : (!transform.any_op) -> !transform.any_op
   %loop1 = transform.structured.match ops{["scf.for"]} in %f1
       : (!transform.any_op) -> !transform.any_op
-  %r1, %e1 = transform.match.loop_ru.rolling_update_next_reduction %loop1
+  %r1, %e1 = transform.fusion.find_next_reduction %loop1
       : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
   transform.print %r1 : !transform.any_op
   transform.print %e1 : !transform.any_op
@@ -65,7 +65,7 @@ transform.named_sequence @__transform_main(%module: !transform.any_op) {
       : (!transform.any_op) -> !transform.any_op
   %loop2 = transform.structured.match ops{["scf.for"]} in %f2
       : (!transform.any_op) -> !transform.any_op
-  %r2, %e2 = transform.match.loop_ru.rolling_update_next_reduction %loop2
+  %r2, %e2 = transform.fusion.find_next_reduction %loop2
       : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
   transform.print %r2 : !transform.any_op
   transform.print %e2 : !transform.any_op
@@ -75,7 +75,7 @@ transform.named_sequence @__transform_main(%module: !transform.any_op) {
       : (!transform.any_op) -> !transform.any_op
   %loop3 = transform.structured.match ops{["scf.for"]} in %f3
       : (!transform.any_op) -> !transform.any_op
-  %r3, %e3 = transform.match.loop_ru.rolling_update_next_reduction %loop3
+  %r3, %e3 = transform.fusion.find_next_reduction %loop3
       : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
   transform.print %r3 : !transform.any_op
   transform.print %e3 : !transform.any_op
@@ -85,7 +85,7 @@ transform.named_sequence @__transform_main(%module: !transform.any_op) {
       : (!transform.any_op) -> !transform.any_op
   %loop4 = transform.structured.match ops{["scf.for"]} in %f4
       : (!transform.any_op) -> !transform.any_op
-  %r4, %e4 = transform.match.loop_ru.rolling_update_next_reduction %loop4
+  %r4, %e4 = transform.fusion.find_next_reduction %loop4
       : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
   transform.print %r4 : !transform.any_op
   transform.print %e4 : !transform.any_op
@@ -95,7 +95,7 @@ transform.named_sequence @__transform_main(%module: !transform.any_op) {
       : (!transform.any_op) -> !transform.any_op
   %loop5 = transform.structured.match ops{["scf.for"]} in %f5
       : (!transform.any_op) -> !transform.any_op
-  %r5, %e5 = transform.match.loop_ru.rolling_update_next_reduction %loop5
+  %r5, %e5 = transform.fusion.find_next_reduction %loop5
       : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
   transform.print %r5 : !transform.any_op
   transform.print %e5 : !transform.any_op

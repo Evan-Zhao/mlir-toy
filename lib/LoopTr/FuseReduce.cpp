@@ -319,7 +319,7 @@ splitForallDimensionForReduction(TransformOpInterface transform, RewriterBase &r
 namespace mlir {
 namespace transform {
 
-void LoopFuseReduceConsumerIntoForall::getEffects(
+void ScfFuseReductionIntoForallOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   consumesHandle(getConsumerOpMutable(), effects);
   onlyReadsHandle(getForallLoopMutable(), effects);
@@ -329,8 +329,8 @@ void LoopFuseReduceConsumerIntoForall::getEffects(
 }
 
 DiagnosedSilenceableFailure
-LoopFuseReduceConsumerIntoForall::apply(transform::TransformRewriter &rewriter,
-                                        TransformResults &transformResults, TransformState &state) {
+ScfFuseReductionIntoForallOp::apply(transform::TransformRewriter &rewriter,
+                                    TransformResults &transformResults, TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getForallLoop, "loop", loop, scf::ForallOp);
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getConsumerOp, "consumer", consumer,

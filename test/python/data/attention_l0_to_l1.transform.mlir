@@ -55,7 +55,7 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     transform.print %elemwise_consumers : !transform.any_op
     %fused_consumers =
-      transform.loop.fuse_into_producer_op %elemwise_consumers into %producer
+      transform.fusion.into_producer %elemwise_consumers into %producer
         : (!transform.any_op, !transform.any_op) -> !transform.any_op
     transform.yield %fused_consumers : !transform.any_op
   }
@@ -127,35 +127,35 @@ module attributes {transform.with_named_sequence} {
         @match_unary_reduction -> @return_matched
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     %fused_bmax, %j0_loop =
-      transform.loop.fuse_reduction_consumer_into_forall %bmax into %forall_loop
+      transform.scf.fuse_reduction_into_forall %bmax into %forall_loop
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
 
     // Step 4. Prepare for rolling update. First find the nearest reduction
     // frontier reachable from the loop-local value, together with the ordered
     // elementwise chain between them.
     %bsum, %elemwise =
-      transform.match.loop_ru.rolling_update_next_reduction %forall_loop
+      transform.fusion.find_next_reduction %forall_loop
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     // Clone and fuse that elementwise chain under %forall_loop and %j0_loop,
     // publishing the sidecar tensors as extra loop results.
     %elemwise_sidecars =
-      transform.loop_ru.clone_fuse_elemwise %elemwise into %forall_loop, %j0_loop
+      transform.fusion.clone_fuse_elemwise %elemwise into %forall_loop, %j0_loop
         : (!transform.any_op, !transform.any_op, !transform.any_op) -> !transform.any_op
     // Repair the first reduction frontier by turning it into loop-carried state
     // driven by the relayed sidecar value.
-    %fused_bsum = transform.loop_ru.repair_reduction_frontier
+    %fused_bsum = transform.fusion.repair_reduction_frontier
         (%fused_bmax, %bsum) and (%elemwise, %elemwise_sidecars) into %forall_loop, %j0_loop
         : (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op,
            !transform.any_op, !transform.any_op) -> !transform.any_op
 
     // Step 5. Apply rolling update again, this time with the second matmul being the reduction.
     %mm2, %elemwise_1 =
-      transform.match.loop_ru.rolling_update_next_reduction %forall_loop
+      transform.fusion.find_next_reduction %forall_loop
         : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     %elemwise_sidecars_1 =
-      transform.loop_ru.clone_fuse_elemwise %elemwise_1 into %forall_loop, %j0_loop
+      transform.fusion.clone_fuse_elemwise %elemwise_1 into %forall_loop, %j0_loop
         : (!transform.any_op, !transform.any_op, !transform.any_op) -> !transform.any_op
-    %reduce_r = transform.loop_ru.repair_reduction_frontier
+    %reduce_r = transform.fusion.repair_reduction_frontier
         (%fused_bsum, %mm2) and (%elemwise_1, %elemwise_sidecars_1) into %forall_loop, %j0_loop
         : (!transform.any_op, !transform.any_op, !transform.any_op, !transform.any_op,
            !transform.any_op, !transform.any_op) -> !transform.any_op

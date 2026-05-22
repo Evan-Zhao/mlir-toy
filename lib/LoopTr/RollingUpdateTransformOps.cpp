@@ -394,8 +394,8 @@ namespace mlir {
 namespace transform {
 
 DiagnosedSilenceableFailure
-LoopRURollingUpdateNextReduction::apply(transform::TransformRewriter &rewriter,
-                                        TransformResults &transformResults, TransformState &state) {
+FusionFindNextReductionOp::apply(transform::TransformRewriter &rewriter,
+                                 TransformResults &transformResults, TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
   CHECK_EXTRACT_UNIQUE_OP(state, transform, getProducerOp, "producer", producer);
 
@@ -448,7 +448,7 @@ LoopRURollingUpdateNextReduction::apply(transform::TransformRewriter &rewriter,
   return DiagnosedSilenceableFailure::success();
 }
 
-void LoopRURepairReductionFrontier::getEffects(
+void FusionRepairReductionFrontierOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   onlyReadsHandle(getProducerReducesMutable(), effects);
   consumesHandle(getThisReduceMutable(), effects);
@@ -462,8 +462,8 @@ void LoopRURepairReductionFrontier::getEffects(
 }
 
 DiagnosedSilenceableFailure
-LoopRURepairReductionFrontier::apply(transform::TransformRewriter &rewriter,
-                                     TransformResults &transformResults, TransformState &state) {
+FusionRepairReductionFrontierOp::apply(transform::TransformRewriter &rewriter,
+                                       TransformResults &transformResults, TransformState &state) {
   // Do some basic validation.
   auto transform = cast<TransformOpInterface>(getOperation());
   CHECK_NON_EMPTY_OPS(state, transform, getProducerReduces, "producer reductions", producerReds);
