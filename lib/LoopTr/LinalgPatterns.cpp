@@ -25,21 +25,23 @@ void replaceUsesAfterElementwiseFusion(RewriterBase &rewriter,
   }
 }
 
-FailureOr<Operation *> tryDirectElementwiseFusion(RewriterBase &rewriter,
+FailureOr<Operation *> tryDirectElementwiseFusion(TransformRewriter &rewriter,
                                                   linalg::LinalgOp linalgTarget,
                                                   size_t operandNumber) {
   OpOperand &fusedOperand = linalgTarget->getOpOperand(operandNumber);
   if (!linalg::areElementwiseOpsFusable(&fusedOperand))
-    return failure();
+    return static_cast<Operation *>(nullptr);
 
   Operation *producer = fusedOperand.get().getDefiningOp();
   rewriter.setInsertionPoint(linalgTarget);
   FailureOr<linalg::ElementwiseOpFusionResult> fusionResult =
       linalg::fuseElementwiseOps(rewriter, &fusedOperand);
   if (failed(fusionResult))
-    return failure();
+    return static_cast<Operation *>(nullptr);
 
   replaceUsesAfterElementwiseFusion(rewriter, *fusionResult, producer);
+  if (failed(rewriter.notifyPayloadOperationReplaced(linalgTarget, fusionResult->fusedOp)))
+    return failure();
   rewriter.eraseOp(linalgTarget);
   return fusionResult->fusedOp;
 }
@@ -135,6 +137,12 @@ DiagnosedSilenceableFailure LinalgFoldExpandingReshapeOp::applyToOne(TransformRe
   return DiagnosedSilenceableFailure::success();
 }
 
+void LinalgGreedyInlineElementwiseOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  onlyReadsHandle(getTargetMutable(), effects);
+  modifiesPayload(effects);
+}
+
 DiagnosedSilenceableFailure
 LinalgGreedyInlineElementwiseOp::applyToOne(TransformRewriter &rewriter, linalg::GenericOp target,
                                             ApplyToEachResultList &results, TransformState &state) {
@@ -149,27 +157,26 @@ LinalgGreedyInlineElementwiseOp::applyToOne(TransformRewriter &rewriter, linalg:
   }
 
   GenericOp currentOp = target;
-  auto scanAllOperands = [&]() {
+  bool applied = false;
+  while (true) {
     size_t beginOprndNum = operandNumber ? *operandNumber : 0,
            endOprndNum = operandNumber ? beginOprndNum + 1 : currentOp.getNumOperands();
     bool changed = false;
     for (size_t i = beginOprndNum; i < endOprndNum; ++i) {
       auto folded = tryDirectElementwiseFusion(rewriter, currentOp, i);
-      if (succeeded(folded)) {
+      if (failed(folded))
+        return emitDefiniteFailure()
+               << "failed to update payload tracking after elementwise fusion";
+      if (*folded) {
         currentOp = cast<GenericOp>(*folded);
-        changed = true;
+        changed = applied = true;
       }
     }
-    return changed;
-  };
-
-  bool changed = false;
-  while (scanAllOperands()) {
-    changed = true;
+    if (!changed)
+      break;
   }
-  if (!changed)
+  if (!applied)
     BAIL("no eligible elementwise inlining or reshape folding");
-  results.push_back(currentOp);
   return DiagnosedSilenceableFailure::success();
 }
 

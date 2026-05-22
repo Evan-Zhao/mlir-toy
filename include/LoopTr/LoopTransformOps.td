@@ -70,10 +70,10 @@ def LinalgFoldExpandingReshapeOp : Op<Transform_Dialect, "linalg.fold_expanding_
   }];
 }
 
-def LinalgGreedyInlineElementwiseOp
-    : Op<Transform_Dialect, "linalg.greedy_inline_elementwise",
-         [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface, TransformOpInterface,
-          TransformEachOpTrait, ReportTrackingListenerFailuresOpTrait]> {
+def LinalgGreedyInlineElementwiseOp : Op<Transform_Dialect, "linalg.greedy_inline_elementwise",
+                                         [TransformOpInterface, TransformEachOpTrait,
+                                          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+                                          ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Greedily inline elementwise producers into a linalg.generic consumer";
 
   let description = [{
@@ -92,9 +92,9 @@ def LinalgGreedyInlineElementwiseOp
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$target, OptionalAttr<I64Attr>:$operand_number);
-  let results = (outs TransformHandleTypeInterface:$fused_op);
+  let results = (outs);
 
-  let assemblyFormat = "$target attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "$target attr-dict `:` type($target)";
 
   let extraClassDeclaration = [{
     ::mlir::DiagnosedSilenceableFailure applyToOne(
