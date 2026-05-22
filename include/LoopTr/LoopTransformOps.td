@@ -67,6 +67,9 @@ def LinalgGreedyInlineElementwiseOp : Op<Transform_Dialect, "linalg.greedy_inlin
     If `operand_number` is present, only that operand of the generic op is considered for inlining.
     Otherwise, operands are tried from left to right and the first eligible operand is inlined.
     The transform keeps iterating until no inlining can make further progress.
+    After the inlining loop, it also applies
+    `linalg::populateEraseUnusedOperandsAndResultsPatterns(...)` to remove
+    dead relay results and redundant operands exposed by the fusion.
 
     This transform reads the target handle and modifies the payload. If payload
     tracking succeeds, the target handle remains valid and is updated to point

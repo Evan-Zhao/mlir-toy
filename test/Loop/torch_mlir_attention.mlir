@@ -53,7 +53,6 @@ module attributes {transform.with_named_sequence} {
     // Inline elementwise ops before bmm0 (in this case, should be F16->F32 casts) into it.
     %bmm0, %_0 = transform.split_handle %bmms_lg : (!any) -> (!any, !any)
     transform.linalg.greedy_inline_elementwise %bmm0 : !any
-    transform.linalg.erase_unused_operands_and_results %bmm0 : !any
     // Tile all parallel dimensions of bmm0 (b, h, i, j) into a scf.forall loop.
     // We'll fuse everything else into this loop nest.
     %_1, %forall_loop = transform.structured.tile_using_forall
@@ -99,7 +98,6 @@ module attributes {transform.with_named_sequence} {
     // Also inline (F16->F32 casts) into the second matmul. `operand_number = 1` says only
     // inline producers of the RHS of the matmul.
     transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any
-    transform.linalg.erase_unused_operands_and_results %bmm1 : !any
     %elemwise_sidecars_1 = transform.fusion.clone_fuse_elemwise
         %elemwise_1 into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
     %_3 = transform.fusion.repair_reduction_frontier

@@ -46,7 +46,7 @@ FailureOr<Operation *> tryDirectElementwiseFusion(TransformRewriter &rewriter,
   return fusionResult->fusedOp;
 }
 
-static SmallVector<unsigned> getLoopDimsWithZeroIndexedMaps(linalg::GenericOp genericOp) {
+SmallVector<unsigned> getLoopDimsWithZeroIndexedMaps(linalg::GenericOp genericOp) {
   SmallVector<unsigned> allowedDims;
   llvm::SmallBitVector seen(genericOp.getNumLoops(), false);
 
@@ -69,7 +69,7 @@ static SmallVector<unsigned> getLoopDimsWithZeroIndexedMaps(linalg::GenericOp ge
   return allowedDims;
 }
 
-static linalg::ControlDropUnitDims makeZeroIndexedUnitDimsOptions() {
+linalg::ControlDropUnitDims makeZeroIndexedUnitDimsOptions() {
   linalg::ControlDropUnitDims options;
   options.controlFn = [](Operation *op) -> SmallVector<unsigned> {
     auto genericOp = dyn_cast<linalg::GenericOp>(op);
@@ -78,6 +78,16 @@ static linalg::ControlDropUnitDims makeZeroIndexedUnitDimsOptions() {
     return getLoopDimsWithZeroIndexedMaps(genericOp);
   };
   return options;
+}
+
+LogicalResult rewriteGreedilyWithPatternSet(MLIRContext *context, OpBuilder &rewriter,
+                                            RewritePatternSet &patterns, Operation *target) {
+  GreedyRewriteConfig config;
+  config.setListener(static_cast<RewriterBase::Listener *>(rewriter.getListener()));
+  config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
+  bool changed = false;
+  return applyOpPatternsGreedily({target}, FrozenRewritePatternSet(std::move(patterns)), config,
+                                 &changed);
 }
 
 } // namespace
@@ -93,18 +103,12 @@ DiagnosedSilenceableFailure LinalgEraseUnusedOperandsAndResultsOp::applyToOne(
     TransformState &state) {
   (void)results;
   (void)state;
+  auto transform = cast<TransformOpInterface>(getOperation());
 
   RewritePatternSet patterns(getContext());
   linalg::populateEraseUnusedOperandsAndResultsPatterns(patterns);
-
-  GreedyRewriteConfig config;
-  config.setListener(static_cast<RewriterBase::Listener *>(rewriter.getListener()));
-  config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
-
-  bool changed = false;
-  if (failed(applyOpPatternsGreedily({target}, FrozenRewritePatternSet(std::move(patterns)), config,
-                                     &changed))) {
-    return emitDefiniteFailure() << "fold_expanding_reshape did not converge";
+  if (failed(rewriteGreedilyWithPatternSet(getContext(), rewriter, patterns, target))) {
+    BAIL("erase_unused_operands_and_results did not converge");
   }
   return DiagnosedSilenceableFailure::success();
 }
@@ -153,6 +157,12 @@ LinalgGreedyInlineElementwiseOp::applyToOne(TransformRewriter &rewriter, linalg:
   }
   if (!applied)
     BAIL("no eligible elementwise inlining or reshape folding");
+
+  RewritePatternSet cleanupPatterns(getContext());
+  linalg::populateEraseUnusedOperandsAndResultsPatterns(cleanupPatterns);
+  if (failed(rewriteGreedilyWithPatternSet(getContext(), rewriter, cleanupPatterns, currentOp))) {
+    BAIL("cleanup patterns did not converge after elementwise fusion");
+  }
   return DiagnosedSilenceableFailure::success();
 }
 

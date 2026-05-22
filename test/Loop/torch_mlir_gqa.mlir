@@ -39,7 +39,6 @@ module attributes {transform.with_named_sequence} {
 
     %bmm0, %_0 = transform.split_handle %bmms_lg : (!any) -> (!any, !any)
     transform.linalg.greedy_inline_elementwise %bmm0 : !any
-    transform.linalg.erase_unused_operands_and_results %bmm0 : !any
     %_1, %forall_loop = transform.structured.tile_using_forall
         %bmm0 tile_sizes [1, 1, 1, 128, 64, 0] : (!any) -> (!any, !any)
 
@@ -65,7 +64,6 @@ module attributes {transform.with_named_sequence} {
     %bmm1, %elemwise_1 = transform.fusion.find_next_reduction
         %forall_loop : (!any) -> (!any, !any)
     transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any
-    transform.linalg.erase_unused_operands_and_results %bmm1 : !any
     %elemwise_sidecars_1 = transform.fusion.clone_fuse_elemwise
         %elemwise_1 into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
     %_3 = transform.fusion.repair_reduction_frontier
