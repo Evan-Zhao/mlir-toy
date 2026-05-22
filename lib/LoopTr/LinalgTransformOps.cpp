@@ -109,32 +109,8 @@ DiagnosedSilenceableFailure LinalgEraseUnusedOperandsAndResultsOp::applyToOne(
   return DiagnosedSilenceableFailure::success();
 }
 
-void LinalgFoldExpandingReshapeOp::getEffects(
-    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  onlyReadsHandle(getTargetMutable(), effects);
-  modifiesPayload(effects);
-}
-
-DiagnosedSilenceableFailure LinalgFoldExpandingReshapeOp::applyToOne(TransformRewriter &rewriter,
-                                                                     linalg::LinalgOp target,
-                                                                     ApplyToEachResultList &results,
-                                                                     TransformState &state) {
-  (void)results;
-  (void)state;
-
-  RewritePatternSet patterns(getContext());
+void ApplyFoldExpandingReshapePatternsOp::populatePatterns(RewritePatternSet &patterns) {
   linalg::populateFoldReshapeOpsByExpansionPatterns(patterns, [](OpOperand *) { return true; });
-
-  GreedyRewriteConfig config;
-  config.setListener(static_cast<RewriterBase::Listener *>(rewriter.getListener()));
-  config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
-
-  bool changed = false;
-  if (failed(applyOpPatternsGreedily({target}, FrozenRewritePatternSet(std::move(patterns)), config,
-                                     &changed))) {
-    return emitDefiniteFailure() << "fold_expanding_reshape did not converge";
-  }
-  return DiagnosedSilenceableFailure::success();
 }
 
 void LinalgGreedyInlineElementwiseOp::getEffects(

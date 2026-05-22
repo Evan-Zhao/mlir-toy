@@ -13,7 +13,7 @@ module attributes {transform.with_named_sequence} {
     %transpose = transform.structured.match ops{["linalg.transpose"]} in %func
         : (!transform.any_op) -> !transform.any_op
     %generic = transform.structured.generalize %transpose : (!transform.any_op) -> !transform.any_op
-    transform.linalg.fold_expanding_reshape %generic : !transform.any_op
+    transform.apply_patterns to %func { transform.apply_patterns.linalg.fold_expanding_reshape } : !transform.any_op
     transform.yield
   }
 

@@ -35,20 +35,19 @@ module attributes {transform.with_named_sequence} {
     // in these indexing maps.
     transform.linalg.fold_zero_indexed_unit_dims %func : !any
 
-    // Prepass 2. TorchMLIR attention describes 4D matmuls with linalg.batch_matmul,
-    // which requires exactly one "batch" dimension, by fusing the batch and head dims together.
-    // We separate these dims by "generalizing" the batch matmul (and its producers,
-    // like linalg.transpose) to a linalg.generic, then fuse the reshaping operation into the generic op.
-    // Do that for the transpose op first (there should be exactly one for the QK^T matmul).
+    // Prepass 2. TorchMLIR uses some linalg builtin ops like linalg.transpose and linalg.batch_matmul.
+    // In particular, it describes the 4D matmuls in attention with linalg.batch_matmul,
+    // fusing the batch and head dims together, because batch_matmul supports exactly one "batch" dimension.
+    // We first "generalize" these ops into linalg.generic, which can describe more flexible iteration spaces,
+    // and then fuse the reshaping operation into the generic op.
     %transposes = transform.structured.match ops{["linalg.transpose"]} in %func : (!any) -> !any
     %transposes_lg = transform.structured.generalize %transposes : (!any) -> !any
-    transform.linalg.fold_expanding_reshape %transposes_lg : !any
-    // Then do batch matmul ops.
     %bmms = transform.structured.match ops{["linalg.batch_matmul"]} in %func : (!any) -> !any
     %bmms_lg = transform.structured.generalize %bmms : (!any) -> !any
-    transform.linalg.fold_expanding_reshape %bmms_lg : !any
-    // This pattern cancels out back-to-back expand+collapse pairs.
-    transform.apply_patterns to %func { transform.apply_patterns.tensor.reassociative_reshape_folding } : !any
+    transform.apply_patterns to %func {
+      transform.apply_patterns.linalg.fold_expanding_reshape
+      transform.apply_patterns.tensor.reassociative_reshape_folding
+    } : !any
 
     // Take the first batch matmul `bmm0`.
     // Inline elementwise ops before bmm0 (in this case, should be F16->F32 casts) into it.

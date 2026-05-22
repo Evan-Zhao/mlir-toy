@@ -36,38 +36,20 @@ def LinalgEraseUnusedOperandsAndResultsOp
   }];
 }
 
-def LinalgFoldExpandingReshapeOp : Op<Transform_Dialect, "linalg.fold_expanding_reshape",
-                                      [TransformOpInterface, TransformEachOpTrait,
-                                       DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
-                                       ReportTrackingListenerFailuresOpTrait]> {
-  let summary =
-      "Expand the dimensions of linalg.generic when that allows reshaping ops to be folded in";
+def ApplyFoldExpandingReshapePatternsOp
+    : Op<Transform_Dialect, "apply_patterns.linalg.fold_expanding_reshape",
+         [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
+  let summary = "Collect patterns that expand linalg iteration spaces to fold reshapes into the op";
 
   let description = [{
-    Create one or more size-one dimensions in the iteration space of
-    a `linalg.generic` op, and fold expanding reshapes into the op,
-    including tensor.expand_shape on the producer (operand) side
-    and tensor.collapse_shape ops on the consumer (result) side.
-
-    Applies the MLIR built-in patterns provided by
-    `linalg::populateFoldReshapeOpsByExpansionPatterns`, using greedy rewrites.
-
-    If rewrite happens, the target handle is preserved remains valid and points to the rewritten op.
-    This pass can fail if the rewrite listener fails to find the op after rewrite.
+    Collects patterns that create one or more size-one dimensions in the
+    iteration space of a `linalg` op when that makes it possible to fold
+    reshapes into the op, including:
+    - `tensor.expand_shape` on the producer (operand) side
+    - `tensor.collapse_shape` on the consumer (result) side
   }];
 
-  let arguments = (ins TransformHandleTypeInterface:$target);
-  let results = (outs);
-
-  let assemblyFormat = "$target attr-dict `:` type($target)";
-
-  let extraClassDeclaration = [{
-    ::mlir::DiagnosedSilenceableFailure applyToOne(
-        ::mlir::transform::TransformRewriter &rewriter,
-        ::mlir::linalg::LinalgOp target,
-        ::mlir::transform::ApplyToEachResultList &results,
-        ::mlir::transform::TransformState &state);
-  }];
+  let assemblyFormat = "attr-dict";
 }
 
 def LinalgGreedyInlineElementwiseOp : Op<Transform_Dialect, "linalg.greedy_inline_elementwise",
