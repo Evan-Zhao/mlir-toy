@@ -135,10 +135,9 @@ LinalgFoldExpandingReshapeOp::applyToOne(transform::TransformRewriter &rewriter,
   return DiagnosedSilenceableFailure::success();
 }
 
-DiagnosedSilenceableFailure LinalgInlineElementwiseOp::applyToOne(TransformRewriter &rewriter,
-                                                                  Operation *target,
-                                                                  ApplyToEachResultList &results,
-                                                                  TransformState &state) {
+DiagnosedSilenceableFailure
+LinalgGreedyInlineElementwiseOp::applyToOne(TransformRewriter &rewriter, Operation *target,
+                                            ApplyToEachResultList &results, TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
   auto genericOp = dyn_cast<linalg::GenericOp>(target);
   if (!genericOp) {

@@ -35,7 +35,7 @@ module attributes {transform.with_named_sequence} {
     // Take the first batch matmul `bmm0`.
     // Inline elementwise ops before bmm0 (in this case, should be F16->F32 casts) into it.
     %bmm0, %_0 = transform.split_handle %bmms_lg : (!any) -> (!any, !any)
-    %bmm0_1 = transform.linalg.inline_elementwise %bmm0: (!any) -> !any
+    %bmm0_1 = transform.linalg.greedy_inline_elementwise %bmm0: (!any) -> !any
     transform.linalg.erase_unused_operands_and_results %bmm0_1 : !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     // Tile all parallel dimensions of mm0 (b, h, i, j) into a scf.forall loop.
@@ -69,7 +69,7 @@ module attributes {transform.with_named_sequence} {
 
     %bmm1, %elemwise_1 = transform.fusion.find_next_reduction
         %forall_loop : (!any) -> (!any, !any)
-    %bmm1_1 = transform.linalg.inline_elementwise %bmm1 { operand_number = 1 }: (!any) -> !any
+    %bmm1_1 = transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 }: (!any) -> !any
     transform.linalg.erase_unused_operands_and_results %bmm1_1 : !any
     %elemwise_sidecars_1 = transform.fusion.clone_fuse_elemwise
         %elemwise_1 into %forall_loop, %j0_loop : (!any, !any, !any) -> !any

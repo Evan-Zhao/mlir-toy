@@ -66,8 +66,8 @@ def LinalgFoldExpandingReshapeOp : Op<Transform_Dialect, "linalg.fold_expanding_
   }];
 }
 
-def LinalgInlineElementwiseOp
-    : Op<Transform_Dialect, "linalg.inline_elementwise",
+def LinalgGreedyInlineElementwiseOp
+    : Op<Transform_Dialect, "linalg.greedy_inline_elementwise",
          [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface, TransformOpInterface,
           TransformEachOpTrait, ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Inline elementwise producers into a linalg.generic consumer";
