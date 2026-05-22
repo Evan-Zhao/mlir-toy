@@ -87,8 +87,8 @@ void LinalgEraseUnusedOperandsAndResultsOp::getEffects(
 }
 
 DiagnosedSilenceableFailure LinalgEraseUnusedOperandsAndResultsOp::applyToOne(
-    transform::TransformRewriter &rewriter, Operation *target,
-    transform::ApplyToEachResultList &results, transform::TransformState &state) {
+    TransformRewriter &rewriter, linalg::GenericOp target, ApplyToEachResultList &results,
+    TransformState &state) {
   (void)results;
   (void)state;
 
@@ -102,7 +102,7 @@ DiagnosedSilenceableFailure LinalgEraseUnusedOperandsAndResultsOp::applyToOne(
   bool changed = false;
   if (failed(applyOpPatternsGreedily({target}, FrozenRewritePatternSet(std::move(patterns)), config,
                                      &changed))) {
-    return emitDefiniteFailure() << "erase-unused-operands-and-results did not converge";
+    return emitDefiniteFailure() << "fold_expanding_reshape did not converge";
   }
   return DiagnosedSilenceableFailure::success();
 }
@@ -113,10 +113,10 @@ void LinalgFoldExpandingReshapeOp::getEffects(
   modifiesPayload(effects);
 }
 
-DiagnosedSilenceableFailure
-LinalgFoldExpandingReshapeOp::applyToOne(transform::TransformRewriter &rewriter, Operation *target,
-                                         transform::ApplyToEachResultList &results,
-                                         transform::TransformState &state) {
+DiagnosedSilenceableFailure LinalgFoldExpandingReshapeOp::applyToOne(TransformRewriter &rewriter,
+                                                                     linalg::LinalgOp target,
+                                                                     ApplyToEachResultList &results,
+                                                                     TransformState &state) {
   (void)results;
   (void)state;
 
@@ -130,29 +130,25 @@ LinalgFoldExpandingReshapeOp::applyToOne(transform::TransformRewriter &rewriter,
   bool changed = false;
   if (failed(applyOpPatternsGreedily({target}, FrozenRewritePatternSet(std::move(patterns)), config,
                                      &changed))) {
-    return emitDefiniteFailure() << "fold-reshape did not converge";
+    return emitDefiniteFailure() << "fold_expanding_reshape did not converge";
   }
   return DiagnosedSilenceableFailure::success();
 }
 
 DiagnosedSilenceableFailure
-LinalgGreedyInlineElementwiseOp::applyToOne(TransformRewriter &rewriter, Operation *target,
+LinalgGreedyInlineElementwiseOp::applyToOne(TransformRewriter &rewriter, linalg::GenericOp target,
                                             ApplyToEachResultList &results, TransformState &state) {
+  (void)results;
+  (void)state;
   auto transform = cast<TransformOpInterface>(getOperation());
-  auto genericOp = dyn_cast<linalg::GenericOp>(target);
-  if (!genericOp) {
-    target->emitError() << "expected a linalg.generic op as the target";
-    BAIL("expected target to be a linalg.generic");
-  }
-
   std::optional<int64_t> operandNumber = getOperandNumber();
-  if (operandNumber && (*operandNumber < 0 || *operandNumber >= genericOp->getNumOperands())) {
-    genericOp->emitError() << "this operation has " << genericOp->getNumOperands()
-                           << " operands, but operand_number is " << *operandNumber;
+  if (operandNumber && (*operandNumber < 0 || *operandNumber >= target.getNumOperands())) {
+    target.emitError() << "this operation has " << target.getNumOperands()
+                       << " operands, but operand_number is " << *operandNumber;
     BAIL("operand_number is out of range");
   }
 
-  GenericOp currentOp = genericOp;
+  GenericOp currentOp = target;
   auto scanAllOperands = [&]() {
     size_t beginOprndNum = operandNumber ? *operandNumber : 0,
            endOprndNum = operandNumber ? beginOprndNum + 1 : currentOp.getNumOperands();

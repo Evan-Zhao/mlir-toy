@@ -10,18 +10,16 @@ def LinalgEraseUnusedOperandsAndResultsOp
   let summary = "Remove unused operands and dead results from linalg.generic";
 
   let description = [{
-    Apply the same upstream cleanup set that `-linalg-fuse-elementwise-ops`
-    uses to remove dead outputs and redundant operands of `linalg.generic`.
-
-    Concretely, this wraps
-    `linalg::populateEraseUnusedOperandsAndResultsPatterns(...)`, which includes:
+    Removes dead outputs and redundant operands of `linalg.generic` ops,
+    by applying the MLIR built-in rewrite patterns
+    `linalg::populateEraseUnusedOperandsAndResultsPatterns`, including:
     - `RemoveUnusedCycleInGenericOp`
     - `DeduplicateAndRemoveDeadOperandsAndResults`
 
-    The transform is applied directly to the targeted op with
-    `applyOpPatternsGreedily`, so the target operation itself may be rewritten.
-    This transform reads the target handle and modifies the payload. It does not
-    return a handle; rematch if you need the rewritten op.
+    This pass uses greedy rewrites with the patterns above.
+    If rewrite happens, the target handle is preserved remains valid and points to the rewritten op.
+    This pass fails if the rewriter doesn't converge, or the rewrite listener fails to
+    find the op after the rewrite.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$target);
@@ -32,7 +30,7 @@ def LinalgEraseUnusedOperandsAndResultsOp
   let extraClassDeclaration = [{
     ::mlir::DiagnosedSilenceableFailure applyToOne(
         ::mlir::transform::TransformRewriter &rewriter,
-        ::mlir::Operation *target,
+        ::mlir::linalg::GenericOp target,
         ::mlir::transform::ApplyToEachResultList &results,
         ::mlir::transform::TransformState &state);
   }];
@@ -42,14 +40,20 @@ def LinalgFoldExpandingReshapeOp : Op<Transform_Dialect, "linalg.fold_expanding_
                                       [TransformOpInterface, TransformEachOpTrait,
                                        DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
                                        ReportTrackingListenerFailuresOpTrait]> {
-  let summary = "Apply linalg's expanding reshape folding patterns directly to a target op";
+  let summary =
+      "Expand the dimensions of linalg.generic when that allows reshaping ops to be folded in";
 
   let description = [{
-    Apply `linalg::populateFoldReshapeOpsByExpansionPatterns(...)`
-    directly to the targeted payload op with `applyOpPatternsGreedily`.
+    Create one or more size-one dimensions in the iteration space of
+    a `linalg.generic` op, and fold expanding reshapes into the op,
+    including tensor.expand_shape on the producer (operand) side
+    and tensor.collapse_shape ops on the consumer (result) side.
 
-    This transform reads the target handle and modifies the payload.
-    The handle should still be valid and point to the modified op.
+    Applies the MLIR built-in patterns provided by
+    `linalg::populateFoldReshapeOpsByExpansionPatterns`, using greedy rewrites.
+
+    If rewrite happens, the target handle is preserved remains valid and points to the rewritten op.
+    This pass can fail if the rewrite listener fails to find the op after rewrite.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$target);
@@ -60,7 +64,7 @@ def LinalgFoldExpandingReshapeOp : Op<Transform_Dialect, "linalg.fold_expanding_
   let extraClassDeclaration = [{
     ::mlir::DiagnosedSilenceableFailure applyToOne(
         ::mlir::transform::TransformRewriter &rewriter,
-        ::mlir::Operation *target,
+        ::mlir::linalg::LinalgOp target,
         ::mlir::transform::ApplyToEachResultList &results,
         ::mlir::transform::TransformState &state);
   }];
@@ -70,26 +74,21 @@ def LinalgGreedyInlineElementwiseOp
     : Op<Transform_Dialect, "linalg.greedy_inline_elementwise",
          [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface, TransformOpInterface,
           TransformEachOpTrait, ReportTrackingListenerFailuresOpTrait]> {
-  let summary = "Inline elementwise producers into a linalg.generic consumer";
+  let summary = "Greedily inline elementwise producers into a linalg.generic consumer";
 
   let description = [{
     Thin transform-level wrapper around upstream `linalg::fuseElementwiseOps`.
 
-    For each targeted `linalg.generic`, this op repeatedly:
-    - folds producer reshape ops into the consumer when possible, and
-    - inlines one producer of an input operand into the consumer.
+    For the targeted `linalg.generic`, this op repeatedly inlines one producer
+    of an input operand into the consumer, until no supported operations are left to inline.
 
-    If `operand_number` is present, only that operand is considered for both
-    reshape folding and inlining. Otherwise, operands are tried from left
-    to right and the first eligible operand is inlined. The transform keeps
-    iterating until neither rewrite can make further progress, then returns a
-    handle to the final `linalg.generic`.
+    If `operand_number` is present, only that operand of the generic op is considered for inlining.
+    Otherwise, operands are tried from left to right and the first eligible operand is inlined.
+    The transform keeps iterating until no inlining can make further progress.
 
-    #### Return modes
-
-    This op produces a silenceable failure if the target is not a
-    `linalg.generic`, if `operand_number` is out of range, or if neither
-    reshape folding nor inlining can make progress.
+    This transform reads the target handle and modifies the payload. If payload
+    tracking succeeds, the target handle remains valid and is updated to point
+    to the rewritten `linalg.generic`.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$target, OptionalAttr<I64Attr>:$operand_number);
@@ -100,7 +99,7 @@ def LinalgGreedyInlineElementwiseOp
   let extraClassDeclaration = [{
     ::mlir::DiagnosedSilenceableFailure applyToOne(
         ::mlir::transform::TransformRewriter &rewriter,
-        ::mlir::Operation *target,
+        ::mlir::linalg::GenericOp target,
         ::mlir::transform::ApplyToEachResultList &results,
         ::mlir::transform::TransformState &state);
   }];
@@ -110,23 +109,21 @@ def LinalgFoldZeroIndexedUnitDimsOp : Op<Transform_Dialect, "linalg.fold_zero_in
                                          [TransformOpInterface, TransformEachOpTrait,
                                           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
                                           ReportTrackingListenerFailuresOpTrait]> {
-  let summary = "Drop only linalg.generic unit dims implicated by zero-valued indexing-map results";
+  let summary = "Drop unit tensor dims implicated by zero-valued indexing-map results";
 
   let description = [{
-    Apply a narrow `linalg.generic` cleanup directly to the targeted payload op.
+    Removes unit-extent dimensions from the iteration space of a `linalg.generic` op.
+    Compared to the upstream `linalg::dropUnitDims(...)`, this transform only removes dims
+    that are implicated by `0`-valued indexing map results,
+    e.g. maps like `(d0, d1, d2, d3) -> (d0, d1, d2, 0)`.
 
-    The rewrite reuses upstream `linalg::dropUnitDims(...)`, but restricts the
-    candidate loop dimensions to those that are implicated by `0`-valued
-    indexing map results, e.g. maps like `(d0, d1, d2, d3) -> (d0, d1, d2, 0)`.
-    This is intended for keepdim-style softmax patterns where broad unit-extent
-    folding would also erase unrelated leading batch dimensions.
+    This transform is designed to convert keepdim-style reductions to non-keepdim ones,
+    and remove `(d0, d1, d2, 0)` indexing maps, which many MLIR upstream transforms
+    don't recognize or like.
 
-    The implementation mirrors the upstream `-linalg-fold-unit-extent-dims`
-    structure: a walk-based fold phase followed by the usual canonicalization
-    cleanup, but with the narrower control function above.
-
-    This transform reads the target handle and modifies the payload. It does not
-    return a handle; rematch if you need rewritten nested ops.
+    This transform recursively visits the target op and ops inside it.
+    While it preserves the target handle and remaps it to the rewritten op,
+    it can invalidate handles that point to operations inside it.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$target);
