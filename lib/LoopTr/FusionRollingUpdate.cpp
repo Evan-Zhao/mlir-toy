@@ -393,6 +393,63 @@ fuseReduceInLoopNest(TransformOpInterface transform, RewriterBase &rewriter, For
 namespace mlir {
 namespace transform {
 
+void FusionCloneFuseElemwiseOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  onlyReadsHandle(getElemwiseChainOpsMutable(), effects);
+  onlyReadsHandle(getOuterLoopMutable(), effects);
+  onlyReadsHandle(getInnerLoopMutable(), effects);
+
+  producesHandle(getOperation()->getOpResults(), effects);
+  modifiesPayload(effects);
+}
+
+DiagnosedSilenceableFailure FusionCloneFuseElemwiseOp::apply(transform::TransformRewriter &rewriter,
+                                                             TransformResults &transformResults,
+                                                             TransformState &state) {
+  auto transform = cast<TransformOpInterface>(getOperation());
+  CHECK_NON_EMPTY_OPS(state, transform, getElemwiseChainOps, "elementwise", elemwiseOps)
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getOuterLoop, "outer loop", outerLoop, ForallOp);
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getInnerLoop, "inner loop", innerLoop, ForOp);
+
+  IRMapping mapping;
+  for (Operation *&elemwiseOp : elemwiseOps) {
+#define BAIL_AND_POINT(message)                                                                    \
+  {                                                                                                \
+    elemwiseOp->emitError() << "failed on this elementwise op";                                    \
+    return emitSilenceableFailure(transform, message);                                             \
+  }
+    if (failed(isSingleOutputElemwiseLinalgOp(elemwiseOp)))
+      BAIL_AND_POINT(
+          "expected every op to be an elementwise linalg.map or linalg.generic with one result");
+
+    rewriter.setInsertionPoint(elemwiseOp);
+    auto newElemwiseOp = rewriter.clone(*elemwiseOp, mapping);
+    if (failed(recursiveMoveOperandsBeforeOp(*newElemwiseOp, rewriter, *outerLoop)))
+      BAIL_AND_POINT("failed to move operands before the outer loop");
+
+    auto fuseResult =
+        tileAndFuseConsumerIntoDoubleLoops(rewriter, outerLoop, innerLoop, *newElemwiseOp);
+    if (failed(fuseResult))
+      BAIL_AND_POINT("failed to fuse consumer into double loops");
+    auto [outerFusedOp, innerFusedOp] = *fuseResult;
+
+    auto newLoopResults = outerLoop->getResults().take_back(elemwiseOp->getNumResults());
+    for (auto [oldResult, newLoopResult] :
+         llvm::zip_equal(elemwiseOp->getResults(), newLoopResults)) {
+      mapping.map(oldResult, newLoopResult);
+    }
+
+    rewriter.eraseOp(newElemwiseOp);
+    rewriter.eraseOp(outerFusedOp);
+    elemwiseOp = innerFusedOp;
+
+    eliminateLocalCommonSubexpressions(rewriter, outerLoop.getOperation());
+  }
+
+  transformResults.set(getOperation()->getResult(0), elemwiseOps);
+  return DiagnosedSilenceableFailure::success();
+}
+
 DiagnosedSilenceableFailure
 FusionFindNextReductionOp::apply(transform::TransformRewriter &rewriter,
                                  TransformResults &transformResults, TransformState &state) {
