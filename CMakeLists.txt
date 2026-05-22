@@ -138,13 +138,13 @@ make_mlir_opt_plugin(
 make_mlir_opt_plugin(
   TARGET LoopTransform
   SOURCES
-    lib/LoopTr/FuseElemwise.cpp
+    lib/LoopTr/FusionIntoProducer.cpp
     lib/LoopTr/FuseReduce.cpp
-    lib/LoopTr/LinalgPatterns.cpp
+    lib/LoopTr/FusionRollingUpdate.cpp
+    lib/LoopTr/LinalgTransformOps.cpp
     lib/LoopTr/LoopTransformPlugin.cpp
     lib/LoopTr/PythonSolver.cpp
-    lib/LoopTr/RollingUpdateTransformOps.cpp
-    lib/LoopTr/ScfPatterns.cpp
+    lib/LoopTr/ScfTransformOps.cpp
     lib/LoopTr/Utils.cpp
     DEPS LoopTransformOpsIncGen
 )
