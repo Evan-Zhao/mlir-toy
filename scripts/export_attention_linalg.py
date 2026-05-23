@@ -45,6 +45,11 @@ class ManualGQAAttentionModule(torch.nn.Module):
 
 class SdpaGQAAttentionModule(torch.nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        # The main difference between this (SDPA GQA) and the one above is that
+        # this one adds a check per-row to see if all entries are -inf.
+        #   compare each logit to `-inf`
+        #   reduce with `or` each row, so each row gets one bit saying "there exists at least one valid entry"
+        #   if no valid entry, replace the softmax output with zeros
         return F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
 
 
