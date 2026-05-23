@@ -53,13 +53,15 @@ class SdpaGQAAttentionModule(torch.nn.Module):
         return F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
 
 
-class DenseMaskedAttentionModule(torch.nn.Module):
-    def forward(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor
-    ) -> torch.Tensor:
+class CausalAttentionModule(torch.nn.Module):
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         scale = 1.0 / math.sqrt(q.shape[-1])
         scores = torch.matmul(q.to(torch.float32), k.to(torch.float32).transpose(-1, -2))
         scores = scores * scale
+        q_len = scores.shape[-2]
+        kv_len = scores.shape[-1]
+        mask = torch.ones((q_len, kv_len), dtype=torch.bool, device=scores.device).tril()
+        mask = mask.view(1, 1, q_len, kv_len)
         neg_inf = torch.tensor(float("-inf"), dtype=scores.dtype, device=scores.device)
         scores = torch.where(mask, scores, neg_inf)
         probs = torch.softmax(scores, dim=-1)
@@ -116,7 +118,7 @@ VARIANTS = (
     "attention",
     "manual-gqa",
     "sdpa-gqa",
-    "dense-masked",
+    "causal",
     "float8-inputs",
     "fake-quant",
     "sparse-mm",
@@ -163,12 +165,6 @@ def _kv_heads(args: argparse.Namespace) -> int:
     return kv_heads
 
 
-def _make_dense_mask(batch: int, seq_len: int) -> torch.Tensor:
-    mask = torch.ones((batch, 1, seq_len, seq_len), dtype=torch.bool)
-    mask[:, :, :, seq_len // 2 :] = False
-    return mask
-
-
 def _build_module_and_args(
     args: argparse.Namespace,
 ) -> tuple[torch.nn.Module, tuple[torch.Tensor, ...]]:
@@ -195,12 +191,11 @@ def _build_module_and_args(
         v = torch.randn(kv_shape, dtype=torch.float16)
         return SdpaGQAAttentionModule().eval(), (q, k, v)
 
-    if args.variant == "dense-masked":
+    if args.variant == "causal":
         q = torch.randn(dense_shape, dtype=torch.float16)
         k = torch.randn(dense_shape, dtype=torch.float16)
         v = torch.randn(dense_shape, dtype=torch.float16)
-        mask = _make_dense_mask(args.batch, args.seq_len)
-        return DenseMaskedAttentionModule().eval(), (q, k, v, mask)
+        return CausalAttentionModule().eval(), (q, k, v)
 
     if args.variant == "float8-inputs":
         q = torch.randn(dense_shape, dtype=torch.float32).to(torch.float8_e4m3fn)
