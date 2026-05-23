@@ -1,3 +1,8 @@
+// RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin %s --transform-interpreter 2>&1 | FileCheck %s --check-prefix=MATCH
+//
+// Transform-dialect schedule that transforms the Torch-MLIR GQA payload below
+// into a FlashAttention-like fused program with a `(group, head)` outer loop shape.
+
 !any = !transform.any_op
 #map = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d3, d4)>
 #map1 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>
@@ -21,17 +26,8 @@ module attributes {transform.with_named_sequence} {
 
   transform.named_sequence @__transform_main(%module: !any) {
     %func = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
-    // Prepass 1. The input program from TorchMLIR has some "keepdim" reductions with an indexing map
-    // like `(d0, d1, d2, d3) -> (d0, d1, d2, 0)`, and many MLIR transformations will reject these maps.
-    // This step converts these keepdim reductions to non-keepdim ones, and remove the `0` dim
-    // in these indexing maps.
     transform.linalg.fold_zero_indexed_unit_dims %func : !any
 
-    // Prepass 2. TorchMLIR uses some linalg builtin ops like linalg.transpose and linalg.batch_matmul.
-    // In particular, it describes the 4D matmuls in attention with linalg.batch_matmul,
-    // fusing the batch and head dims together, because batch_matmul supports exactly one "batch" dimension.
-    // We first "generalize" these ops into linalg.generic, which can describe more flexible iteration spaces,
-    // and then fuse the reshaping operation into the generic op.
     %transposes = transform.structured.match ops{["linalg.transpose"]} in %func : (!any) -> !any
     %transposes_lg = transform.structured.generalize %transposes : (!any) -> !any
     %bmms = transform.structured.match ops{["linalg.batch_matmul"]} in %func : (!any) -> !any
@@ -41,55 +37,33 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.tensor.reassociative_reshape_folding
     } : !any
 
-    // Take the first batch matmul `bmm0`.
-    // Inline elementwise ops before bmm0 (in this case, should be F16->F32 casts) into it.
     %bmm0, %_0 = transform.split_handle %bmms_lg : (!any) -> (!any, !any)
     transform.linalg.greedy_inline_elementwise %bmm0 : !any
     transform.linalg.erase_unused_operands_and_results %bmm0 : !any
-    // Tile all parallel dimensions of bmm0 (b, h, i, j) into a scf.forall loop.
-    // We'll fuse everything else into this loop nest.
     %_1, %forall_loop = transform.structured.tile_using_forall
         %bmm0 tile_sizes [1, 1, 1, 128, 64, 0] : (!any) -> (!any, !any)
 
-    // Fusion 1. Match an element-wise op that is a consumer of mm0, and fuse it into mm0.
-    //   TVM: sch.reverse_compute_at(bscale, j0)
     %bscale = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
     %fused_bscale = transform.fusion.into_producer %bscale into %forall_loop : (!any, !any) -> !any
-    // Fusion can create redundant loop-carried values, and canonicalization removes them.
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
-    // Fusion 2. Fuse row-max into forall, splitting a serial `for` loop from forall in the process.
-    // Because of how MLIR scf.for works, this fusion implicitly also r-factors the reduction.
-    //   TVM: sch.reverse_compute_at(bmax, j0); sch.rfactor(...)
     %consumers = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
     %_2, %bmax = transform.foreach_match restrict_root in %consumers
         @match_4d_1d_reduction -> @return_matched : (!any) -> (!any, !any)
-    // The "row-max" in the input program has two outputs: the max value and the argmax.
-    // The subsequent fusion only supports single-output ops, so we remove the unused argmax
-    // output before fusion.
     transform.linalg.erase_unused_operands_and_results %bmax : !any
     %fused_bmax, %j0_loop = transform.scf.fuse_reduction_into_forall
         %bmax into %forall_loop : (!any, !any) -> (!any, !any)
 
-    // Fusion 3 (rolling update). First find the nearest reduction reachable from the loop's
-    // output value, together with the ordered elementwise chain between them.
     %bsum, %elemwise = transform.fusion.find_next_reduction
         %forall_loop : (!any) -> (!any, !any)
-    // Clone and fuse that elementwise chain under %forall_loop and %j0_loop,
-    // publishing the "sidecar" tensors as extra loop results.
     %elemwise_sidecars = transform.fusion.clone_fuse_elemwise
         %elemwise into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
-    // Repair the first reduction frontier by turning it into loop-carried state
-    // driven by the relayed sidecar value.
     %fused_bsum = transform.fusion.repair_reduction_frontier
         (%fused_bmax, %bsum) and (%elemwise, %elemwise_sidecars) into %forall_loop, %j0_loop
         : (!any, !any, !any, !any, !any, !any) -> !any
 
-    // Fusion 4. Apply rolling update again, this time with the second matmul being the reduction.
     %bmm1, %elemwise_1 = transform.fusion.find_next_reduction
         %forall_loop : (!any) -> (!any, !any)
-    // Also inline (F16->F32 casts) into the second matmul. `operand_number = 1` says only
-    // inline producers of the RHS of the matmul.
     transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any
     transform.linalg.erase_unused_operands_and_results %bmm1 : !any
     %elemwise_sidecars_1 = transform.fusion.clone_fuse_elemwise
@@ -98,13 +72,13 @@ module attributes {transform.with_named_sequence} {
         (%fused_bsum, %bmm1) and (%elemwise_1, %elemwise_sidecars_1) into %forall_loop, %j0_loop
         : (!any, !any, !any, !any, !any, !any) -> !any
 
-    // Fusion 5. Fuse the trailing FP32->FP16 cast into the forall loop (but outside the for loop).
     %trunc = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
     %fused_trunc = transform.fusion.into_producer %trunc into %forall_loop : (!any, !any) -> !any
 
-    // Post-pass: pushes lingering init tensor (see destination-passing style)
-    // before and outside the loops into the loop body.
-    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+    transform.apply_patterns to %func {
+      transform.apply_patterns.tensor.bubble_up_extract_slice
+      transform.apply_patterns.canonicalization
+    } : !any
     transform.scf.localize_scratch_tensors %func : !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.apply_cse to %func : !any
@@ -112,7 +86,8 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 
-  func.func @attention(%arg0: tensor<1x4x128x64xf16>, %arg1: tensor<1x2x128x64xf16>, %arg2: tensor<1x2x128x64xf16>) -> tensor<1x2x2x128x64xf16> {
+  func.func @attention(%arg0: tensor<1x4x128x64xf16>, %arg1: tensor<1x2x128x64xf16>,
+      %arg2: tensor<1x2x128x64xf16>) -> tensor<1x2x2x128x64xf16> {
     %c0_i64 = arith.constant 0 : i64
     %cst = arith.constant 0.000000e+00 : f32
     %cst_0 = arith.constant 0xFF800000 : f32
@@ -207,3 +182,19 @@ module attributes {transform.with_named_sequence} {
     return %27 : tensor<1x2x2x128x64xf16>
   }
 }
+
+// MATCH-LABEL: func.func @attention(
+// MATCH-NOT: linalg.batch_matmul
+// MATCH-NOT: linalg.transpose
+// MATCH-NOT: tensor.collapse_shape
+// MATCH-NOT: tensor.expand_shape %arg0
+// MATCH: %[[OUT:.+]] = scf.forall (%{{.*}}, %{{.*}}) in (2, 2) shared_outs(%{{.*}} = %{{.*}}) -> (tensor<1x2x2x128x64xf32>)
+// MATCH: %{{.*}}:3 = scf.for %{{.*}} = %c0 to %c2 step %c1 iter_args(
+// MATCH: affine.linearize_index disjoint [%{{.*}}, %{{.*}}] by (2, 2) : index
+// MATCH: tensor.extract_slice %arg0[0, %{{.*}}, 0, 0] [1, 1, 128, 64] [1, 1, 1, 1]
+// MATCH: tensor.expand_shape %{{.*}} output_shape [1, 1, 1, 128, 64]
+// MATCH: tensor.empty() : tensor<1x1x1x128x64xf32>
+// MATCH: linalg.generic {indexing_maps = [#map1, #map2, #map3], iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel", "reduction"]}
+// MATCH: math.exp
+// MATCH: arith.divf %cst, %{{.*}} : f32
+// MATCH: linalg.generic {indexing_maps = [#map4, #map4], iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]} ins(%{{.*}} : tensor<1x2x2x128x64xf32>) outs(%{{.*}} : tensor<1x2x2x128x64xf16>)
