@@ -3,7 +3,7 @@
 
 Usage:
   python scripts/export_attention_linalg.py > attention.mlir
-  python scripts/export_attention_linalg.py --variant manual-gqa > attention_gqa.mlir
+  python scripts/export_attention_linalg.py --variant global-gqa > attention_gqa.mlir
   python scripts/export_attention_linalg.py --variant sparse-mm > sparse_probe.mlir
 """
 
@@ -11,7 +11,6 @@ import argparse
 import math
 
 import torch
-import torch.nn.functional as F
 from torch_mlir import fx
 
 
@@ -41,16 +40,6 @@ class ManualGQAAttentionModule(torch.nn.Module):
         probs = torch.softmax(scores, dim=-1)
         out_f32 = torch.matmul(probs, v.to(torch.float32))
         return out_f32.to(torch.float16).reshape(q.shape)
-
-
-class SdpaGQAAttentionModule(torch.nn.Module):
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        # The main difference between this (SDPA GQA) and the one above is that
-        # this one adds a check per-row to see if all entries are -inf.
-        #   compare each logit to `-inf`
-        #   reduce with `or` each row, so each row gets one bit saying "there exists at least one valid entry"
-        #   if no valid entry, replace the softmax output with zeros
-        return F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
 
 
 class CausalAttentionModule(torch.nn.Module):
@@ -115,10 +104,9 @@ def _module_to_text(module) -> str:
 
 
 VARIANTS = (
-    "attention",
-    "manual-gqa",
-    "sdpa-gqa",
-    "causal",
+    "global-attn",
+    "causal-attn",
+    "global-gqa",
     "float8-inputs",
     "fake-quant",
     "sparse-mm",
@@ -170,32 +158,24 @@ def _build_module_and_args(
 ) -> tuple[torch.nn.Module, tuple[torch.Tensor, ...]]:
     dense_shape = (args.batch, args.heads, args.seq_len, args.dhead)
 
-    if args.variant == "attention":
+    if args.variant == "global-attn":
         module = AttentionModule().eval()
         example_args = tuple(torch.randn(dense_shape, dtype=torch.float16) for _ in range(3))
         return module, example_args
 
-    if args.variant == "manual-gqa":
+    if args.variant == "causal-attn":
+        q = torch.randn(dense_shape, dtype=torch.float16)
+        k = torch.randn(dense_shape, dtype=torch.float16)
+        v = torch.randn(dense_shape, dtype=torch.float16)
+        return CausalAttentionModule().eval(), (q, k, v)
+
+    if args.variant == "global-gqa":
         kv_heads = _kv_heads(args)
         q = torch.randn(dense_shape, dtype=torch.float16)
         kv_shape = (args.batch, kv_heads, args.seq_len, args.dhead)
         k = torch.randn(kv_shape, dtype=torch.float16)
         v = torch.randn(kv_shape, dtype=torch.float16)
         return ManualGQAAttentionModule().eval(), (q, k, v)
-
-    if args.variant == "sdpa-gqa":
-        kv_heads = _kv_heads(args)
-        q = torch.randn(dense_shape, dtype=torch.float16)
-        kv_shape = (args.batch, kv_heads, args.seq_len, args.dhead)
-        k = torch.randn(kv_shape, dtype=torch.float16)
-        v = torch.randn(kv_shape, dtype=torch.float16)
-        return SdpaGQAAttentionModule().eval(), (q, k, v)
-
-    if args.variant == "causal":
-        q = torch.randn(dense_shape, dtype=torch.float16)
-        k = torch.randn(dense_shape, dtype=torch.float16)
-        v = torch.randn(dense_shape, dtype=torch.float16)
-        return CausalAttentionModule().eval(), (q, k, v)
 
     if args.variant == "float8-inputs":
         q = torch.randn(dense_shape, dtype=torch.float32).to(torch.float8_e4m3fn)
@@ -222,12 +202,16 @@ def _build_module_and_args(
     raise ValueError(f"unknown variant: {args.variant}")
 
 
-def main() -> int:
+def main():
     args = parse_args()
     model, example_args = _build_module_and_args(args)
 
     exported_program = torch.export.export(model, example_args)
-    exported_program = exported_program.run_decompositions()
+    # Possible to control decomposition behavior by passing this `decomp_table` to `run_decompositions`.
+    # Now we don't run this decomposition step because we don't need it.
+    # But it will be needed when we use SDPA.
+    # decomp_table = torch.export.default_decompositions().materialize()
+    # exported_program = exported_program.run_decompositions(decomp_table)
     module = fx.export_and_import(
         exported_program,
         output_type="linalg-on-tensors",
@@ -235,8 +219,7 @@ def main() -> int:
         import_symbolic_shape_expressions=True,
     )
     print(_module_to_text(module))
-    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
