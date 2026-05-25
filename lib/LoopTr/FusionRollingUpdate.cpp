@@ -86,42 +86,6 @@ static FailureOr<AffineMap> dropDomainDim(AffineMap map, unsigned droppedDim) {
   return map.replaceDimsAndSymbols(dimRepls, map.getResults(), oldNumDims - 1, map.getNumSymbols());
 }
 
-struct SelfReductionMatch {
-  BlockArgument accumulatorArg;
-  Value yieldValue;
-  Value reduceOperand;
-  Operation *reduceCombiner;
-};
-
-FailureOr<SelfReductionMatch> matchSelfReductionConsumer(GenericOp reduceOp, OpResult redResult) {
-  // Get the in-body value that corresponds to the reduction result, then check if it's a reasonable
-  // reduction (scalar) operation, like addF.
-  unsigned resultNumber = redResult.getResultNumber();
-  auto yield = cast<linalg::YieldOp>(reduceOp.getBody()->getTerminator());
-  Value yieldValue = yield.getOperand(resultNumber);
-  Operation *combiner = yieldValue.getDefiningOp();
-  if (!combiner || combiner->getNumOperands() != 2 || combiner->getNumResults() != 1) {
-    reduceOp.emitError() << "expected the reduction combiner to have 2 operands and 1 result";
-    if (combiner)
-      combiner->emitRemark() << "this is the reduction combiner";
-    return failure();
-  }
-  Value lhs = combiner->getOperand(0), rhs = combiner->getOperand(1);
-
-  // Find the accumulator as an argument of the block.
-  unsigned numInputs = reduceOp.getNumDpsInputs();
-  auto accumulatorArg = reduceOp.getBlock()->getArgument(numInputs + resultNumber);
-  // We're then expecting the other argument of the combiner is the result to fold over.
-  Value otherArg = lhs == accumulatorArg ? rhs : lhs;
-
-  return SelfReductionMatch{
-      .accumulatorArg = accumulatorArg,
-      .yieldValue = yieldValue,
-      .reduceOperand = otherArg,
-      .reduceCombiner = combiner,
-  };
-}
-
 struct LinalgProvenance {
   OpResult tileValue;
   AffineMap indexMap;
@@ -193,7 +157,8 @@ extractRepairInputExprs(RewriterBase &rewriter, ArrayRef<Operation *> producingR
   });
 
   // Step 2. Check this currentOp is a reduction, and get some information about it.
-  auto match = matchSelfReductionConsumer(currentOp, reductionResult);
+  auto match = matchBinaryReductionCombiner(currentOp, reductionResult.getResultNumber(),
+                                            /*emitDiagnostics=*/true);
   if (failed(match))
     return failure();
 
@@ -226,7 +191,7 @@ extractRepairInputExprs(RewriterBase &rewriter, ArrayRef<Operation *> producingR
   }
 
   // Step 4. Extract the g expression from reduceOperand upwards.
-  auto gExpr = serializeMLIRExprToJSON(match->reduceOperand, gExprVarNames, currentOp);
+  auto gExpr = serializeMLIRExprToJSON(match->nonAccumulator, gExprVarNames, currentOp);
   if (failed(gExpr)) {
     currentOp->emitRemark("this is the compute operation we're extracting from");
     return failure();
@@ -236,9 +201,9 @@ extractRepairInputExprs(RewriterBase &rewriter, ArrayRef<Operation *> producingR
   static const std::string accVarName = "acc";
   DenseMap<Value, std::string> fExprVarNames{
       {match->accumulatorArg, accVarName},
-      {match->reduceOperand, "x"},
+      {match->nonAccumulator, "x"},
   };
-  auto fExpr = serializeMLIRExprToJSON(match->yieldValue, fExprVarNames, currentOp);
+  auto fExpr = serializeMLIRExprToJSON(match->yieldedValue, fExprVarNames, currentOp);
   if (failed(fExpr))
     return failure();
 
@@ -450,9 +415,9 @@ DiagnosedSilenceableFailure FusionCloneFuseElemwiseOp::apply(transform::Transfor
   return DiagnosedSilenceableFailure::success();
 }
 
-DiagnosedSilenceableFailure
-FusionFindNextReductionOp::apply(transform::TransformRewriter &rewriter,
-                                 TransformResults &transformResults, TransformState &state) {
+DiagnosedSilenceableFailure FusionFindNextReductionOp::apply(transform::TransformRewriter &rewriter,
+                                                             TransformResults &transformResults,
+                                                             TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
   CHECK_EXTRACT_UNIQUE_OP(state, transform, getProducerOp, "producer", producer);
 

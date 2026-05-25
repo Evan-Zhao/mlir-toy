@@ -5,15 +5,18 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SetVector.h"
-
+#include "llvm/ADT/TypeSwitch.h"
 #include <optional>
+#include <variant>
 
 using namespace mlir;
 
@@ -21,6 +24,23 @@ namespace mlir::transform {
 namespace {
 
 #define BAIL(message) return emitSilenceableFailure(transform, message)
+
+std::string valueName(Value value);
+std::optional<Attribute> asSplatConstantAttr(Value value);
+bool attrsEqualByValue(Attribute lhs, Attribute rhs);
+
+template <typename T, typename Func>
+FailureOr<SmallVector<T>> mapFAggFailure(ValueRange vec, Func &&func) {
+  SmallVector<T> results;
+  results.reserve(vec.size());
+  for (Value value : vec) {
+    auto result = func(value);
+    if (failed(result))
+      return failure();
+    results.push_back(*result);
+  }
+  return results;
+}
 
 struct PredicateAtom {
   arith::CmpIOp cmp;
@@ -47,38 +67,32 @@ public:
 
     if (auto apply = value.getDefiningOp<affine::AffineApplyOp>()) {
       AffineMap map = apply.getAffineMap();
-      SmallVector<AffineExpr> dimReplacements;
-      SmallVector<AffineExpr> symbolReplacements;
-      dimReplacements.reserve(map.getNumDims());
-      symbolReplacements.reserve(map.getNumSymbols());
+      auto self = [&](Value operand) { return getExpr(operand); };
+      auto dimReplacements = mapFAggFailure<AffineExpr>(apply.getDimOperands(), self);
+      auto symbolReplacements = mapFAggFailure<AffineExpr>(apply.getSymbolOperands(), self);
+      if (failed(dimReplacements) || failed(symbolReplacements))
+        return failure();
 
-      for (Value operand : apply.getDimOperands()) {
-        FailureOr<AffineExpr> replacement = getExpr(operand);
-        if (failed(replacement))
-          return failure();
-        dimReplacements.push_back(*replacement);
-      }
-      for (Value operand : apply.getSymbolOperands()) {
-        FailureOr<AffineExpr> replacement = getExpr(operand);
-        if (failed(replacement))
-          return failure();
-        symbolReplacements.push_back(*replacement);
-      }
-
-      AffineExpr expr = map.getResult(0).replaceDimsAndSymbols(dimReplacements, symbolReplacements);
+      AffineExpr expr =
+          map.getResult(0).replaceDimsAndSymbols(*dimReplacements, *symbolReplacements);
       return simplifyAffineMap(AffineMap::get(getNumDims(), getNumSymbols(), expr)).getResult(0);
     }
 
+#define RETURN_BINARY_EXPR(binOp, operator)                                                        \
+  {                                                                                                \
+    auto lhs = getExpr((binOp).getLhs()), rhs = getExpr((binOp).getRhs());                         \
+    if (failed(lhs) || failed(rhs))                                                                \
+      return failure();                                                                            \
+    return simplifyAffineMap(AffineMap::get(getNumDims(), getNumSymbols(), (*lhs) operator(*rhs))) \
+        .getResult(0);                                                                             \
+  }
+
     if (auto cast = value.getDefiningOp<arith::IndexCastOp>())
       return getExpr(cast.getIn());
-
     if (auto add = value.getDefiningOp<arith::AddIOp>())
-      return getBinaryExpr(add.getLhs(), add.getRhs(),
-                           [](AffineExpr lhs, AffineExpr rhs) { return lhs + rhs; });
-
+      RETURN_BINARY_EXPR(add, +);
     if (auto sub = value.getDefiningOp<arith::SubIOp>())
-      return getBinaryExpr(sub.getLhs(), sub.getRhs(),
-                           [](AffineExpr lhs, AffineExpr rhs) { return lhs - rhs; });
+      RETURN_BINARY_EXPR(sub, -);
 
     Attribute attr;
     if (matchPattern(value, m_Constant(&attr))) {
@@ -88,7 +102,6 @@ public:
 
     if (!value.getType().isIndex())
       return failure();
-
     return getAffineSymbolExpr(getOrAddValueSymbol(value), context);
   }
 
@@ -100,16 +113,6 @@ public:
   ArrayRef<Value> getValues() const { return values; }
 
 private:
-  template <typename Fn>
-  FailureOr<AffineExpr> getBinaryExpr(Value lhsValue, Value rhsValue, Fn &&fn) {
-    FailureOr<AffineExpr> lhs = getExpr(lhsValue);
-    FailureOr<AffineExpr> rhs = getExpr(rhsValue);
-    if (failed(lhs) || failed(rhs))
-      return failure();
-    return simplifyAffineMap(AffineMap::get(getNumDims(), getNumSymbols(), fn(*lhs, *rhs)))
-        .getResult(0);
-  }
-
   unsigned getOrAddValueSymbol(Value value) {
     auto it = valueSymbols.find(value);
     if (it != valueSymbols.end())
@@ -130,7 +133,139 @@ private:
 struct AffineBound {
   AffineMap map;
   SmallVector<Value> operands;
+
+  std::string format() const {
+    std::string storage;
+    llvm::raw_string_ostream os(storage);
+    map.print(os);
+    os << "(";
+    llvm::interleaveComma(operands, os, [&](Value value) { os << valueName(value); });
+    os << ")";
+    return storage;
+  }
+
+  static FailureOr<AffineBound> project(const AffineScalarExpr &expr, linalg::GenericOp generic,
+                                        bool lowerBound) {
+    MLIRContext *context = generic.getContext();
+    unsigned numIndexDims = generic.getNumLoops();
+    unsigned numSymbols = expr.values.size();
+
+    SmallVector<std::optional<Value>> dimValues(numIndexDims, std::nullopt);
+    for (Value value : expr.values)
+      dimValues.push_back(value);
+
+    affine::FlatAffineValueConstraints constraints(numIndexDims, numSymbols,
+                                                   /*numLocals=*/0, dimValues);
+    if (failed(addStaticIndexDomain(constraints, generic.getStaticLoopRanges())))
+      return failure();
+
+    AffineMap exprMap = simplifyAffineMap(AffineMap::get(numIndexDims, numSymbols, expr.expr));
+    if (failed(constraints.composeMatchingMap(exprMap)))
+      return failure();
+
+    // `composeMatchingMap` adds the expression result as the leading dimension.
+    // Projecting out the Linalg iteration dimensions computes a parametric bound
+    // for the whole tile, expressed only in terms of surrounding SSA values.
+    constraints.projectOut(/*pos=*/1, numIndexDims);
+
+    auto [lbMap, ubMap] =
+        constraints.getLowerAndUpperBound(/*pos=*/0, /*offset=*/0, /*num=*/1,
+                                          /*symStartPos=*/1, /*localExprs=*/{}, context,
+                                          /*closedUB=*/true);
+    if (!lbMap || !ubMap)
+      return failure();
+
+    SmallVector<Value> operands;
+    constraints.getValues(/*start=*/1, constraints.getNumDimAndSymbolVars(), &operands);
+    return AffineBound{lowerBound ? lbMap : ubMap, operands};
+  }
+
+private:
+  static LogicalResult addStaticIndexDomain(affine::FlatAffineValueConstraints &constraints,
+                                            ArrayRef<int64_t> loopRanges) {
+    for (auto [dim, range] : llvm::enumerate(loopRanges)) {
+      if (ShapedType::isDynamic(range))
+        return failure();
+      constraints.addBound(presburger::BoundType::LB, dim, 0);
+      constraints.addBound(presburger::BoundType::UB, dim, range - 1);
+    }
+    return success();
+  }
 };
+
+template <typename T, std::enable_if_t<!std::is_same_v<T, Attribute>, int> = 0>
+struct AbstractValueData {
+  std::variant<Attribute, T, std::nullopt_t> value;
+
+  static AbstractValueData getUnknown() { return {std::nullopt}; }
+  static AbstractValueData getConstant(Attribute attr) { return {attr}; }
+  static AbstractValueData getEquivalentTo(T value) { return {value}; }
+
+  AbstractValueData getZeroLike() {
+    auto attr = getConstantAttr();
+    if (auto floatAttr = dyn_cast<FloatAttr>(*attr))
+      return getConstant(FloatAttr::get(floatAttr.getType(), 0.0));
+    if (auto intAttr = dyn_cast<IntegerAttr>(*attr))
+      return getConstant(IntegerAttr::get(intAttr.getType(), 0));
+    return getUnknown();
+  }
+
+  bool isKnown() const { return !std::holds_alternative<std::nullopt_t>(value); }
+
+  std::optional<Attribute> getConstantAttr() const {
+    return std::holds_alternative<Attribute>(value) ? std::make_optional(std::get<Attribute>(value))
+                                                    : std::nullopt;
+  }
+  std::optional<T> getEquivalentValue() const {
+    return std::holds_alternative<T>(value) ? std::make_optional(std::get<T>(value)) : std::nullopt;
+  }
+
+  bool isConstZero() const { return mapConstAttribute(isZeroAttr); }
+  bool isConstOne() const { return mapConstAttribute(isOneAttr); }
+
+  bool isConstBool(bool expectedValue) const {
+    return mapConstAttribute([&](Attribute attr) {
+      auto boolAttr = dyn_cast<BoolAttr>(attr);
+      return boolAttr && boolAttr.getValue() == expectedValue;
+    });
+  }
+
+  bool isNegativeInfinity() const {
+    return mapConstAttribute([](Attribute attr) {
+      auto floatAttr = dyn_cast<FloatAttr>(attr);
+      return floatAttr && floatAttr.getValue().isInfinity() && floatAttr.getValue().isNegative();
+    });
+  }
+
+  bool bitwiseEqualToAttr(Attribute rhs) const {
+    return mapConstAttribute([&](Attribute attr) { return attrsEqualByValue(attr, rhs); });
+  }
+
+private:
+  bool mapConstAttribute(std::function<bool(Attribute)> &&predicate) const {
+    auto attr = getConstantAttr();
+    return attr && predicate(*attr);
+  }
+
+  static bool isZeroAttr(Attribute attr) {
+    if (auto floatAttr = dyn_cast<FloatAttr>(attr))
+      return floatAttr.getValue().isZero();
+    if (auto intAttr = dyn_cast<IntegerAttr>(attr))
+      return intAttr.getValue().isZero();
+    return false;
+  }
+
+  static bool isOneAttr(Attribute attr) {
+    if (auto floatAttr = dyn_cast<FloatAttr>(attr))
+      return floatAttr.getValue().isExactlyValue(1.0);
+    if (auto intAttr = dyn_cast<IntegerAttr>(attr))
+      return intAttr.getValue().isOne();
+    return false;
+  }
+};
+
+using ScalarExprState = AbstractValueData<OpOperand *>;
+using AbstractValue = AbstractValueData<Value>;
 
 std::string valueName(Value value) {
   std::string storage;
@@ -139,13 +274,10 @@ std::string valueName(Value value) {
   return storage;
 }
 
-std::string formatAffineBound(AffineMap map, ValueRange operands) {
+std::string formatAttribute(Attribute attr) {
   std::string storage;
   llvm::raw_string_ostream os(storage);
-  map.print(os);
-  os << "(";
-  llvm::interleaveComma(operands, os, [&](Value value) { os << valueName(value); });
-  os << ")";
+  attr.print(os);
   return storage;
 }
 
@@ -155,89 +287,96 @@ std::string formatLiveInterval(Value iv, std::optional<AffineBound> lower,
   llvm::raw_string_ostream os(storage);
   os << "possible live interval for " << valueName(iv) << ": ";
   if (lower)
-    os << valueName(iv) << " >= " << formatAffineBound(lower->map, lower->operands);
+    os << valueName(iv) << " >= " << lower->format();
   else
     os << "unbounded below";
   os << ", ";
   if (upper)
-    os << valueName(iv) << " <= " << formatAffineBound(upper->map, upper->operands);
+    os << valueName(iv) << " <= " << upper->format();
   else
     os << "unbounded above";
   return storage;
 }
 
-LogicalResult addStaticIndexDomain(affine::FlatAffineValueConstraints &constraints,
-                                   ArrayRef<int64_t> loopRanges) {
-  for (auto [dim, range] : llvm::enumerate(loopRanges)) {
-    if (ShapedType::isDynamic(range))
-      return failure();
-    constraints.addBound(presburger::BoundType::LB, dim, 0);
-    constraints.addBound(presburger::BoundType::UB, dim, range - 1);
+AbstractValue resolveAbstractValue(AbstractValue state,
+                                   const DenseMap<Value, AbstractValue> &states) {
+  SmallPtrSet<void *, 8> visited;
+  while (auto equivalent = state.getEquivalentValue()) {
+    if (!visited.insert(equivalent->getAsOpaquePointer()).second)
+      break;
+
+    if (auto attr = asSplatConstantAttr(*equivalent))
+      return AbstractValue::getConstant(*attr);
+
+    auto it = states.find(*equivalent);
+    if (it == states.end() || !it->second.isKnown())
+      break;
+    state = it->second;
   }
-  return success();
+  return state;
 }
 
-FailureOr<AffineBound> getProjectedBound(const AffineScalarExpr &expr, linalg::GenericOp generic,
-                                         bool lowerBound) {
-  MLIRContext *context = generic.getContext();
-  unsigned numIndexDims = generic.getNumLoops();
-  unsigned numSymbols = expr.values.size();
-
-  SmallVector<std::optional<Value>> dimValues(numIndexDims, std::nullopt);
-  for (Value value : expr.values)
-    dimValues.push_back(value);
-
-  affine::FlatAffineValueConstraints constraints(numIndexDims, numSymbols,
-                                                 /*numLocals=*/0, dimValues);
-  if (failed(addStaticIndexDomain(constraints, generic.getStaticLoopRanges())))
-    return failure();
-
-  AffineMap exprMap = simplifyAffineMap(AffineMap::get(numIndexDims, numSymbols, expr.expr));
-  if (failed(constraints.composeMatchingMap(exprMap)))
-    return failure();
-
-  // `composeMatchingMap` adds the expression result as the leading dimension.
-  // Projecting out the Linalg iteration dimensions computes a parametric bound
-  // for the whole tile, expressed only in terms of surrounding SSA values.
-  constraints.projectOut(/*pos=*/1, numIndexDims);
-
-  AffineMap lbMap, ubMap;
-  std::tie(lbMap, ubMap) =
-      constraints.getLowerAndUpperBound(/*pos=*/0, /*offset=*/0, /*num=*/1,
-                                        /*symStartPos=*/1, /*localExprs=*/{}, context,
-                                        /*closedUB=*/true);
-  if (!lbMap || !ubMap)
-    return failure();
-
-  SmallVector<Value> operands;
-  constraints.getValues(/*start=*/1, constraints.getNumDimAndSymbolVars(), &operands);
-  return AffineBound{lowerBound ? lbMap : ubMap, operands};
+AbstractValue getKnownState(Value value, const DenseMap<Value, AbstractValue> &states) {
+  auto it = states.find(value);
+  if (it != states.end())
+    return resolveAbstractValue(it->second, states);
+  if (auto attr = asSplatConstantAttr(value))
+    return AbstractValue::getConstant(*attr);
+  if (isa<BlockArgument>(value))
+    return AbstractValue::getEquivalentTo(value);
+  return AbstractValue::getUnknown();
 }
 
-enum class RelationKind { LE, LT, GE, GT };
+std::optional<unsigned> getLoopIterArgIndex(Value value, scf::ForOp loop) {
+  auto blockArg = dyn_cast<BlockArgument>(value);
+  if (!blockArg || blockArg.getOwner() != loop.getBody() || blockArg.getArgNumber() == 0)
+    return std::nullopt;
+  return blockArg.getArgNumber() - 1;
+}
+
+std::string formatAbstractValue(AbstractValue state, const DenseMap<Value, AbstractValue> &states,
+                                scf::ForOp loop) {
+  state = resolveAbstractValue(state, states);
+  if (!state.isKnown())
+    return "unknown";
+  if (auto constAttr = state.getConstantAttr())
+    return "constant(" + formatAttribute(*constAttr) + ")";
+
+  Value equivalent = *state.getEquivalentValue();
+  if (std::optional<unsigned> iterArg = getLoopIterArgIndex(equivalent, loop))
+    return "same as iter_arg #" + std::to_string(*iterArg);
+  return "same as " + valueName(equivalent);
+}
+
+std::string formatYieldSummary(scf::ForOp loop, ArrayRef<AbstractValue> yieldStates,
+                               const DenseMap<Value, AbstractValue> &states) {
+  std::string storage;
+  llvm::raw_string_ostream os(storage);
+  os << "dead-iteration yields: ";
+  llvm::interleaveComma(llvm::seq<unsigned>(0, yieldStates.size()), os, [&](unsigned i) {
+    os << "yield #" << i << " = " << formatAbstractValue(yieldStates[i], states, loop);
+  });
+  return storage;
+}
+
+std::string formatResultSummary(Operation *op, ArrayRef<AbstractValue> resultStates,
+                                const DenseMap<Value, AbstractValue> &states, scf::ForOp loop) {
+  std::string storage;
+  llvm::raw_string_ostream os(storage);
+  os << "dead-tile propagation: ";
+  llvm::interleaveComma(llvm::seq<unsigned>(0, resultStates.size()), os, [&](unsigned i) {
+    os << "result #" << i << " = " << formatAbstractValue(resultStates[i], states, loop);
+  });
+  return storage;
+}
+
+enum class RelationKind : uint8_t { LE, LT, GE, GT };
 
 struct NecessaryLiveRelation {
   AffineBound lhs;
   AffineBound rhs;
   RelationKind kind;
 };
-
-LogicalResult collectPredicateAtoms(Value predicate, bool liveWhenPredicateIsTrue,
-                                    SmallVectorImpl<PredicateAtom> &atoms) {
-  if (auto andOp = predicate.getDefiningOp<arith::AndIOp>()) {
-    if (!liveWhenPredicateIsTrue)
-      return failure();
-    if (failed(collectPredicateAtoms(andOp.getLhs(), liveWhenPredicateIsTrue, atoms)))
-      return failure();
-    return collectPredicateAtoms(andOp.getRhs(), liveWhenPredicateIsTrue, atoms);
-  }
-
-  auto cmp = predicate.getDefiningOp<arith::CmpIOp>();
-  if (!cmp)
-    return failure();
-  atoms.push_back(PredicateAtom{cmp, liveWhenPredicateIsTrue});
-  return success();
-}
 
 FailureOr<NecessaryLiveRelation> getNecessaryLiveRelation(PredicateAtom atom,
                                                           linalg::GenericOp generic) {
@@ -253,10 +392,10 @@ FailureOr<NecessaryLiveRelation> getNecessaryLiveRelation(PredicateAtom atom,
 
   AffineScalarExpr lhs = {*lhsExpr, llvm::to_vector(affineBuilder.getValues())};
   AffineScalarExpr rhs = {*rhsExpr, llvm::to_vector(affineBuilder.getValues())};
-  FailureOr<AffineBound> lhsLower = getProjectedBound(lhs, generic, /*lowerBound=*/true);
-  FailureOr<AffineBound> lhsUpper = getProjectedBound(lhs, generic, /*lowerBound=*/false);
-  FailureOr<AffineBound> rhsLower = getProjectedBound(rhs, generic, /*lowerBound=*/true);
-  FailureOr<AffineBound> rhsUpper = getProjectedBound(rhs, generic, /*lowerBound=*/false);
+  FailureOr<AffineBound> lhsLower = AffineBound::project(lhs, generic, /*lowerBound=*/true),
+                         lhsUpper = AffineBound::project(lhs, generic, /*lowerBound=*/false),
+                         rhsLower = AffineBound::project(rhs, generic, /*lowerBound=*/true),
+                         rhsUpper = AffineBound::project(rhs, generic, /*lowerBound=*/false);
   if (failed(lhsLower) || failed(lhsUpper) || failed(rhsLower) || failed(rhsUpper))
     return failure();
 
@@ -348,8 +487,7 @@ getIvIntervalFromRelations(ArrayRef<NecessaryLiveRelation> relations, Value iv) 
   if (!constraints.findVar(iv, &ivPos))
     return failure();
 
-  AffineMap lbMap, ubMap;
-  std::tie(lbMap, ubMap) =
+  auto [lbMap, ubMap] =
       constraints.getLowerAndUpperBound(/*pos=*/ivPos, /*offset=*/0, /*num=*/1,
                                         /*symStartPos=*/1, /*localExprs=*/{}, iv.getContext(),
                                         /*closedUB=*/true);
@@ -372,16 +510,209 @@ getIvIntervalFromRelations(ArrayRef<NecessaryLiveRelation> relations, Value iv) 
   return std::make_pair(lower, upper);
 }
 
+std::optional<unsigned> getGenericInputArgNumber(Value value, linalg::GenericOp generic) {
+  auto blockArg = dyn_cast<BlockArgument>(value);
+  if (!blockArg || blockArg.getOwner() != generic.getBlock())
+    return std::nullopt;
+  if (blockArg.getArgNumber() >= generic.getNumDpsInputs())
+    return std::nullopt;
+  return blockArg.getArgNumber();
+}
+
+OpOperand *getGenericInputOperand(Value value, linalg::GenericOp generic) {
+  std::optional<unsigned> inputArgNumber = getGenericInputArgNumber(value, generic);
+  if (!inputArgNumber)
+    return nullptr;
+  return generic.getDpsInputOperands()[*inputArgNumber];
+}
+
+ScalarExprState evaluateScalarValue(Value value, DenseMap<Value, ScalarExprState> &states,
+                                    Attribute deadValue) {
+  auto it = states.find(value);
+  if (it != states.end())
+    return it->second;
+
+  if (auto attr = asSplatConstantAttr(value))
+    return ScalarExprState::getConstant(*attr);
+
+  Operation *def = value.getDefiningOp();
+  if (!def || def->getNumResults() != 1)
+    return ScalarExprState::getUnknown();
+
+  auto foldAddLike = [](ScalarExprState lhs, ScalarExprState rhs) {
+    if (lhs.isConstZero())
+      return rhs;
+    if (rhs.isConstZero())
+      return lhs;
+    return ScalarExprState::getUnknown();
+  };
+  auto foldSubLike = [](ScalarExprState lhs, ScalarExprState rhs) {
+    return rhs.isConstZero() ? lhs : ScalarExprState::getUnknown();
+  };
+  auto foldMulLike = [](ScalarExprState lhs, ScalarExprState rhs) {
+    if (lhs.isConstZero() || rhs.isConstOne())
+      return lhs;
+    if (rhs.isConstZero() || lhs.isConstOne())
+      return rhs;
+    return ScalarExprState::getUnknown();
+  };
+  auto foldDivLike = [](ScalarExprState lhs, ScalarExprState rhs) {
+    return rhs.isConstOne() ? lhs : ScalarExprState::getUnknown();
+  };
+  auto foldAndLike = [](ScalarExprState lhs, ScalarExprState rhs) {
+    if (lhs.isConstBool(false) || rhs.isConstBool(true))
+      return lhs;
+    if (lhs.isConstBool(true) || rhs.isConstBool(false))
+      return rhs;
+    return ScalarExprState::getUnknown();
+  };
+  auto foldSelectLike = [](ScalarExprState condition, ScalarExprState trueValue,
+                           ScalarExprState falseValue) {
+    if (condition.isConstBool(true))
+      return trueValue;
+    if (condition.isConstBool(false))
+      return falseValue;
+    // Can implement a trueValue == falseValue check here, but we don't have use for it.
+    return ScalarExprState::getUnknown();
+  };
+  auto foldMaximumLike = [&](ScalarExprState lhs, ScalarExprState rhs) {
+    if (lhs.bitwiseEqualToAttr(deadValue))
+      return rhs;
+    if (rhs.bitwiseEqualToAttr(deadValue))
+      return lhs;
+    return ScalarExprState::getUnknown();
+  };
+  auto foldExpLike = [](ScalarExprState operand) {
+    if (operand.isNegativeInfinity())
+      return operand.getZeroLike();
+    return ScalarExprState::getUnknown();
+  };
+  auto evaluate = [&](Value operand) { return evaluateScalarValue(operand, states, deadValue); };
+
+#define CASE_BIN_OP(foldLike)                                                                      \
+  [&](auto op) { return foldLike(evaluate(op.getLhs()), evaluate(op.getRhs())); }
+
+  ScalarExprState result =
+      llvm::TypeSwitch<Operation *, ScalarExprState>(def)
+          .Case<arith::ConstantOp>([&](arith::ConstantOp constant) {
+            return ScalarExprState::getConstant(constant.getValue());
+          })
+          .Case<math::ExpOp>(
+              [&](math::ExpOp exp) { return foldExpLike(evaluate(exp.getOperand())); })
+          .Case<arith::AddFOp, arith::AddIOp>(CASE_BIN_OP(foldAddLike))
+          .Case<arith::SubFOp, arith::SubIOp>(CASE_BIN_OP(foldSubLike))
+          .Case<arith::MulFOp, arith::MulIOp>(CASE_BIN_OP(foldMulLike))
+          .Case<arith::DivFOp>(CASE_BIN_OP(foldDivLike))
+          .Case<arith::AndIOp>(CASE_BIN_OP(foldAndLike))
+          .Case<arith::MaximumFOp>(CASE_BIN_OP(foldMaximumLike))
+          .Case<arith::SelectOp>([&](arith::SelectOp select) {
+            return foldSelectLike(evaluate(select.getCondition()), evaluate(select.getTrueValue()),
+                                  evaluate(select.getFalseValue()));
+          })
+          .Default([](Operation *) { return ScalarExprState::getUnknown(); });
+  states[value] = result;
+  return result;
+}
+
+DenseMap<Value, ScalarExprState>
+seedGenericInputScalarStates(linalg::GenericOp generic,
+                             const DenseMap<Value, AbstractValue> &states) {
+  DenseMap<Value, ScalarExprState> scalarStates;
+  for (auto [i, inputOperand] : llvm::enumerate(generic.getDpsInputOperands())) {
+    AbstractValue inputState = getKnownState(inputOperand->get(), states);
+    BlockArgument blockArg = generic.getBlock()->getArgument(i);
+    if (auto attr = inputState.getConstantAttr())
+      scalarStates[blockArg] = ScalarExprState::getConstant(*attr);
+    else
+      scalarStates[blockArg] = ScalarExprState::getEquivalentTo(inputOperand);
+  }
+  return scalarStates;
+}
+
+AbstractValue analyzeGeneric(linalg::GenericOp generic,
+                             const DenseMap<Value, AbstractValue> &states, Attribute deadValue) {
+  if (generic.getNumResults() != 1 || generic.getNumDpsInits() != 1)
+    return AbstractValue::getUnknown();
+
+  auto yield = cast<linalg::YieldOp>(generic.getBlock()->getTerminator());
+  DenseMap<Value, ScalarExprState> scalarStates = seedGenericInputScalarStates(generic, states);
+  SmallVector<OpOperand *> inputOperands = generic.getDpsInputOperands();
+  OpOperand *initOperand = generic.getDpsInitOperand(0);
+  BlockArgument accumulatorArg = generic.getBlock()->getArgument(generic.getNumDpsInputs());
+  scalarStates[accumulatorArg] = ScalarExprState::getEquivalentTo(initOperand);
+  bool isReduction = generic.getNumReductionLoops() != 0;
+  ScalarExprState yielded = evaluateScalarValue(yield.getOperand(0), scalarStates, deadValue);
+
+  if (isReduction && yielded.getEquivalentValue() == initOperand) {
+    return AbstractValue::getEquivalentTo(initOperand->get());
+  } else if (auto equivInput = yielded.getEquivalentValue()) {
+    unsigned inputIndex = (*equivInput)->getOperandNumber();
+    return AbstractValue::getEquivalentTo(inputOperands[inputIndex]->get());
+  } else if (auto attr = yielded.getConstantAttr()) {
+    return AbstractValue::getConstant(*attr);
+  }
+  return AbstractValue::getUnknown();
+}
+
+AbstractValue analyzeFill(linalg::FillOp fill) {
+  if (auto attr = asSplatConstantAttr(fill.getInputs().front()))
+    return AbstractValue::getConstant(*attr);
+  return AbstractValue::getUnknown();
+}
+
+AbstractValue analyzeTensorLikeUnaryOp(Value source, const DenseMap<Value, AbstractValue> &states) {
+  AbstractValue sourceState = getKnownState(source, states);
+  if (sourceState.getConstantAttr())
+    return sourceState;
+  return AbstractValue::getUnknown();
+}
+
+SmallVector<AbstractValue> analyzeLoopDeadPropagation(scf::ForOp loop, linalg::GenericOp producer,
+                                                      Attribute deadValue,
+                                                      DenseMap<Value, AbstractValue> &states) {
+  if (producer.getNumResults() == 1)
+    states[producer->getResult(0)] = AbstractValue::getConstant(deadValue);
+
+  for (Operation &op : loop.getBody()->without_terminator()) {
+    SmallVector<AbstractValue> resultStates(op.getNumResults(), AbstractValue::getUnknown());
+    if (op.getNumResults() == 1) {
+      if (&op == producer)
+        resultStates[0] = AbstractValue::getConstant(deadValue);
+      else if (auto fill = dyn_cast<linalg::FillOp>(&op))
+        resultStates[0] = analyzeFill(fill);
+      else if (auto generic = dyn_cast<linalg::GenericOp>(&op))
+        resultStates[0] = analyzeGeneric(generic, states, deadValue);
+      else if (auto extract = dyn_cast<tensor::ExtractSliceOp>(op))
+        resultStates[0] = analyzeTensorLikeUnaryOp(extract.getSource(), states);
+      else if (auto collapse = dyn_cast<tensor::CollapseShapeOp>(op))
+        resultStates[0] = analyzeTensorLikeUnaryOp(collapse.getSrc(), states);
+      else if (auto expand = dyn_cast<tensor::ExpandShapeOp>(op))
+        resultStates[0] = analyzeTensorLikeUnaryOp(expand.getSrc(), states);
+    }
+
+    for (auto [result, state] : llvm::zip(op.getResults(), resultStates))
+      if (state.isKnown())
+        states[result] = state;
+
+    bool anyKnown = llvm::any_of(resultStates, [](auto state) { return state.isKnown(); });
+    if (anyKnown)
+      op.emitRemark() << formatResultSummary(&op, resultStates, states, loop);
+  }
+
+  auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+  SmallVector<AbstractValue> yieldStates;
+  yieldStates.reserve(yield.getNumOperands());
+  for (Value operand : yield.getOperands())
+    yieldStates.push_back(getKnownState(operand, states));
+  return yieldStates;
+}
+
 bool isFalseConstant(Value value) {
   Attribute attr;
   if (!matchPattern(value, m_Constant(&attr)))
     return false;
   auto boolAttr = dyn_cast<BoolAttr>(attr);
   return boolAttr && !boolAttr.getValue();
-}
-
-bool floatAttrsBitwiseEqual(FloatAttr lhs, FloatAttr rhs) {
-  return lhs.getValue().bitwiseIsEqual(rhs.getValue());
 }
 
 bool attrsEqualByValue(Attribute lhs, Attribute rhs) {
@@ -391,12 +722,12 @@ bool attrsEqualByValue(Attribute lhs, Attribute rhs) {
   auto lhsFloat = dyn_cast<FloatAttr>(lhs);
   auto rhsFloat = dyn_cast<FloatAttr>(rhs);
   if (lhsFloat && rhsFloat)
-    return floatAttrsBitwiseEqual(lhsFloat, rhsFloat);
+    return lhsFloat.getValue().bitwiseIsEqual(rhsFloat.getValue());
 
   return false;
 }
 
-std::optional<Attribute> getSplatConstantAttr(Value value) {
+std::optional<Attribute> asSplatConstantAttr(Value value) {
   Attribute attr;
   if (!matchPattern(value, m_Constant(&attr)))
     return std::nullopt;
@@ -411,38 +742,12 @@ std::optional<Attribute> getSplatConstantAttr(Value value) {
 }
 
 std::optional<Attribute> getConstantAttrForScalarValue(linalg::GenericOp generic, Value value) {
-  if (auto constant = getSplatConstantAttr(value))
+  if (auto constant = asSplatConstantAttr(value))
     return constant;
-
-  auto blockArg = dyn_cast<BlockArgument>(value);
-  if (!blockArg || blockArg.getOwner() != generic.getBlock())
+  OpOperand *inputOperand = getGenericInputOperand(value, generic);
+  if (!inputOperand)
     return std::nullopt;
-
-  unsigned argNumber = blockArg.getArgNumber();
-  if (argNumber >= generic.getNumDpsInputs())
-    return std::nullopt;
-
-  SmallVector<OpOperand *> inputOperands = generic.getDpsInputOperands();
-  OpOperand *inputOperand = inputOperands[argNumber];
-  return getSplatConstantAttr(inputOperand->get());
-}
-
-bool scalarValueEqualsAttr(linalg::GenericOp generic, Value value, Attribute expected) {
-  std::optional<Attribute> actual = getConstantAttrForScalarValue(generic, value);
-  return actual && attrsEqualByValue(*actual, expected);
-}
-
-FailureOr<Value> getSufficientLivePredicate(Value predicate) {
-  auto select = predicate.getDefiningOp<arith::SelectOp>();
-  if (!select)
-    return predicate;
-
-  if (!isFalseConstant(select.getFalseValue()))
-    return predicate;
-
-  // If `select(%cmp, maybe_mask, false)` is false whenever `%cmp` is false,
-  // then `%cmp` is a sufficient live predicate for proving all-dead tiles.
-  return select.getCondition();
+  return asSplatConstantAttr(inputOperand->get());
 }
 
 FailureOr<MatchedDeadSelect> matchDeadSelect(linalg::GenericOp generic, Attribute deadValue) {
@@ -454,17 +759,46 @@ FailureOr<MatchedDeadSelect> matchDeadSelect(linalg::GenericOp generic, Attribut
   if (!select)
     return failure();
 
-  bool trueIsDead = scalarValueEqualsAttr(generic, select.getTrueValue(), deadValue);
-  bool falseIsDead = scalarValueEqualsAttr(generic, select.getFalseValue(), deadValue);
+  auto scalarValueEqualsAttr = [&](Value value) {
+    auto actual = getConstantAttrForScalarValue(generic, value);
+    return actual && attrsEqualByValue(*actual, deadValue);
+  };
+  bool trueIsDead = scalarValueEqualsAttr(select.getTrueValue());
+  bool falseIsDead = scalarValueEqualsAttr(select.getFalseValue());
   if (trueIsDead == falseIsDead)
     return failure();
+  bool liveWhenPredicateIsTrue = !trueIsDead;
 
+  auto getSufficientLivePredicate = [](Value predicate) {
+    auto select = predicate.getDefiningOp<arith::SelectOp>();
+    if (!select)
+      return predicate;
+    if (!isFalseConstant(select.getFalseValue()))
+      return predicate;
+    // If `select(%cmp, maybe_mask, false)` is false whenever `%cmp` is false,
+    // then `%cmp` is a sufficient live predicate for proving all-dead tiles.
+    return select.getCondition();
+  };
   FailureOr<Value> livePredicate = getSufficientLivePredicate(select.getCondition());
   if (failed(livePredicate))
     return failure();
 
   SmallVector<PredicateAtom> atoms;
-  if (failed(collectPredicateAtoms(*livePredicate, /*liveWhenPredicateIsTrue=*/!trueIsDead, atoms)))
+  std::function<LogicalResult(Value)> collectPredicateAtoms = [&](Value predicate) {
+    if (auto andOp = predicate.getDefiningOp<arith::AndIOp>()) {
+      if (!liveWhenPredicateIsTrue)
+        return failure();
+      if (failed(collectPredicateAtoms(andOp.getLhs())))
+        return failure();
+      return collectPredicateAtoms(andOp.getRhs());
+    }
+    auto cmp = predicate.getDefiningOp<arith::CmpIOp>();
+    if (!cmp)
+      return failure();
+    atoms.push_back(PredicateAtom{cmp, liveWhenPredicateIsTrue});
+    return success();
+  };
+  if (failed(collectPredicateAtoms(*livePredicate)))
     return failure();
   return MatchedDeadSelect{atoms};
 }
@@ -514,8 +848,13 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
   if (failed(interval))
     BAIL("failed to derive an affine possible-live interval for the loop IV");
 
+  DenseMap<Value, AbstractValue> states;
+  SmallVector<AbstractValue> yieldStates =
+      analyzeLoopDeadPropagation(loop, producer, getDeadValue(), states);
+
   loop.emitRemark() << formatLiveInterval(loop.getInductionVar(), interval->first,
                                           interval->second);
+  loop.emitRemark() << formatYieldSummary(loop, yieldStates, states);
   return DiagnosedSilenceableFailure::success();
 }
 

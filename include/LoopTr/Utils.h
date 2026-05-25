@@ -75,6 +75,22 @@ using LoopResultRelaysT = SmallVector<LoopResultRelay>;
 FailureOr<DenseMap<OpResult, LoopResultRelaysT>>
 getChainedLoopResultMap(ArrayRef<Operation *> loops);
 
+struct BinaryReductionCombinerMatch {
+  BlockArgument accumulatorArg;
+  Value yieldedValue;
+  Value nonAccumulator;
+  Operation *combiner;
+};
+
+/// Match a single-result scalar combiner for one result of a linalg.generic reduction.
+///
+/// The matched combiner must define the corresponding linalg.yield operand, have two operands
+/// and one result, and use the matching output block argument exactly once. The returned
+/// `nonAccumulator` is the other combiner operand.
+FailureOr<BinaryReductionCombinerMatch> matchBinaryReductionCombiner(linalg::GenericOp generic,
+                                                                     unsigned resultNumber,
+                                                                     bool emitDiagnostics = false);
+
 SmallVector<OpFoldResult> getUnitStrides(RewriterBase &rewriter, size_t rank);
 
 SmallVector<OpFoldResult> getMixedTensorSizes(RewriterBase &rewriter, Location loc, Value tensor);
