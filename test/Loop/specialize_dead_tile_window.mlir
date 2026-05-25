@@ -13,9 +13,10 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 
-  // CHECK: remark: possible live interval for
-  // CHECK-SAME: >= ()[s0] -> (s0 * 2 - 1)
-  // CHECK-SAME: <= ()[s0] -> (s0 * 2 + 1)
+  // CHECK: remark: fully-live prefix upper bound for
+  // CHECK-SAME: loop lower bound
+  // CHECK: remark: fully-dead lower bound for
+  // CHECK-SAME: ()[s0] -> (s0 * 2 + 2)
   func.func @windowed_dead_tile(%q_block: index, %live: tensor<1x128x64xf32>)
       -> tensor<1x128x64xf32> {
     %c0 = arith.constant 0 : index

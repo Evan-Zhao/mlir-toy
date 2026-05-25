@@ -144,6 +144,13 @@ struct AffineBound {
     return storage;
   }
 
+  AffineBound offset(int64_t delta) const {
+    MLIRContext *context = map.getContext();
+    AffineExpr expr = map.getResult(0) + getAffineConstantExpr(delta, context);
+    return {simplifyAffineMap(AffineMap::get(map.getNumDims(), map.getNumSymbols(), expr)),
+            operands};
+  }
+
   static FailureOr<AffineBound> project(const AffineScalarExpr &expr, linalg::GenericOp generic,
                                         bool lowerBound) {
     MLIRContext *context = generic.getContext();
@@ -267,6 +274,19 @@ private:
 using ScalarExprState = AbstractValueData<OpOperand *>;
 using AbstractValue = AbstractValueData<Value>;
 
+struct AffineInterval {
+  std::optional<AffineBound> lower;
+  std::optional<AffineBound> upper;
+  bool empty = false;
+};
+
+enum class LoopBoundaryKind : uint8_t { Affine, LoopLowerBound, LoopUpperBound };
+
+struct LoopBoundary {
+  LoopBoundaryKind kind;
+  std::optional<AffineBound> affine;
+};
+
 std::string valueName(Value value) {
   std::string storage;
   llvm::raw_string_ostream os(storage);
@@ -281,20 +301,21 @@ std::string formatAttribute(Attribute attr) {
   return storage;
 }
 
-std::string formatLiveInterval(Value iv, std::optional<AffineBound> lower,
-                               std::optional<AffineBound> upper) {
+std::string formatLoopBoundary(Value iv, StringRef label, const LoopBoundary &boundary) {
   std::string storage;
   llvm::raw_string_ostream os(storage);
-  os << "possible live interval for " << valueName(iv) << ": ";
-  if (lower)
-    os << valueName(iv) << " >= " << lower->format();
-  else
-    os << "unbounded below";
-  os << ", ";
-  if (upper)
-    os << valueName(iv) << " <= " << upper->format();
-  else
-    os << "unbounded above";
+  os << label << " for " << valueName(iv) << ": ";
+  switch (boundary.kind) {
+  case LoopBoundaryKind::Affine:
+    os << boundary.affine->format();
+    break;
+  case LoopBoundaryKind::LoopLowerBound:
+    os << "loop lower bound";
+    break;
+  case LoopBoundaryKind::LoopUpperBound:
+    os << "loop upper bound";
+    break;
+  }
   return storage;
 }
 
@@ -417,6 +438,45 @@ FailureOr<NecessaryLiveRelation> getNecessaryLiveRelation(PredicateAtom atom,
   }
 }
 
+FailureOr<NecessaryLiveRelation> getSufficientLiveRelation(PredicateAtom atom,
+                                                           linalg::GenericOp generic) {
+  arith::CmpIPredicate predicate = atom.cmp.getPredicate();
+  if (!atom.liveWhenCmpIsTrue)
+    predicate = arith::invertPredicate(predicate);
+
+  AffineScalarBuilder affineBuilder(generic.getContext(), generic.getNumLoops());
+  FailureOr<AffineExpr> lhsExpr = affineBuilder.getExpr(atom.cmp.getLhs());
+  FailureOr<AffineExpr> rhsExpr = affineBuilder.getExpr(atom.cmp.getRhs());
+  if (failed(lhsExpr) || failed(rhsExpr))
+    return failure();
+
+  AffineScalarExpr lhs = {*lhsExpr, llvm::to_vector(affineBuilder.getValues())};
+  AffineScalarExpr rhs = {*rhsExpr, llvm::to_vector(affineBuilder.getValues())};
+  FailureOr<AffineBound> lhsLower = AffineBound::project(lhs, generic, /*lowerBound=*/true),
+                         lhsUpper = AffineBound::project(lhs, generic, /*lowerBound=*/false),
+                         rhsLower = AffineBound::project(rhs, generic, /*lowerBound=*/true),
+                         rhsUpper = AffineBound::project(rhs, generic, /*lowerBound=*/false);
+  if (failed(lhsLower) || failed(lhsUpper) || failed(rhsLower) || failed(rhsUpper))
+    return failure();
+
+  switch (predicate) {
+  case arith::CmpIPredicate::sle:
+  case arith::CmpIPredicate::ule:
+    return NecessaryLiveRelation{*lhsUpper, *rhsLower, RelationKind::LE};
+  case arith::CmpIPredicate::slt:
+  case arith::CmpIPredicate::ult:
+    return NecessaryLiveRelation{*lhsUpper, *rhsLower, RelationKind::LT};
+  case arith::CmpIPredicate::sge:
+  case arith::CmpIPredicate::uge:
+    return NecessaryLiveRelation{*lhsLower, *rhsUpper, RelationKind::GE};
+  case arith::CmpIPredicate::sgt:
+  case arith::CmpIPredicate::ugt:
+    return NecessaryLiveRelation{*lhsLower, *rhsUpper, RelationKind::GT};
+  default:
+    return failure();
+  }
+}
+
 LogicalResult addNecessaryLiveConstraint(const NecessaryLiveRelation &relation,
                                          affine::FlatAffineValueConstraints &constraints) {
   AffineMap alignedLhs = constraints.computeAlignedMap(relation.lhs.map, relation.lhs.operands);
@@ -452,8 +512,8 @@ LogicalResult addNecessaryLiveConstraint(const NecessaryLiveRelation &relation,
   return success();
 }
 
-FailureOr<std::pair<std::optional<AffineBound>, std::optional<AffineBound>>>
-getIvIntervalFromRelations(ArrayRef<NecessaryLiveRelation> relations, Value iv) {
+FailureOr<AffineInterval> getIvIntervalFromRelations(ArrayRef<NecessaryLiveRelation> relations,
+                                                     Value iv) {
   llvm::SetVector<Value> operandSet;
   for (const NecessaryLiveRelation &relation : relations) {
     for (Value value : relation.lhs.operands)
@@ -482,6 +542,11 @@ getIvIntervalFromRelations(ArrayRef<NecessaryLiveRelation> relations, Value iv) 
     if (failed(addNecessaryLiveConstraint(relation, constraints)))
       return failure();
   }
+  if (constraints.isEmpty()) {
+    AffineInterval interval;
+    interval.empty = true;
+    return interval;
+  }
 
   unsigned ivPos;
   if (!constraints.findVar(iv, &ivPos))
@@ -507,7 +572,7 @@ getIvIntervalFromRelations(ArrayRef<NecessaryLiveRelation> relations, Value iv) 
     lower = AffineBound{lbMap, boundOperands};
   if (ubMap)
     upper = AffineBound{ubMap, boundOperands};
-  return std::make_pair(lower, upper);
+  return AffineInterval{lower, upper, false};
 }
 
 std::optional<unsigned> getGenericInputArgNumber(Value value, linalg::GenericOp generic) {
@@ -803,9 +868,8 @@ FailureOr<MatchedDeadSelect> matchDeadSelect(linalg::GenericOp generic, Attribut
   return MatchedDeadSelect{atoms};
 }
 
-FailureOr<std::pair<std::optional<AffineBound>, std::optional<AffineBound>>>
-derivePossibleLiveInterval(linalg::GenericOp generic, scf::ForOp loop,
-                           const MatchedDeadSelect &match) {
+FailureOr<AffineInterval> derivePossibleLiveInterval(linalg::GenericOp generic, scf::ForOp loop,
+                                                     const MatchedDeadSelect &match) {
   SmallVector<NecessaryLiveRelation> relations;
   relations.reserve(match.atoms.size());
   for (const PredicateAtom &atom : match.atoms) {
@@ -818,6 +882,38 @@ derivePossibleLiveInterval(linalg::GenericOp generic, scf::ForOp loop,
   if (relations.empty())
     return failure();
   return getIvIntervalFromRelations(relations, loop.getInductionVar());
+}
+
+FailureOr<AffineInterval> deriveFullyLiveInterval(linalg::GenericOp generic, scf::ForOp loop,
+                                                  const MatchedDeadSelect &match) {
+  SmallVector<NecessaryLiveRelation> relations;
+  relations.reserve(match.atoms.size());
+  for (const PredicateAtom &atom : match.atoms) {
+    FailureOr<NecessaryLiveRelation> relation = getSufficientLiveRelation(atom, generic);
+    if (failed(relation))
+      return failure();
+    relations.push_back(*relation);
+  }
+
+  if (relations.empty())
+    return failure();
+  return getIvIntervalFromRelations(relations, loop.getInductionVar());
+}
+
+LoopBoundary getFullyLivePrefixUpperBound(const AffineInterval &fullLiveInterval) {
+  if (fullLiveInterval.empty)
+    return {LoopBoundaryKind::LoopLowerBound, std::nullopt};
+  if (fullLiveInterval.upper)
+    return {LoopBoundaryKind::Affine, fullLiveInterval.upper->offset(1)};
+  return {LoopBoundaryKind::LoopUpperBound, std::nullopt};
+}
+
+LoopBoundary getFirstFullyDeadIteration(const AffineInterval &possibleLiveInterval) {
+  if (possibleLiveInterval.empty)
+    return {LoopBoundaryKind::LoopLowerBound, std::nullopt};
+  if (possibleLiveInterval.upper)
+    return {LoopBoundaryKind::Affine, possibleLiveInterval.upper->offset(1)};
+  return {LoopBoundaryKind::LoopUpperBound, std::nullopt};
 }
 
 } // namespace
@@ -843,17 +939,22 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
   if (failed(match))
     BAIL("expected producer to yield select(live_predicate, live_value, dead_value)");
 
-  FailureOr<std::pair<std::optional<AffineBound>, std::optional<AffineBound>>> interval =
+  FailureOr<AffineInterval> possibleLiveInterval =
       derivePossibleLiveInterval(producer, loop, *match);
-  if (failed(interval))
+  if (failed(possibleLiveInterval))
     BAIL("failed to derive an affine possible-live interval for the loop IV");
+  FailureOr<AffineInterval> fullyLiveInterval = deriveFullyLiveInterval(producer, loop, *match);
+  if (failed(fullyLiveInterval))
+    BAIL("failed to derive an affine fully-live interval for the loop IV");
 
   DenseMap<Value, AbstractValue> states;
   SmallVector<AbstractValue> yieldStates =
       analyzeLoopDeadPropagation(loop, producer, getDeadValue(), states);
 
-  loop.emitRemark() << formatLiveInterval(loop.getInductionVar(), interval->first,
-                                          interval->second);
+  loop.emitRemark() << formatLoopBoundary(loop.getInductionVar(), "fully-live prefix upper bound",
+                                          getFullyLivePrefixUpperBound(*fullyLiveInterval));
+  loop.emitRemark() << formatLoopBoundary(loop.getInductionVar(), "fully-dead lower bound",
+                                          getFirstFullyDeadIteration(*possibleLiveInterval));
   loop.emitRemark() << formatYieldSummary(loop, yieldStates, states);
   return DiagnosedSilenceableFailure::success();
 }

@@ -26,6 +26,10 @@ module attributes {transform.with_named_sequence} {
   // CHECK: remark: dead-tile propagation: result #0 = constant(0.000000e+00 : f32)
   // CHECK: remark: dead-tile propagation: result #0 = same as iter_arg #1
   // CHECK: remark: dead-tile propagation: result #0 = same as iter_arg #2
+  // CHECK: remark: fully-live prefix upper bound for
+  // CHECK-SAME: ()[s0] -> (s0 * 2)(%arg0)
+  // CHECK: remark: fully-dead lower bound for
+  // CHECK-SAME: ()[s0] -> (s0 * 2 + 2)(%arg0)
   // CHECK: remark: dead-iteration yields: yield #0 = same as iter_arg #0, yield #1 = same as iter_arg #1, yield #2 = same as iter_arg #2
   func.func @propagate_dead_tile(
       %q_block: index,

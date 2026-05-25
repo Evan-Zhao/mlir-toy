@@ -40,7 +40,7 @@ The first implementation should be conservative and pattern-driven. General
 dataflow can be added later, but the useful optimization comes from a few
 well-chosen rules.
 
-## Step 1: Prove a Full Dead Tile
+## Step 1: Classify the Tile Predicate
 
 Given a Linalg producer, match a scalar yield of this shape:
 
@@ -51,7 +51,13 @@ linalg.yield %selected : f32
 
 where `%dead` equals the schedule-provided dead value.
 
-Then prove `%pred` is false for every point in the producer iteration domain.
+Then classify `%pred` over the full producer iteration domain. The first
+implementation should distinguish three cases:
+
+- Fully dead: `%pred` is false for every point in the tile.
+- Partially dead: `%pred` is true for some points and false for others.
+- Fully live: `%pred` is true for every point in the tile.
+
 For causal attention, after tiling:
 
 ```text
@@ -74,6 +80,21 @@ which simplifies to:
 j * BK > q_block * BQ + (BQ - 1)
 ```
 
+A full live tile is:
+
+```text
+forall row in [0, BQ), col in [0, BK):
+  j * BK + col <= q_block * BQ + row
+```
+
+which simplifies to:
+
+```text
+j * BK + (BK - 1) <= q_block * BQ
+```
+
+Partially dead tiles are the remaining iterations between those two regions.
+
 Existing MLIR tools to use:
 
 - Linalg op interfaces expose iterator types, indexing maps, `linalg.index`,
@@ -82,7 +103,8 @@ Existing MLIR tools to use:
   `j * BK + col` from `affine.apply`, `linalg.index`, and loop IVs.
 - Presburger / affine constraint utilities, such as
   `FlatLinearValueConstraints`, can prove that the conjunction of loop/tile
-  bounds and `pred == true` is empty.
+  bounds and `pred == true` is empty or that the conjunction with
+  `pred == false` is empty.
 
 What not to rely on:
 
@@ -151,22 +173,35 @@ What not to rely on:
   `math` operations, but it does not evaluate a whole Linalg op over a dense
   constant input.
 
-## Step 3: Derive a Loop Boundary
+## Step 3: Derive Loop Boundaries
 
-Once the full-dead condition is represented as an affine inequality in the
-streaming loop IV, derive the first dead iteration.
+Once the full-dead and full-live conditions are represented as affine
+inequalities in the streaming loop IV, derive the region boundaries.
 
 For causal attention:
 
 ```text
 dead iff j * BK > q_block * BQ + (BQ - 1)
-live_ub = min(num_j_tiles, floordiv(q_block * BQ + BQ - 1, BK) + 1)
+dead_lb = min(num_j_tiles, floordiv(q_block * BQ + BQ - 1, BK) + 1)
 ```
 
 For the common `BQ = 128`, `BK = 64` case:
 
 ```text
-live_ub = min(num_j_tiles, 2 * q_block + 2)
+dead_lb = min(num_j_tiles, 2 * q_block + 2)
+```
+
+Similarly, the fully-live prefix is characterized by:
+
+```text
+live iff j * BK + (BK - 1) <= q_block * BQ
+live_prefix_ub = min(num_j_tiles, floordiv(q_block * BQ, BK))
+```
+
+For the common `BQ = 128`, `BK = 64` case:
+
+```text
+live_prefix_ub = min(num_j_tiles, 2 * q_block + 1)
 ```
 
 Existing MLIR tools to use:
@@ -178,36 +213,50 @@ Existing MLIR tools to use:
 The transform should not try to solve arbitrary nonlinear arithmetic. Start
 with affine expressions and constant positive tile sizes.
 
-## Step 4: Split or Erase the Dead Suffix
+## Step 4: Tighten or Split the Loop
 
-The core rewrite is loop splitting:
+If Step 2 proves that fully-dead iterations yield every incoming iter_arg
+unchanged, tighten the streaming loop bound in place:
 
 ```mlir
-%state_live = scf.for %j = %lb to %live_ub step %step
+%state = scf.for %j = %lb to %dead_lb step %step
     iter_args(...) -> (...) {
   // original or simplified live body
 }
+```
 
-%state_dead = scf.for %j = %live_ub to %ub step %step
+If Step 1 proves a fully-live prefix, specialize that prefix separately and
+erase the mask producer there:
+
+```mlir
+%state_live = scf.for %j = %lb to %live_prefix_ub step %step
+    iter_args(...) -> (...) {
+  // body rewritten without the mask producer
+}
+
+%state_mixed = scf.for %j = %live_prefix_ub to %dead_lb step %step
     iter_args(%state_live...) -> (...) {
-  // simplified dead body
+  // original masked body
 }
 ```
 
-If Step 2 proves the dead body yields every incoming iter_arg unchanged, erase
-the dead suffix and replace `%state_dead` with `%state_live`.
+This rewrite requires loop splitting or peeling because the fully-live prefix
+and partially-dead middle region use different loop bodies. If both a fully-
+live prefix and a fully-dead suffix are proven, the resulting structure is:
+
+```text
+[fully live prefix] [partially dead middle] [fully dead suffix]
+```
+
+where the fully-live prefix drops the mask producer, the partially-dead middle
+keeps the original masked body, and the fully-dead suffix is removed entirely.
 
 Existing MLIR tools to use:
 
-- `scf::ForOp` builders and ordinary IR cloning/remapping for the split.
-- `scf-for-loop-peeling` or Transform dialect loop peeling only after the split,
-  for cleanup or boundary specialization.
+- `scf::ForOp` mutation/builders and ordinary IR cloning/remapping.
+- `scf-for-loop-peeling` or Transform dialect loop peeling after the split, for
+  cleanup or boundary specialization.
 - Canonicalization, CSE, and remove-dead-values to erase now-unused tile ops.
-
-Loop peeling is not the discovery mechanism. It can peel static first/last
-iterations, but it does not lift a tensor mask predicate into a loop-level
-condition. The custom transform must derive and materialize the split point
-first.
 
 ## Constant Propagation Reality Check
 
@@ -260,4 +309,3 @@ Add tests in layers:
 4. Negative tests where the predicate is non-affine, the dead value does not
    match, NaN-sensitive rules would be required, or a loop yield cannot be
    proven unchanged.
-
