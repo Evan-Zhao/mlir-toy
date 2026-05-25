@@ -141,6 +141,7 @@ make_mlir_opt_plugin(
     lib/LoopTr/FusionIntoProducer.cpp
     lib/LoopTr/FusionRollingUpdate.cpp
     lib/LoopTr/LinalgTransformOps.cpp
+    lib/LoopTr/LoopSpecializeDeadTile.cpp
     lib/LoopTr/LoopTransformPlugin.cpp
     lib/LoopTr/PythonSolver.cpp
     lib/LoopTr/ScfTransformOps.cpp

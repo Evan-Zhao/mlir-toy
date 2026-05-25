@@ -256,6 +256,33 @@ def FusionFindNextReductionOp
   let assemblyFormat = "$producer_op attr-dict `:` functional-type(operands, results)";
 }
 
+def LoopSpecializeDeadTileOp
+    : Op<Transform_Dialect, "loop.specialize_dead_tile",
+         [DeclareOpInterfaceMethods<TransformOpInterface>,
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Analyze when a loop-local tile producer is uniformly dead";
+
+  let description = [{
+    Analysis-only first step for dead-tile specialization.
+
+    The op takes a loop-local `linalg.generic` producer, an enclosing `scf.for`,
+    and a schedule-provided `dead_value` attribute. It recognizes a yielded
+    `arith.select` that chooses between a live value and the dead value, derives
+    a sufficient all-dead condition over the selected loop IV by eliminating
+    the producer's `linalg.index` dimensions, and prints the simplified
+    condition as a remark.
+
+    This op does not rewrite payload IR yet.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$producer_op,
+      TransformHandleTypeInterface:$loop, AnyAttr:$dead_value);
+  let results = (outs);
+
+  let assemblyFormat = "$producer_op `in` $loop attr-dict "
+                       " `:` type($producer_op) `,` type($loop)";
+}
+
 def FusionCloneFuseElemwiseOp
     : Op<Transform_Dialect, "fusion.clone_fuse_elemwise",
          [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,

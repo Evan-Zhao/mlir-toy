@@ -24,7 +24,8 @@ void registerLoopTransformExtension(mlir::DialectRegistry &registry) {
             mlir::transform::LinalgGreedyInlineElementwiseOp, mlir::transform::FusionIntoProducerOp,
             mlir::transform::ScfFuseReductionIntoForallOp,
             mlir::transform::FusionFindNextReductionOp, mlir::transform::FusionCloneFuseElemwiseOp,
-            mlir::transform::FusionRepairReductionFrontierOp>();
+            mlir::transform::FusionRepairReductionFrontierOp,
+            mlir::transform::LoopSpecializeDeadTileOp>();
   });
 }
 
