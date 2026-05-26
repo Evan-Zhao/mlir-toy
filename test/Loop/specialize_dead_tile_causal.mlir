@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin %s --transform-interpreter 2>&1 | FileCheck %s
+// RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin %s --transform-interpreter | FileCheck %s
 
 !any = !transform.any_op
 
@@ -16,21 +16,20 @@ module attributes {transform.with_named_sequence} {
     %loop = transform.structured.match ops{["scf.for"]} in %func : (!any) -> !any
     %producer = transform.structured.match ops{["linalg.generic"]}
         attributes {tag = "producer"} in %func : (!any) -> !any
-    transform.loop.specialize_dead_tile %producer in %loop
-        {dead_value = 0xFF800000 : f32} : !any, !any
+    %live_loop, %mixed_loop =
+      transform.loop.specialize_dead_tile %producer in %loop
+        {dead_value = 0xFF800000 : f32} : !any, !any -> !any, !any
     transform.yield
   }
 
-  // CHECK: remark: dead-tile propagation: result #0 = constant(0xFF800000 : f32)
-  // CHECK: remark: dead-tile propagation: result #0 = same as iter_arg #0
-  // CHECK: remark: dead-tile propagation: result #0 = constant(0.000000e+00 : f32)
-  // CHECK: remark: dead-tile propagation: result #0 = same as iter_arg #1
-  // CHECK: remark: dead-tile propagation: result #0 = same as iter_arg #2
-  // CHECK: remark: fully-live prefix upper bound for
-  // CHECK-SAME: ()[s0] -> (s0 * 2)(%arg0)
-  // CHECK: remark: fully-dead lower bound for
-  // CHECK-SAME: ()[s0] -> (s0 * 2 + 2)(%arg0)
-  // CHECK: remark: dead-iteration yields: yield #0 = same as iter_arg #0, yield #1 = same as iter_arg #1, yield #2 = same as iter_arg #2
+  // CHECK-LABEL: func.func @propagate_dead_tile(
+  // CHECK: %[[LIVE_BOUND:.*]] = arith.select %{{.*}}, %{{.*}}, %c16 : index
+  // CHECK: %[[LIVE_LOOP:.*]]:3 = scf.for %{{.*}} = %c0 to %[[LIVE_BOUND]] step %c1 iter_args(%{{.*}} = %arg3, %{{.*}} = %arg4, %{{.*}} = %arg5) -> (tensor<1x128xf32>, tensor<1x128xf32>, tensor<1x128x32xf32>) {
+  // CHECK-NOT: tag = "producer"
+  // CHECK: ins(%arg1 : tensor<1x128x64xf32>) outs(%{{.*}} : tensor<1x128xf32>)
+  // CHECK: ins(%arg1 : tensor<1x128x64xf32>) outs(%0 : tensor<1x128x64xf32>)
+  // CHECK: %[[MIXED_LOOP:.*]]:3 = scf.for %{{.*}} = %[[LIVE_BOUND]] to %c16 step %c1 iter_args(%{{.*}} = %[[LIVE_LOOP]]#0, %{{.*}} = %[[LIVE_LOOP]]#1, %{{.*}} = %[[LIVE_LOOP]]#2) -> (tensor<1x128xf32>, tensor<1x128xf32>, tensor<1x128x32xf32>) {
+  // CHECK: tag = "producer"
   func.func @propagate_dead_tile(
       %q_block: index,
       %live: tensor<1x128x64xf32>,

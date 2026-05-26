@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin %s --transform-interpreter 2>&1 | FileCheck %s
+// RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin %s --transform-interpreter | FileCheck %s
 
 !any = !transform.any_op
 
@@ -8,15 +8,18 @@ module attributes {transform.with_named_sequence} {
         attributes {sym_name = "dead_tile"} in %module : (!any) -> !any
     %loop = transform.structured.match ops{["scf.for"]} in %func : (!any) -> !any
     %producer = transform.structured.match ops{["linalg.generic"]} in %func : (!any) -> !any
-    transform.loop.specialize_dead_tile %producer in %loop
-        {dead_value = 0xFF800000 : f32} : !any, !any
+    %live_loop, %mixed_loop =
+      transform.loop.specialize_dead_tile %producer in %loop
+        {dead_value = 0xFF800000 : f32} : !any, !any -> !any, !any
     transform.yield
   }
 
-  // CHECK: remark: fully-live prefix upper bound for
-  // CHECK-SAME: ()[s0] -> (s0 * 2)(%arg0)
-  // CHECK: remark: fully-dead lower bound for
-  // CHECK-SAME: ()[s0] -> (s0 * 2 + 2)(%arg0)
+  // CHECK-LABEL: func.func @dead_tile(
+  // CHECK: %[[LIVE_BOUND:.*]] = arith.select %{{.*}}, %{{.*}}, %c16 : index
+  // CHECK: %[[LIVE_LOOP:.*]] = scf.for %{{.*}} = %c0 to %[[LIVE_BOUND]] step %c1 iter_args(%{{.*}} = %0) -> (tensor<1x128x64xf32>) {
+  // CHECK-NEXT: scf.yield %arg1 : tensor<1x128x64xf32>
+  // CHECK: %[[MIXED_LOOP:.*]] = scf.for %{{.*}} = %[[LIVE_BOUND]] to %c16 step %c1 iter_args(%{{.*}} = %[[LIVE_LOOP]]) -> (tensor<1x128x64xf32>) {
+  // CHECK: linalg.generic
   func.func @dead_tile(%q_block: index, %live: tensor<1x128x64xf32>)
       -> tensor<1x128x64xf32> {
     %c0 = arith.constant 0 : index

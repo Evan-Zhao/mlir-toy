@@ -257,34 +257,38 @@ def FusionFindNextReductionOp
 }
 
 def LoopSpecializeDeadTileOp : Op<Transform_Dialect, "loop.specialize_dead_tile",
-                                  [DeclareOpInterfaceMethods<TransformOpInterface>,
-                                   DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
-  let summary = "Analyze dead-tile conditions and loop-local consequences";
+                                  [FunctionalStyleTransformOpTrait,
+                                   DeclareOpInterfaceMethods<TransformOpInterface>,
+                                   DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+                                   ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Split a streaming loop into a fully-live prefix and a mixed suffix";
 
   let description = [{
-    Analysis-only first steps for dead-tile specialization.
-
     The op takes a loop-local `linalg.generic` producer, an enclosing `scf.for`,
     and a schedule-provided `dead_value` attribute. It recognizes a yielded
-    `arith.select` that chooses between a live value and the dead value, derives
-    a sufficient all-dead condition over the selected loop IV by eliminating
-    the producer's `linalg.index` dimensions, and prints the derived possible
-    live interval as a remark.
+    `arith.select` that chooses between a live value and the dead value,
+    derives live-interval information over the selected loop IV by eliminating
+    the producer's `linalg.index` dimensions, and rewrites the `scf.for` into:
+    - a fully-live prefix loop, where the producer is bypassed and replaced by
+      its live input, and
+    - a mixed suffix loop, where the original producer remains.
 
-    The op also uses the loop handle to propagate the full-dead-tile assumption
-    through loop-local tensor ops under the `scf.for`, printing the abstract
-    state of recognized results and the resulting abstract states of the loop
-    yields.
+    The `loop` handle is consumed because the original loop is replaced by two
+    new loops. The transform returns handles to those new loops explicitly:
+    `live_loop` and `mixed_loop`.
 
-    This op does not rewrite payload IR yet.
+    The `producer_op` handle is read-only and remains valid after the rewrite.
+    It is remapped to the cloned producer operation in the mixed suffix loop.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$producer_op,
       TransformHandleTypeInterface:$loop, AnyAttr:$dead_value);
-  let results = (outs);
+  let results = (outs TransformHandleTypeInterface:$live_loop,
+      TransformHandleTypeInterface:$mixed_loop);
 
   let assemblyFormat = "$producer_op `in` $loop attr-dict "
-                       " `:` type($producer_op) `,` type($loop)";
+                       " `:` type($producer_op) `,` type($loop) `->` "
+                       " type($live_loop) `,` type($mixed_loop)";
 }
 
 def FusionCloneFuseElemwiseOp
