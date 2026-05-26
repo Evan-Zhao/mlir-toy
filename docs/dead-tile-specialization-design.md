@@ -1,311 +1,165 @@
-# Dead Tile Specialization Design
+# Dead Tile Specialization
 
 ## Goal
 
-This note sketches a transform-dialect optimization for scheduled tile programs
-where a schedule writer can identify a tile-producing op and a "dead value".
-The transform should prove when that op produces a full tensor of the dead
-value, propagate the consequence through nearby loop-local computation, and
-specialize the streaming loop so fully-dead iterations do no work.
+`transform.loop.specialize_dead_tile` specializes a scheduled streaming
+`scf.for` when a loop-local tile producer becomes trivial on contiguous regions
+of the loop IV space.
 
-The motivating case is causal attention after the L0-to-L1 attention schedule:
-a loop-local mask op may produce a full tile of `-inf` for K/V blocks that are
-strictly to the right of the current query tile. Those blocks should be removed
-from the streaming loop rather than computed and masked elementwise.
+The motivating case is causal attention: after tiling, a mask producer may
+return a full `-inf` tile for K/V blocks strictly to the right of the current
+query tile, and it may return the unmasked score tile for an initial fully-live
+prefix. The transform exploits those two regions to simplify the loop.
 
-The design is intentionally not attention-only. It relies on a schedule-provided
-anchor op plus a dead-value hint, and then applies structured-analysis rules to
-Linalg and SCF.
+## Transform
 
-## Proposed Transform
+It takes as input:
 
-Use a dedicated transform op that targets one loop-local producer and one
-surrounding streaming loop:
+- a schedule-provided producer op,
+- a surrounding `scf.for`,
+- and a schedule-provided dead value.
 
 ```mlir
-transform.loop.specialize_dead_tile %producer in %loop
-  { dead_value = 0xFF800000 : f32 }
+%live_loop, %mixed_loop = transform.loop.specialize_dead_tile %producer in %loop
+    {dead_value = 0xFF800000 : f32} : !any, !any -> !any, !any
 ```
 
-The exact name is open. The important contract is:
+Contract:
 
-- `%producer` is the op whose result may become a full dead-value tensor.
-- `%loop` is the `scf.for` whose induction variable appears in the producer's
-  tile predicate.
-- `dead_value` is an explicit schedule hint, not rediscovered by the compiler.
-- The transform is allowed to fail unless it can prove the rewrite preserves
-  the loop-carried results.
+- `%producer` is a loop-local tensor producer whose result may become a full
+  dead-value tile.
+- `%loop` is the streaming `scf.for` whose IV appears in the producer
+  predicate.
+- `dead_value` is an explicit hint. The pass does not try to rediscover it.
+- The transform may fail if it cannot prove the rewrite preserves loop state.
 
-The first implementation should be conservative and pattern-driven. General
-dataflow can be added later, but the useful optimization comes from a few
-well-chosen rules.
+The op returns handles to the new fully-live prefix loop and mixed loop. The
+producer handle remains valid when tracking succeeds.
 
-## Step 1: Classify the Tile Predicate
+## Current Implementation
 
-Given a Linalg producer, match a scalar yield of this shape:
+The pass is implemented in four pieces.
+
+### 1. Classify the Producer
+
+The pass matches a producer of the form:
 
 ```mlir
 %selected = arith.select %pred, %live, %dead : f32
 linalg.yield %selected : f32
 ```
 
-where `%dead` equals the schedule-provided dead value.
+with `%dead` equal to the transform attribute.
 
-Then classify `%pred` over the full producer iteration domain. The first
-implementation should distinguish three cases:
+It then rebuilds `%pred` as affine expressions over:
 
-- Fully dead: `%pred` is false for every point in the tile.
-- Partially dead: `%pred` is true for some points and false for others.
-- Fully live: `%pred` is true for every point in the tile.
+- loop IVs,
+- `linalg.index`,
+- and simple `affine.apply` compositions.
 
-For causal attention, after tiling:
+Using affine/Presburger reasoning, it classifies the producer tile as:
+
+- fully live: `%pred` is true everywhere in the tile,
+- fully dead: `%pred` is false everywhere,
+- mixed: otherwise.
+
+For tiled causal attention:
 
 ```text
 q_abs = q_block * BQ + row
 k_abs = j * BK + col
 live iff k_abs <= q_abs
-dead iff k_abs > q_abs
 ```
 
-A full dead tile is:
+This yields two useful boundaries:
 
 ```text
-forall row in [0, BQ), col in [0, BK):
-  j * BK + col > q_block * BQ + row
+fully-live prefix: j * BK + (BK - 1) <= q_block * BQ
+fully-dead suffix: j * BK > q_block * BQ + (BQ - 1)
 ```
 
-which simplifies to:
+The implementation handles general affine expressions, not just hand-written
+linear forms.
 
-```text
-j * BK > q_block * BQ + (BQ - 1)
-```
+### 2. Propagate Dead-Tile Facts
 
-A full live tile is:
+When the producer is fully dead, the pass runs a small loop-local abstract
+interpretation over downstream ops to answer one question:
 
-```text
-forall row in [0, BQ), col in [0, BK):
-  j * BK + col <= q_block * BQ + row
-```
+> does this iteration yield the incoming loop-carried state unchanged?
 
-which simplifies to:
+The analysis tracks values such as:
 
-```text
-j * BK + (BK - 1) <= q_block * BQ
-```
+- constants,
+- equivalence to another tensor or loop-carried value,
+- and a few operation-specific identities.
 
-Partially dead tiles are the remaining iterations between those two regions.
+The useful attention-style rules are things like:
 
-Existing MLIR tools to use:
+- `maximumf(dead, x) -> x`,
+- `exp(-inf) -> 0`,
+- reduction with zero input returns the init/accumulator,
+- DPS elementwise ops may forward an input or init tensor unchanged.
 
-- Linalg op interfaces expose iterator types, indexing maps, `linalg.index`,
-  inputs, outputs, and scalar body operations.
-- Affine composition utilities can recover expressions such as
-  `j * BK + col` from `affine.apply`, `linalg.index`, and loop IVs.
-- Presburger / affine constraint utilities, such as
-  `FlatLinearValueConstraints`, can prove that the conjunction of loop/tile
-  bounds and `pred == true` is empty or that the conjunction with
-  `pred == false` is empty.
+This is intentionally narrow. The pass does not rely on generic tensor-level
+constant propagation through arbitrary `linalg.generic` bodies.
 
-What not to rely on:
+### 3. Derive Loop Regions
 
-- `sccp` and scalar integer range optimizations do not prove "this entire
-  tensor tile is a constant". The fact quantifies over the Linalg iteration
-  domain, so it needs structured tensor/tile reasoning.
+The fully-live and fully-dead conditions are projected onto the streaming loop
+IV and converted into half-open affine intervals.
 
-## Step 2: Propagate Dead-Tile Consequences
-
-After proving the producer result is a full dead-value tensor for some loop
-iterations, run a small rule-based analysis over loop-local consumers.
-
-Use a compact lattice, for example:
-
-```text
-Unknown
-AllConstant(value)
-AllDead(value)
-SameAsLoopIterArg(index)
-AllZero
-```
-
-The exact states can evolve. The important point is that the analysis should
-answer whether each yielded loop-carried value is unchanged in a fully-dead
-iteration.
-
-For the attention recurrence, the useful proof is not "everything downstream is
-also `-inf`". It is:
-
-```text
-if score_tile is all -inf,
-then row_max update is the previous row max,
-then row_sum update is the previous row sum,
-then accumulator update is the previous accumulator,
-therefore the scf.for iteration yields its incoming iter_args unchanged.
-```
-
-That requires semantic rules for reductions and common elementwise operations:
-
-- `maximumf(dead_value, x) -> x` for `dead_value = -inf`, subject to the chosen
-  NaN semantics and assumptions about `x`.
-- `exp(-inf) -> 0`.
-- `sum(zeros, init) -> init`.
-- `matmul(zeros, rhs, init) -> init`.
-- Pointwise identity rules such as `x * 1 -> x`, `x + 0 -> x`, and `x / x -> 1`
-  only when the required nonzero / non-NaN preconditions are available.
-
-The first version should avoid aggressive floating-point reasoning. For
-example, only use rules that directly prove a loop yield equals the incoming
-iter_arg. If a downstream value becomes `NaN` in a corner case, the transform
-should fail unless the value is proven unused or the NaN path is unreachable.
-
-Existing MLIR tools to use:
-
-- Def-use walking and dominance to restrict analysis to loop-local consumers.
-- `linalg::LinalgOp` and `DestinationStyleOpInterface` to distinguish inputs,
-  DPS init operands, reductions, and yielded values.
-- Existing canonicalization, CSE, and dead-value cleanup after the transform
-  rewrites the loop.
-
-What not to rely on:
-
-- MLIR does not currently run an inter-op tensor constant propagation pass
-  through arbitrary `linalg.generic` bodies.
-- Generic scalar constant folding applies inside scalar/tensor `arith` and
-  `math` operations, but it does not evaluate a whole Linalg op over a dense
-  constant input.
-
-## Step 3: Derive Loop Boundaries
-
-Once the full-dead and full-live conditions are represented as affine
-inequalities in the streaming loop IV, derive the region boundaries.
-
-For causal attention:
-
-```text
-dead iff j * BK > q_block * BQ + (BQ - 1)
-dead_lb = min(num_j_tiles, floordiv(q_block * BQ + BQ - 1, BK) + 1)
-```
-
-For the common `BQ = 128`, `BK = 64` case:
-
-```text
-dead_lb = min(num_j_tiles, 2 * q_block + 2)
-```
-
-Similarly, the fully-live prefix is characterized by:
-
-```text
-live iff j * BK + (BK - 1) <= q_block * BQ
-live_prefix_ub = min(num_j_tiles, floordiv(q_block * BQ, BK))
-```
-
-For the common `BQ = 128`, `BK = 64` case:
+For the common causal-attention case with `BQ = 128`, `BK = 64`:
 
 ```text
 live_prefix_ub = min(num_j_tiles, 2 * q_block + 1)
+dead_lb        = min(num_j_tiles, 2 * q_block + 2)
 ```
 
-Existing MLIR tools to use:
+Those boundaries are then materialized as SSA values for rewriting.
 
-- Affine maps and `affine.min` can materialize clipped static expressions.
-- `scf-for-loop-range-folding` and SCF canonicalization can simplify loop
-  bounds after the rewrite.
+### 4. Rewrite the Loop
 
-The transform should not try to solve arbitrary nonlinear arithmetic. Start
-with affine expressions and constant positive tile sizes.
-
-## Step 4: Tighten or Split the Loop
-
-If Step 2 proves that fully-dead iterations yield every incoming iter_arg
-unchanged, tighten the streaming loop bound in place:
+The current rewrite specializes the fully-live prefix and keeps the remaining
+possibly-live region as a mixed loop:
 
 ```mlir
-%state = scf.for %j = %lb to %dead_lb step %step
-    iter_args(...) -> (...) {
-  // original or simplified live body
-}
+%state_live = scf.for %j = %lb to %live_prefix_ub step %step ...
+%state_mixed = scf.for %j = %live_prefix_ub to %mixed_ub step %step ...
 ```
 
-If Step 1 proves a fully-live prefix, specialize that prefix separately and
-erase the mask producer there:
+In the live prefix, the matched mask producer is removed and its result is
+rewired directly to the live input tile when that replacement is pointwise
+aligned with the producer output.
 
-```mlir
-%state_live = scf.for %j = %lb to %live_prefix_ub step %step
-    iter_args(...) -> (...) {
-  // body rewritten without the mask producer
-}
+The mixed loop keeps the original masked body. When dead-tile propagation proves
+that fully-dead iterations preserve every loop-carried value, `%mixed_ub` is
+tightened to the first fully-dead iteration; otherwise it remains the original
+loop upper bound.
 
-%state_mixed = scf.for %j = %live_prefix_ub to %dead_lb step %step
-    iter_args(%state_live...) -> (...) {
-  // original masked body
-}
-```
+## Constant Propagation Note
 
-This rewrite requires loop splitting or peeling because the fully-live prefix
-and partially-dead middle region use different loop bodies. If both a fully-
-live prefix and a fully-dead suffix are proven, the resulting structure is:
+This transformation drops iterations from a loop by reasoning
+if the loop would return the same value as its carried inputs in this iteration
+(basically a no-op).
 
-```text
-[fully live prefix] [partially dead middle] [fully dead suffix]
-```
+Stock MLIR constant propagation and folding is not enough for this transformation.
+Current MLIR can fold `arith` and `math` operations over dense constants (tensors),
+but it does not apply to `linalg.generic` operations.
+Furthermore, it does not track if the output of an operation would be _identical_
+to another value, which is crucial for this transformation.
 
-where the fully-live prefix drops the mask producer, the partially-dead middle
-keeps the original masked body, and the fully-dead suffix is removed entirely.
+This transformation builds its own abstract interpretation-based analysis
+over Linalg and SCF to track value propagation.
+The implementation is limited to a small set of patterns that are common in attention masking,
+but it could be extended in the future if needed.
 
-Existing MLIR tools to use:
+## Tests
 
-- `scf::ForOp` mutation/builders and ordinary IR cloning/remapping.
-- `scf-for-loop-peeling` or Transform dialect loop peeling after the split, for
-  cleanup or boundary specialization.
-- Canonicalization, CSE, and remove-dead-values to erase now-unused tile ops.
+Current tests cover:
 
-## Constant Propagation Reality Check
-
-The local toolchain used for this note is Homebrew LLVM/MLIR 20.1.8.
-
-Current MLIR can fold tensor-level `arith` and `math` operations over dense
-constants. For example, this is folded by `--sccp --canonicalize`:
-
-```mlir
-%a = arith.constant dense<0xFF800000> : tensor<2x3xf32>
-%b = arith.maximumf %a, %a : tensor<2x3xf32>
-%c = arith.subf %a, %b : tensor<2x3xf32>
-%d = math.exp %c : tensor<2x3xf32>
-```
-
-The result becomes a dense NaN tensor because `-inf - -inf` is NaN and
-`exp(NaN)` is NaN.
-
-Current MLIR does not, however, fold equivalent computation when it is wrapped
-in `linalg.generic`. These remain as Linalg ops after
-`--sccp --canonicalize --cse`:
-
-```mlir
-%r = linalg.generic ... ins(%dense_constant) outs(%empty) {
-^bb0(%in: f32, %out: f32):
-  %e = math.exp %in : f32
-  linalg.yield %e : f32
-} -> tensor<...xf32>
-```
-
-The same is true for reductions over dense constant tensors. A row-wise
-`maximumf` reduction over an all-`-inf` tensor is not folded to an all-`-inf`
-constant by the standard cleanup pipeline.
-
-Therefore dead-tile specialization should not be phrased as "let constant
-propagation compute the rest". It should be a structured analysis that proves
-tile-level facts from Linalg domains and then applies explicit semantic rules
-for the small set of operations in the scheduled loop.
-
-## Testing Plan
-
-Add tests in layers:
-
-1. A small `linalg.generic select(live, dead)` test where the transform proves
-   all-dead from affine loop/tile inequalities.
-2. A test where all-dead propagation proves an `scf.for` iteration yields
-   unchanged iter_args and erases the dead suffix.
-3. A causal-attention scheduled test where the inner K/V loop upper bound
-   becomes `min(num_k_tiles, floor((q_end) / BK) + 1)`.
-4. Negative tests where the predicate is non-affine, the dead value does not
-   match, NaN-sensitive rules would be required, or a loop yield cannot be
-   proven unchanged.
+- small producer-only dead-tile classification,
+- windowed and causal boundary derivation,
+- dead-tile-driven live/mixed loop splitting,
+- causal-attention end-to-end scheduling,
+- and handle preservation across loop-rewriting transforms.

@@ -15,6 +15,8 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/Debug.h"
+#include <mlir/IR/Builders.h>
 #include <optional>
 #include <variant>
 
@@ -23,10 +25,27 @@ using namespace mlir;
 namespace mlir::transform {
 namespace {
 
+#define DEBUG_TYPE "loop-specialize-dead-tile"
 #define BAIL(message) return emitSilenceableFailure(transform, message)
 
 std::optional<Attribute> asSplatConstantAttr(Value value);
 bool attrsEqualByValue(Attribute lhs, Attribute rhs);
+
+bool isZeroAttr(Attribute attr) {
+  if (auto floatAttr = dyn_cast<FloatAttr>(attr))
+    return floatAttr.getValue().isZero();
+  if (auto intAttr = dyn_cast<IntegerAttr>(attr))
+    return intAttr.getValue().isZero();
+  return false;
+}
+
+bool isOneAttr(Attribute attr) {
+  if (auto floatAttr = dyn_cast<FloatAttr>(attr))
+    return floatAttr.getValue().isExactlyValue(1.0);
+  if (auto intAttr = dyn_cast<IntegerAttr>(attr))
+    return intAttr.getValue().isOne();
+  return false;
+}
 
 template <typename T, typename Func>
 FailureOr<SmallVector<T>> mapFAggFailure(ValueRange vec, Func &&func) {
@@ -199,13 +218,13 @@ struct AbstractValueData {
   static AbstractValueData getConstant(Attribute attr) { return {attr}; }
   static AbstractValueData getEquivalentTo(T value) { return {value}; }
 
-  AbstractValueData getZeroLike() {
-    auto attr = getConstantAttr();
-    if (auto floatAttr = dyn_cast<FloatAttr>(*attr))
-      return getConstant(FloatAttr::get(floatAttr.getType(), 0.0));
-    if (auto intAttr = dyn_cast<IntegerAttr>(*attr))
-      return getConstant(IntegerAttr::get(intAttr.getType(), 0));
-    return getUnknown();
+  template <typename U> static AbstractValueData getConstantOfType(Type type, U constVal) {
+    if (auto floatType = dyn_cast<FloatType>(type))
+      return {FloatAttr::get(floatType, constVal)};
+    if (auto intType = dyn_cast<IntegerType>(type))
+      return {IntegerAttr::get(intType, constVal)};
+    llvm::errs() << "Unsupported type for constant attribute: " << type << "\n";
+    llvm_unreachable("unsupported type");
   }
 
   bool isKnown() const { return !std::holds_alternative<std::nullopt_t>(value); }
@@ -239,26 +258,17 @@ struct AbstractValueData {
     return mapConstAttribute([&](Attribute attr) { return attrsEqualByValue(attr, rhs); });
   }
 
+  bool equals(const AbstractValueData &rhs) const {
+    auto rhsAttr = rhs.getConstantAttr();
+    if (rhsAttr && bitwiseEqualToAttr(*rhsAttr))
+      return true;
+    return getEquivalentValue() == rhs.getEquivalentValue();
+  };
+
 private:
   bool mapConstAttribute(std::function<bool(Attribute)> &&predicate) const {
     auto attr = getConstantAttr();
     return attr && predicate(*attr);
-  }
-
-  static bool isZeroAttr(Attribute attr) {
-    if (auto floatAttr = dyn_cast<FloatAttr>(attr))
-      return floatAttr.getValue().isZero();
-    if (auto intAttr = dyn_cast<IntegerAttr>(attr))
-      return intAttr.getValue().isZero();
-    return false;
-  }
-
-  static bool isOneAttr(Attribute attr) {
-    if (auto floatAttr = dyn_cast<FloatAttr>(attr))
-      return floatAttr.getValue().isExactlyValue(1.0);
-    if (auto intAttr = dyn_cast<IntegerAttr>(attr))
-      return intAttr.getValue().isOne();
-    return false;
   }
 };
 
@@ -550,35 +560,94 @@ ScalarExprState evaluateScalarValue(Value value, DenseMap<Value, ScalarExprState
   if (!def || def->getNumResults() != 1)
     return ScalarExprState::getUnknown();
 
-  auto foldAddLike = [](ScalarExprState lhs, ScalarExprState rhs) {
+  auto foldConstant = [](arith::ConstantOp constant) {
+    return ScalarExprState::getConstant(constant.getValue());
+  };
+  auto foldAdd = [](ScalarExprState lhs, ScalarExprState rhs, Type _) {
     if (lhs.isConstZero())
       return rhs;
     if (rhs.isConstZero())
       return lhs;
     return ScalarExprState::getUnknown();
   };
-  auto foldSubLike = [](ScalarExprState lhs, ScalarExprState rhs) {
-    return rhs.isConstZero() ? lhs : ScalarExprState::getUnknown();
+  auto foldSub = [&](ScalarExprState lhs, ScalarExprState rhs, Type resultTy) {
+    if (lhs.equals(rhs))
+      return ScalarExprState::getConstantOfType(resultTy, 0);
+    if (lhs.isNegativeInfinity() || rhs.isConstZero())
+      return lhs;
+    return ScalarExprState::getUnknown();
   };
-  auto foldMulLike = [](ScalarExprState lhs, ScalarExprState rhs) {
+  auto foldMul = [](ScalarExprState lhs, ScalarExprState rhs, Type _) {
     if (lhs.isConstZero() || rhs.isConstOne())
       return lhs;
     if (rhs.isConstZero() || lhs.isConstOne())
       return rhs;
     return ScalarExprState::getUnknown();
   };
-  auto foldDivLike = [](ScalarExprState lhs, ScalarExprState rhs) {
-    return rhs.isConstOne() ? lhs : ScalarExprState::getUnknown();
+  auto foldDiv = [&](ScalarExprState lhs, ScalarExprState rhs, Type resultTy) {
+    if (lhs.equals(rhs))
+      return ScalarExprState::getConstantOfType(resultTy, 1.0);
+    if (lhs.isConstZero() || rhs.isConstOne())
+      return lhs;
+    return ScalarExprState::getUnknown();
   };
-  auto foldAndLike = [](ScalarExprState lhs, ScalarExprState rhs) {
+  auto foldAnd = [](ScalarExprState lhs, ScalarExprState rhs, Type _) {
     if (lhs.isConstBool(false) || rhs.isConstBool(true))
       return lhs;
     if (lhs.isConstBool(true) || rhs.isConstBool(false))
       return rhs;
     return ScalarExprState::getUnknown();
   };
-  auto foldSelectLike = [](ScalarExprState condition, ScalarExprState trueValue,
-                           ScalarExprState falseValue) {
+  auto foldMaximum = [](ScalarExprState lhs, ScalarExprState rhs, Type _) {
+    if (lhs.isNegativeInfinity())
+      return rhs;
+    if (rhs.isNegativeInfinity())
+      return lhs;
+    return ScalarExprState::getUnknown();
+  };
+  auto evaluate = [&](Value operand) { return evaluateScalarValue(operand, states, deadValue); };
+  // Recognize the rolling-update idiom `(x * y) * (1 / y) -> x` (and swapped
+  // operands). Plain recursive evaluation loses the reciprocal structure
+  // because the current abstract domain does not represent `1 / y`.
+  auto foldMulF = [&](arith::MulFOp mulf) -> ScalarExprState {
+    Value lhsValue = mulf.getLhs();
+    Value rhsValue = mulf.getRhs();
+    auto tryFold = [&](Value mulValue, Value divValue) {
+      auto mul = mulValue.getDefiningOp<arith::MulFOp>();
+      auto div = divValue.getDefiningOp<arith::DivFOp>();
+      if (!mul || !div || !evaluate(div.getLhs()).isConstOne())
+        return ScalarExprState::getUnknown();
+
+      ScalarExprState denominator = evaluate(div.getRhs());
+      ScalarExprState lhs = evaluate(mul.getLhs());
+      ScalarExprState rhs = evaluate(mul.getRhs());
+      if (lhs.equals(denominator))
+        return rhs;
+      if (rhs.equals(denominator))
+        return lhs;
+      return ScalarExprState::getUnknown();
+    };
+
+    ScalarExprState folded = tryFold(lhsValue, rhsValue);
+    if (folded.isKnown())
+      return folded;
+    folded = tryFold(rhsValue, lhsValue);
+    if (folded.isKnown())
+      return folded;
+    return foldMul(evaluate(lhsValue), evaluate(rhsValue), mulf.getResult().getType());
+  };
+  auto foldExpOp = [&](math::ExpOp exp) {
+    Type resultTy = exp.getResult().getType();
+    auto operand = evaluate(exp.getOperand());
+    if (operand.isNegativeInfinity())
+      return ScalarExprState::getConstantOfType(resultTy, 0.0);
+    if (operand.isConstZero())
+      return ScalarExprState::getConstantOfType(resultTy, 1.0);
+    return ScalarExprState::getUnknown();
+  };
+  auto foldSelectOp = [&](arith::SelectOp select) {
+    auto condition = evaluate(select.getCondition()), trueValue = evaluate(select.getTrueValue()),
+         falseValue = evaluate(select.getFalseValue());
     if (condition.isConstBool(true))
       return trueValue;
     if (condition.isConstBool(false))
@@ -586,41 +655,24 @@ ScalarExprState evaluateScalarValue(Value value, DenseMap<Value, ScalarExprState
     // Can implement a trueValue == falseValue check here, but we don't have use for it.
     return ScalarExprState::getUnknown();
   };
-  auto foldMaximumLike = [&](ScalarExprState lhs, ScalarExprState rhs) {
-    if (lhs.bitwiseEqualToAttr(deadValue))
-      return rhs;
-    if (rhs.bitwiseEqualToAttr(deadValue))
-      return lhs;
-    return ScalarExprState::getUnknown();
-  };
-  auto foldExpLike = [](ScalarExprState operand) {
-    if (operand.isNegativeInfinity())
-      return operand.getZeroLike();
-    return ScalarExprState::getUnknown();
-  };
-  auto evaluate = [&](Value operand) { return evaluateScalarValue(operand, states, deadValue); };
 
 #define CASE_BIN_OP(foldLike)                                                                      \
-  [&](auto op) { return foldLike(evaluate(op.getLhs()), evaluate(op.getRhs())); }
+  [&](auto op) {                                                                                   \
+    return foldLike(evaluate(op.getLhs()), evaluate(op.getRhs()), op.getResult().getType());       \
+  }
 
-  ScalarExprState result =
-      llvm::TypeSwitch<Operation *, ScalarExprState>(def)
-          .Case<arith::ConstantOp>([&](arith::ConstantOp constant) {
-            return ScalarExprState::getConstant(constant.getValue());
-          })
-          .Case<math::ExpOp>(
-              [&](math::ExpOp exp) { return foldExpLike(evaluate(exp.getOperand())); })
-          .Case<arith::AddFOp, arith::AddIOp>(CASE_BIN_OP(foldAddLike))
-          .Case<arith::SubFOp, arith::SubIOp>(CASE_BIN_OP(foldSubLike))
-          .Case<arith::MulFOp, arith::MulIOp>(CASE_BIN_OP(foldMulLike))
-          .Case<arith::DivFOp>(CASE_BIN_OP(foldDivLike))
-          .Case<arith::AndIOp>(CASE_BIN_OP(foldAndLike))
-          .Case<arith::MaximumFOp>(CASE_BIN_OP(foldMaximumLike))
-          .Case<arith::SelectOp>([&](arith::SelectOp select) {
-            return foldSelectLike(evaluate(select.getCondition()), evaluate(select.getTrueValue()),
-                                  evaluate(select.getFalseValue()));
-          })
-          .Default([](Operation *) { return ScalarExprState::getUnknown(); });
+  ScalarExprState result = llvm::TypeSwitch<Operation *, ScalarExprState>(def)
+                               .Case<arith::ConstantOp>(foldConstant)
+                               .Case<math::ExpOp>(foldExpOp)
+                               .Case<arith::AddFOp, arith::AddIOp>(CASE_BIN_OP(foldAdd))
+                               .Case<arith::SubFOp, arith::SubIOp>(CASE_BIN_OP(foldSub))
+                               .Case<arith::MulFOp>(foldMulF)
+                               .Case<arith::MulIOp>(CASE_BIN_OP(foldMul))
+                               .Case<arith::DivFOp>(CASE_BIN_OP(foldDiv))
+                               .Case<arith::AndIOp>(CASE_BIN_OP(foldAnd))
+                               .Case<arith::MaximumFOp>(CASE_BIN_OP(foldMaximum))
+                               .Case<arith::SelectOp>(foldSelectOp)
+                               .Default([](Operation *) { return ScalarExprState::getUnknown(); });
   states[value] = result;
   return result;
 }
@@ -629,13 +681,37 @@ DenseMap<Value, ScalarExprState>
 seedGenericInputScalarStates(linalg::GenericOp generic,
                              const DenseMap<Value, AbstractValue> &states) {
   DenseMap<Value, ScalarExprState> scalarStates;
-  for (auto [i, inputOperand] : llvm::enumerate(generic.getDpsInputOperands())) {
+  SmallVector<OpOperand *> inputOperands = generic.getDpsInputOperands();
+  DenseMap<Value, OpOperand *> equivalentValueToInputOperand;
+  auto findInputOperandForValue = [&](Value value) -> OpOperand * {
+    for (OpOperand *inputOperand : inputOperands)
+      if (inputOperand->get() == value)
+        return inputOperand;
+    return nullptr;
+  };
+
+  for (auto [i, inputOperand] : llvm::enumerate(inputOperands)) {
     AbstractValue inputState = getKnownState(inputOperand->get(), states);
     BlockArgument blockArg = generic.getBlock()->getArgument(i);
-    if (auto attr = inputState.getConstantAttr())
+    if (auto attr = inputState.getConstantAttr()) {
       scalarStates[blockArg] = ScalarExprState::getConstant(*attr);
-    else
-      scalarStates[blockArg] = ScalarExprState::getEquivalentTo(inputOperand);
+      continue;
+    }
+
+    if (auto equivalent = inputState.getEquivalentValue()) {
+      if (OpOperand *equivalentInput = findInputOperandForValue(*equivalent)) {
+        scalarStates[blockArg] = ScalarExprState::getEquivalentTo(equivalentInput);
+        continue;
+      }
+      if (auto it = equivalentValueToInputOperand.find(*equivalent);
+          it != equivalentValueToInputOperand.end()) {
+        scalarStates[blockArg] = ScalarExprState::getEquivalentTo(it->second);
+        continue;
+      }
+      equivalentValueToInputOperand[*equivalent] = inputOperand;
+    }
+
+    scalarStates[blockArg] = ScalarExprState::getEquivalentTo(inputOperand);
   }
   return scalarStates;
 }
@@ -820,6 +896,42 @@ FailureOr<AffineInterval> deriveLiveInterval(linalg::GenericOp generic, scf::For
   return getIvIntervalFromRelations(relations, loop.getInductionVar());
 }
 
+bool deadIterationPreservesLoopState(scf::ForOp loop,
+                                     const DenseMap<Value, AbstractValue> &states) {
+  auto printAbstractValue = [&](raw_ostream &os, AbstractValue value) {
+    if (auto attr = value.getConstantAttr()) {
+      os << "constant(" << *attr << ")";
+      return;
+    }
+    if (auto equivalent = value.getEquivalentValue()) {
+      os << "equivalent(" << *equivalent << ")";
+      return;
+    }
+    os << "unknown";
+  };
+
+  auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+  for (auto [yieldedIdx, yieldedAndIterArg] :
+       llvm::enumerate(llvm::zip_equal(yield.getOperands(), loop.getRegionIterArgs()))) {
+    auto [yielded, iterArg] = yieldedAndIterArg;
+    AbstractValue yieldedState = getKnownState(yielded, states);
+    std::optional<Value> equivalent = yieldedState.getEquivalentValue();
+    if (!equivalent || *equivalent != iterArg) {
+      LLVM_DEBUG({
+        llvm::dbgs() << "dead-tile suffix truncation failed for loop-carried value #" << yieldedIdx
+                     << " in loop " << loop << "\n";
+        llvm::dbgs() << "  yielded: " << yielded << "\n";
+        llvm::dbgs() << "  iter_arg: " << iterArg << "\n";
+        llvm::dbgs() << "  abstract value: ";
+        printAbstractValue(llvm::dbgs(), yieldedState);
+        llvm::dbgs() << "\n";
+      });
+      return false;
+    }
+  }
+  return true;
+}
+
 LogicalResult canSpecializeFullyLiveProducer(linalg::GenericOp producer,
                                              const MatchedDeadSelect &match) {
   if (!match.liveInputOperandNumber || producer->getNumResults() != 1 ||
@@ -854,7 +966,9 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
   if (failed(match))
     BAIL("expected producer to yield select(live_predicate, live_value, dead_value)");
 
-  if (failed(deriveLiveInterval(producer, loop, *match, LiveRelationStrength::Necessary)))
+  FailureOr<AffineInterval> possibleLiveInterval =
+      deriveLiveInterval(producer, loop, *match, LiveRelationStrength::Necessary);
+  if (failed(possibleLiveInterval))
     BAIL("failed to derive an affine possible-live interval for the loop IV");
   FailureOr<AffineInterval> fullyLiveInterval =
       deriveLiveInterval(producer, loop, *match, LiveRelationStrength::Sufficient);
@@ -863,6 +977,7 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
 
   DenseMap<Value, AbstractValue> states;
   analyzeLoopDeadPropagation(loop, producer, getDeadValue(), states);
+  bool canTruncateDeadSuffix = deadIterationPreservesLoopState(loop, states);
   if (failed(canSpecializeFullyLiveProducer(producer, *match)))
     BAIL("expected producer live value to come from an input with the same indexing as the output");
 
@@ -871,6 +986,14 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
       materializeIntervalUpperBound(rewriter, loop, *fullyLiveInterval);
   if (failed(liveUpperBound))
     BAIL("failed to materialize the fully-live prefix upper bound");
+  Value mixedUpperBound = loop.getUpperBound();
+  if (canTruncateDeadSuffix) {
+    FailureOr<Value> deadUpperBound =
+        materializeIntervalUpperBound(rewriter, loop, *possibleLiveInterval);
+    if (failed(deadUpperBound))
+      BAIL("failed to materialize the fully-dead suffix lower bound");
+    mixedUpperBound = *deadUpperBound;
+  }
   FailureOr<scf::ForOp> liveLoop =
       cloneForWithBody(rewriter, loop, loop.getLowerBound(), *liveUpperBound, loop.getInitArgs(),
                        [&](RewriterBase &, IRMapping &mapping, Operation &op) -> FailureOr<bool> {
@@ -886,7 +1009,7 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
 
   Operation *mixedProducer = nullptr;
   FailureOr<scf::ForOp> mixedLoop = cloneForWithBody(
-      rewriter, loop, *liveUpperBound, loop.getUpperBound(), liveLoop->getResults(),
+      rewriter, loop, *liveUpperBound, mixedUpperBound, liveLoop->getResults(),
       [&](RewriterBase &rewriter, IRMapping &mapping, Operation &op) -> FailureOr<bool> {
         if (&op != producer.getOperation())
           return false;

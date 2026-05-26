@@ -88,12 +88,13 @@ module attributes {transform.with_named_sequence} {
     %trunc = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
     %fused_trunc = transform.fusion.into_producer %trunc into %forall_loop : (!any, !any) -> !any
 
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+    transform.scf.localize_scratch_tensors %func : !any
+
     // 0xFF800000: -inf in f32
     %live_loop, %mixed_loop = transform.loop.specialize_dead_tile %fused_bmask in %j0_loop
         {dead_value = 0xFF800000 : f32} : !any, !any -> !any, !any
 
-    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
-    transform.scf.localize_scratch_tensors %func : !any
     transform.apply_patterns to %func {
       transform.apply_patterns.tensor.bubble_up_extract_slice
       transform.apply_patterns.canonicalization
@@ -212,10 +213,11 @@ module attributes {transform.with_named_sequence} {
 
 // MATCH-LABEL: func.func @attention(
 // MATCH: %[[FORALL:.+]] = scf.forall (%{{.*}}, %{{.*}}) in (4, 8) shared_outs(%{{.*}} = %{{.*}}) -> (tensor<4x1024x64xf16>)
-// MATCH: %[[BOUND:.+]] = arith.select %{{.*}}, %{{.*}}, %c16 : index
-// MATCH: %[[LIVE:.+]]:9 = scf.for %{{.*}} = %c0 to %[[BOUND]] step %c1 iter_args(
-// MATCH: %[[MIXED:.+]]:3 = scf.for %{{.*}} = %[[BOUND]] to %c16 step %c1 iter_args(%{{.*}} = %[[LIVE]]#1, %{{.*}} = %[[LIVE]]#4, %{{.*}} = %[[LIVE]]#8) -> (tensor<1x128xf32>, tensor<1x128xf32>, tensor<1x128x64xf32>)
-// MATCH: linalg.generic {indexing_maps = [#map10, #map6, #map11, #map6], iterator_types = ["parallel", "parallel", "parallel"]}
+// MATCH: %[[LIVE_BOUND:.+]] = arith.select %{{.*}}, %{{.*}}, %c16 : index
+// MATCH: %[[DEAD_BOUND:.+]] = arith.select %{{.*}}, %{{.*}}, %c16 : index
+// MATCH: %[[LIVE:.+]]:3 = scf.for %{{.*}} = %c0 to %[[LIVE_BOUND]] step %c1 iter_args(
+// MATCH: %[[MIXED:.+]]:3 = scf.for %{{.*}} = %[[LIVE_BOUND]] to %[[DEAD_BOUND]] step %c1 iter_args(%{{.*}} = %[[LIVE]]#0, %{{.*}} = %[[LIVE]]#1, %{{.*}} = %[[LIVE]]#2) -> (tensor<1x128xf32>, tensor<1x128xf32>, tensor<1x128x64xf32>)
+// MATCH: linalg.generic {indexing_maps = [#map{{[0-9]+}}, #map{{[0-9]+}}, #map{{[0-9]+}}, #map{{[0-9]+}}], iterator_types = ["parallel", "parallel", "parallel"]}
 // MATCH: math.exp
 // MATCH: arith.divf %cst, %{{.*}} : f32
-// MATCH: tensor.parallel_insert_slice %{{.*}} into %arg5[%arg3, %4, 0] [1, 128, 64] [1, 1, 1] : tensor<1x128x64xf16> into tensor<4x1024x64xf16>
+// MATCH: tensor.parallel_insert_slice %{{.*}} into %arg5[%arg3, %{{.*}}, 0] [1, 128, 64] [1, 1, 1] : tensor<1x128x64xf16> into tensor<4x1024x64xf16>

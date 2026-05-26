@@ -24,11 +24,12 @@ module attributes {transform.with_named_sequence} {
 
   // CHECK-LABEL: func.func @propagate_dead_tile(
   // CHECK: %[[LIVE_BOUND:.*]] = arith.select %{{.*}}, %{{.*}}, %c16 : index
+  // CHECK: %[[DEAD_BOUND:.*]] = arith.select %{{.*}}, %{{.*}}, %c16 : index
   // CHECK: %[[LIVE_LOOP:.*]]:3 = scf.for %{{.*}} = %c0 to %[[LIVE_BOUND]] step %c1 iter_args(%{{.*}} = %arg3, %{{.*}} = %arg4, %{{.*}} = %arg5) -> (tensor<1x128xf32>, tensor<1x128xf32>, tensor<1x128x32xf32>) {
   // CHECK-NOT: tag = "producer"
   // CHECK: ins(%arg1 : tensor<1x128x64xf32>) outs(%{{.*}} : tensor<1x128xf32>)
   // CHECK: ins(%arg1 : tensor<1x128x64xf32>) outs(%0 : tensor<1x128x64xf32>)
-  // CHECK: %[[MIXED_LOOP:.*]]:3 = scf.for %{{.*}} = %[[LIVE_BOUND]] to %c16 step %c1 iter_args(%{{.*}} = %[[LIVE_LOOP]]#0, %{{.*}} = %[[LIVE_LOOP]]#1, %{{.*}} = %[[LIVE_LOOP]]#2) -> (tensor<1x128xf32>, tensor<1x128xf32>, tensor<1x128x32xf32>) {
+  // CHECK: %[[MIXED_LOOP:.*]]:3 = scf.for %{{.*}} = %[[LIVE_BOUND]] to %[[DEAD_BOUND]] step %c1 iter_args(%{{.*}} = %[[LIVE_LOOP]]#0, %{{.*}} = %[[LIVE_LOOP]]#1, %{{.*}} = %[[LIVE_LOOP]]#2) -> (tensor<1x128xf32>, tensor<1x128xf32>, tensor<1x128x32xf32>) {
   // CHECK: tag = "producer"
   func.func @propagate_dead_tile(
       %q_block: index,
