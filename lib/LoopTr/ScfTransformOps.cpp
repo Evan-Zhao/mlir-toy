@@ -314,6 +314,7 @@ struct SplitForallIntoForResult {
   scf::ForOp innerFor;
   Value outerTile, innerTile;
   TileSlice reductionSlice;
+  SmallVector<std::pair<Operation *, Operation *>> clonedOps;
 };
 
 std::variant<SplitForallIntoForResult, DiagnosedSilenceableFailure>
@@ -380,8 +381,11 @@ splitForallDimensionForReduction(TransformOpInterface transform, RewriterBase &r
                                     ValueRange{tileInit, redTileInit});
   outerIvMapping.map(loop.getInductionVars()[plan.removedIvIndex], forLoop.getInductionVar());
   rewriter.setInsertionPointToStart(forLoop.getBody());
-  for (Operation &op : loop.getBody()->without_terminator())
-    rewriter.clone(op, outerIvMapping);
+  SmallVector<std::pair<Operation *, Operation *>> clonedOps;
+  for (Operation &op : loop.getBody()->without_terminator()) {
+    Operation *newOp = rewriter.clone(op, outerIvMapping);
+    clonedOps.emplace_back(&op, newOp);
+  }
   Value outerTile = outerIvMapping.lookup(plan.producerInsert.getSource());
 
   rewriter.setInsertionPointToEnd(forLoop.getBody());
@@ -402,7 +406,8 @@ splitForallDimensionForReduction(TransformOpInterface transform, RewriterBase &r
                                   .innerTile = innerTile,
                                   .reductionSlice = {.offsets = std::move(redTileOffsets),
                                                      .sizes = std::move(redTileSizes),
-                                                     .strides = std::move(nMinus1DStrides)}};
+                                                     .strides = std::move(nMinus1DStrides)},
+                                  .clonedOps = std::move(clonedOps)};
 }
 
 } // namespace
@@ -467,6 +472,11 @@ ScfFuseReductionIntoForallOp::apply(transform::TransformRewriter &rewriter,
   RETURN_DIAGNOSTICS_OR_BIND_VAL(
       SplitForallIntoForResult, split,
       splitForallDimensionForReduction(transform, rewriter, loop, splitPlan));
+  for (auto [oldOp, newOp] : split.clonedOps) {
+    if (succeeded(rewriter.notifyPayloadOperationReplaced(oldOp, newOp)))
+      continue;
+    rewriter.silenceTrackingFailure();
+  }
 
   rewriter.setInsertionPointToEnd(split.innerFor.getBody());
   auto fusedReduction =
@@ -489,6 +499,8 @@ ScfFuseReductionIntoForallOp::apply(transform::TransformRewriter &rewriter,
                                         outerReductionArg, split.reductionSlice.offsets,
                                         split.reductionSlice.sizes, split.reductionSlice.strides);
 
+  if (failed(rewriter.notifyPayloadOperationReplaced(loop, split.newForall.getOperation())))
+    BAIL("failed to preserve the scf.forall handle");
   rewriter.replaceOp(consumer, split.newForall.getResults().back());
   rewriter.replaceOp(loop, split.newForall.getResults().take_front(loop.getNumResults()));
 

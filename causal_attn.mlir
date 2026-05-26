@@ -50,7 +50,7 @@ module attributes {transform.with_named_sequence} {
     transform.fusion.into_producer %bscale into %forall_loop : (!any, !any) -> !any
     %bmask = transform.get_consumers_of_result %forall_loop[1] : (!any) -> !any
     transform.linalg.greedy_inline_elementwise %bmask : !any
-    transform.fusion.into_producer %bmask into %forall_loop : (!any, !any) -> !any
+    %fused_bmask = transform.fusion.into_producer %bmask into %forall_loop : (!any, !any) -> !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     %consumers = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
@@ -80,6 +80,10 @@ module attributes {transform.with_named_sequence} {
 
     %trunc = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
     %fused_trunc = transform.fusion.into_producer %trunc into %forall_loop : (!any, !any) -> !any
+
+    // 0xFF800000: -inf in f32
+    %live_loop, %mixed_loop = transform.loop.specialize_dead_tile %fused_bmask in %j0_loop
+        {dead_value = 0xFF800000 : f32} : !any, !any -> !any, !any
 
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.scf.localize_scratch_tensors %func : !any
