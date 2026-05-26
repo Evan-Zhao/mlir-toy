@@ -173,7 +173,8 @@ def ScfLocalizeScratchTensorsOp : Op<Transform_Dialect, "scf.localize_scratch_te
 def ScfFuseReductionIntoForallOp
     : Op<Transform_Dialect, "scf.fuse_reduction_into_forall",
          [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
-          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+          ReportTrackingListenerFailuresOpTrait]> {
   let summary =
       "Fuse a reduction consumer into a forall producer, sequentializing one forall dimension";
 
@@ -190,6 +191,8 @@ def ScfFuseReductionIntoForallOp
     inside that loop.  The outer forall issues only the final values.
 
     The `forall_loop` handle is preserved and remapped to the rewritten loop.
+    Existing handles to operations nested under that loop are also expected to
+    remain valid when payload tracking succeeds.
     The `consumer_op` handle is consumed. The new inner `scf.for` is returned
     explicitly because it did not exist before the transformation.
   }];
