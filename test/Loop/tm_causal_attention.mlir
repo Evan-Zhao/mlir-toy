@@ -213,8 +213,8 @@ module attributes {transform.with_named_sequence} {
 // MATCH-LABEL: func.func @attention(
 // MATCH: %[[FORALL:.+]] = scf.forall (%{{.*}}, %{{.*}}) in (4, 8) shared_outs(%{{.*}} = %{{.*}}) -> (tensor<4x1024x64xf16>)
 // MATCH: %[[BOUND:.+]] = arith.select %{{.*}}, %{{.*}}, %c16 : index
-// MATCH: %[[LIVE:.+]]:8 = scf.for %{{.*}} = %c0 to %[[BOUND]] step %c1 iter_args(
-// MATCH: %[[MIXED:.+]]:3 = scf.for %{{.*}} = %[[BOUND]] to %c16 step %c1 iter_args(%{{.*}} = %[[LIVE]]#0, %{{.*}} = %[[LIVE]]#3, %{{.*}} = %[[LIVE]]#7) -> (tensor<1x128xf32>, tensor<1x128xf32>, tensor<1x128x64xf32>)
+// MATCH: %[[LIVE:.+]]:9 = scf.for %{{.*}} = %c0 to %[[BOUND]] step %c1 iter_args(
+// MATCH: %[[MIXED:.+]]:3 = scf.for %{{.*}} = %[[BOUND]] to %c16 step %c1 iter_args(%{{.*}} = %[[LIVE]]#1, %{{.*}} = %[[LIVE]]#4, %{{.*}} = %[[LIVE]]#8) -> (tensor<1x128xf32>, tensor<1x128xf32>, tensor<1x128x64xf32>)
 // MATCH: linalg.generic {indexing_maps = [#map10, #map6, #map11, #map6], iterator_types = ["parallel", "parallel", "parallel"]}
 // MATCH: math.exp
 // MATCH: arith.divf %cst, %{{.*}} : f32

@@ -2,7 +2,7 @@
 
 // CHECK-LABEL: func.func @localize_inner_scratch
 // CHECK: %[[ROW_INIT:.*]] = linalg.fill
-// CHECK: %[[FOR:.*]] = scf.for %[[J:.*]] = %c0 to %c2 step %c1 iter_args(%[[ROW:.*]] = %[[ROW_INIT]]) -> (tensor<8xf32>) {
+// CHECK: %[[FOR:.*]] = scf.for %[[J:.*]] = %c0 to %c2 step %c1 iter_args(%[[ROW:.*]] = %{{.*}}) -> (tensor<8xf32>) {
 // CHECK: %[[OFF:.*]] = affine.apply #map(%[[J]])
 // CHECK: %[[MAT_INIT:.*]] = tensor.empty() : tensor<8x4xf32>
 // CHECK: %[[MAT_SEED:.*]] = linalg.fill

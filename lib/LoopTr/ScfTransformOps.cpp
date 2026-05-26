@@ -12,9 +12,9 @@
 #include "mlir/Dialect/Tensor/Transforms/Transforms.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/IR/IRMapping.h"
-#include "mlir/Pass/PassManager.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include <variant>
@@ -56,7 +56,7 @@ Value makeEmptyLikeExtractSlice(RewriterBase &rewriter, tensor::ExtractSliceOp e
                                  resultType.getElementType());
 }
 
-bool localizeScratchSlicesInFor(transform::TransformRewriter &rewriter, scf::ForOp loop) {
+bool localizeScratchSlicesInFor(TransformRewriter &rewriter, scf::ForOp loop) {
   auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
   SmallVector<tensor::ExtractSliceOp> toReplace;
 
@@ -99,7 +99,7 @@ bool localizeScratchSlicesInFor(transform::TransformRewriter &rewriter, scf::For
   return !toReplace.empty();
 }
 
-bool localizeScratchSlicesInForall(transform::TransformRewriter &rewriter, scf::ForallOp loop) {
+bool localizeScratchSlicesInForall(TransformRewriter &rewriter, scf::ForallOp loop) {
   SmallVector<tensor::ExtractSliceOp> toReplace;
 
   for (auto [index, result] : llvm::enumerate(loop.getResults())) {
@@ -142,7 +142,7 @@ bool localizeScratchSlicesInForall(transform::TransformRewriter &rewriter, scf::
   return !toReplace.empty();
 }
 
-bool localizeScratchSlices(transform::TransformRewriter &rewriter, Operation *target) {
+bool localizeScratchSlices(TransformRewriter &rewriter, Operation *target) {
   bool changed = false;
   target->walk<WalkOrder::PostOrder>(
       [&](scf::ForOp loop) { changed |= localizeScratchSlicesInFor(rewriter, loop); });
@@ -151,24 +151,91 @@ bool localizeScratchSlices(transform::TransformRewriter &rewriter, Operation *ta
   return changed;
 }
 
-LogicalResult runGreedyCleanup(transform::TransformRewriter &rewriter, Operation *target) {
+bool dropUnusedScratchForResults(TransformRewriter &rewriter, scf::ForOp loop) {
+  auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+  BitVector resultsToDrop(loop.getNumResults(), false);
+  BitVector bodyArgsToDrop(loop.getBody()->getNumArguments(), false);
+  BitVector operandsToDrop(loop->getNumOperands(), false);
+  SmallVector<Operation *> insertsToErase;
+
+  for (auto [index, result] : llvm::enumerate(loop.getResults())) {
+    if (!result.use_empty())
+      continue;
+
+    BlockArgument iterArg = loop.getRegionIterArg(index);
+    auto insert = yield.getOperand(index).getDefiningOp<tensor::InsertSliceOp>();
+    if (!insert || insert.getDest() != iterArg || !insert->hasOneUse())
+      continue;
+
+    bool onlyUsedByInsert = llvm::all_of(
+        iterArg.getUses(), [&](OpOperand &use) { return use.getOwner() == insert.getOperation(); });
+    if (!onlyUsedByInsert)
+      continue;
+
+    resultsToDrop.set(index);
+    bodyArgsToDrop.set(iterArg.getArgNumber());
+    insertsToErase.push_back(insert);
+  }
+
+  if (resultsToDrop.none())
+    return false;
+
+  for (auto [index, init] : llvm::enumerate(loop.getInitArgsMutable())) {
+    if (resultsToDrop[index])
+      operandsToDrop.set(init.getOperandNumber());
+  }
+
+  rewriter.modifyOpInPlace(yield, [&]() { yield->eraseOperands(resultsToDrop); });
+  for (Operation *insert : insertsToErase)
+    rewriter.eraseOp(insert);
+  rewriter.modifyOpInPlace(loop, [&]() { loop.getBody()->eraseArguments(bodyArgsToDrop); });
+  rewriter.modifyOpInPlace(loop, [&]() { loop->eraseOperands(operandsToDrop); });
+  rewriter.eraseOpResults(loop, resultsToDrop);
+  return true;
+}
+
+bool dropUnusedScratchForResults(TransformRewriter &rewriter, Operation *target) {
+  bool changed = false;
+  target->walk<WalkOrder::PostOrder>(
+      [&](scf::ForOp loop) { changed |= dropUnusedScratchForResults(rewriter, loop); });
+  return changed;
+}
+
+bool eraseTriviallyDeadOps(TransformRewriter &rewriter, Operation *target) {
+  bool changed = false;
+  bool changedThisRound = true;
+  while (changedThisRound) {
+    changedThisRound = false;
+    SmallVector<Operation *> deadOps;
+    target->walk<WalkOrder::PostOrder>([&](Operation *op) {
+      if (op != target && isOpTriviallyDead(op))
+        deadOps.push_back(op);
+    });
+    for (Operation *op : deadOps) {
+      if (!op->getBlock())
+        continue;
+      rewriter.eraseOp(op);
+      changed = true;
+      changedThisRound = true;
+    }
+  }
+  return changed;
+}
+
+LogicalResult runGreedyCleanup(TransformRewriter &rewriter, Operation *target) {
   RewritePatternSet patterns(target->getContext());
   linalg::populateSwapExtractSliceWithFillPatterns(patterns);
   tensor::populateFoldTensorEmptyPatterns(patterns);
   tensor::populateReassociativeReshapeFoldingPatterns(patterns);
   scf::populateSCFForLoopCanonicalizationPatterns(patterns);
+  populateRegionBranchOpInterfaceCanonicalizationPatterns(patterns, scf::ForOp::getOperationName());
+  populateRegionBranchOpInterfaceCanonicalizationPatterns(patterns,
+                                                          scf::ForallOp::getOperationName());
 
   GreedyRewriteConfig config;
   config.setListener(static_cast<RewriterBase::Listener *>(rewriter.getListener()));
   config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
   return applyPatternsGreedily(target, std::move(patterns), config);
-}
-
-LogicalResult runPassCleanup(Operation *isolatedTarget) {
-  PassManager pm(isolatedTarget->getContext(), isolatedTarget->getName().getStringRef());
-  pm.addPass(createRemoveDeadValuesPass());
-  pm.addPass(createCanonicalizerPass());
-  return pm.run(isolatedTarget);
 }
 
 FailureOr<uint64_t> matchUnarySingleReductionGeneric(linalg::GenericOp generic) {
@@ -418,10 +485,10 @@ void ScfLocalizeScratchTensorsOp::getEffects(
   modifiesPayload(effects);
 }
 
-DiagnosedSilenceableFailure
-ScfLocalizeScratchTensorsOp::applyToOne(transform::TransformRewriter &rewriter, Operation *target,
-                                        transform::ApplyToEachResultList &results,
-                                        transform::TransformState &state) {
+DiagnosedSilenceableFailure ScfLocalizeScratchTensorsOp::applyToOne(TransformRewriter &rewriter,
+                                                                    Operation *target,
+                                                                    ApplyToEachResultList &results,
+                                                                    TransformState &state) {
   (void)results;
   (void)state;
 
@@ -433,9 +500,8 @@ ScfLocalizeScratchTensorsOp::applyToOne(transform::TransformRewriter &rewriter, 
     return ::mlir::emitDefiniteFailure(target, "initial greedy cleanup did not converge");
 
   localizeScratchSlices(rewriter, isolatedTarget);
-
-  if (failed(runPassCleanup(isolatedTarget)))
-    return ::mlir::emitDefiniteFailure(target, "remove-dead-values cleanup failed");
+  dropUnusedScratchForResults(rewriter, isolatedTarget);
+  eraseTriviallyDeadOps(rewriter, isolatedTarget);
 
   if (failed(runGreedyCleanup(rewriter, isolatedTarget)))
     return ::mlir::emitDefiniteFailure(target, "final greedy cleanup did not converge");
@@ -452,9 +518,9 @@ void ScfFuseReductionIntoForallOp::getEffects(
   modifiesPayload(effects);
 }
 
-DiagnosedSilenceableFailure
-ScfFuseReductionIntoForallOp::apply(transform::TransformRewriter &rewriter,
-                                    TransformResults &transformResults, TransformState &state) {
+DiagnosedSilenceableFailure ScfFuseReductionIntoForallOp::apply(TransformRewriter &rewriter,
+                                                                TransformResults &transformResults,
+                                                                TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getForallLoop, "loop", loop, scf::ForallOp);
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getConsumerOp, "consumer", consumer,
