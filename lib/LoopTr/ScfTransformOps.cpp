@@ -367,7 +367,7 @@ FailureOr<SmallVector<OpFoldResult>> remapAffineIndices(RewriterBase &rewriter, 
       return failure();
     value = *result;
   }
-  return std::move(values);
+  return values;
 }
 
 struct SplitForallIntoForResult {

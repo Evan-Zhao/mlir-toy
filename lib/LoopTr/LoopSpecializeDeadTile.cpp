@@ -460,6 +460,8 @@ LogicalResult addNecessaryLiveConstraint(const NecessaryLiveRelation &relation,
     diff = alignedLhs.getResult(0) - alignedRhs.getResult(0);
     lowerBound = 1;
     break;
+  default:
+    llvm_unreachable("unexpected RelationKind");
   }
 
   AffineMap diffMap = simplifyAffineMap(
@@ -898,18 +900,6 @@ FailureOr<AffineInterval> deriveLiveInterval(linalg::GenericOp generic, scf::For
 
 bool deadIterationPreservesLoopState(scf::ForOp loop,
                                      const DenseMap<Value, AbstractValue> &states) {
-  auto printAbstractValue = [&](raw_ostream &os, AbstractValue value) {
-    if (auto attr = value.getConstantAttr()) {
-      os << "constant(" << *attr << ")";
-      return;
-    }
-    if (auto equivalent = value.getEquivalentValue()) {
-      os << "equivalent(" << *equivalent << ")";
-      return;
-    }
-    os << "unknown";
-  };
-
   auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
   for (auto [yieldedIdx, yieldedAndIterArg] :
        llvm::enumerate(llvm::zip_equal(yield.getOperands(), loop.getRegionIterArgs()))) {
@@ -918,6 +908,18 @@ bool deadIterationPreservesLoopState(scf::ForOp loop,
     std::optional<Value> equivalent = yieldedState.getEquivalentValue();
     if (!equivalent || *equivalent != iterArg) {
       LLVM_DEBUG({
+        auto printAbstractValue = [&](raw_ostream &os, AbstractValue value) {
+          if (auto attr = value.getConstantAttr()) {
+            os << "constant(" << *attr << ")";
+            return;
+          }
+          if (auto equivalent = value.getEquivalentValue()) {
+            os << "equivalent(" << *equivalent << ")";
+            return;
+          }
+          os << "unknown";
+        };
+
         llvm::dbgs() << "dead-tile suffix truncation failed for loop-carried value #" << yieldedIdx
                      << " in loop " << loop << "\n";
         llvm::dbgs() << "  yielded: " << yielded << "\n";

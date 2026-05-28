@@ -429,7 +429,8 @@ llvm::Expected<json::Value> solveRollingUpdaterWithPython(const json::Value &fEx
       // Intentionally leak the interpreter. If the d'tor of the interpreter throws an exception, it
       // can cause a crash (likely during program shutdown, but still ugly).
       auto interpreter = std::make_unique<py::scoped_interpreter>();
-      auto _ = interpreter.release();
+      auto interpPtr = interpreter.release();
+      (void)interpPtr;
       solverModule = py::module_::import("neptune_mlir.rolling_solver");
       jsonModule = py::module_::import("json");
     } catch (const py::error_already_set &e) {
