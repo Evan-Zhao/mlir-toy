@@ -1,9 +1,8 @@
 // RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin %s --transform-interpreter 2>&1 | FileCheck %s --check-prefix=MATCH
 //
-// Transform-dialect schedule that transforms the Torch-MLIR attention payload
-// below into a FlashAttention-like fused program. Mirrors
-// `_schedule_attention_flash` from Neptune, with some extra dimension
-// reshaping capabilities.
+// FlashAttention-1 global attention. Applies rolling update fusion twice to fuse the entire
+// attention computation into a single loop nest.
+// See also schedules for FA-2-style attention in the same directory.
 
 !any = !transform.any_op
 #map = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
@@ -49,17 +48,9 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.tensor.reassociative_reshape_folding
     } : !any
 
-    // Expression rewrite. Take the second matmul `bmm1` and exchange it with the division of the softmax.
-    // This rewrite is sound because (P_ij / s_i) * V_jk = (P_ij * V_jk) / s_i.
-    // The benefit is now we just need to do division once.
-    %bmm0, %bmm1 = transform.split_handle %bmms_lg : (!any) -> (!any, !any)
-    %bmm1_1, %_0 = transform.linalg.exchange_div_and_matmul %bmm1 : (!any) -> (!any, !any)
-    // Also inline elementwise ops before bmm1 (in this case, should be F16->F32 casts) into it.
-    // `operand_number = 1` says only inline producers of the RHS of the matmul.
-    transform.linalg.greedy_inline_elementwise %bmm1_1 { operand_number = 1 } : !any
-
-    // Start working out a full loop nest over the first batch matmul `bmm0`.
-    // Inline F16->F32 casts into bmm0.
+    // Take the first batch matmul `bmm0`.
+    // Inline elementwise ops before bmm0 (in this case, should be F16->F32 casts) into it.
+    %bmm0, %_0 = transform.split_handle %bmms_lg : (!any) -> (!any, !any)
     transform.linalg.greedy_inline_elementwise %bmm0 : !any
     // Tile all parallel dimensions of bmm0 (b, h, i, j) into a scf.forall loop.
     // We'll fuse everything else into this loop nest.
@@ -88,9 +79,7 @@ module attributes {transform.with_named_sequence} {
 
     // Fusion 3 (rolling update). First find the nearest reduction reachable from the loop's
     // output value, together with the ordered elementwise chain between them.
-    // This could find either the row-sum of softmax, or the second matmul,
-    // since they both depend on the loop's output. In this schedule
-    %bmm1_2, %elemwise = transform.fusion.find_next_reduction
+    %bsum, %elemwise = transform.fusion.find_next_reduction
         %forall_loop : (!any) -> (!any, !any)
     // Clone and fuse that elementwise chain under %forall_loop and %j0_loop,
     // publishing the "sidecar" tensors as extra loop results.
@@ -98,31 +87,29 @@ module attributes {transform.with_named_sequence} {
         %elemwise into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
     // Repair the first reduction frontier by turning it into loop-carried state
     // driven by the relayed sidecar value.
-    %_3 = transform.fusion.repair_reduction_frontier
-        (%fused_bmax, %bmm1_2) and (%elemwise, %elemwise_sidecars) into %forall_loop, %j0_loop
+    %fused_bsum = transform.fusion.repair_reduction_frontier
+        (%fused_bmax, %bsum) and (%elemwise, %elemwise_sidecars) into %forall_loop, %j0_loop
         : (!any, !any, !any, !any, !any, !any) -> !any
 
     // Fusion 4. Apply rolling update again, this time with the second matmul being the reduction.
-    %bsum, %elemwise_1 = transform.fusion.find_next_reduction
+    %bmm1, %elemwise_1 = transform.fusion.find_next_reduction
         %forall_loop : (!any) -> (!any, !any)
+    // Also inline (F16->F32 casts) into the second matmul. `operand_number = 1` says only
+    // inline producers of the RHS of the matmul.
+    transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any
     %elemwise_sidecars_1 = transform.fusion.clone_fuse_elemwise
         %elemwise_1 into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
-    %_4 = transform.fusion.repair_reduction_frontier
-        (%fused_bmax, %bsum) and (%elemwise_1, %elemwise_sidecars_1) into %forall_loop, %j0_loop
+    %_3 = transform.fusion.repair_reduction_frontier
+        (%fused_bsum, %bmm1) and (%elemwise_1, %elemwise_sidecars_1) into %forall_loop, %j0_loop
         : (!any, !any, !any, !any, !any, !any) -> !any
-    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
-    // Fusion 5. Fuse the trailing elemwise ops into the forall loop (but outside the for loop):
-    // elemwise division, then FP32->FP16 cast.
-    %div = transform.get_consumers_of_result %forall_loop[1] : (!any) -> !any
-    transform.fusion.into_producer %div into %forall_loop : (!any, !any) -> !any
-    %trunc = transform.get_consumers_of_result %forall_loop[2] : (!any) -> !any
-    transform.fusion.into_producer %trunc into %forall_loop : (!any, !any) -> !any
+    // Fusion 5. Fuse the trailing FP32->FP16 cast into the forall loop (but outside the for loop).
+    %trunc = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
+    %fused_trunc = transform.fusion.into_producer %trunc into %forall_loop : (!any, !any) -> !any
 
     // Post-pass: pushes lingering init tensor (see destination-passing style)
     // before and outside the loops into the loop body.
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
-    transform.apply_cse to %func : !any
     transform.scf.localize_scratch_tensors %func : !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.apply_cse to %func : !any
@@ -222,14 +209,10 @@ module attributes {transform.with_named_sequence} {
 // MATCH-NOT: linalg.transpose
 // MATCH-NOT: tensor.collapse_shape
 // MATCH-NOT: tensor.expand_shape
-// MATCH-NOT: tensor.empty() : tensor<1x4x128x64xf32>
-// MATCH: %[[LOOP:[0-9]+]] = scf.forall (%{{.*}}) in (4) shared_outs(%{{.*}} = %{{.*}}) -> (tensor<1x4x128x64xf16>)
-// MATCH: tensor.empty() : tensor<1x1x128x64xf32>
-// MATCH: linalg.fill ins(%cst : f32) outs(%{{.*}} : tensor<1x1x128x64xf32>)
+// MATCH: %[[OUT:.+]] = scf.forall (%{{.*}}) in (4) shared_outs(%{{.*}} = %{{.*}}) -> (tensor<1x4x128x64xf32>)
 // MATCH: %{{.*}}:3 = scf.for %{{.*}} = %c0 to %c2 step %c1 iter_args(
+// MATCH: tensor.empty() : tensor<1x1x128x64xf32>
 // MATCH: linalg.generic {indexing_maps = [#map1, #map2, #map3], iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction"]}
 // MATCH: math.exp
-// MATCH: linalg.generic {indexing_maps = [#map4, #map5, #map4], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%{{.*}}#1, %{{.*}}#2 : tensor<1x1x128x64xf32>, tensor<1x1x128xf32>)
-// MATCH: arith.divf %{{.*}}, %{{.*}} : f32
-// MATCH: linalg.generic {indexing_maps = [#map4, #map4], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%{{.*}} : tensor<1x1x128x64xf32>) outs(%{{.*}} : tensor<1x1x128x64xf16>)
-// MATCH: tensor.parallel_insert_slice %{{.*}} into %{{.*}}[0, %{{.*}}, 0, 0] [1, 1, 128, 64] [1, 1, 1, 1] : tensor<1x1x128x64xf16> into tensor<1x4x128x64xf16>
+// MATCH: arith.divf %cst, %{{.*}} : f32
+// MATCH: linalg.generic {indexing_maps = [#map4, #map4], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%{{.*}} : tensor<1x4x128x64xf32>) outs(%{{.*}} : tensor<1x4x128x64xf16>)

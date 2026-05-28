@@ -37,7 +37,10 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.tensor.reassociative_reshape_folding
     } : !any
 
-    %bmm0, %_0 = transform.split_handle %bmms_lg : (!any) -> (!any, !any)
+    %bmm0, %bmm1 = transform.split_handle %bmms_lg : (!any) -> (!any, !any)
+    %bmm1_1, %_0 = transform.linalg.exchange_div_and_matmul %bmm1 : (!any) -> (!any, !any)
+    transform.linalg.greedy_inline_elementwise %bmm1_1 { operand_number = 1 } : !any
+
     transform.linalg.greedy_inline_elementwise %bmm0 : !any
     %_1, %forall_loop = transform.structured.tile_using_forall
         %bmm0 tile_sizes [1, 1, 1, 128, 64, 0] : (!any) -> (!any, !any)
@@ -53,30 +56,33 @@ module attributes {transform.with_named_sequence} {
     %fused_bmax, %j0_loop = transform.scf.fuse_reduction_into_forall
         %bmax into %forall_loop : (!any, !any) -> (!any, !any)
 
-    %bsum, %elemwise = transform.fusion.find_next_reduction
+    %bmm1_2, %elemwise = transform.fusion.find_next_reduction
         %forall_loop : (!any) -> (!any, !any)
     %elemwise_sidecars = transform.fusion.clone_fuse_elemwise
         %elemwise into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
-    %fused_bsum = transform.fusion.repair_reduction_frontier
-        (%fused_bmax, %bsum) and (%elemwise, %elemwise_sidecars) into %forall_loop, %j0_loop
+    %_3 = transform.fusion.repair_reduction_frontier
+        (%fused_bmax, %bmm1_2) and (%elemwise, %elemwise_sidecars) into %forall_loop, %j0_loop
         : (!any, !any, !any, !any, !any, !any) -> !any
 
-    %bmm1, %elemwise_1 = transform.fusion.find_next_reduction
+    %bsum, %elemwise_1 = transform.fusion.find_next_reduction
         %forall_loop : (!any) -> (!any, !any)
-    transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any
     %elemwise_sidecars_1 = transform.fusion.clone_fuse_elemwise
         %elemwise_1 into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
-    %_3 = transform.fusion.repair_reduction_frontier
-        (%fused_bsum, %bmm1) and (%elemwise_1, %elemwise_sidecars_1) into %forall_loop, %j0_loop
+    %_4 = transform.fusion.repair_reduction_frontier
+        (%fused_bmax, %bsum) and (%elemwise_1, %elemwise_sidecars_1) into %forall_loop, %j0_loop
         : (!any, !any, !any, !any, !any, !any) -> !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
-    %trunc = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
-    %fused_trunc = transform.fusion.into_producer %trunc into %forall_loop : (!any, !any) -> !any
+    %div = transform.get_consumers_of_result %forall_loop[1] : (!any) -> !any
+    transform.fusion.into_producer %div into %forall_loop : (!any, !any) -> !any
+    %trunc = transform.get_consumers_of_result %forall_loop[2] : (!any) -> !any
+    transform.fusion.into_producer %trunc into %forall_loop : (!any, !any) -> !any
 
     transform.apply_patterns to %func {
       transform.apply_patterns.tensor.bubble_up_extract_slice
       transform.apply_patterns.canonicalization
     } : !any
+    transform.apply_cse to %func : !any
     transform.scf.localize_scratch_tensors %func : !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.apply_cse to %func : !any
@@ -186,13 +192,17 @@ module attributes {transform.with_named_sequence} {
 // MATCH-NOT: linalg.transpose
 // MATCH-NOT: tensor.collapse_shape
 // MATCH-NOT: tensor.expand_shape %arg0
-// MATCH: %[[OUT:.+]] = scf.forall (%{{.*}}, %{{.*}}) in (2, 2) shared_outs(%{{.*}} = %{{.*}}) -> (tensor<1x2x2x128x64xf32>)
+// MATCH-NOT: tensor.empty() : tensor<1x2x2x128x64xf32>
+// MATCH: %[[LOOP:[0-9]+]] = scf.forall (%{{.*}}, %{{.*}}) in (2, 2) shared_outs(%{{.*}} = %{{.*}}) -> (tensor<1x2x2x128x64xf16>)
+// MATCH: tensor.empty() : tensor<1x1x1x128x64xf32>
+// MATCH: linalg.fill ins(%cst : f32) outs(%{{.*}} : tensor<1x1x1x128x64xf32>)
 // MATCH: %{{.*}}:3 = scf.for %{{.*}} = %c0 to %c2 step %c1 iter_args(
 // MATCH: affine.linearize_index disjoint [%{{.*}}, %{{.*}}] by (2, 2) : index
 // MATCH: tensor.extract_slice %arg0[0, %{{.*}}, 0, 0] [1, 1, 128, 64] [1, 1, 1, 1]
 // MATCH: tensor.expand_shape %{{.*}} output_shape [1, 1, 1, 128, 64]
-// MATCH: tensor.empty() : tensor<1x1x1x128x64xf32>
 // MATCH: linalg.generic {indexing_maps = [#map1, #map2, #map3], iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel", "reduction"]}
 // MATCH: math.exp
-// MATCH: arith.divf %cst, %{{.*}} : f32
-// MATCH: linalg.generic {indexing_maps = [#map4, #map4], iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]} ins(%{{.*}} : tensor<1x2x2x128x64xf32>) outs(%{{.*}} : tensor<1x2x2x128x64xf16>)
+// MATCH: linalg.generic {indexing_maps = [#map4, #map5, #map4], iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]} ins(%{{.*}}#1, %{{.*}}#2 : tensor<1x1x1x128x64xf32>, tensor<1x1x1x128xf32>)
+// MATCH: arith.divf %{{.*}}, %{{.*}} : f32
+// MATCH: linalg.generic {indexing_maps = [#map4, #map4], iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]} ins(%{{.*}} : tensor<1x1x1x128x64xf32>) outs(%{{.*}} : tensor<1x1x1x128x64xf16>)
+// MATCH: tensor.parallel_insert_slice %{{.*}} into %{{.*}}[0, %{{.*}}, %{{.*}}, 0, 0] [1, 1, 1, 128, 64] [1, 1, 1, 1, 1] : tensor<1x1x1x128x64xf16> into tensor<1x2x2x128x64xf16>

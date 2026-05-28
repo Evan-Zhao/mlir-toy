@@ -90,6 +90,49 @@ def LinalgGreedyInlineElementwiseOp : Op<Transform_Dialect, "linalg.greedy_inlin
   }];
 }
 
+def LinalgExchangeDivAndMatmulOp
+    : Op<Transform_Dialect, "linalg.exchange_div_and_matmul",
+         [FunctionalStyleTransformOpTrait, TransformOpInterface, TransformEachOpTrait,
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+          ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Exchange an invariant division with a matmul-like linalg reduction";
+
+  let description = [{
+    Rewrites a matmul-like `linalg.generic` that consumes an elementwise
+    division by a value invariant along the contraction reduction dimension:
+
+    ```
+      sum((num / den) * rhs)  ->  sum(num * rhs) / den
+    ```
+
+    This is intended for the attention softmax normalization before the second
+    matmul. The transform is deliberately narrow: the target must be a
+    single-result `linalg.generic` with one reduction iterator, a zero fill
+    destination, and an `addf(acc, mulf(...))` scalar body. The selected operand
+    must be produced by an all-parallel two-input `linalg.generic` whose body
+    yields `arith.divf`.
+
+    `operand_number` defaults to 0, matching the usual `(softmax_probs @ V)`
+    layout. The original reduction is replaced by the trailing division. The op
+    returns handles to the rebuilt reduction and the trailing division.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$target,
+      DefaultValuedOptionalAttr<I64Attr, "0">:$operand_number);
+  let results = (outs TransformHandleTypeInterface:$reduction,
+      TransformHandleTypeInterface:$division);
+
+  let assemblyFormat = "$target attr-dict `:` functional-type(operands, results)";
+
+  let extraClassDeclaration = [{
+    ::mlir::DiagnosedSilenceableFailure applyToOne(
+        ::mlir::transform::TransformRewriter &rewriter,
+        ::mlir::linalg::GenericOp target,
+        ::mlir::transform::ApplyToEachResultList &results,
+        ::mlir::transform::TransformState &state);
+  }];
+}
+
 def LinalgFoldZeroIndexedUnitDimsOp : Op<Transform_Dialect, "linalg.fold_zero_indexed_unit_dims",
                                          [TransformOpInterface, TransformEachOpTrait,
                                           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
@@ -259,11 +302,11 @@ def FusionFindNextReductionOp
   let assemblyFormat = "$producer_op attr-dict `:` functional-type(operands, results)";
 }
 
-def LoopSpecializeDeadTileOp : Op<Transform_Dialect, "loop.specialize_dead_tile",
-                                  [FunctionalStyleTransformOpTrait,
-                                   DeclareOpInterfaceMethods<TransformOpInterface>,
-                                   DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
-                                   ReportTrackingListenerFailuresOpTrait]> {
+def LoopSpecializeDeadTileOp
+    : Op<Transform_Dialect, "loop.specialize_dead_tile",
+         [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+          ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Split a streaming loop into a fully-live prefix and a mixed suffix";
 
   let description = [{
