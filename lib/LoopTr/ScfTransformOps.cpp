@@ -16,6 +16,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Config/llvm-config.h"
 
 #include <variant>
 
@@ -229,8 +230,10 @@ LogicalResult runGreedyCleanup(TransformRewriter &rewriter, Operation *target) {
   tensor::populateReassociativeReshapeFoldingPatterns(patterns);
   scf::populateSCFForLoopCanonicalizationPatterns(patterns);
   populateRegionBranchOpInterfaceCanonicalizationPatterns(patterns, scf::ForOp::getOperationName());
+#if LLVM_VERSION_MAJOR >= 23
   populateRegionBranchOpInterfaceCanonicalizationPatterns(patterns,
                                                           scf::ForallOp::getOperationName());
+#endif
 
   GreedyRewriteConfig config;
   config.setListener(static_cast<RewriterBase::Listener *>(rewriter.getListener()));
