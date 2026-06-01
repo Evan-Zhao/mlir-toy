@@ -28,6 +28,15 @@ config.substitutions.append(
         ),
     )
 )
+config.substitutions.append(
+    (
+        "%neptune_ta_plugin",
+        os.path.join(
+            config.neptune_mlir_obj_root,
+            "libTADialect" + config.neptune_mlir_shared_library_suffix,
+        ),
+    )
+)
 
 llvm_config.add_tool_substitutions(
     ["mlir-opt", "FileCheck", "not"],
