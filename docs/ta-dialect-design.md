@@ -805,6 +805,8 @@ ta.log2
 ta.rsqrt
 ta.sqrt
 ta.tanh
+ta.extf
+ta.truncf
 
 ta.powf
 ta.fma

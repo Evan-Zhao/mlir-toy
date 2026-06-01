@@ -72,6 +72,20 @@ func.func @elementwise_ta(%rows: tensor<16xf32>, %cols: tensor<32xf32>)
   return %0 : tensor<16x32xf32>
 }
 
+// CHECK-LABEL: func.func @float_cast_ta
+func.func @float_cast_ta(%tensor: tensor<16xf16>) -> tensor<16xf16> {
+  %0 = ta.scope axes(%coord "i" : index) {
+    %x = ta.at %tensor[%coord] {axes = #ta.axes<i>}
+        : tensor<16xf16> -> !ta.expr<f16, [i]>
+    %wide = ta.extf %x
+        : (!ta.expr<f16, [i]>) -> !ta.expr<f32, [i]>
+    %narrow = ta.truncf %wide
+        : (!ta.expr<f32, [i]>) -> !ta.expr<f16, [i]>
+    ta.yield %narrow : !ta.expr<f16, [i]>
+  } : () -> tensor<16xf16>
+  return %0 : tensor<16xf16>
+}
+
 // CHECK-LABEL: func.func @map_ta
 func.func @map_ta(%rows: tensor<16xf32>, %cols: tensor<32xf32>)
     -> tensor<16x32xf32> {

@@ -278,6 +278,34 @@ static mlir::LogicalResult verifyTernaryFloatElementwiseOp(mlir::Operation *op) 
   return verifyFloatElementwiseOp(op);
 }
 
+static mlir::LogicalResult verifyFloatCastElementwiseOp(mlir::Operation *op,
+                                                        bool widening) {
+  if (op->getNumOperands() != 1)
+    return op->emitOpError("expected one operand");
+
+  auto scopeOr = verifyInsideScope(op);
+  if (mlir::failed(scopeOr))
+    return mlir::failure();
+  if (mlir::failed(verifyElementwiseAxes(op, *scopeOr)))
+    return mlir::failure();
+
+  auto operand = llvm::cast<ExprType>(op->getOperand(0).getType());
+  auto result = llvm::cast<ExprType>(op->getResult(0).getType());
+  auto operandElement = llvm::dyn_cast<mlir::FloatType>(operand.getElementType());
+  auto resultElement = llvm::dyn_cast<mlir::FloatType>(result.getElementType());
+  if (!operandElement || !resultElement)
+    return op->emitOpError("requires floating-point operand and result element types");
+
+  unsigned operandWidth = operandElement.getWidth();
+  unsigned resultWidth = resultElement.getWidth();
+  if (widening && resultWidth <= operandWidth)
+    return op->emitOpError("result element type must be wider than operand element type");
+  if (!widening && resultWidth >= operandWidth)
+    return op->emitOpError("result element type must be narrower than operand element type");
+
+  return mlir::success();
+}
+
 mlir::LogicalResult YieldOp::verify() {
   auto scopeOr = verifyInsideScope(getOperation());
   if (mlir::failed(scopeOr))
@@ -432,6 +460,14 @@ DEFINE_TA_TERNARY_FLOAT_VERIFY(FmaOp)
 #undef DEFINE_TA_UNARY_FLOAT_VERIFY
 #undef DEFINE_TA_BINARY_FLOAT_VERIFY
 #undef DEFINE_TA_TERNARY_FLOAT_VERIFY
+
+mlir::LogicalResult ExtFOp::verify() {
+  return verifyFloatCastElementwiseOp(getOperation(), /*widening=*/true);
+}
+
+mlir::LogicalResult TruncFOp::verify() {
+  return verifyFloatCastElementwiseOp(getOperation(), /*widening=*/false);
+}
 
 mlir::LogicalResult CmpFOp::verify() {
   auto scopeOr = verifyInsideScope(getOperation());

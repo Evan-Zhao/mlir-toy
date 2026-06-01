@@ -111,6 +111,8 @@ def TA_Log2Op : TA_UnaryElementwiseOp<"log2">;
 def TA_RsqrtOp : TA_UnaryElementwiseOp<"rsqrt">;
 def TA_SqrtOp : TA_UnaryElementwiseOp<"sqrt">;
 def TA_TanhOp : TA_UnaryElementwiseOp<"tanh">;
+def TA_ExtFOp : TA_UnaryElementwiseOp<"extf">;
+def TA_TruncFOp : TA_UnaryElementwiseOp<"truncf">;
 
 def TA_PowFOp : TA_BinaryElementwiseOp<"powf">;
 def TA_FmaOp : TA_TernaryElementwiseOp<"fma">;
