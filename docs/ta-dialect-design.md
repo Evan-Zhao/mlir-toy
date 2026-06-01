@@ -197,23 +197,31 @@ Applies ordinary scalar computation pointwise over the union of operand axis set
 Sketch:
 
 ```mlir
-%centered = ta.map (%s, %m)
-  : (!ta.expr<f32, [b,h,i,j]>, !ta.expr<f32, [b,h,i]>)
- -> !ta.expr<f32, [b,h,i,j]> {
+%centered = ta.map %s, %m {
 ^bb0(%s0: f32, %m0: f32):
   %r = arith.subf %s0, %m0 : f32
   ta.yield %r : f32
-}
+} : (!ta.expr<f32, [b,h,i,j]>, !ta.expr<f32, [b,h,i]>)
+ -> !ta.expr<f32, [b,h,i,j]>
 ```
 
-This avoids needing custom `ta.addf`, `ta.mulf`, `ta.exp`, etc. for every scalar op. A practical implementation can add sugar later:
+The body computes on ordinary scalar values. The `ta.map` result has the
+yielded scalar element type and the union of all operand axes, ordered by the
+enclosing `ta.scope`.
+
+For rewrite friendliness, common scalar operations also have first-class `ta`
+ops. These are not merely pretty syntax; they are the preferred canonical form
+for algebraic rewrites:
 
 ```mlir
 %centered = ta.subf %s, %m
+  : (!ta.expr<f32, [b,h,i,j]>, !ta.expr<f32, [b,h,i]>)
+ -> !ta.expr<f32, [b,h,i,j]>
 %p = ta.exp %centered
+  : (!ta.expr<f32, [b,h,i,j]>) -> !ta.expr<f32, [b,h,i,j]>
 ```
 
-but the semantic primitive can be `ta.map`.
+`ta.map` remains the escape hatch for scalar code without a dedicated `ta` op.
 
 ---
 
@@ -302,9 +310,21 @@ axes(constant) = {}
 axes(ta.at T[index_exprs...]) = axes used by index expressions
 axes(ta.eval tensor[index_exprs...]) = axes used by index expressions
 axes(ta.map f(x1,...,xn)) = union_i axes(xi)
+axes(ta.elementwise_op(x1,...,xn)) = union_i axes(xi)
 axes(ta.reduce over R of x) = axes(x) - R
 axes(ta.select c x y) = axes(c) ∪ axes(x) ∪ axes(y)
 ```
+
+The same elementwise rule is used by `ta.map` and by sugar ops such as
+`ta.addf`, `ta.mulf`, `ta.exp`, `ta.cmpf`, and `ta.select`. Binary and ternary
+ops implicitly broadcast operands over missing axes:
+
+```text
+!ta.expr<f32, [i]> + !ta.expr<f32, [i,j]> -> !ta.expr<f32, [i,j]>
+!ta.expr<f32, [i]> + !ta.expr<f32, [j]>   -> !ta.expr<f32, [i,j]>
+```
+
+The result axis order is the enclosing `ta.scope` order, not operand order.
 
 ---
 
@@ -329,7 +349,7 @@ Inputs:
 Q : tensor<Batch x Heads x QuerySeq x QKHeadDim x f32>
 K : tensor<Batch x Heads x KeySeq   x QKHeadDim x f32>
 V : tensor<Batch x Heads x KeySeq   x ValueDim  x f32>
-scale : f32
+scale : f32 constant
 ```
 
 Program:
@@ -342,7 +362,8 @@ Program:
   %k = ta.at %K[%b, %h, %j, %d]
        : tensor<?x?x?x?xf32> -> !ta.expr<f32, [b,h,j,d]>
   %qk = ta.mulf %q, %k
-        : !ta.expr<f32, [b,h,i,j,d]>
+        : (!ta.expr<f32, [b,h,i,d]>, !ta.expr<f32, [b,h,j,d]>)
+       -> !ta.expr<f32, [b,h,i,j,d]>
 
   %dot = ta.reduce add over(%d) identity(%zero) %qk
          : !ta.expr<f32, [b,h,i,j,d]> -> !ta.expr<f32, [b,h,i,j]>
@@ -354,8 +375,10 @@ Program:
   %dot = ta.eval %Dot[%b, %h, %i, %j]
          : tensor<Batch x Heads x QuerySeq x KeySeq x f32>
         -> !ta.expr<f32, [b,h,i,j]>
-  %s = ta.mulf %scale, %dot
-       : !ta.expr<f32, [b,h,i,j]>
+  %scale_expr = ta.constant 1.250000e-01 : f32 : !ta.expr<f32, []>
+  %s = ta.mulf %scale_expr, %dot
+       : (!ta.expr<f32, []>, !ta.expr<f32, [b,h,i,j]>)
+      -> !ta.expr<f32, [b,h,i,j]>
   ta.yield %s : !ta.expr<f32, [b,h,i,j]>
 } : () -> tensor<Batch x Heads x QuerySeq x KeySeq x f32>
 
@@ -380,7 +403,8 @@ Program:
        : tensor<Batch x Heads x QuerySeq x f32>
       -> !ta.expr<f32, [b,h,i]>
   %o = ta.divf %num, %l
-       : !ta.expr<f32, [b,h,i,e]>
+       : (!ta.expr<f32, [b,h,i,e]>, !ta.expr<f32, [b,h,i]>)
+      -> !ta.expr<f32, [b,h,i,e]>
   ta.yield %o : !ta.expr<f32, [b,h,i,e]>
 } : () -> tensor<Batch x Heads x QuerySeq x ValueDim x f32>
 ```
@@ -746,26 +770,49 @@ tensor type carries the materialized shape.
 
 ### Sugar vs Primitive Ops
 
-Initial primitive:
+Escape hatch:
 
 ```text
 ta.map with scalar region
 ```
 
-Useful sugar:
+Canonical scalar rewrite surface:
 
 ```text
+ta.constant
+
+ta.negf
 ta.addf
 ta.subf
 ta.mulf
 ta.divf
+ta.maximumf
+ta.minimumf
+ta.maxnumf
+ta.minnumf
+
+ta.absf
+ta.ceil
 ta.exp
 ta.exp2
-ta.maximumf
+ta.floor
+ta.log
+ta.log2
+ta.rsqrt
+ta.sqrt
+ta.tanh
+
+ta.powf
+ta.fma
+
+ta.cmpf
 ta.select
 ```
 
-The sugar can canonicalize to `ta.map`, or `ta.map` can be used as the only semantic primitive.
+These ops share the same type rule as `ta.map`: result axes are the union of
+operand axes in the enclosing scope order. Rewriters should primarily match
+these first-class ops. `ta.map` is available for imported scalar regions that
+have not been canonicalized to a known operation.
 
 ### Rewriter Requirements
 
@@ -774,12 +821,18 @@ The rewrite engine needs:
 ```text
 axis-support queries
 axis independence checks
+elementwise op queries
 reduction algebra metadata
 positivity/nonnegativity facts
 fastmath/NaN policy checks
 CSE across scopes
 scope-transparent eval/build beta-reduction
 ```
+
+Elementwise `ta` ops should expose a common interface with the scalar op kind,
+operand axes, and result axes, so rewrites can choose between matching specific
+ops such as `ta.mulf` and reasoning generically about axis-broadcasted
+elementwise computation.
 
 Useful side-condition query:
 
@@ -904,6 +957,7 @@ ta.scope       declared axis universe and tensor boundary
 ta.at          external tensor element access
 ta.eval        scope expression access
 ta.map         scalar computation lifted over axes
+ta.addf/...    canonical elementwise scalar algebra lifted over axes
 ta.reduce      mathematical reduction binder
 ```
 

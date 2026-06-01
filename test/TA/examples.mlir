@@ -24,3 +24,53 @@ func.func @two_axis_ta(%tensor: tensor<16x32xf32>)
   } : () -> tensor<16x32xf32>
   return %0 : tensor<16x32xf32>
 }
+
+// CHECK-LABEL: func.func @elementwise_ta
+func.func @elementwise_ta(%rows: tensor<16xf32>, %cols: tensor<32xf32>)
+    -> tensor<16x32xf32> {
+  %0 = ta.scope axes(%row "i" : index, %col "j" : index) {
+    %x = ta.at %rows[%row] {axes = #ta.axes<i>}
+        : tensor<16xf32> -> !ta.expr<f32, [i]>
+    %y = ta.at %cols[%col] {axes = #ta.axes<j>}
+        : tensor<32xf32> -> !ta.expr<f32, [j]>
+    %sum = ta.addf %x, %y
+        : (!ta.expr<f32, [i]>, !ta.expr<f32, [j]>)
+       -> !ta.expr<f32, [i, j]>
+    %scale = ta.constant 2.000000e+00 : f32 : !ta.expr<f32, []>
+    %scaled = ta.mulf %sum, %scale
+        : (!ta.expr<f32, [i, j]>, !ta.expr<f32, []>)
+       -> !ta.expr<f32, [i, j]>
+    %limit = ta.exp2 %scaled
+        : (!ta.expr<f32, [i, j]>) -> !ta.expr<f32, [i, j]>
+    %pred = ta.cmpf olt, %sum, %limit
+        : (!ta.expr<f32, [i, j]>, !ta.expr<f32, [i, j]>)
+       -> !ta.expr<i1, [i, j]>
+    %selected = ta.select %pred, %sum, %limit
+        : (!ta.expr<i1, [i, j]>, !ta.expr<f32, [i, j]>, !ta.expr<f32, [i, j]>)
+       -> !ta.expr<f32, [i, j]>
+    ta.yield %selected : !ta.expr<f32, [i, j]>
+  } : () -> tensor<16x32xf32>
+  return %0 : tensor<16x32xf32>
+}
+
+// CHECK-LABEL: func.func @map_ta
+func.func @map_ta(%rows: tensor<16xf32>, %cols: tensor<32xf32>)
+    -> tensor<16x32xf32> {
+  %0 = ta.scope axes(%row "i" : index, %col "j" : index) {
+    %x = ta.at %rows[%row] {axes = #ta.axes<i>}
+        : tensor<16xf32> -> !ta.expr<f32, [i]>
+    %y = ta.at %cols[%col] {axes = #ta.axes<j>}
+        : tensor<32xf32> -> !ta.expr<f32, [j]>
+    %diff = ta.map %x, %y {
+    ^bb0(%sx : f32, %sy : f32):
+      %r = arith.subf %sx, %sy : f32
+      ta.yield %r : f32
+    } : (!ta.expr<f32, [i]>, !ta.expr<f32, [j]>)
+     -> !ta.expr<f32, [i, j]>
+    %smooth = ta.fma %diff, %diff, %x
+        : (!ta.expr<f32, [i, j]>, !ta.expr<f32, [i, j]>, !ta.expr<f32, [i]>)
+       -> !ta.expr<f32, [i, j]>
+    ta.yield %smooth : !ta.expr<f32, [i, j]>
+  } : () -> tensor<16x32xf32>
+  return %0 : tensor<16x32xf32>
+}

@@ -1,5 +1,6 @@
 #include "TA/TADialect.h"
 #include "TA/TAAttrs.h"
+#include "TA/TAInterfaces.h"
 #include "TA/TAOps.h"
 #include "TA/TATypes.h"
 #include "mlir/IR/OpImplementation.h"
@@ -165,13 +166,116 @@ static mlir::LogicalResult verifyExprAxes(mlir::Operation *op, ScopeOp scope, ml
   return mlir::success();
 }
 
+static bool sameAxes(AxesAttr lhs, AxesAttr rhs) {
+  mlir::ArrayAttr lhsAxes = lhs.getAxes();
+  mlir::ArrayAttr rhsAxes = rhs.getAxes();
+  if (lhsAxes.size() != rhsAxes.size())
+    return false;
+
+  for (auto [lhsAttr, rhsAttr] : llvm::zip_equal(lhsAxes, rhsAxes)) {
+    AxisAttr lhsAxis = llvm::cast<AxisAttr>(lhsAttr);
+    AxisAttr rhsAxis = llvm::cast<AxisAttr>(rhsAttr);
+    if (lhsAxis.getName() != rhsAxis.getName())
+      return false;
+  }
+
+  return true;
+}
+
+static AxesAttr inferUnionAxes(mlir::MLIRContext *context, AxesAttr scopeAxes,
+                               mlir::ValueRange operands) {
+  llvm::StringSet<> used;
+  for (mlir::Value operand : operands) {
+    auto expr = llvm::cast<ExprType>(operand.getType());
+    for (mlir::Attribute attr : expr.getAxes().getAxes()) {
+      AxisAttr axis = llvm::cast<AxisAttr>(attr);
+      used.insert(axis.getName().getValue());
+    }
+  }
+
+  llvm::SmallVector<mlir::Attribute> inferred;
+  for (mlir::Attribute attr : scopeAxes.getAxes()) {
+    AxisAttr axis = llvm::cast<AxisAttr>(attr);
+    if (used.contains(axis.getName().getValue()))
+      inferred.push_back(attr);
+  }
+
+  return AxesAttr::get(context, mlir::ArrayAttr::get(context, inferred));
+}
+
+static mlir::LogicalResult verifyElementwiseAxes(mlir::Operation *op, ScopeOp scope) {
+  for (mlir::Value operand : op->getOperands()) {
+    if (mlir::failed(verifyExprAxes(op, scope, operand.getType(), "operand")))
+      return mlir::failure();
+  }
+
+  if (mlir::failed(verifyExprAxes(op, scope, op->getResult(0).getType(), "result")))
+    return mlir::failure();
+
+  auto result = llvm::cast<ExprType>(op->getResult(0).getType());
+  AxesAttr expected = inferUnionAxes(op->getContext(), scope.getAxes(), op->getOperands());
+  if (!sameAxes(result.getAxes(), expected))
+    return op->emitOpError()
+           << "result axes must be the union of operand axes in enclosing ta.scope order; "
+           << "expected " << expected;
+
+  return mlir::success();
+}
+
+static mlir::LogicalResult verifyFloatElementwiseOp(mlir::Operation *op) {
+  auto scopeOr = verifyInsideScope(op);
+  if (mlir::failed(scopeOr))
+    return mlir::failure();
+
+  if (mlir::failed(verifyElementwiseAxes(op, *scopeOr)))
+    return mlir::failure();
+
+  auto result = llvm::cast<ExprType>(op->getResult(0).getType());
+  mlir::Type elementType = result.getElementType();
+  if (!llvm::isa<mlir::FloatType>(elementType))
+    return op->emitOpError("requires a floating-point expression result");
+
+  for (mlir::Value operand : op->getOperands()) {
+    auto expr = llvm::cast<ExprType>(operand.getType());
+    if (expr.getElementType() != elementType)
+      return op->emitOpError("requires all operand and result element types to match");
+  }
+
+  return mlir::success();
+}
+
+static mlir::LogicalResult verifyUnaryFloatElementwiseOp(mlir::Operation *op) {
+  if (op->getNumOperands() != 1)
+    return op->emitOpError("expected one operand");
+  return verifyFloatElementwiseOp(op);
+}
+
+static mlir::LogicalResult verifyBinaryFloatElementwiseOp(mlir::Operation *op) {
+  if (op->getNumOperands() != 2)
+    return op->emitOpError("expected two operands");
+  return verifyFloatElementwiseOp(op);
+}
+
+static mlir::LogicalResult verifyTernaryFloatElementwiseOp(mlir::Operation *op) {
+  if (op->getNumOperands() != 3)
+    return op->emitOpError("expected three operands");
+  return verifyFloatElementwiseOp(op);
+}
+
 mlir::LogicalResult YieldOp::verify() {
   auto scopeOr = verifyInsideScope(getOperation());
   if (mlir::failed(scopeOr))
     return mlir::failure();
 
   mlir::Operation *parent = getOperation()->getParentOp();
-  if (auto scope = llvm::dyn_cast<ScopeOp>(parent)) {
+  if (auto map = llvm::dyn_cast<MapOp>(parent)) {
+    if (getValues().size() != 1)
+      return emitOpError("terminating ta.map must yield exactly one value");
+
+    auto result = llvm::cast<ExprType>(map.getResult().getType());
+    if (getValues().front().getType() != result.getElementType())
+      return emitOpError("terminating ta.map must yield the map result element type");
+  } else if (auto scope = llvm::dyn_cast<ScopeOp>(parent)) {
     if (getValues().size() != 1)
       return emitOpError("terminating ta.scope must yield exactly one value");
 
@@ -226,12 +330,121 @@ mlir::LogicalResult MapOp::verify() {
     return mlir::failure();
 
   ScopeOp scope = *scopeOr;
-  for (mlir::Value input : getInputs()) {
-    if (mlir::failed(verifyExprAxes(getOperation(), scope, input.getType(), "input")))
-      return mlir::failure();
+  if (mlir::failed(verifyElementwiseAxes(getOperation(), scope)))
+    return mlir::failure();
+
+  auto result = llvm::cast<ExprType>(getResult().getType());
+  mlir::Block &block = getBody().front();
+  if (block.getNumArguments() != getInputs().size())
+    return emitOpError("expected one body argument per input");
+
+  for (auto [input, arg] : llvm::zip_equal(getInputs(), block.getArguments())) {
+    auto expr = llvm::cast<ExprType>(input.getType());
+    if (arg.getType() != expr.getElementType())
+      return emitOpError("body argument types must match input expression element types");
   }
 
-  return verifyExprAxes(getOperation(), scope, getResult().getType(), "result");
+  auto yield = llvm::dyn_cast<YieldOp>(block.getTerminator());
+  if (!yield)
+    return emitOpError("body must terminate with ta.yield");
+  if (yield.getValues().size() != 1)
+    return emitOpError("body must yield exactly one value");
+  if (yield.getValues().front().getType() != result.getElementType())
+    return emitOpError("body yield type must match result expression element type");
+
+  return mlir::success();
+}
+
+mlir::LogicalResult ConstantOp::verify() {
+  auto scopeOr = verifyInsideScope(getOperation());
+  if (mlir::failed(scopeOr))
+    return mlir::failure();
+
+  auto result = llvm::cast<ExprType>(getResult().getType());
+  if (!result.getAxes().getAxes().empty())
+    return emitOpError("result axes must be empty");
+  if (mlir::failed(verifyExprAxes(getOperation(), *scopeOr, getResult().getType(), "result")))
+    return mlir::failure();
+  if (getValue().getType() != result.getElementType())
+    return emitOpError("value type must match result expression element type");
+
+  return mlir::success();
+}
+
+#define DEFINE_TA_UNARY_FLOAT_VERIFY(OP)                                                          \
+  mlir::LogicalResult OP::verify() { return verifyUnaryFloatElementwiseOp(getOperation()); }
+
+#define DEFINE_TA_BINARY_FLOAT_VERIFY(OP)                                                         \
+  mlir::LogicalResult OP::verify() { return verifyBinaryFloatElementwiseOp(getOperation()); }
+
+#define DEFINE_TA_TERNARY_FLOAT_VERIFY(OP)                                                        \
+  mlir::LogicalResult OP::verify() { return verifyTernaryFloatElementwiseOp(getOperation()); }
+
+DEFINE_TA_UNARY_FLOAT_VERIFY(NegFOp)
+DEFINE_TA_BINARY_FLOAT_VERIFY(AddFOp)
+DEFINE_TA_BINARY_FLOAT_VERIFY(SubFOp)
+DEFINE_TA_BINARY_FLOAT_VERIFY(MulFOp)
+DEFINE_TA_BINARY_FLOAT_VERIFY(DivFOp)
+DEFINE_TA_BINARY_FLOAT_VERIFY(MaximumFOp)
+DEFINE_TA_BINARY_FLOAT_VERIFY(MinimumFOp)
+DEFINE_TA_BINARY_FLOAT_VERIFY(MaxNumFOp)
+DEFINE_TA_BINARY_FLOAT_VERIFY(MinNumFOp)
+DEFINE_TA_UNARY_FLOAT_VERIFY(AbsFOp)
+DEFINE_TA_UNARY_FLOAT_VERIFY(CeilOp)
+DEFINE_TA_UNARY_FLOAT_VERIFY(ExpOp)
+DEFINE_TA_UNARY_FLOAT_VERIFY(Exp2Op)
+DEFINE_TA_UNARY_FLOAT_VERIFY(FloorOp)
+DEFINE_TA_UNARY_FLOAT_VERIFY(LogOp)
+DEFINE_TA_UNARY_FLOAT_VERIFY(Log2Op)
+DEFINE_TA_UNARY_FLOAT_VERIFY(RsqrtOp)
+DEFINE_TA_UNARY_FLOAT_VERIFY(SqrtOp)
+DEFINE_TA_UNARY_FLOAT_VERIFY(TanhOp)
+DEFINE_TA_BINARY_FLOAT_VERIFY(PowFOp)
+DEFINE_TA_TERNARY_FLOAT_VERIFY(FmaOp)
+
+#undef DEFINE_TA_UNARY_FLOAT_VERIFY
+#undef DEFINE_TA_BINARY_FLOAT_VERIFY
+#undef DEFINE_TA_TERNARY_FLOAT_VERIFY
+
+mlir::LogicalResult CmpFOp::verify() {
+  auto scopeOr = verifyInsideScope(getOperation());
+  if (mlir::failed(scopeOr))
+    return mlir::failure();
+  if (mlir::failed(verifyElementwiseAxes(getOperation(), *scopeOr)))
+    return mlir::failure();
+
+  auto lhs = llvm::cast<ExprType>(getLhs().getType());
+  auto rhs = llvm::cast<ExprType>(getRhs().getType());
+  auto result = llvm::cast<ExprType>(getResult().getType());
+  if (!llvm::isa<mlir::FloatType>(lhs.getElementType()))
+    return emitOpError("requires floating-point operand element types");
+  if (lhs.getElementType() != rhs.getElementType())
+    return emitOpError("requires matching operand element types");
+  if (!result.getElementType().isInteger(1))
+    return emitOpError("result element type must be i1");
+
+  return mlir::success();
+}
+
+mlir::LogicalResult SelectOp::verify() {
+  auto scopeOr = verifyInsideScope(getOperation());
+  if (mlir::failed(scopeOr))
+    return mlir::failure();
+  if (mlir::failed(verifyElementwiseAxes(getOperation(), *scopeOr)))
+    return mlir::failure();
+
+  auto condition = llvm::cast<ExprType>(getCondition().getType());
+  auto trueValue = llvm::cast<ExprType>(getTrueValue().getType());
+  auto falseValue = llvm::cast<ExprType>(getFalseValue().getType());
+  auto result = llvm::cast<ExprType>(getResult().getType());
+
+  if (!condition.getElementType().isInteger(1))
+    return emitOpError("condition element type must be i1");
+  if (trueValue.getElementType() != falseValue.getElementType() ||
+      trueValue.getElementType() != result.getElementType())
+    return emitOpError("true, false, and result element types must match");
+
+  return mlir::success();
 }
 
 mlir::LogicalResult ReduceOp::verify() {
@@ -363,6 +576,8 @@ extern "C" LLVM_ATTRIBUTE_WEAK mlir::DialectPluginLibraryInfo mlirGetDialectPlug
 
 #include "mlir/IR/DialectImplementation.h"
 #include "llvm/ADT/TypeSwitch.h"
+
+#include "TAInterfaces.cpp.inc"
 
 #define GET_ATTRDEF_CLASSES
 #include "TAAttrs.cpp.inc"

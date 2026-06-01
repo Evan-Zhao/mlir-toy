@@ -92,6 +92,11 @@ mlir_tablegen(TAOpsDialect.h.inc -gen-dialect-decls -dialect=ta)
 mlir_tablegen(TAOpsDialect.cpp.inc -gen-dialect-defs -dialect=ta)
 add_public_tablegen_target(TAOpsIncGen)
 
+set(LLVM_TARGET_DEFINITIONS include/TA/TAInterfaces.td)
+mlir_tablegen(TAInterfaces.h.inc -gen-op-interface-decls)
+mlir_tablegen(TAInterfaces.cpp.inc -gen-op-interface-defs)
+add_public_tablegen_target(TAInterfacesIncGen)
+
 set(LLVM_TARGET_DEFINITIONS include/TA/TAAttrs.td)
 mlir_tablegen(TAAttrs.h.inc -gen-attrdef-decls -attrdefs-dialect=ta)
 mlir_tablegen(TAAttrs.cpp.inc -gen-attrdef-defs -attrdefs-dialect=ta)
@@ -155,7 +160,7 @@ make_mlir_opt_plugin(
 make_mlir_opt_plugin(
   TARGET TADialect
   SOURCES lib/TA/TADialect.cpp
-  DEPS TAOpsIncGen TAAttrsIncGen TATypesIncGen
+  DEPS TAOpsIncGen TAInterfacesIncGen TAAttrsIncGen TATypesIncGen
 )
 make_mlir_opt_plugin(
   TARGET LoopTransform
