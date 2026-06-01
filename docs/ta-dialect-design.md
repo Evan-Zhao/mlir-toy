@@ -95,7 +95,7 @@ axis coordinates like runtime loop values. A future version may introduce a
 dedicated coordinate type, such as `!ta.index<[axes]>`, or restrict which ops
 may consume scope axis block arguments.
 
-All expression-level `ta` operations, such as `ta.at`, `ta.eval`, `ta.map`, and
+All expression-level `ta` operations, such as `ta.at`, `ta.map`, and
 `ta.reduce`, must be nested inside a `ta.scope`. They may only use or define
 axes declared by the enclosing scope. This makes every scope a closed indexed
 expression over a known coordinate system.
@@ -171,25 +171,6 @@ Observes an external tensor at indexed coordinates.
 ```
 
 `ta.at` is the analog of scalar tensor element access, but it produces a `ta.expr` value rather than an ordinary scalar.
-
----
-
-### `ta.eval`
-
-Observes a tensor result produced by another scope at particular axes.
-
-```mlir
-%s = ta.eval %S[%b, %h, %i, %j]
-     : tensor<?x?x?x?xf32> -> !ta.expr<f32, [b,h,i,j]>
-```
-
-`ta.eval` should be rewrite-transparent. Conceptually:
-
-```text
-ta.eval(ta.scope axes(...) { body }, indices)  =>  body[axes := indices]
-```
-
-but implementations should preserve let-sharing rather than eagerly inlining everything.
 
 ---
 
@@ -339,7 +320,6 @@ Core typing rules:
 ```text
 axes(constant) = {}
 axes(ta.at T[index_exprs...]) = axes used by index expressions
-axes(ta.eval tensor[index_exprs...]) = axes used by index expressions
 axes(ta.map f(x1,...,xn)) = union_i axes(xi)
 axes(ta.elementwise_op(x1,...,xn)) = union_i axes(xi)
 axes(ta.reduce over R { yield x }) = axes(x) - R
@@ -681,7 +661,7 @@ For each `linalg.generic` op:
 2. Map each local iterator to a global `ta` axis using the union-find result.
 3. Determine output axes from the output operand indexing map.
 4. Determine reduction axes from iterators marked `reduction` that do not appear in the output axes.
-5. Translate input element accesses into `ta.at` or `ta.eval`.
+5. Translate input element accesses into `ta.at`.
 6. Copy the scalar payload computation into the scope body.
 7. Wrap reduction payloads in `ta.reduce`.
 8. Preserve the original op boundary as a `ta.scope`.
@@ -902,16 +882,15 @@ empty-domain behavior is compatible
 
 A practical v1 could be:
 
-1. Implement `ta.scope`, `ta.eval`, `ta.at`, `ta.reduce`, `ta.yield`.
+1. Implement `ta.scope`, `ta.at`, `ta.reduce`, `ta.yield`.
 2. Implement `!ta.expr<type, axes>`.
 3. Implement axis attributes and scope-local axis verification.
 4. Implement dependency/axis-set inference.
 5. Import simple `linalg.generic` ops with projected permutation maps.
 6. Import attention-like programs into one scope graph with one scope per linalg op.
-7. Implement scope-transparent CSE and beta-reduction for `ta.eval`.
-8. Implement scalar rewrites and the reduction movement rule needed for `exp -> exp2`.
-9. Lower unchanged or simply rewritten scopes back to `linalg.generic`.
-10. Add support for affine access expressions later.
+7. Implement scalar rewrites and the reduction movement rule needed for `exp -> exp2`.
+8. Lower unchanged or simply rewritten scopes back to `linalg.generic`.
+9. Add support for affine access expressions later.
 
 A useful first demo is exactly:
 
@@ -955,40 +934,3 @@ After:
 6. How should materialization costs be estimated after rewrites?
 7. How should the dialect represent masks: as ordinary selects, or as semantic extended-real masked logits?
 8. Should `ta.scan` be part of v1, or added later for recurrence-like models such as Mamba?
-
----
-
-## Summary
-
-The `ta` dialect is a proposed tensor algebra rewrite IR.
-
-Its main abstraction is:
-
-```text
-indexed scalar expressions over a shared set of named axes
-```
-
-instead of isolated tensor ops with local loop nests.
-
-The key operations are:
-
-```text
-ta.scope       declared axis universe and tensor boundary
-ta.at          external tensor element access
-ta.eval        scope expression access
-ta.map         scalar computation lifted over axes
-ta.addf/...    canonical elementwise scalar algebra lifted over axes
-ta.reduce      mathematical reduction binder
-```
-
-The key type is:
-
-```text
-!ta.expr<element_type, axis_set>
-```
-
-This type carries the dependency information needed for whole-program rewrites.
-Original `linalg` ops translate naturally into `ta.scope`s, preserving their
-tensor materialization boundaries while making the algebra visible across them.
-
-The design is especially useful for rewrites like attention's `exp` to `exp2` base conversion, where a local scalar identity must be propagated through broadcasts, max reductions, and earlier scalar producers before it becomes profitable.
