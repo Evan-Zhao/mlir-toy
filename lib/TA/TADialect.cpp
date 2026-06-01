@@ -2,6 +2,7 @@
 #include "TA/TAAttrs.h"
 #include "TA/TAOps.h"
 #include "TA/TAPasses.h"
+#include "TA/TATransformOps.h"
 #include "TA/TATypes.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Support/LogicalResult.h"
@@ -176,7 +177,7 @@ static bool sameAxes(AxesAttr lhs, AxesAttr rhs) {
 }
 
 static AxesAttr inferUnionAxes(MLIRContext *context, AxesAttr scopeAxes, ValueRange operands) {
-  StringSet used;
+  llvm::StringSet<> used;
   for (Value operand : operands) {
     auto expr = cast<ExprType>(operand.getType());
     for (Attribute attr : expr.getAxes().getAxes()) {
@@ -676,6 +677,7 @@ extern "C" LLVM_ATTRIBUTE_WEAK mlir::DialectPluginLibraryInfo mlirGetDialectPlug
   return {MLIR_PLUGIN_API_VERSION, "TADialectPlugin", LLVM_VERSION_STRING,
           [](mlir::DialectRegistry *registry) {
             registry->insert<ta::TADialect>();
+            ta::registerTATransformExtension(*registry);
             ta::registerTAPasses();
           }};
 }

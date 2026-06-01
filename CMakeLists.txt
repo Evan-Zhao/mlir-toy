@@ -109,6 +109,11 @@ mlir_tablegen(TATypes.h.inc -gen-typedef-decls -typedefs-dialect=ta)
 mlir_tablegen(TATypes.cpp.inc -gen-typedef-defs -typedefs-dialect=ta)
 add_public_tablegen_target(TATypesIncGen)
 
+set(LLVM_TARGET_DEFINITIONS include/TA/TATransformOps.td)
+mlir_tablegen(TATransformOps.h.inc -gen-op-decls)
+mlir_tablegen(TATransformOps.cpp.inc -gen-op-defs)
+add_public_tablegen_target(TATransformOpsIncGen)
+
 function(make_mlir_opt_plugin)
   cmake_parse_arguments(ARG "" "TARGET" "SOURCES;DEPS" ${ARGN})
   # Shared plugin for `mlir-opt --load-dialect-plugin=<path>/libHTileDialect.so`
@@ -161,8 +166,8 @@ make_mlir_opt_plugin(
 )
 make_mlir_opt_plugin(
   TARGET TADialect
-  SOURCES lib/TA/TADialect.cpp lib/TA/LinalgToTA.cpp
-  DEPS TAOpsIncGen TAInterfacesIncGen TAAttrsIncGen TATypesIncGen
+  SOURCES lib/TA/TADialect.cpp lib/TA/LinalgToTA.cpp lib/TA/TATransformOps.cpp
+  DEPS TAOpsIncGen TAInterfacesIncGen TAAttrsIncGen TATypesIncGen TATransformOpsIncGen
 )
 make_mlir_opt_plugin(
   TARGET LoopTransform
