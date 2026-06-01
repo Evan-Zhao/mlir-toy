@@ -7,13 +7,15 @@
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Tools/Plugins/DialectPlugin.h"
 #include "mlir/Tools/Plugins/PassPlugin.h"
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
 
 #define GET_DIALECT_DEFS
 #include "TAOpsDialect.cpp.inc"
 
 namespace ta {
+
+using namespace mlir;
+
 void TADialect::initialize() {
   addAttributes<
 #define GET_ATTRDEF_LIST
@@ -31,89 +33,81 @@ void TADialect::initialize() {
       >();
 }
 
-static mlir::LogicalResult verifyAxisArray(llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
-                                           mlir::ArrayAttr axes) {
+static LogicalResult verifyAxisArray(function_ref<InFlightDiagnostic()> emitError, ArrayAttr axes) {
   if (!axes)
     return emitError() << "expected an array attribute of #ta.axis attributes";
 
-  llvm::StringSet<> seen;
-  for (mlir::Attribute attr : axes) {
-    auto axis = llvm::dyn_cast<AxisAttr>(attr);
+  StringSet<> seen;
+  for (Attribute attr : axes) {
+    auto axis = dyn_cast<AxisAttr>(attr);
     if (!axis)
       return emitError() << "expected axis list element to be a #ta.axis attribute";
 
-    llvm::StringRef name = axis.getName().getValue();
+    StringRef name = axis.getName().getValue();
     if (!seen.insert(name).second)
       return emitError() << "duplicate axis '" << name << "'";
   }
 
-  return mlir::success();
+  return success();
 }
 
-static void printAxisNames(mlir::AsmPrinter &printer, mlir::ArrayAttr axes, llvm::StringRef open,
-                           llvm::StringRef close) {
+static void printAxisNames(AsmPrinter &printer, ArrayAttr axes, StringRef open, StringRef close) {
   printer << open;
-  llvm::interleaveComma(axes, printer, [&](mlir::Attribute attr) {
-    printer << llvm::cast<AxisAttr>(attr).getName().getValue();
-  });
+  llvm::interleaveComma(
+      axes, printer, [&](Attribute attr) { printer << cast<AxisAttr>(attr).getName().getValue(); });
   printer << close;
 }
 
-static mlir::FailureOr<AxesAttr> parseAxisList(mlir::AsmParser &parser,
-                                               mlir::AsmParser::Delimiter delimiter) {
-  llvm::SmallVector<mlir::Attribute> axes;
-  if (parser.parseCommaSeparatedList(delimiter, [&]() -> mlir::ParseResult {
-        llvm::StringRef name;
+static FailureOr<AxesAttr> parseAxisList(AsmParser &parser, AsmParser::Delimiter delimiter) {
+  SmallVector<Attribute> axes;
+  if (parser.parseCommaSeparatedList(delimiter, [&]() -> ParseResult {
+        StringRef name;
         if (parser.parseKeyword(&name))
-          return mlir::failure();
+          return failure();
         axes.push_back(AxisAttr::get(parser.getContext(), name));
-        return mlir::success();
+        return success();
       }))
-    return mlir::failure();
+    return failure();
 
-  return AxesAttr::get(parser.getContext(), mlir::ArrayAttr::get(parser.getContext(), axes));
+  return AxesAttr::get(parser.getContext(), ArrayAttr::get(parser.getContext(), axes));
 }
 
-mlir::LogicalResult AxisAttr::verify(llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
-                                     mlir::StringAttr name) {
+LogicalResult AxisAttr::verify(function_ref<InFlightDiagnostic()> emitError, StringAttr name) {
   if (!name || name.getValue().empty())
     return emitError() << "axis name must be non-empty";
 
-  return mlir::success();
+  return success();
 }
 
-mlir::Attribute AxesAttr::parse(mlir::AsmParser &parser, mlir::Type type) {
+Attribute AxesAttr::parse(AsmParser &parser, Type type) {
   (void)type;
-  mlir::FailureOr<AxesAttr> axes = parseAxisList(parser, mlir::AsmParser::Delimiter::LessGreater);
-  if (mlir::failed(axes))
+  FailureOr<AxesAttr> axes = parseAxisList(parser, AsmParser::Delimiter::LessGreater);
+  if (failed(axes))
     return {};
   return *axes;
 }
 
-void AxesAttr::print(mlir::AsmPrinter &printer) const {
-  printAxisNames(printer, getAxes(), "<", ">");
-}
+void AxesAttr::print(AsmPrinter &printer) const { printAxisNames(printer, getAxes(), "<", ">"); }
 
-mlir::LogicalResult AxesAttr::verify(llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
-                                     mlir::ArrayAttr axes) {
+LogicalResult AxesAttr::verify(function_ref<InFlightDiagnostic()> emitError, ArrayAttr axes) {
   return verifyAxisArray(emitError, axes);
 }
 
-mlir::Type ExprType::parse(mlir::AsmParser &parser) {
-  llvm::SMLoc loc = parser.getCurrentLocation();
-  mlir::Type elementType;
+Type ExprType::parse(AsmParser &parser) {
+  SMLoc loc = parser.getCurrentLocation();
+  Type elementType;
 
   if (parser.parseLess() || parser.parseType(elementType) || parser.parseComma())
     return {};
 
-  mlir::FailureOr<AxesAttr> axes = parseAxisList(parser, mlir::AsmParser::Delimiter::Square);
-  if (mlir::failed(axes) || parser.parseGreater())
+  FailureOr<AxesAttr> axes = parseAxisList(parser, AsmParser::Delimiter::Square);
+  if (failed(axes) || parser.parseGreater())
     return {};
 
   return parser.getChecked<ExprType>(loc, parser.getContext(), elementType, *axes);
 }
 
-void ExprType::print(mlir::AsmPrinter &printer) const {
+void ExprType::print(AsmPrinter &printer) const {
   printer << "<";
   printer.printStrippedAttrOrType(getElementType());
   printer << ", ";
@@ -121,61 +115,59 @@ void ExprType::print(mlir::AsmPrinter &printer) const {
   printer << ">";
 }
 
-mlir::LogicalResult ExprType::verify(llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
-                                     mlir::Type elementType, AxesAttr axes) {
+LogicalResult ExprType::verify(function_ref<InFlightDiagnostic()> emitError, Type elementType,
+                               AxesAttr axes) {
   if (!elementType)
     return emitError() << "expression element type must be present";
   if (!axes)
     return emitError() << "expression axes must be present";
 
-  return mlir::success();
+  return success();
 }
 
-static bool axisContains(mlir::ArrayAttr axes, AxisAttr axis) {
-  return llvm::any_of(axes, [&](mlir::Attribute attr) {
-    return llvm::cast<AxisAttr>(attr).getName() == axis.getName();
-  });
+static bool axisContains(ArrayAttr axes, AxisAttr axis) {
+  return llvm::any_of(
+      axes, [&](Attribute attr) { return cast<AxisAttr>(attr).getName() == axis.getName(); });
 }
 
-static mlir::LogicalResult verifyAxesSubset(mlir::Operation *op, AxesAttr scopeAxes,
-                                            AxesAttr usedAxes, llvm::StringRef what) {
+static LogicalResult verifyAxesSubset(Operation *op, AxesAttr scopeAxes, AxesAttr usedAxes,
+                                      StringRef what) {
   if (!usedAxes)
-    return mlir::success();
+    return success();
 
-  mlir::ArrayAttr allowed = scopeAxes.getAxes();
-  for (mlir::Attribute attr : usedAxes.getAxes()) {
-    AxisAttr axis = llvm::cast<AxisAttr>(attr);
+  ArrayAttr allowed = scopeAxes.getAxes();
+  for (Attribute attr : usedAxes.getAxes()) {
+    AxisAttr axis = cast<AxisAttr>(attr);
     if (!axisContains(allowed, axis)) {
       return op->emitOpError() << what << " uses axis '" << axis.getName().getValue()
                                << "' outside enclosing ta.scope axes";
     }
   }
-  return mlir::success();
+  return success();
 }
 
-static mlir::FailureOr<ScopeOp> verifyInsideScope(mlir::Operation *op) {
+static FailureOr<ScopeOp> verifyInsideScope(Operation *op) {
   ScopeOp scope = op->getParentOfType<ScopeOp>();
   if (!scope)
     return op->emitOpError("must be nested inside a ta.scope");
   return scope;
 }
 
-static mlir::LogicalResult verifyExprAxes(mlir::Operation *op, ScopeOp scope, mlir::Type type,
-                                          llvm::StringRef what) {
-  if (auto expr = llvm::dyn_cast<ExprType>(type))
+static LogicalResult verifyExprAxes(Operation *op, ScopeOp scope, Type type, StringRef what) {
+  if (auto expr = dyn_cast<ExprType>(type))
     return verifyAxesSubset(op, scope.getAxes(), expr.getAxes(), what);
-  return mlir::success();
+  return success();
 }
 
 static bool sameAxes(AxesAttr lhs, AxesAttr rhs) {
-  mlir::ArrayAttr lhsAxes = lhs.getAxes();
-  mlir::ArrayAttr rhsAxes = rhs.getAxes();
+  ArrayAttr lhsAxes = lhs.getAxes();
+  ArrayAttr rhsAxes = rhs.getAxes();
   if (lhsAxes.size() != rhsAxes.size())
     return false;
 
   for (auto [lhsAttr, rhsAttr] : llvm::zip_equal(lhsAxes, rhsAxes)) {
-    AxisAttr lhsAxis = llvm::cast<AxisAttr>(lhsAttr);
-    AxisAttr rhsAxis = llvm::cast<AxisAttr>(rhsAttr);
+    AxisAttr lhsAxis = cast<AxisAttr>(lhsAttr);
+    AxisAttr rhsAxis = cast<AxisAttr>(rhsAttr);
     if (lhsAxis.getName() != rhsAxis.getName())
       return false;
   }
@@ -183,117 +175,116 @@ static bool sameAxes(AxesAttr lhs, AxesAttr rhs) {
   return true;
 }
 
-static AxesAttr inferUnionAxes(mlir::MLIRContext *context, AxesAttr scopeAxes,
-                               mlir::ValueRange operands) {
-  llvm::StringSet<> used;
-  for (mlir::Value operand : operands) {
-    auto expr = llvm::cast<ExprType>(operand.getType());
-    for (mlir::Attribute attr : expr.getAxes().getAxes()) {
-      AxisAttr axis = llvm::cast<AxisAttr>(attr);
+static AxesAttr inferUnionAxes(MLIRContext *context, AxesAttr scopeAxes, ValueRange operands) {
+  StringSet used;
+  for (Value operand : operands) {
+    auto expr = cast<ExprType>(operand.getType());
+    for (Attribute attr : expr.getAxes().getAxes()) {
+      AxisAttr axis = cast<AxisAttr>(attr);
       used.insert(axis.getName().getValue());
     }
   }
 
-  llvm::SmallVector<mlir::Attribute> inferred;
-  for (mlir::Attribute attr : scopeAxes.getAxes()) {
-    AxisAttr axis = llvm::cast<AxisAttr>(attr);
+  SmallVector<Attribute> inferred;
+  for (Attribute attr : scopeAxes.getAxes()) {
+    AxisAttr axis = cast<AxisAttr>(attr);
     if (used.contains(axis.getName().getValue()))
       inferred.push_back(attr);
   }
 
-  return AxesAttr::get(context, mlir::ArrayAttr::get(context, inferred));
+  return AxesAttr::get(context, ArrayAttr::get(context, inferred));
 }
 
-static AxesAttr subtractAxes(mlir::MLIRContext *context, AxesAttr source, AxesAttr removed) {
-  llvm::StringSet<> removedNames;
-  for (mlir::Attribute attr : removed.getAxes()) {
-    AxisAttr axis = llvm::cast<AxisAttr>(attr);
+static AxesAttr subtractAxes(MLIRContext *context, AxesAttr source, AxesAttr removed) {
+  StringSet<> removedNames;
+  for (Attribute attr : removed.getAxes()) {
+    AxisAttr axis = cast<AxisAttr>(attr);
     removedNames.insert(axis.getName().getValue());
   }
 
-  llvm::SmallVector<mlir::Attribute> kept;
-  for (mlir::Attribute attr : source.getAxes()) {
-    AxisAttr axis = llvm::cast<AxisAttr>(attr);
+  SmallVector<Attribute> kept;
+  for (Attribute attr : source.getAxes()) {
+    AxisAttr axis = cast<AxisAttr>(attr);
     if (!removedNames.contains(axis.getName().getValue()))
       kept.push_back(attr);
   }
 
-  return AxesAttr::get(context, mlir::ArrayAttr::get(context, kept));
+  return AxesAttr::get(context, ArrayAttr::get(context, kept));
 }
 
-static mlir::LogicalResult verifyElementwiseAxes(mlir::Operation *op, ScopeOp scope) {
-  for (mlir::Value operand : op->getOperands()) {
-    if (mlir::failed(verifyExprAxes(op, scope, operand.getType(), "operand")))
-      return mlir::failure();
+static LogicalResult verifyElementwiseAxes(Operation *op, ScopeOp scope) {
+  for (Value operand : op->getOperands()) {
+    if (failed(verifyExprAxes(op, scope, operand.getType(), "operand")))
+      return failure();
   }
 
-  if (mlir::failed(verifyExprAxes(op, scope, op->getResult(0).getType(), "result")))
-    return mlir::failure();
+  if (failed(verifyExprAxes(op, scope, op->getResult(0).getType(), "result")))
+    return failure();
 
-  auto result = llvm::cast<ExprType>(op->getResult(0).getType());
+  auto result = cast<ExprType>(op->getResult(0).getType());
   AxesAttr expected = inferUnionAxes(op->getContext(), scope.getAxes(), op->getOperands());
   if (!sameAxes(result.getAxes(), expected))
     return op->emitOpError()
            << "result axes must be the union of operand axes in enclosing ta.scope order; "
            << "expected " << expected;
 
-  return mlir::success();
+  return success();
 }
 
-static mlir::LogicalResult verifyFloatElementwiseOp(mlir::Operation *op) {
+static LogicalResult verifyFloatElementwiseOp(Operation *op) {
   auto scopeOr = verifyInsideScope(op);
-  if (mlir::failed(scopeOr))
-    return mlir::failure();
+  if (failed(scopeOr))
+    return failure();
 
-  if (mlir::failed(verifyElementwiseAxes(op, *scopeOr)))
-    return mlir::failure();
+  if (failed(verifyElementwiseAxes(op, *scopeOr)))
+    return failure();
 
-  auto result = llvm::cast<ExprType>(op->getResult(0).getType());
-  mlir::Type elementType = result.getElementType();
-  if (!llvm::isa<mlir::FloatType>(elementType))
+  auto result = cast<ExprType>(op->getResult(0).getType());
+  Type elementType = result.getElementType();
+  if (!isa<FloatType>(elementType))
     return op->emitOpError("requires a floating-point expression result");
 
-  for (mlir::Value operand : op->getOperands()) {
-    auto expr = llvm::cast<ExprType>(operand.getType());
+  for (Value operand : op->getOperands()) {
+    auto expr = cast<ExprType>(operand.getType());
     if (expr.getElementType() != elementType)
       return op->emitOpError("requires all operand and result element types to match");
   }
 
-  return mlir::success();
+  return success();
 }
 
-static mlir::LogicalResult verifyUnaryFloatElementwiseOp(mlir::Operation *op) {
+static LogicalResult verifyUnaryFloatElementwiseOp(Operation *op) {
   if (op->getNumOperands() != 1)
     return op->emitOpError("expected one operand");
   return verifyFloatElementwiseOp(op);
 }
 
-static mlir::LogicalResult verifyBinaryFloatElementwiseOp(mlir::Operation *op) {
+static LogicalResult verifyBinaryFloatElementwiseOp(Operation *op) {
   if (op->getNumOperands() != 2)
     return op->emitOpError("expected two operands");
   return verifyFloatElementwiseOp(op);
 }
 
-static mlir::LogicalResult verifyTernaryFloatElementwiseOp(mlir::Operation *op) {
+static LogicalResult verifyTernaryFloatElementwiseOp(Operation *op) {
   if (op->getNumOperands() != 3)
     return op->emitOpError("expected three operands");
   return verifyFloatElementwiseOp(op);
 }
 
-static mlir::LogicalResult verifyFloatCastElementwiseOp(mlir::Operation *op, bool widening) {
+static LogicalResult verifyFloatCastElementwiseOp(Operation *op, bool widening) {
   if (op->getNumOperands() != 1)
     return op->emitOpError("expected one operand");
 
   auto scopeOr = verifyInsideScope(op);
-  if (mlir::failed(scopeOr))
-    return mlir::failure();
-  if (mlir::failed(verifyElementwiseAxes(op, *scopeOr)))
-    return mlir::failure();
+  if (failed(scopeOr))
+    return failure();
+  if (failed(verifyElementwiseAxes(op, *scopeOr)))
+    return failure();
 
-  auto operand = llvm::cast<ExprType>(op->getOperand(0).getType());
-  auto result = llvm::cast<ExprType>(op->getResult(0).getType());
-  auto operandElement = llvm::dyn_cast<mlir::FloatType>(operand.getElementType());
-  auto resultElement = llvm::dyn_cast<mlir::FloatType>(result.getElementType());
+  auto operand = cast<ExprType>(op->getOperand(0).getType());
+  auto result = cast<ExprType>(op->getResult(0).getType());
+  auto operandElement = dyn_cast<FloatType>(operand.getElementType());
+  auto resultElement = dyn_cast<FloatType>(result.getElementType());
   if (!operandElement || !resultElement)
     return op->emitOpError("requires floating-point operand and result element types");
 
@@ -304,103 +295,103 @@ static mlir::LogicalResult verifyFloatCastElementwiseOp(mlir::Operation *op, boo
   if (!widening && resultWidth >= operandWidth)
     return op->emitOpError("result element type must be narrower than operand element type");
 
-  return mlir::success();
+  return success();
 }
 
-mlir::LogicalResult YieldOp::verify() {
+LogicalResult YieldOp::verify() {
   auto scopeOr = verifyInsideScope(getOperation());
-  if (mlir::failed(scopeOr))
-    return mlir::failure();
+  if (failed(scopeOr))
+    return failure();
 
-  mlir::Operation *parent = getOperation()->getParentOp();
-  if (auto map = llvm::dyn_cast<MapOp>(parent)) {
+  Operation *parent = getOperation()->getParentOp();
+  if (auto map = dyn_cast<MapOp>(parent)) {
     if (getValues().size() != 1)
       return emitOpError("terminating ta.map must yield exactly one value");
 
-    auto result = llvm::cast<ExprType>(map.getResult().getType());
+    auto result = cast<ExprType>(map.getResult().getType());
     if (getValues().front().getType() != result.getElementType())
       return emitOpError("terminating ta.map must yield the map result element type");
-  } else if (auto reduce = llvm::dyn_cast<MapReduceOp>(parent)) {
+  } else if (auto reduce = dyn_cast<MapReduceOp>(parent)) {
     if (getValues().size() != 1)
       return emitOpError("terminating ta.map_reduce must yield exactly one value");
 
-    auto expr = llvm::dyn_cast<ExprType>(getValues().front().getType());
+    auto expr = dyn_cast<ExprType>(getValues().front().getType());
     if (!expr)
       return emitOpError("terminating ta.map_reduce must yield a ta.expr value");
 
-    auto result = llvm::cast<ExprType>(reduce.getResult().getType());
+    auto result = cast<ExprType>(reduce.getResult().getType());
     if (expr.getElementType() != result.getElementType())
       return emitOpError("terminating ta.map_reduce must yield the reduce result element type");
-  } else if (auto scope = llvm::dyn_cast<ScopeOp>(parent)) {
+  } else if (auto scope = dyn_cast<ScopeOp>(parent)) {
     if (getValues().size() != 1)
       return emitOpError("terminating ta.scope must yield exactly one value");
 
-    auto expr = llvm::dyn_cast<ExprType>(getValues().front().getType());
+    auto expr = dyn_cast<ExprType>(getValues().front().getType());
     if (!expr)
       return emitOpError("terminating ta.scope must yield a ta.expr value");
 
-    if (mlir::failed(verifyAxesSubset(getOperation(), scope.getAxes(), expr.getAxes(),
-                                      "yielded expression")))
-      return mlir::failure();
+    if (failed(verifyAxesSubset(getOperation(), scope.getAxes(), expr.getAxes(),
+                                "yielded expression")))
+      return failure();
 
-    auto resultType = llvm::cast<mlir::RankedTensorType>(scope.getResult().getType());
+    auto resultType = cast<RankedTensorType>(scope.getResult().getType());
     if (resultType.getElementType() != expr.getElementType())
       return emitOpError("yielded expression element type must match ta.scope result tensor "
                          "element type");
   }
 
-  return mlir::success();
+  return success();
 }
 
-mlir::LogicalResult AtOp::verify() {
+LogicalResult AtOp::verify() {
   auto scopeOr = verifyInsideScope(getOperation());
-  if (mlir::failed(scopeOr))
-    return mlir::failure();
+  if (failed(scopeOr))
+    return failure();
 
   ScopeOp scope = *scopeOr;
   if (auto axes = getAxes()) {
-    if (mlir::failed(verifyAxesSubset(getOperation(), scope.getAxes(), *axes, "access")))
-      return mlir::failure();
+    if (failed(verifyAxesSubset(getOperation(), scope.getAxes(), *axes, "access")))
+      return failure();
   }
 
   return verifyExprAxes(getOperation(), scope, getResult().getType(), "result");
 }
 
-mlir::LogicalResult EvalOp::verify() {
+LogicalResult EvalOp::verify() {
   auto scopeOr = verifyInsideScope(getOperation());
-  if (mlir::failed(scopeOr))
-    return mlir::failure();
+  if (failed(scopeOr))
+    return failure();
 
   ScopeOp scope = *scopeOr;
   if (auto axes = getAxes()) {
-    if (mlir::failed(verifyAxesSubset(getOperation(), scope.getAxes(), *axes, "eval")))
-      return mlir::failure();
+    if (failed(verifyAxesSubset(getOperation(), scope.getAxes(), *axes, "eval")))
+      return failure();
   }
 
   return verifyExprAxes(getOperation(), scope, getResult().getType(), "result");
 }
 
-mlir::LogicalResult MapOp::verify() {
+LogicalResult MapOp::verify() {
   auto scopeOr = verifyInsideScope(getOperation());
-  if (mlir::failed(scopeOr))
-    return mlir::failure();
+  if (failed(scopeOr))
+    return failure();
 
   ScopeOp scope = *scopeOr;
-  if (mlir::failed(verifyElementwiseAxes(getOperation(), scope)))
-    return mlir::failure();
+  if (failed(verifyElementwiseAxes(getOperation(), scope)))
+    return failure();
 
-  auto result = llvm::cast<ExprType>(getResult().getType());
-  mlir::Block &block = getBody().front();
+  auto result = cast<ExprType>(getResult().getType());
+  Block &block = getBody().front();
   if (block.getNumArguments() != getInputs().size())
     return emitOpError("expected one body argument per input");
 
-  for (auto [input, arg] : llvm::zip_equal(getInputs(), block.getArguments())) {
-    auto expr = llvm::cast<ExprType>(input.getType());
+  for (auto [input, arg] : zip_equal(getInputs(), block.getArguments())) {
+    auto expr = cast<ExprType>(input.getType());
     if (arg.getType() != expr.getElementType())
       return emitOpError("body argument types must match input expression element types");
   }
 
-  auto yield = llvm::dyn_cast<YieldOp>(block.getTerminator());
+  auto yield = dyn_cast<YieldOp>(block.getTerminator());
   if (!yield)
     return emitOpError("body must terminate with ta.yield");
   if (yield.getValues().size() != 1)
@@ -408,33 +399,33 @@ mlir::LogicalResult MapOp::verify() {
   if (yield.getValues().front().getType() != result.getElementType())
     return emitOpError("body yield type must match result expression element type");
 
-  return mlir::success();
+  return success();
 }
 
-mlir::LogicalResult ConstantOp::verify() {
+LogicalResult ConstantOp::verify() {
   auto scopeOr = verifyInsideScope(getOperation());
-  if (mlir::failed(scopeOr))
-    return mlir::failure();
+  if (failed(scopeOr))
+    return failure();
 
-  auto result = llvm::cast<ExprType>(getResult().getType());
+  auto result = cast<ExprType>(getResult().getType());
   if (!result.getAxes().getAxes().empty())
     return emitOpError("result axes must be empty");
-  if (mlir::failed(verifyExprAxes(getOperation(), *scopeOr, getResult().getType(), "result")))
-    return mlir::failure();
+  if (failed(verifyExprAxes(getOperation(), *scopeOr, getResult().getType(), "result")))
+    return failure();
   if (getValue().getType() != result.getElementType())
     return emitOpError("value type must match result expression element type");
 
-  return mlir::success();
+  return success();
 }
 
 #define DEFINE_TA_UNARY_FLOAT_VERIFY(OP)                                                           \
-  mlir::LogicalResult OP::verify() { return verifyUnaryFloatElementwiseOp(getOperation()); }
+  LogicalResult OP::verify() { return verifyUnaryFloatElementwiseOp(getOperation()); }
 
 #define DEFINE_TA_BINARY_FLOAT_VERIFY(OP)                                                          \
-  mlir::LogicalResult OP::verify() { return verifyBinaryFloatElementwiseOp(getOperation()); }
+  LogicalResult OP::verify() { return verifyBinaryFloatElementwiseOp(getOperation()); }
 
 #define DEFINE_TA_TERNARY_FLOAT_VERIFY(OP)                                                         \
-  mlir::LogicalResult OP::verify() { return verifyTernaryFloatElementwiseOp(getOperation()); }
+  LogicalResult OP::verify() { return verifyTernaryFloatElementwiseOp(getOperation()); }
 
 DEFINE_TA_UNARY_FLOAT_VERIFY(NegFOp)
 DEFINE_TA_BINARY_FLOAT_VERIFY(AddFOp)
@@ -462,45 +453,45 @@ DEFINE_TA_TERNARY_FLOAT_VERIFY(FmaOp)
 #undef DEFINE_TA_BINARY_FLOAT_VERIFY
 #undef DEFINE_TA_TERNARY_FLOAT_VERIFY
 
-mlir::LogicalResult ExtFOp::verify() {
+LogicalResult ExtFOp::verify() {
   return verifyFloatCastElementwiseOp(getOperation(), /*widening=*/true);
 }
 
-mlir::LogicalResult TruncFOp::verify() {
+LogicalResult TruncFOp::verify() {
   return verifyFloatCastElementwiseOp(getOperation(), /*widening=*/false);
 }
 
-mlir::LogicalResult CmpFOp::verify() {
+LogicalResult CmpFOp::verify() {
   auto scopeOr = verifyInsideScope(getOperation());
-  if (mlir::failed(scopeOr))
-    return mlir::failure();
-  if (mlir::failed(verifyElementwiseAxes(getOperation(), *scopeOr)))
-    return mlir::failure();
+  if (failed(scopeOr))
+    return failure();
+  if (failed(verifyElementwiseAxes(getOperation(), *scopeOr)))
+    return failure();
 
-  auto lhs = llvm::cast<ExprType>(getLhs().getType());
-  auto rhs = llvm::cast<ExprType>(getRhs().getType());
-  auto result = llvm::cast<ExprType>(getResult().getType());
-  if (!llvm::isa<mlir::FloatType>(lhs.getElementType()))
+  auto lhs = cast<ExprType>(getLhs().getType());
+  auto rhs = cast<ExprType>(getRhs().getType());
+  auto result = cast<ExprType>(getResult().getType());
+  if (!isa<FloatType>(lhs.getElementType()))
     return emitOpError("requires floating-point operand element types");
   if (lhs.getElementType() != rhs.getElementType())
     return emitOpError("requires matching operand element types");
   if (!result.getElementType().isInteger(1))
     return emitOpError("result element type must be i1");
 
-  return mlir::success();
+  return success();
 }
 
-mlir::LogicalResult SelectOp::verify() {
+LogicalResult SelectOp::verify() {
   auto scopeOr = verifyInsideScope(getOperation());
-  if (mlir::failed(scopeOr))
-    return mlir::failure();
-  if (mlir::failed(verifyElementwiseAxes(getOperation(), *scopeOr)))
-    return mlir::failure();
+  if (failed(scopeOr))
+    return failure();
+  if (failed(verifyElementwiseAxes(getOperation(), *scopeOr)))
+    return failure();
 
-  auto condition = llvm::cast<ExprType>(getCondition().getType());
-  auto trueValue = llvm::cast<ExprType>(getTrueValue().getType());
-  auto falseValue = llvm::cast<ExprType>(getFalseValue().getType());
-  auto result = llvm::cast<ExprType>(getResult().getType());
+  auto condition = cast<ExprType>(getCondition().getType());
+  auto trueValue = cast<ExprType>(getTrueValue().getType());
+  auto falseValue = cast<ExprType>(getFalseValue().getType());
+  auto result = cast<ExprType>(getResult().getType());
 
   if (!condition.getElementType().isInteger(1))
     return emitOpError("condition element type must be i1");
@@ -508,18 +499,17 @@ mlir::LogicalResult SelectOp::verify() {
       trueValue.getElementType() != result.getElementType())
     return emitOpError("true, false, and result element types must match");
 
-  return mlir::success();
+  return success();
 }
 
-static mlir::LogicalResult verifyReducePayload(mlir::Operation *op, ScopeOp scope,
-                                               AxesAttr reductionAxes, ExprType payload,
-                                               ExprType result, mlir::Value identity) {
-  if (mlir::failed(verifyAxesSubset(op, scope.getAxes(), reductionAxes, "reduction")))
-    return mlir::failure();
-  if (mlir::failed(verifyAxesSubset(op, scope.getAxes(), payload.getAxes(), "payload")))
-    return mlir::failure();
-  if (mlir::failed(verifyAxesSubset(op, scope.getAxes(), result.getAxes(), "result")))
-    return mlir::failure();
+static LogicalResult verifyReducePayload(Operation *op, ScopeOp scope, AxesAttr reductionAxes,
+                                         ExprType payload, ExprType result, Value identity) {
+  if (failed(verifyAxesSubset(op, scope.getAxes(), reductionAxes, "reduction")))
+    return failure();
+  if (failed(verifyAxesSubset(op, scope.getAxes(), payload.getAxes(), "payload")))
+    return failure();
+  if (failed(verifyAxesSubset(op, scope.getAxes(), result.getAxes(), "result")))
+    return failure();
 
   if (result.getElementType() != payload.getElementType())
     return op->emitOpError("result element type must match payload element type");
@@ -532,104 +522,104 @@ static mlir::LogicalResult verifyReducePayload(mlir::Operation *op, ScopeOp scop
   if (identity && identity.getType() != result.getElementType())
     return op->emitOpError("identity type must match result expression element type");
 
-  return mlir::success();
+  return success();
 }
 
-ExprType ReduceOp::getPayloadExprType() { return llvm::cast<ExprType>(getInput().getType()); }
+ExprType ReduceOp::getPayloadExprType() { return cast<ExprType>(getInput().getType()); }
 
 ExprType MapReduceOp::getPayloadExprType() {
-  auto yield = llvm::cast<YieldOp>(getBody().front().getTerminator());
-  return llvm::cast<ExprType>(yield.getValues().front().getType());
+  auto yield = cast<YieldOp>(getBody().front().getTerminator());
+  return cast<ExprType>(yield.getValues().front().getType());
 }
 
-mlir::LogicalResult ReduceOp::verify() {
+LogicalResult ReduceOp::verify() {
   auto scopeOr = verifyInsideScope(getOperation());
-  if (mlir::failed(scopeOr))
-    return mlir::failure();
+  if (failed(scopeOr))
+    return failure();
 
-  auto payload = llvm::cast<ExprType>(getInput().getType());
-  auto result = llvm::cast<ExprType>(getResult().getType());
+  auto payload = cast<ExprType>(getInput().getType());
+  auto result = cast<ExprType>(getResult().getType());
   return verifyReducePayload(getOperation(), *scopeOr, getAxes(), payload, result, getIdentity());
 }
 
-mlir::LogicalResult MapReduceOp::verify() {
+LogicalResult MapReduceOp::verify() {
   auto scopeOr = verifyInsideScope(getOperation());
-  if (mlir::failed(scopeOr))
-    return mlir::failure();
+  if (failed(scopeOr))
+    return failure();
 
-  mlir::Block &block = getBody().front();
+  Block &block = getBody().front();
   if (block.getNumArguments() != 0)
     return emitOpError("body must not have arguments");
 
-  auto yield = llvm::dyn_cast<YieldOp>(block.getTerminator());
+  auto yield = dyn_cast<YieldOp>(block.getTerminator());
   if (!yield)
     return emitOpError("body must terminate with ta.yield");
   if (yield.getValues().size() != 1)
     return emitOpError("body must yield exactly one value");
 
-  auto payload = llvm::dyn_cast<ExprType>(yield.getValues().front().getType());
+  auto payload = dyn_cast<ExprType>(yield.getValues().front().getType());
   if (!payload)
     return emitOpError("body must yield a ta.expr value");
 
-  auto result = llvm::cast<ExprType>(getResult().getType());
+  auto result = cast<ExprType>(getResult().getType());
   return verifyReducePayload(getOperation(), *scopeOr, getAxes(), payload, result, getIdentity());
 }
 
-mlir::ParseResult ScopeOp::parse(mlir::OpAsmParser &parser, mlir::OperationState &result) {
-  llvm::SmallVector<mlir::OpAsmParser::Argument> axisArgs;
-  llvm::SmallVector<mlir::Attribute> axes;
+ParseResult ScopeOp::parse(OpAsmParser &parser, OperationState &result) {
+  SmallVector<OpAsmParser::Argument> axisArgs;
+  SmallVector<Attribute> axes;
   if (parser.parseKeyword("axes") || parser.parseLParen())
-    return mlir::failure();
+    return failure();
 
   if (parser.parseOptionalRParen()) {
     do {
-      mlir::OpAsmParser::Argument arg;
+      OpAsmParser::Argument arg;
       std::string axisName;
       if (parser.parseArgument(arg) || parser.parseString(&axisName) ||
           parser.parseColonType(arg.type))
-        return mlir::failure();
+        return failure();
       if (!arg.type.isIndex())
         return parser.emitError(arg.ssaName.location, "expected axis to have index type");
 
       axisArgs.push_back(arg);
       axes.push_back(AxisAttr::get(parser.getContext(), axisName));
-    } while (mlir::succeeded(parser.parseOptionalComma()));
+    } while (succeeded(parser.parseOptionalComma()));
 
     if (parser.parseRParen())
-      return mlir::failure();
+      return failure();
   }
 
   result.addAttribute(
       getAxesAttrName(result.name),
-      AxesAttr::get(parser.getContext(), mlir::ArrayAttr::get(parser.getContext(), axes)));
+      AxesAttr::get(parser.getContext(), ArrayAttr::get(parser.getContext(), axes)));
 
-  mlir::Region *body = result.addRegion();
+  Region *body = result.addRegion();
   if (parser.parseRegion(*body, axisArgs))
-    return mlir::failure();
+    return failure();
 
   if (parser.parseOptionalAttrDict(result.attributes))
-    return mlir::failure();
+    return failure();
 
-  llvm::SmallVector<mlir::Type> resultTypes;
+  SmallVector<Type> resultTypes;
   if (parser.parseColon() || parser.parseLParen() || parser.parseRParen() ||
       parser.parseArrowTypeList(resultTypes))
-    return mlir::failure();
+    return failure();
   if (resultTypes.size() != 1)
     return parser.emitError(parser.getCurrentLocation(), "expected one result type");
 
   result.addTypes(resultTypes);
-  return mlir::success();
+  return success();
 }
 
-void ScopeOp::print(mlir::OpAsmPrinter &printer) {
+void ScopeOp::print(OpAsmPrinter &printer) {
   printer << " axes(";
-  mlir::Block &block = getBody().front();
-  mlir::ArrayAttr axes = getAxes().getAxes();
-  llvm::interleaveComma(llvm::seq<unsigned>(0, block.getNumArguments()), printer, [&](unsigned i) {
-    mlir::BlockArgument arg = block.getArgument(i);
+  Block &block = getBody().front();
+  ArrayAttr axes = getAxes().getAxes();
+  interleaveComma(llvm::seq<unsigned>(0, block.getNumArguments()), printer, [&](unsigned i) {
+    BlockArgument arg = block.getArgument(i);
     printer.printOperand(arg);
     printer << " \"";
-    printer << llvm::cast<AxisAttr>(axes[i]).getName().getValue();
+    printer << cast<AxisAttr>(axes[i]).getName().getValue();
     printer << "\" : ";
     printer.printType(arg.getType());
   });
@@ -641,45 +631,44 @@ void ScopeOp::print(mlir::OpAsmPrinter &printer) {
   printer.printType(getResult().getType());
 }
 
-mlir::LogicalResult ScopeOp::verify() {
-  mlir::Block &block = getBody().front();
+LogicalResult ScopeOp::verify() {
+  Block &block = getBody().front();
   if (block.getNumArguments() != getAxes().getAxes().size())
     return emitOpError("expected one region argument per axis");
-  for (mlir::BlockArgument arg : block.getArguments()) {
+  for (BlockArgument arg : block.getArguments()) {
     if (!arg.getType().isIndex())
       return emitOpError("expected axis region arguments to have index type");
   }
 
-  auto yield = llvm::dyn_cast<YieldOp>(block.getTerminator());
+  auto yield = dyn_cast<YieldOp>(block.getTerminator());
   if (!yield)
     return emitOpError("body must terminate with ta.yield");
 
   if (yield.getValues().size() != 1)
     return emitOpError("body must yield exactly one value");
 
-  auto expr = llvm::dyn_cast<ExprType>(yield.getValues().front().getType());
+  auto expr = dyn_cast<ExprType>(yield.getValues().front().getType());
   if (!expr)
     return emitOpError("body must yield a ta.expr value");
 
-  auto resultType = llvm::cast<mlir::RankedTensorType>(getResult().getType());
+  auto resultType = cast<RankedTensorType>(getResult().getType());
   if (resultType.getElementType() != expr.getElementType())
     return emitOpError("result tensor element type must match yielded expression element type");
 
-  if (mlir::failed(
-          verifyAxesSubset(getOperation(), getAxes(), expr.getAxes(), "yielded expression")))
-    return mlir::failure();
+  if (failed(verifyAxesSubset(getOperation(), getAxes(), expr.getAxes(), "yielded expression")))
+    return failure();
 
-  return mlir::success();
+  return success();
 }
 
-void ScopeOp::getAsmBlockArgumentNames(mlir::Region &region, mlir::OpAsmSetValueNameFn setNameFn) {
+void ScopeOp::getAsmBlockArgumentNames(Region &region, OpAsmSetValueNameFn setNameFn) {
   if (&region != &getBody())
     return;
 
-  mlir::Block &block = region.front();
-  mlir::ArrayAttr axes = getAxes().getAxes();
-  for (auto [arg, axis] : llvm::zip_equal(block.getArguments(), axes))
-    setNameFn(arg, llvm::cast<AxisAttr>(axis).getName().getValue());
+  Block &block = region.front();
+  ArrayAttr axes = getAxes().getAxes();
+  for (auto [arg, axis] : zip_equal(block.getArguments(), axes))
+    setNameFn(arg, cast<AxisAttr>(axis).getName().getValue());
 }
 } // namespace ta
 
