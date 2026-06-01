@@ -196,6 +196,86 @@ static AxesAttr inferUnionAxes(MLIRContext *context, AxesAttr scopeAxes, ValueRa
   return AxesAttr::get(context, ArrayAttr::get(context, inferred));
 }
 
+static LogicalResult emitInferError(std::optional<Location> location, StringRef message) {
+  if (location)
+    emitError(*location) << message;
+  return failure();
+}
+
+static ScopeOp findScope(Value value) {
+  if (Operation *definingOp = value.getDefiningOp())
+    return definingOp->getParentOfType<ScopeOp>();
+
+  Block *block = cast<BlockArgument>(value).getOwner();
+  Operation *parent = block->getParentOp();
+  if (!parent)
+    return {};
+  if (auto scope = dyn_cast<ScopeOp>(parent))
+    return scope;
+  return parent->getParentOfType<ScopeOp>();
+}
+
+static FailureOr<AxesAttr> inferUnionAxesFromOperands(MLIRContext *context,
+                                                      std::optional<Location> location,
+                                                      ValueRange operands) {
+  if (operands.empty())
+    return emitInferError(location, "cannot infer expression axes without operands");
+
+  ScopeOp scope;
+  for (Value operand : operands) {
+    auto expr = dyn_cast<ExprType>(operand.getType());
+    if (!expr)
+      return emitInferError(location, "expected ta.expr operands for type inference");
+    if (!scope)
+      scope = findScope(operand);
+  }
+  if (!scope)
+    return emitInferError(location, "expected operands to be nested in ta.scope");
+
+  return inferUnionAxes(context, scope.getAxes(), operands);
+}
+
+static LogicalResult inferSameElementwiseReturnTypes(MLIRContext *context,
+                                                     std::optional<Location> location,
+                                                     ValueRange operands,
+                                                     SmallVectorImpl<Type> &inferredReturnTypes) {
+  if (operands.empty())
+    return emitInferError(location, "expected at least one operand for elementwise type inference");
+
+  auto first = dyn_cast<ExprType>(operands.front().getType());
+  if (!first)
+    return emitInferError(location, "expected ta.expr operands for elementwise type inference");
+
+  for (Value operand : operands) {
+    auto expr = dyn_cast<ExprType>(operand.getType());
+    if (!expr)
+      return emitInferError(location, "expected ta.expr operands for elementwise type inference");
+    if (expr.getElementType() != first.getElementType())
+      return emitInferError(location,
+                            "expected matching operand element types for type inference");
+  }
+
+  FailureOr<AxesAttr> axes = inferUnionAxesFromOperands(context, location, operands);
+  if (failed(axes))
+    return failure();
+  inferredReturnTypes.push_back(ExprType::get(context, first.getElementType(), *axes));
+  return success();
+}
+
+static FailureOr<ExprType> inferMapReducePayload(std::optional<Location> location,
+                                                 RegionRange regions) {
+  if (regions.size() != 1 || regions[0]->empty())
+    return emitInferError(location, "expected one non-empty region for type inference");
+  Block &block = regions[0]->front();
+  auto yield = dyn_cast_or_null<YieldOp>(block.getTerminator());
+  if (!yield || yield.getValues().size() != 1)
+    return emitInferError(location, "expected region to yield one value for type inference");
+  auto payload = dyn_cast<ExprType>(yield.getValues().front().getType());
+  if (!payload)
+    return emitInferError(location, "expected region to yield a ta.expr value");
+  return payload;
+}
+
 static AxesAttr subtractAxes(MLIRContext *context, AxesAttr source, AxesAttr removed) {
   StringSet<> removedNames;
   for (Attribute attr : removed.getAxes()) {
@@ -296,6 +376,127 @@ static LogicalResult verifyFloatCastElementwiseOp(Operation *op, bool widening) 
   if (!widening && resultWidth >= operandWidth)
     return op->emitOpError("result element type must be narrower than operand element type");
 
+  return success();
+}
+
+LogicalResult MapOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
+                                      Adaptor adaptor,
+                                      SmallVectorImpl<Type> &inferredReturnTypes) {
+  FailureOr<AxesAttr> axes = inferUnionAxesFromOperands(context, location, adaptor.getInputs());
+  if (failed(axes))
+    return failure();
+
+  if (adaptor.getBody().empty())
+    return emitInferError(location, "expected ta.map body for type inference");
+  Block &block = adaptor.getBody().front();
+  auto yield = dyn_cast_or_null<YieldOp>(block.getTerminator());
+  if (!yield || yield.getValues().size() != 1)
+    return emitInferError(location, "expected ta.map body to yield one value for type inference");
+
+  inferredReturnTypes.push_back(ExprType::get(context, yield.getValues().front().getType(), *axes));
+  return success();
+}
+
+LogicalResult ConstantOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
+                                           Adaptor adaptor,
+                                           SmallVectorImpl<Type> &inferredReturnTypes) {
+  Attribute value = adaptor.getValue();
+  if (!value)
+    return emitInferError(location, "expected constant value for type inference");
+  auto typedValue = dyn_cast<TypedAttr>(value);
+  if (!typedValue)
+    return emitInferError(location, "expected typed constant value for type inference");
+  Type elementType = typedValue.getType();
+  if (!elementType)
+    return emitInferError(location, "expected typed constant value for type inference");
+
+  inferredReturnTypes.push_back(
+      ExprType::get(context, elementType, AxesAttr::get(context, ArrayAttr::get(context, {}))));
+  return success();
+}
+
+#define DEFINE_TA_SAME_ELEMENTWISE_INFER(OP)                                                       \
+  LogicalResult OP::inferReturnTypes(MLIRContext *context, std::optional<Location> location,       \
+                                     Adaptor adaptor,                                              \
+                                     SmallVectorImpl<Type> &inferredReturnTypes) {                 \
+    return inferSameElementwiseReturnTypes(context, location, adaptor.getOperands(),                \
+                                           inferredReturnTypes);                                   \
+  }
+
+DEFINE_TA_SAME_ELEMENTWISE_INFER(NegFOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(AddFOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(SubFOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(MulFOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(DivFOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(MaximumFOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(MinimumFOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(MaxNumFOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(MinNumFOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(AbsFOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(CeilOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(ExpOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(Exp2Op)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(FloorOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(LogOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(Log2Op)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(RsqrtOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(SqrtOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(TanhOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(PowFOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(FmaOp)
+
+#undef DEFINE_TA_SAME_ELEMENTWISE_INFER
+
+LogicalResult CmpFOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
+                                       Adaptor adaptor,
+                                       SmallVectorImpl<Type> &inferredReturnTypes) {
+  FailureOr<AxesAttr> axes = inferUnionAxesFromOperands(context, location, adaptor.getOperands());
+  if (failed(axes))
+    return failure();
+  inferredReturnTypes.push_back(ExprType::get(context, IntegerType::get(context, 1), *axes));
+  return success();
+}
+
+LogicalResult SelectOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
+                                         Adaptor adaptor,
+                                         SmallVectorImpl<Type> &inferredReturnTypes) {
+  auto trueValue = dyn_cast<ExprType>(adaptor.getTrueValue().getType());
+  auto falseValue = dyn_cast<ExprType>(adaptor.getFalseValue().getType());
+  if (!trueValue || !falseValue)
+    return emitInferError(location, "expected ta.expr select values for type inference");
+  if (trueValue.getElementType() != falseValue.getElementType())
+    return emitInferError(location, "expected matching select value element types");
+
+  FailureOr<AxesAttr> axes = inferUnionAxesFromOperands(context, location, adaptor.getOperands());
+  if (failed(axes))
+    return failure();
+  inferredReturnTypes.push_back(ExprType::get(context, trueValue.getElementType(), *axes));
+  return success();
+}
+
+LogicalResult ReduceOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
+                                         Adaptor adaptor,
+                                         SmallVectorImpl<Type> &inferredReturnTypes) {
+  auto payload = dyn_cast<ExprType>(adaptor.getInput().getType());
+  if (!payload)
+    return emitInferError(location, "expected ta.reduce input to be a ta.expr value");
+
+  inferredReturnTypes.push_back(
+      ExprType::get(context, payload.getElementType(),
+                    subtractAxes(context, payload.getAxes(), adaptor.getAxes())));
+  return success();
+}
+
+LogicalResult MapReduceOp::inferReturnTypes(MLIRContext *context,
+                                            std::optional<Location> location, Adaptor adaptor,
+                                            SmallVectorImpl<Type> &inferredReturnTypes) {
+  FailureOr<ExprType> payload = inferMapReducePayload(location, adaptor.getRegions());
+  if (failed(payload))
+    return failure();
+
+  inferredReturnTypes.push_back(
+      ExprType::get(context, payload->getElementType(),
+                    subtractAxes(context, payload->getAxes(), adaptor.getAxes())));
   return success();
 }
 

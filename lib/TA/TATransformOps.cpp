@@ -18,8 +18,6 @@ bool intersects(ta::AxesAttr lhs, ta::AxesAttr rhs) {
   return llvm::any_of(lhs.getAxes(), [&](Attribute axis) { return containsAxis(rhs, axis); });
 }
 
-bool sameAxes(ta::AxesAttr lhs, ta::AxesAttr rhs) { return lhs.getAxes() == rhs.getAxes(); }
-
 ta::AxesAttr unionAxesInScopeOrder(MLIRContext *context, ta::ScopeOp scope, ValueRange values) {
   SmallVector<Attribute> axes;
   for (Attribute scopeAxis : scope.getAxes().getAxes()) {
@@ -107,11 +105,7 @@ DiagnosedSilenceableFailure TAExchangeDivAndMatmulOp::applyToOne(
   MLIRContext *context = target.getContext();
   ta::AxesAttr newPayloadAxes = unionAxesInScopeOrder(context, scope, ValueRange{numerator, other});
   ta::AxesAttr newReductionAxes = subtractAxes(context, newPayloadAxes, target.getAxes());
-  ta::AxesAttr finalAxes = unionAxesInScopeOrder(context, scope, ValueRange{target.getResult(), divisor});
   auto originalResultType = cast<ta::ExprType>(target.getResult().getType());
-  auto divisionResultType = exprType(originalResultType.getElementType(), finalAxes);
-  if (!sameAxes(divisionResultType.getAxes(), originalResultType.getAxes()))
-    BAIL("exchanged division result axes do not match the original reduction result axes");
 
   Location loc = target.getLoc();
   rewriter.setInsertionPoint(target);
@@ -141,16 +135,12 @@ DiagnosedSilenceableFailure TAExchangeDivAndMatmulOp::applyToOne(
     Value mappedOther = mapping.lookupOrDefault(other);
     Value lhs = operandNumber == 0 ? mappedNumerator : mappedOther;
     Value rhs = operandNumber == 0 ? mappedOther : mappedNumerator;
-    auto product =
-        ta::MulFOp::create(rewriter, loc, exprType(originalResultType.getElementType(),
-                                                  newPayloadAxes),
-                           lhs, rhs);
+    auto product = ta::MulFOp::create(rewriter, loc, lhs, rhs);
     ta::YieldOp::create(rewriter, loc, product.getResult());
   }
 
   rewriter.setInsertionPointAfter(newReduction);
-  auto division = ta::DivFOp::create(rewriter, loc, originalResultType, newReduction.getResult(),
-                                    divisor);
+  auto division = ta::DivFOp::create(rewriter, loc, newReduction.getResult(), divisor);
 
   bool divIsInsideTarget = div->getBlock() == &body;
   rewriter.replaceOp(target, division.getResult());

@@ -6,6 +6,7 @@ include "mlir/IR/CommonAttrConstraints.td"
 include "mlir/IR/BuiltinAttributeInterfaces.td"
 include "mlir/IR/OpAsmInterface.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
+include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
 class TA_Op<string mnemonic, list<Trait> traits = []>
@@ -17,22 +18,29 @@ class TA_ElementwiseOp<string mnemonic, list<Trait> traits = []>
 }
 
 class TA_UnaryElementwiseOp<string mnemonic, list<Trait> traits = []>
-    : TA_ElementwiseOp<mnemonic, traits> {
+    : TA_ElementwiseOp<mnemonic, [InferTypeOpAdaptor] # traits> {
   let arguments = (ins TA_ExprType:$operand);
   let results = (outs TA_ExprType:$result);
   let assemblyFormat = "operands attr-dict `:` functional-type(operands, results)";
 }
 
 class TA_BinaryElementwiseOp<string mnemonic, list<Trait> traits = []>
-    : TA_ElementwiseOp<mnemonic, traits> {
+    : TA_ElementwiseOp<mnemonic, [InferTypeOpAdaptor] # traits> {
   let arguments = (ins TA_ExprType:$lhs, TA_ExprType:$rhs);
   let results = (outs TA_ExprType:$result);
   let assemblyFormat = "operands attr-dict `:` functional-type(operands, results)";
 }
 
 class TA_TernaryElementwiseOp<string mnemonic, list<Trait> traits = []>
-    : TA_ElementwiseOp<mnemonic, traits> {
+    : TA_ElementwiseOp<mnemonic, [InferTypeOpAdaptor] # traits> {
   let arguments = (ins TA_ExprType:$a, TA_ExprType:$b, TA_ExprType:$c);
+  let results = (outs TA_ExprType:$result);
+  let assemblyFormat = "operands attr-dict `:` functional-type(operands, results)";
+}
+
+class TA_FloatCastElementwiseOp<string mnemonic, list<Trait> traits = []>
+    : TA_ElementwiseOp<mnemonic, traits> {
+  let arguments = (ins TA_ExprType:$operand);
   let results = (outs TA_ExprType:$result);
   let assemblyFormat = "operands attr-dict `:` functional-type(operands, results)";
 }
@@ -69,6 +77,7 @@ def TA_EvalOp : TA_Op<"eval", [Pure]> {
 
 def TA_MapOp : TA_Op<"map", [
     SingleBlockImplicitTerminator<"YieldOp">,
+    InferTypeOpAdaptor,
     TA_ElementwiseOpInterface]> {
   let summary = "pointwise scalar map over expression operands";
   let description = [{
@@ -83,7 +92,7 @@ def TA_MapOp : TA_Op<"map", [
   let hasVerifier = 1;
 }
 
-def TA_ConstantOp : TA_Op<"constant", [Pure]> {
+def TA_ConstantOp : TA_Op<"constant", [Pure, InferTypeOpAdaptor]> {
   let summary = "scalar constant lifted to a ta.expr";
   let arguments = (ins TypedAttrInterface:$value);
   let results = (outs TA_ExprType:$result);
@@ -111,13 +120,13 @@ def TA_Log2Op : TA_UnaryElementwiseOp<"log2">;
 def TA_RsqrtOp : TA_UnaryElementwiseOp<"rsqrt">;
 def TA_SqrtOp : TA_UnaryElementwiseOp<"sqrt">;
 def TA_TanhOp : TA_UnaryElementwiseOp<"tanh">;
-def TA_ExtFOp : TA_UnaryElementwiseOp<"extf">;
-def TA_TruncFOp : TA_UnaryElementwiseOp<"truncf">;
+def TA_ExtFOp : TA_FloatCastElementwiseOp<"extf">;
+def TA_TruncFOp : TA_FloatCastElementwiseOp<"truncf">;
 
 def TA_PowFOp : TA_BinaryElementwiseOp<"powf">;
 def TA_FmaOp : TA_TernaryElementwiseOp<"fma">;
 
-def TA_CmpFOp : TA_ElementwiseOp<"cmpf"> {
+def TA_CmpFOp : TA_ElementwiseOp<"cmpf", [InferTypeOpAdaptor]> {
   let summary = "floating-point comparison lifted over ta.expr axes";
   let arguments = (ins Arith_CmpFPredicateAttr:$predicate,
                        TA_ExprType:$lhs,
@@ -126,7 +135,7 @@ def TA_CmpFOp : TA_ElementwiseOp<"cmpf"> {
   let assemblyFormat = "$predicate `,` operands attr-dict `:` functional-type(operands, results)";
 }
 
-def TA_SelectOp : TA_ElementwiseOp<"select"> {
+def TA_SelectOp : TA_ElementwiseOp<"select", [InferTypeOpAdaptor]> {
   let summary = "select lifted over ta.expr axes";
   let arguments = (ins TA_ExprType:$condition,
                        TA_ExprType:$true_value,
@@ -137,6 +146,7 @@ def TA_SelectOp : TA_ElementwiseOp<"select"> {
 
 class TA_ReduceLikeOp<string mnemonic, list<Trait> traits = []>
     : TA_Op<mnemonic, [Pure,
+                       InferTypeOpAdaptor,
                        TA_ReduceLikeOpInterface,
                        DeclareOpInterfaceMethods<TA_ReduceLikeOpInterface,
                                                  ["getPayloadExprType"]>] # traits> {
