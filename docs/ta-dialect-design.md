@@ -209,12 +209,14 @@ for algebraic rewrites:
 
 ---
 
-### `ta.reduce`
+### `ta.reduce` and `ta.map_reduce`
 
-A mathematical reduction binder over one or more axes.
+Mathematical reduction binders over one or more axes. `ta.reduce` reduces an
+existing expression value. `ta.map_reduce` computes a local payload expression
+region and reduces the yielded value.
 
 ```mlir
-%dot = ta.reduce <add> {
+%dot = ta.map_reduce #ta.reduce_kind<add> {
   %q = ta.at %Q[%b, %h, %i, %d]
        : tensor<?x?x?x?xf32> -> !ta.expr<f32, [b,h,i,d]>
   %k = ta.at %K[%b, %h, %j, %d]
@@ -226,29 +228,30 @@ A mathematical reduction binder over one or more axes.
 } {axes = #ta.axes<d>} : !ta.expr<f32, [b,h,i,j]>
 ```
 
-`ta.reduce` is not a loop. It is a mathematical expression.
+These ops are not loops. They are mathematical expressions.
 
 The reducer kind is a structured enum attribute, not an arbitrary string.
 Built-in reducers include `add`, `mul`, `max`, and `min`.
 
-The payload-body form is the v1 implementation target because it preserves a
-single structured contraction-like unit. The operand form is also useful and
-should be allowed eventually:
+`ta.map_reduce` preserves a single structured contraction-like unit.
+`ta.reduce` is equivalent when the payload already exists:
 
 ```mlir
 %qk = ta.mulf %q, %k
   : (!ta.expr<f32, [b,h,i,d]>, !ta.expr<f32, [b,h,j,d]>)
  -> !ta.expr<f32, [b,h,i,j,d]>
-%dot = ta.reduce <add> %qk {axes = #ta.axes<d>}
+%dot = ta.reduce #ta.reduce_kind<add> %qk {axes = #ta.axes<d>}
   : !ta.expr<f32, [b,h,i,j,d]> -> !ta.expr<f32, [b,h,i,j]>
 ```
 
-Both forms represent the same mathematical binder. The payload-body form maps
-more directly to and from one `linalg.generic` reduction. The operand form is a
-more normalized expression DAG and is convenient when the payload is shared or
-already exists as a value.
+Both ops represent the same mathematical binder and share the same verifier rule
+through a reduce-like interface. `ta.map_reduce` maps more directly to and from
+one `linalg.generic` reduction. `ta.reduce` is a more normalized expression DAG
+node and is convenient when the payload is shared or already exists as a value.
+A `ta.map_reduce` body that only yields an existing value should canonicalize to
+`ta.reduce`.
 
-`ta.reduce` should carry reducer metadata:
+Reduction ops should carry reducer metadata:
 
 ```text
 reducer kind: add, mul, max, min, later custom
@@ -322,7 +325,8 @@ axes(constant) = {}
 axes(ta.at T[index_exprs...]) = axes used by index expressions
 axes(ta.map f(x1,...,xn)) = union_i axes(xi)
 axes(ta.elementwise_op(x1,...,xn)) = union_i axes(xi)
-axes(ta.reduce over R { yield x }) = axes(x) - R
+axes(ta.map_reduce over R { yield x }) = axes(x) - R
+axes(ta.reduce over R x) = axes(x) - R
 axes(ta.select c x y) = axes(c) ∪ axes(x) ∪ axes(y)
 ```
 
@@ -371,7 +375,7 @@ Program shape:
 %O = ta.scope axes(%b "b" : index, %h "h" : index,
                    %i "i" : index, %j "j" : index,
                    %d "d" : index, %e "e" : index) {
-  %dot = ta.reduce <add> {
+  %dot = ta.map_reduce #ta.reduce_kind<add> {
     ...
     ta.yield %qk : !ta.expr<f32, [b,h,i,j,d]>
   } {axes = #ta.axes<d>} : !ta.expr<f32, [b,h,i,j]>
@@ -381,9 +385,8 @@ Program shape:
        : (!ta.expr<f32, []>, !ta.expr<f32, [b,h,i,j]>)
       -> !ta.expr<f32, [b,h,i,j]>
 
-  %m = ta.reduce <max> {
-    ta.yield %s : !ta.expr<f32, [b,h,i,j]>
-  } {axes = #ta.axes<j>} : !ta.expr<f32, [b,h,i]>
+  %m = ta.reduce #ta.reduce_kind<max> %s {axes = #ta.axes<j>}
+       : !ta.expr<f32, [b,h,i,j]> -> !ta.expr<f32, [b,h,i]>
 
   %centered = ta.subf %s, %m
        : (!ta.expr<f32, [b,h,i,j]>, !ta.expr<f32, [b,h,i]>)
@@ -391,10 +394,10 @@ Program shape:
   %p = ta.exp %centered
        : (!ta.expr<f32, [b,h,i,j]>) -> !ta.expr<f32, [b,h,i,j]>
 
-  %l = ta.reduce <add> { ta.yield %p : !ta.expr<f32, [b,h,i,j]> }
-       {axes = #ta.axes<j>} : !ta.expr<f32, [b,h,i]>
+  %l = ta.reduce #ta.reduce_kind<add> %p {axes = #ta.axes<j>}
+       : !ta.expr<f32, [b,h,i,j]> -> !ta.expr<f32, [b,h,i]>
 
-  %num = ta.reduce <add> {
+  %num = ta.map_reduce #ta.reduce_kind<add> {
     ...
     ta.yield %pv : !ta.expr<f32, [b,h,i,j,e]>
   } {axes = #ta.axes<j>} : !ta.expr<f32, [b,h,i,e]>
@@ -663,14 +666,15 @@ For each `linalg.generic` op:
 4. Determine reduction axes from iterators marked `reduction` that do not appear in the output axes.
 5. Translate input element accesses into `ta.at`.
 6. Copy the scalar payload computation into the scope body.
-7. Wrap reduction payloads in `ta.reduce`.
+7. Wrap reduction payloads in `ta.map_reduce`, or use `ta.reduce` when the
+   payload already exists as a value.
 8. Preserve the original op boundary as a `ta.scope`.
 
 A linalg op with one reduction usually becomes:
 
 ```mlir
 %Y = ta.scope axes(%i "i" : index, %j "j" : index, %red "r" : index) {
-  %sum = ta.reduce <add> {
+  %sum = ta.map_reduce #ta.reduce_kind<add> {
     %body_value = ... expression over output axes and reduction axes ...
     ta.yield %body_value : !ta.expr<element_type, [i,j,r]>
   } {axes = #ta.axes<r>} : !ta.expr<element_type, [i,j]>
@@ -882,12 +886,12 @@ empty-domain behavior is compatible
 
 A practical v1 could be:
 
-1. Implement `ta.scope`, `ta.at`, `ta.reduce`, `ta.yield`.
+1. Implement `ta.scope`, `ta.at`, `ta.reduce`, `ta.map_reduce`, `ta.yield`.
 2. Implement `!ta.expr<type, axes>`.
 3. Implement axis attributes and scope-local axis verification.
 4. Implement dependency/axis-set inference.
 5. Import simple `linalg.generic` ops with projected permutation maps.
-6. Import attention-like programs into one scope graph with one scope per linalg op.
+6. Import attention-like programs into one scope graph that can span multiple linalg ops.
 7. Implement scalar rewrites and the reduction movement rule needed for `exp -> exp2`.
 8. Lower unchanged or simply rewritten scopes back to `linalg.generic`.
 9. Add support for affine access expressions later.
@@ -899,7 +903,8 @@ plain attention in linalg
   -> ta
   -> exp-to-exp2 rewrite
   -> fold log2(e) into score scale
-  -> lower back to linalg with same scope structure
+  -> choose scope placement
+  -> lower back to linalg
 ```
 
 Expected before/after:
@@ -927,7 +932,7 @@ After:
 ## Open Questions
 
 1. Should `ta.scope` be multi-result, or should multi-output linalg ops be split into separate scopes?
-2. Should `ta.reduce` support custom reducer regions in v1, or only built-in reducers?
+2. Should reduction ops support custom reducer definitions in v1, or only built-in reducers?
 3. How much fastmath policy should live on `ta.scope` versus individual ops?
 4. Should `ta.expr` axis sets be exact dependencies or conservative supports?
 5. How should scope placement be represented: a separate schedule dialect, or transform annotations?

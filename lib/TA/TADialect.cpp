@@ -291,17 +291,17 @@ mlir::LogicalResult YieldOp::verify() {
     auto result = llvm::cast<ExprType>(map.getResult().getType());
     if (getValues().front().getType() != result.getElementType())
       return emitOpError("terminating ta.map must yield the map result element type");
-  } else if (auto reduce = llvm::dyn_cast<ReduceOp>(parent)) {
+  } else if (auto reduce = llvm::dyn_cast<MapReduceOp>(parent)) {
     if (getValues().size() != 1)
-      return emitOpError("terminating ta.reduce must yield exactly one value");
+      return emitOpError("terminating ta.map_reduce must yield exactly one value");
 
     auto expr = llvm::dyn_cast<ExprType>(getValues().front().getType());
     if (!expr)
-      return emitOpError("terminating ta.reduce must yield a ta.expr value");
+      return emitOpError("terminating ta.map_reduce must yield a ta.expr value");
 
     auto result = llvm::cast<ExprType>(reduce.getResult().getType());
     if (expr.getElementType() != result.getElementType())
-      return emitOpError("terminating ta.reduce must yield the reduce result element type");
+      return emitOpError("terminating ta.map_reduce must yield the reduce result element type");
   } else if (auto scope = llvm::dyn_cast<ScopeOp>(parent)) {
     if (getValues().size() != 1)
       return emitOpError("terminating ta.scope must yield exactly one value");
@@ -474,13 +474,52 @@ mlir::LogicalResult SelectOp::verify() {
   return mlir::success();
 }
 
+static mlir::LogicalResult verifyReducePayload(mlir::Operation *op, ScopeOp scope,
+                                               AxesAttr reductionAxes, ExprType payload,
+                                               ExprType result, mlir::Value identity) {
+  if (mlir::failed(verifyAxesSubset(op, scope.getAxes(), reductionAxes, "reduction")))
+    return mlir::failure();
+  if (mlir::failed(verifyAxesSubset(op, scope.getAxes(), payload.getAxes(), "payload")))
+    return mlir::failure();
+  if (mlir::failed(verifyAxesSubset(op, scope.getAxes(), result.getAxes(), "result")))
+    return mlir::failure();
+
+  if (result.getElementType() != payload.getElementType())
+    return op->emitOpError("result element type must match payload element type");
+
+  AxesAttr expected = subtractAxes(op->getContext(), payload.getAxes(), reductionAxes);
+  if (!sameAxes(result.getAxes(), expected))
+    return op->emitOpError()
+           << "result axes must be payload axes minus reduction axes; expected " << expected;
+
+  if (identity && identity.getType() != result.getElementType())
+    return op->emitOpError("identity type must match result expression element type");
+
+  return mlir::success();
+}
+
+ExprType ReduceOp::getPayloadExprType() {
+  return llvm::cast<ExprType>(getInput().getType());
+}
+
+ExprType MapReduceOp::getPayloadExprType() {
+  auto yield = llvm::cast<YieldOp>(getBody().front().getTerminator());
+  return llvm::cast<ExprType>(yield.getValues().front().getType());
+}
+
 mlir::LogicalResult ReduceOp::verify() {
   auto scopeOr = verifyInsideScope(getOperation());
   if (mlir::failed(scopeOr))
     return mlir::failure();
 
-  ScopeOp scope = *scopeOr;
-  if (mlir::failed(verifyAxesSubset(getOperation(), scope.getAxes(), getAxes(), "reduction")))
+  auto payload = llvm::cast<ExprType>(getInput().getType());
+  auto result = llvm::cast<ExprType>(getResult().getType());
+  return verifyReducePayload(getOperation(), *scopeOr, getAxes(), payload, result, getIdentity());
+}
+
+mlir::LogicalResult MapReduceOp::verify() {
+  auto scopeOr = verifyInsideScope(getOperation());
+  if (mlir::failed(scopeOr))
     return mlir::failure();
 
   mlir::Block &block = getBody().front();
@@ -497,25 +536,8 @@ mlir::LogicalResult ReduceOp::verify() {
   if (!payload)
     return emitOpError("body must yield a ta.expr value");
 
-  if (mlir::failed(verifyAxesSubset(getOperation(), scope.getAxes(), payload.getAxes(), "payload")))
-    return mlir::failure();
-  if (mlir::failed(verifyExprAxes(getOperation(), scope, getResult().getType(), "result")))
-    return mlir::failure();
-
   auto result = llvm::cast<ExprType>(getResult().getType());
-  if (result.getElementType() != payload.getElementType())
-    return emitOpError("result element type must match yielded payload element type");
-
-  AxesAttr expected = subtractAxes(getContext(), payload.getAxes(), getAxes());
-  if (!sameAxes(result.getAxes(), expected))
-    return emitOpError()
-           << "result axes must be yielded payload axes minus reduction axes; expected "
-           << expected;
-
-  if (getIdentity() && getIdentity().getType() != result.getElementType())
-    return emitOpError("identity type must match result expression element type");
-
-  return mlir::success();
+  return verifyReducePayload(getOperation(), *scopeOr, getAxes(), payload, result, getIdentity());
 }
 
 mlir::ParseResult ScopeOp::parse(mlir::OpAsmParser &parser, mlir::OperationState &result) {

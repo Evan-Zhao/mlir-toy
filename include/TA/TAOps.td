@@ -133,8 +133,28 @@ def TA_SelectOp : TA_ElementwiseOp<"select"> {
   let assemblyFormat = "operands attr-dict `:` functional-type(operands, results)";
 }
 
-def TA_ReduceOp : TA_Op<"reduce", [Pure]> {
+class TA_ReduceLikeOp<string mnemonic, list<Trait> traits = []>
+    : TA_Op<mnemonic, [Pure,
+                       TA_ReduceLikeOpInterface,
+                       DeclareOpInterfaceMethods<TA_ReduceLikeOpInterface,
+                                                 ["getPayloadExprType"]>] # traits> {
+  let hasVerifier = 1;
+}
+
+def TA_ReduceOp : TA_ReduceLikeOp<"reduce"> {
   let summary = "mathematical reduction over expression axes";
+  let arguments = (ins TA_ReduceKindEnumAttr:$kind,
+                       TA_ExprType:$input,
+                       Optional<AnyType>:$identity,
+                       TA_AxesAttr:$axes);
+  let results = (outs TA_ExprType:$result);
+
+  let assemblyFormat = "$kind $input (`identity` `(` $identity^ `:` type($identity) `)`)? "
+                       "attr-dict `:` type($input) `->` type($result)";
+}
+
+def TA_MapReduceOp : TA_ReduceLikeOp<"map_reduce"> {
+  let summary = "map payload region followed by mathematical reduction";
   let arguments = (ins TA_ReduceKindEnumAttr:$kind,
                        Optional<AnyType>:$identity,
                        TA_AxesAttr:$axes);
@@ -143,7 +163,6 @@ def TA_ReduceOp : TA_Op<"reduce", [Pure]> {
 
   let assemblyFormat = "$kind (`identity` `(` $identity^ `:` type($identity) `)`)? "
                        "$body attr-dict `:` type($result)";
-  let hasVerifier = 1;
 }
 
 def TA_ScopeOp : TA_Op<"scope", [

@@ -58,8 +58,8 @@ func.func @bad_reduce_result_axes(%tensor: tensor<16x32xf32>)
   %0 = ta.scope axes(%row "i" : index, %col "j" : index) {
     %x = ta.at %tensor[%row, %col] {axes = #ta.axes<i, j>}
         : tensor<16x32xf32> -> !ta.expr<f32, [i, j]>
-    // expected-error @+1 {{'ta.reduce' op result axes must be yielded payload axes minus reduction axes; expected #ta.axes<i>}}
-    %bad = ta.reduce <add> {
+    // expected-error @+1 {{'ta.map_reduce' op result axes must be payload axes minus reduction axes; expected #ta.axes<i>}}
+    %bad = ta.map_reduce #ta.reduce_kind<add> {
       ta.yield %x : !ta.expr<f32, [i, j]>
     } {axes = #ta.axes<j>} : !ta.expr<f32, [j]>
     ta.yield %bad : !ta.expr<f32, [j]>

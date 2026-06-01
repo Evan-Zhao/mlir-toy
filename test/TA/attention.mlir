@@ -8,7 +8,7 @@ func.func @attention_ta(%Q: tensor<2x3x4x6xf32>,
   %O = ta.scope axes(%b "b" : index, %h "h" : index,
                      %i "i" : index, %j "j" : index,
                      %d "d" : index, %e "e" : index) {
-    %dot = ta.reduce <add> {
+    %dot = ta.map_reduce #ta.reduce_kind<add> {
       %q = ta.at %Q[%b, %h, %i, %d] {axes = #ta.axes<b, h, i, d>}
           : tensor<2x3x4x6xf32> -> !ta.expr<f32, [b, h, i, d]>
       %k = ta.at %K[%b, %h, %j, %d] {axes = #ta.axes<b, h, j, d>}
@@ -24,9 +24,8 @@ func.func @attention_ta(%Q: tensor<2x3x4x6xf32>,
         : (!ta.expr<f32, []>, !ta.expr<f32, [b, h, i, j]>)
        -> !ta.expr<f32, [b, h, i, j]>
 
-    %m = ta.reduce <max> {
-      ta.yield %s : !ta.expr<f32, [b, h, i, j]>
-    } {axes = #ta.axes<j>} : !ta.expr<f32, [b, h, i]>
+    %m = ta.reduce #ta.reduce_kind<max> %s {axes = #ta.axes<j>}
+        : !ta.expr<f32, [b, h, i, j]> -> !ta.expr<f32, [b, h, i]>
 
     %centered = ta.subf %s, %m
         : (!ta.expr<f32, [b, h, i, j]>, !ta.expr<f32, [b, h, i]>)
@@ -34,11 +33,10 @@ func.func @attention_ta(%Q: tensor<2x3x4x6xf32>,
     %p = ta.exp %centered
         : (!ta.expr<f32, [b, h, i, j]>) -> !ta.expr<f32, [b, h, i, j]>
 
-    %l = ta.reduce <add> {
-      ta.yield %p : !ta.expr<f32, [b, h, i, j]>
-    } {axes = #ta.axes<j>} : !ta.expr<f32, [b, h, i]>
+    %l = ta.reduce #ta.reduce_kind<add> %p {axes = #ta.axes<j>}
+        : !ta.expr<f32, [b, h, i, j]> -> !ta.expr<f32, [b, h, i]>
 
-    %num = ta.reduce <add> {
+    %num = ta.map_reduce #ta.reduce_kind<add> {
       %v = ta.at %V[%b, %h, %j, %e] {axes = #ta.axes<b, h, j, e>}
           : tensor<2x3x5x7xf32> -> !ta.expr<f32, [b, h, j, e]>
       %pv = ta.mulf %p, %v
