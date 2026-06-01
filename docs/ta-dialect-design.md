@@ -144,17 +144,20 @@ Owns one indexed expression region, declares the allowed body axes, and
 materializes the yielded expression as a tensor result.
 
 ```mlir
-%S = ta.scope axes(%b "b" : index, %h "h" : index,
-                   %i "i" : index, %j "j" : index) {
+%O = ta.scope axes(%b "b" : index, %h "h" : index,
+                   %i "i" : index, %j "j" : index,
+                   %d "d" : index, %e "e" : index) {
   ...
-  ta.yield %s : !ta.expr<f32, [b,h,i,j]>
+  ta.yield %o : !ta.expr<f32, [b,h,i,e]>
 } : () -> tensor<?x?x?x?xf32>
 ```
 
-A scope result is the tensor version of the expression yielded by its
-terminator. The yielded expression may depend on a subset of the scope axes;
-materializing over a superset is a broadcast. Yielding an expression that
-depends on an undeclared axis is illegal.
+A scope result is the tensor version of the expression yielded by its terminator.
+The scope axis list is the ambient coordinate universe for the body,
+not necessarily the result shape.
+The yielded expression may depend on a subset of the scope axes;
+axes used only inside reductions or intermediate expressions
+do not appear in the result expression.
 
 Scopes are the only place where `ta` indexed expression ops may appear.
 
@@ -358,7 +361,9 @@ The result axis order is the enclosing `ta.scope` order, not operand order.
 
 ## Attention in `ta`
 
-This section shows the target imported representation for plain materialized attention.
+This section sketches the target representation for plain attention inside one
+ambient `ta.scope`. The full executable MLIR example lives in
+`test/TA/attention.mlir`.
 
 Symbolic axes:
 
@@ -380,57 +385,40 @@ V : tensor<Batch x Heads x KeySeq   x ValueDim  x f32>
 scale : f32 constant
 ```
 
-Program:
+Program shape:
 
 ```mlir
-%Dot = ta.scope axes(%b "b" : index, %h "h" : index, %i "i" : index,
-                     %j "j" : index, %d "d" : index) {
+%O = ta.scope axes(%b "b" : index, %h "h" : index,
+                   %i "i" : index, %j "j" : index,
+                   %d "d" : index, %e "e" : index) {
   %dot = ta.reduce <add> {
-    %q = ta.at %Q[%b, %h, %i, %d]
-         : tensor<?x?x?x?xf32> -> !ta.expr<f32, [b,h,i,d]>
-    %k = ta.at %K[%b, %h, %j, %d]
-         : tensor<?x?x?x?xf32> -> !ta.expr<f32, [b,h,j,d]>
-    %qk = ta.mulf %q, %k
-          : (!ta.expr<f32, [b,h,i,d]>, !ta.expr<f32, [b,h,j,d]>)
-         -> !ta.expr<f32, [b,h,i,j,d]>
+    ...
     ta.yield %qk : !ta.expr<f32, [b,h,i,j,d]>
   } {axes = #ta.axes<d>} : !ta.expr<f32, [b,h,i,j]>
-  ta.yield %dot : !ta.expr<f32, [b,h,i,j]>
-} : () -> tensor<Batch x Heads x QuerySeq x KeySeq x f32>
 
-%S = ta.scope axes(%b "b" : index, %h "h" : index,
-                   %i "i" : index, %j "j" : index) {
-  %dot = ta.eval %Dot[%b, %h, %i, %j]
-         : tensor<Batch x Heads x QuerySeq x KeySeq x f32>
-        -> !ta.expr<f32, [b,h,i,j]>
   %scale_expr = ta.constant 1.250000e-01 : f32 : !ta.expr<f32, []>
   %s = ta.mulf %scale_expr, %dot
        : (!ta.expr<f32, []>, !ta.expr<f32, [b,h,i,j]>)
       -> !ta.expr<f32, [b,h,i,j]>
-  ta.yield %s : !ta.expr<f32, [b,h,i,j]>
-} : () -> tensor<Batch x Heads x QuerySeq x KeySeq x f32>
 
-%M = ta.scope axes(%b "b" : index, %h "h" : index,
-                   %i "i" : index, %j "j" : index) {
-  %s = ta.eval %S[%b, %h, %i, %j]
-       : tensor<Batch x Heads x QuerySeq x KeySeq x f32>
-      -> !ta.expr<f32, [b,h,i,j]>
   %m = ta.reduce <max> {
     ta.yield %s : !ta.expr<f32, [b,h,i,j]>
   } {axes = #ta.axes<j>} : !ta.expr<f32, [b,h,i]>
-  ta.yield %m : !ta.expr<f32, [b,h,i]>
-} : () -> tensor<Batch x Heads x QuerySeq x f32>
 
-...
+  %centered = ta.subf %s, %m
+       : (!ta.expr<f32, [b,h,i,j]>, !ta.expr<f32, [b,h,i]>)
+      -> !ta.expr<f32, [b,h,i,j]>
+  %p = ta.exp %centered
+       : (!ta.expr<f32, [b,h,i,j]>) -> !ta.expr<f32, [b,h,i,j]>
 
-%O = ta.scope axes(%b "b" : index, %h "h" : index,
-                   %i "i" : index, %e "e" : index) {
-  %num = ta.eval %Num[%b, %h, %i, %e]
-         : tensor<Batch x Heads x QuerySeq x ValueDim x f32>
-        -> !ta.expr<f32, [b,h,i,e]>
-  %l = ta.eval %L[%b, %h, %i]
-       : tensor<Batch x Heads x QuerySeq x f32>
-      -> !ta.expr<f32, [b,h,i]>
+  %l = ta.reduce <add> { ta.yield %p : !ta.expr<f32, [b,h,i,j]> }
+       {axes = #ta.axes<j>} : !ta.expr<f32, [b,h,i]>
+
+  %num = ta.reduce <add> {
+    ...
+    ta.yield %pv : !ta.expr<f32, [b,h,i,j,e]>
+  } {axes = #ta.axes<j>} : !ta.expr<f32, [b,h,i,e]>
+
   %o = ta.divf %num, %l
        : (!ta.expr<f32, [b,h,i,e]>, !ta.expr<f32, [b,h,i]>)
       -> !ta.expr<f32, [b,h,i,e]>
@@ -438,9 +426,10 @@ Program:
 } : () -> tensor<Batch x Heads x QuerySeq x ValueDim x f32>
 ```
 
-Each `ta.scope` returns the materialized tensor for its yielded expression.
-This representation preserves the original materialized scopes, but all scopes
-can be looked through during whole-program rewriting.
+One `ta.scope` can expose the whole attention computation as a scalar indexed
+expression graph. Intermediate reductions over `d` and `j` are internal binders;
+only the final yielded expression axes `[b,h,i,e]` determine the materialized
+tensor result.
 
 ---
 
