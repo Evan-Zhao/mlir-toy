@@ -161,7 +161,7 @@ make_mlir_opt_plugin(
 )
 make_mlir_opt_plugin(
   TARGET TADialect
-  SOURCES lib/TA/TADialect.cpp
+  SOURCES lib/TA/TADialect.cpp lib/TA/LinalgToTA.cpp
   DEPS TAOpsIncGen TAInterfacesIncGen TAAttrsIncGen TATypesIncGen
 )
 make_mlir_opt_plugin(

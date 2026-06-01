@@ -1,10 +1,12 @@
 #include "TA/TADialect.h"
 #include "TA/TAAttrs.h"
 #include "TA/TAOps.h"
+#include "TA/TAPasses.h"
 #include "TA/TATypes.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Tools/Plugins/DialectPlugin.h"
+#include "mlir/Tools/Plugins/PassPlugin.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
 
@@ -278,8 +280,7 @@ static mlir::LogicalResult verifyTernaryFloatElementwiseOp(mlir::Operation *op) 
   return verifyFloatElementwiseOp(op);
 }
 
-static mlir::LogicalResult verifyFloatCastElementwiseOp(mlir::Operation *op,
-                                                        bool widening) {
+static mlir::LogicalResult verifyFloatCastElementwiseOp(mlir::Operation *op, bool widening) {
   if (op->getNumOperands() != 1)
     return op->emitOpError("expected one operand");
 
@@ -525,8 +526,8 @@ static mlir::LogicalResult verifyReducePayload(mlir::Operation *op, ScopeOp scop
 
   AxesAttr expected = subtractAxes(op->getContext(), payload.getAxes(), reductionAxes);
   if (!sameAxes(result.getAxes(), expected))
-    return op->emitOpError()
-           << "result axes must be payload axes minus reduction axes; expected " << expected;
+    return op->emitOpError() << "result axes must be payload axes minus reduction axes; expected "
+                             << expected;
 
   if (identity && identity.getType() != result.getElementType())
     return op->emitOpError("identity type must match result expression element type");
@@ -534,9 +535,7 @@ static mlir::LogicalResult verifyReducePayload(mlir::Operation *op, ScopeOp scop
   return mlir::success();
 }
 
-ExprType ReduceOp::getPayloadExprType() {
-  return llvm::cast<ExprType>(getInput().getType());
-}
+ExprType ReduceOp::getPayloadExprType() { return llvm::cast<ExprType>(getInput().getType()); }
 
 ExprType MapReduceOp::getPayloadExprType() {
   auto yield = llvm::cast<YieldOp>(getBody().front().getTerminator());
@@ -686,7 +685,15 @@ void ScopeOp::getAsmBlockArgumentNames(mlir::Region &region, mlir::OpAsmSetValue
 
 extern "C" LLVM_ATTRIBUTE_WEAK mlir::DialectPluginLibraryInfo mlirGetDialectPluginInfo() {
   return {MLIR_PLUGIN_API_VERSION, "TADialectPlugin", LLVM_VERSION_STRING,
-          [](mlir::DialectRegistry *registry) { registry->insert<ta::TADialect>(); }};
+          [](mlir::DialectRegistry *registry) {
+            registry->insert<ta::TADialect>();
+            ta::registerTAPasses();
+          }};
+}
+
+extern "C" LLVM_ATTRIBUTE_WEAK mlir::PassPluginLibraryInfo mlirGetPassPluginInfo() {
+  return {MLIR_PLUGIN_API_VERSION, "TAPassPlugin", LLVM_VERSION_STRING,
+          []() { ta::registerTAPasses(); }};
 }
 
 #include "mlir/IR/DialectImplementation.h"
