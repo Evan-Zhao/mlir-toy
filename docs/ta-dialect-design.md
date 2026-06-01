@@ -230,16 +230,44 @@ for algebraic rewrites:
 A mathematical reduction binder over one or more axes.
 
 ```mlir
-%dot = ta.reduce add over(%d) identity(%zero) %qk
-       : !ta.expr<f32, [b,h,i,j,d]> -> !ta.expr<f32, [b,h,i,j]>
+%dot = ta.reduce <add> {
+  %q = ta.at %Q[%b, %h, %i, %d]
+       : tensor<?x?x?x?xf32> -> !ta.expr<f32, [b,h,i,d]>
+  %k = ta.at %K[%b, %h, %j, %d]
+       : tensor<?x?x?x?xf32> -> !ta.expr<f32, [b,h,j,d]>
+  %qk = ta.mulf %q, %k
+        : (!ta.expr<f32, [b,h,i,d]>, !ta.expr<f32, [b,h,j,d]>)
+       -> !ta.expr<f32, [b,h,i,j,d]>
+  ta.yield %qk : !ta.expr<f32, [b,h,i,j,d]>
+} {axes = #ta.axes<d>} : !ta.expr<f32, [b,h,i,j]>
 ```
 
 `ta.reduce` is not a loop. It is a mathematical expression.
 
-It should carry reducer metadata:
+The reducer kind is a structured enum attribute, not an arbitrary string.
+Built-in reducers include `add`, `mul`, `max`, and `min`.
+
+The payload-body form is the v1 implementation target because it preserves a
+single structured contraction-like unit. The operand form is also useful and
+should be allowed eventually:
+
+```mlir
+%qk = ta.mulf %q, %k
+  : (!ta.expr<f32, [b,h,i,d]>, !ta.expr<f32, [b,h,j,d]>)
+ -> !ta.expr<f32, [b,h,i,j,d]>
+%dot = ta.reduce <add> %qk {axes = #ta.axes<d>}
+  : !ta.expr<f32, [b,h,i,j,d]> -> !ta.expr<f32, [b,h,i,j]>
+```
+
+Both forms represent the same mathematical binder. The payload-body form maps
+more directly to and from one `linalg.generic` reduction. The operand form is a
+more normalized expression DAG and is convenient when the payload is shared or
+already exists as a value.
+
+`ta.reduce` should carry reducer metadata:
 
 ```text
-reducer kind: add, mul, max, min, custom
+reducer kind: add, mul, max, min, later custom
 identity value
 associative / commutative / idempotent flags
 ordered or unordered semantics
@@ -311,7 +339,7 @@ axes(ta.at T[index_exprs...]) = axes used by index expressions
 axes(ta.eval tensor[index_exprs...]) = axes used by index expressions
 axes(ta.map f(x1,...,xn)) = union_i axes(xi)
 axes(ta.elementwise_op(x1,...,xn)) = union_i axes(xi)
-axes(ta.reduce over R of x) = axes(x) - R
+axes(ta.reduce over R { yield x }) = axes(x) - R
 axes(ta.select c x y) = axes(c) ∪ axes(x) ∪ axes(y)
 ```
 
@@ -357,16 +385,16 @@ Program:
 ```mlir
 %Dot = ta.scope axes(%b "b" : index, %h "h" : index, %i "i" : index,
                      %j "j" : index, %d "d" : index) {
-  %q = ta.at %Q[%b, %h, %i, %d]
-       : tensor<?x?x?x?xf32> -> !ta.expr<f32, [b,h,i,d]>
-  %k = ta.at %K[%b, %h, %j, %d]
-       : tensor<?x?x?x?xf32> -> !ta.expr<f32, [b,h,j,d]>
-  %qk = ta.mulf %q, %k
-        : (!ta.expr<f32, [b,h,i,d]>, !ta.expr<f32, [b,h,j,d]>)
-       -> !ta.expr<f32, [b,h,i,j,d]>
-
-  %dot = ta.reduce add over(%d) identity(%zero) %qk
-         : !ta.expr<f32, [b,h,i,j,d]> -> !ta.expr<f32, [b,h,i,j]>
+  %dot = ta.reduce <add> {
+    %q = ta.at %Q[%b, %h, %i, %d]
+         : tensor<?x?x?x?xf32> -> !ta.expr<f32, [b,h,i,d]>
+    %k = ta.at %K[%b, %h, %j, %d]
+         : tensor<?x?x?x?xf32> -> !ta.expr<f32, [b,h,j,d]>
+    %qk = ta.mulf %q, %k
+          : (!ta.expr<f32, [b,h,i,d]>, !ta.expr<f32, [b,h,j,d]>)
+         -> !ta.expr<f32, [b,h,i,j,d]>
+    ta.yield %qk : !ta.expr<f32, [b,h,i,j,d]>
+  } {axes = #ta.axes<d>} : !ta.expr<f32, [b,h,i,j]>
   ta.yield %dot : !ta.expr<f32, [b,h,i,j]>
 } : () -> tensor<Batch x Heads x QuerySeq x KeySeq x f32>
 
@@ -387,8 +415,9 @@ Program:
   %s = ta.eval %S[%b, %h, %i, %j]
        : tensor<Batch x Heads x QuerySeq x KeySeq x f32>
       -> !ta.expr<f32, [b,h,i,j]>
-  %m = ta.reduce max over(%j) identity(%neg_inf) %s
-       : !ta.expr<f32, [b,h,i,j]> -> !ta.expr<f32, [b,h,i]>
+  %m = ta.reduce <max> {
+    ta.yield %s : !ta.expr<f32, [b,h,i,j]>
+  } {axes = #ta.axes<j>} : !ta.expr<f32, [b,h,i]>
   ta.yield %m : !ta.expr<f32, [b,h,i]>
 } : () -> tensor<Batch x Heads x QuerySeq x f32>
 
@@ -672,9 +701,11 @@ A linalg op with one reduction usually becomes:
 
 ```mlir
 %Y = ta.scope axes(%i "i" : index, %j "j" : index, %red "r" : index) {
-  %body_value = ... expression over output axes and reduction axes ...
-  %sum = ta.reduce reducer over(reduction_axes...) identity(%init) %body_value
-  ta.yield %sum
+  %sum = ta.reduce <add> {
+    %body_value = ... expression over output axes and reduction axes ...
+    ta.yield %body_value : !ta.expr<element_type, [i,j,r]>
+  } {axes = #ta.axes<r>} : !ta.expr<element_type, [i,j]>
+  ta.yield %sum : !ta.expr<element_type, [i,j]>
 } : () -> tensor<...xelement_type>
 ```
 

@@ -1,6 +1,5 @@
 #include "TA/TADialect.h"
 #include "TA/TAAttrs.h"
-#include "TA/TAInterfaces.h"
 #include "TA/TAOps.h"
 #include "TA/TATypes.h"
 #include "mlir/IR/OpImplementation.h"
@@ -203,6 +202,23 @@ static AxesAttr inferUnionAxes(mlir::MLIRContext *context, AxesAttr scopeAxes,
   return AxesAttr::get(context, mlir::ArrayAttr::get(context, inferred));
 }
 
+static AxesAttr subtractAxes(mlir::MLIRContext *context, AxesAttr source, AxesAttr removed) {
+  llvm::StringSet<> removedNames;
+  for (mlir::Attribute attr : removed.getAxes()) {
+    AxisAttr axis = llvm::cast<AxisAttr>(attr);
+    removedNames.insert(axis.getName().getValue());
+  }
+
+  llvm::SmallVector<mlir::Attribute> kept;
+  for (mlir::Attribute attr : source.getAxes()) {
+    AxisAttr axis = llvm::cast<AxisAttr>(attr);
+    if (!removedNames.contains(axis.getName().getValue()))
+      kept.push_back(attr);
+  }
+
+  return AxesAttr::get(context, mlir::ArrayAttr::get(context, kept));
+}
+
 static mlir::LogicalResult verifyElementwiseAxes(mlir::Operation *op, ScopeOp scope) {
   for (mlir::Value operand : op->getOperands()) {
     if (mlir::failed(verifyExprAxes(op, scope, operand.getType(), "operand")))
@@ -275,6 +291,17 @@ mlir::LogicalResult YieldOp::verify() {
     auto result = llvm::cast<ExprType>(map.getResult().getType());
     if (getValues().front().getType() != result.getElementType())
       return emitOpError("terminating ta.map must yield the map result element type");
+  } else if (auto reduce = llvm::dyn_cast<ReduceOp>(parent)) {
+    if (getValues().size() != 1)
+      return emitOpError("terminating ta.reduce must yield exactly one value");
+
+    auto expr = llvm::dyn_cast<ExprType>(getValues().front().getType());
+    if (!expr)
+      return emitOpError("terminating ta.reduce must yield a ta.expr value");
+
+    auto result = llvm::cast<ExprType>(reduce.getResult().getType());
+    if (expr.getElementType() != result.getElementType())
+      return emitOpError("terminating ta.reduce must yield the reduce result element type");
   } else if (auto scope = llvm::dyn_cast<ScopeOp>(parent)) {
     if (getValues().size() != 1)
       return emitOpError("terminating ta.scope must yield exactly one value");
@@ -371,13 +398,13 @@ mlir::LogicalResult ConstantOp::verify() {
   return mlir::success();
 }
 
-#define DEFINE_TA_UNARY_FLOAT_VERIFY(OP)                                                          \
+#define DEFINE_TA_UNARY_FLOAT_VERIFY(OP)                                                           \
   mlir::LogicalResult OP::verify() { return verifyUnaryFloatElementwiseOp(getOperation()); }
 
-#define DEFINE_TA_BINARY_FLOAT_VERIFY(OP)                                                         \
+#define DEFINE_TA_BINARY_FLOAT_VERIFY(OP)                                                          \
   mlir::LogicalResult OP::verify() { return verifyBinaryFloatElementwiseOp(getOperation()); }
 
-#define DEFINE_TA_TERNARY_FLOAT_VERIFY(OP)                                                        \
+#define DEFINE_TA_TERNARY_FLOAT_VERIFY(OP)                                                         \
   mlir::LogicalResult OP::verify() { return verifyTernaryFloatElementwiseOp(getOperation()); }
 
 DEFINE_TA_UNARY_FLOAT_VERIFY(NegFOp)
@@ -455,10 +482,40 @@ mlir::LogicalResult ReduceOp::verify() {
   ScopeOp scope = *scopeOr;
   if (mlir::failed(verifyAxesSubset(getOperation(), scope.getAxes(), getAxes(), "reduction")))
     return mlir::failure();
-  if (mlir::failed(verifyExprAxes(getOperation(), scope, getInput().getType(), "input")))
+
+  mlir::Block &block = getBody().front();
+  if (block.getNumArguments() != 0)
+    return emitOpError("body must not have arguments");
+
+  auto yield = llvm::dyn_cast<YieldOp>(block.getTerminator());
+  if (!yield)
+    return emitOpError("body must terminate with ta.yield");
+  if (yield.getValues().size() != 1)
+    return emitOpError("body must yield exactly one value");
+
+  auto payload = llvm::dyn_cast<ExprType>(yield.getValues().front().getType());
+  if (!payload)
+    return emitOpError("body must yield a ta.expr value");
+
+  if (mlir::failed(verifyAxesSubset(getOperation(), scope.getAxes(), payload.getAxes(), "payload")))
+    return mlir::failure();
+  if (mlir::failed(verifyExprAxes(getOperation(), scope, getResult().getType(), "result")))
     return mlir::failure();
 
-  return verifyExprAxes(getOperation(), scope, getResult().getType(), "result");
+  auto result = llvm::cast<ExprType>(getResult().getType());
+  if (result.getElementType() != payload.getElementType())
+    return emitOpError("result element type must match yielded payload element type");
+
+  AxesAttr expected = subtractAxes(getContext(), payload.getAxes(), getAxes());
+  if (!sameAxes(result.getAxes(), expected))
+    return emitOpError()
+           << "result axes must be yielded payload axes minus reduction axes; expected "
+           << expected;
+
+  if (getIdentity() && getIdentity().getType() != result.getElementType())
+    return emitOpError("identity type must match result expression element type");
+
+  return mlir::success();
 }
 
 mlir::ParseResult ScopeOp::parse(mlir::OpAsmParser &parser, mlir::OperationState &result) {
@@ -578,6 +635,8 @@ extern "C" LLVM_ATTRIBUTE_WEAK mlir::DialectPluginLibraryInfo mlirGetDialectPlug
 #include "llvm/ADT/TypeSwitch.h"
 
 #include "TAInterfaces.cpp.inc"
+
+#include "TAEnums.cpp.inc"
 
 #define GET_ATTRDEF_CLASSES
 #include "TAAttrs.cpp.inc"

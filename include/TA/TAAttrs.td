@@ -1,5 +1,22 @@
 include "TA/TADialect.td"
 include "mlir/IR/AttrTypeBase.td"
+include "mlir/IR/EnumAttr.td"
+
+def TA_ReduceKindAttr : I32EnumAttr<
+    "ReduceKind", "built-in tensor algebra reducer",
+    [
+      I32EnumAttrCase<"Add", 0, "add">,
+      I32EnumAttrCase<"Mul", 1, "mul">,
+      I32EnumAttrCase<"Max", 2, "max">,
+      I32EnumAttrCase<"Min", 3, "min">
+    ]> {
+  let cppNamespace = "::ta";
+  let genSpecializedAttr = 0;
+}
+
+def TA_ReduceKindEnumAttr : EnumAttr<TA_Dialect, TA_ReduceKindAttr, "reduce_kind"> {
+  let assemblyFormat = "`<` $value `>`";
+}
 
 def TA_AxisAttr : AttrDef<TA_Dialect, "Axis"> {
   let mnemonic = "axis";

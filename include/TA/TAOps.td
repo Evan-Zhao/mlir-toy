@@ -135,14 +135,14 @@ def TA_SelectOp : TA_ElementwiseOp<"select"> {
 
 def TA_ReduceOp : TA_Op<"reduce", [Pure]> {
   let summary = "mathematical reduction over expression axes";
-  let arguments = (ins TA_ExprType:$input,
+  let arguments = (ins TA_ReduceKindEnumAttr:$kind,
                        Optional<AnyType>:$identity,
-                       StrAttr:$kind,
                        TA_AxesAttr:$axes);
   let results = (outs TA_ExprType:$result);
+  let regions = (region SizedRegion<1>:$body);
 
-  let assemblyFormat = "$input (`identity` `(` $identity^ `:` type($identity) `)`)? "
-                       "attr-dict `:` type($input) `->` type($result)";
+  let assemblyFormat = "$kind (`identity` `(` $identity^ `:` type($identity) `)`)? "
+                       "$body attr-dict `:` type($result)";
   let hasVerifier = 1;
 }
 

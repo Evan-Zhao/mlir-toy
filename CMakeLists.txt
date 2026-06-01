@@ -100,6 +100,8 @@ add_public_tablegen_target(TAInterfacesIncGen)
 set(LLVM_TARGET_DEFINITIONS include/TA/TAAttrs.td)
 mlir_tablegen(TAAttrs.h.inc -gen-attrdef-decls -attrdefs-dialect=ta)
 mlir_tablegen(TAAttrs.cpp.inc -gen-attrdef-defs -attrdefs-dialect=ta)
+mlir_tablegen(TAEnums.h.inc -gen-enum-decls)
+mlir_tablegen(TAEnums.cpp.inc -gen-enum-defs)
 add_public_tablegen_target(TAAttrsIncGen)
 
 set(LLVM_TARGET_DEFINITIONS include/TA/TATypes.td)
