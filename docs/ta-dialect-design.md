@@ -354,14 +354,14 @@ The motivating attention fragment inside one `ta.scope` looks like:
 With `c = log2(e)`, the rewrite proceeds as ordinary algebra over the
 score expression:
 
-| Step | Rule | Result |
-| --- | --- | --- |
-| Original softmax numerator | definition | `P = exp(S - M)` |
-| Change exponential base | `exp(x) => exp2(c * x)` | `P = exp2(c * (S - M))` |
-| Distribute scale | `c * (x - y) => c*x - c*y` | `P = exp2(c*S - c*M)` |
-| Move through max | `c * max_j(S) => max_j(c*S)`, for `c > 0` and `j notin axes(c)` | `P = exp2(S2 - M2)` |
-| Rebase score | CSE `S2 = c*S`, `M2 = max_j S2` | `P = exp2(S2 - M2)` |
-| Fold score scale | `S = scale * Dot` | `S2 = (c * scale) * Dot` |
+| Step                       | Rule                                                            | Result                   |
+| -------------------------- | --------------------------------------------------------------- | ------------------------ |
+| Original softmax numerator | definition                                                      | `P = exp(S - M)`         |
+| Change exponential base    | `exp(x) => exp2(c * x)`                                         | `P = exp2(c * (S - M))`  |
+| Distribute scale           | `c * (x - y) => c*x - c*y`                                      | `P = exp2(c*S - c*M)`    |
+| Move through max           | `c * max_j(S) => max_j(c*S)`, for `c > 0` and `j notin axes(c)` | `P = exp2(S2 - M2)`      |
+| Rebase score               | CSE `S2 = c*S`, `M2 = max_j S2`                                 | `P = exp2(S2 - M2)`      |
+| Fold score scale           | `S = scale * Dot`                                               | `S2 = (c * scale) * Dot` |
 
 The current rewrite driver reaches the desired form by repeatedly applying
 these separate PDLL rules and running CSE between greedy iterations.
@@ -397,9 +397,12 @@ mlir-opt \
   input.mlir
 ```
 
-The importer is demand-driven: starting from the returned tensor, it walks
-producers backward and asks each producer for an expression over the axes
-required by its users.
+The importer has two phases. First it walks the tensor dataflow rooted at the
+return value to assign canonical axes to tensor dimensions and `linalg.generic`
+loops. Then it emits TA in function order, translating each source
+`linalg.generic` at most once and recording the result in an SSA value map. This
+keeps shared subexpressions, such as the QK score matrix in attention, shared in
+the imported TA program.
 
 Supported producer forms include:
 
@@ -415,12 +418,13 @@ The importer currently emits one `ta.scope` for the returned expression graph.
 This makes cross-op algebra visible immediately, but it is not yet a full
 whole-program scope-placement system.
 
-### Axis Propagation
+### Axis Discovery
 
-The current importer uses demand-driven axis propagation. Result tensor
-dimensions get fresh axes. Each visited `linalg.generic` uses its output
-indexing map to assign those axes to loop dimensions. Input maps then project
-loop axes onto operand dimensions and produce `ta.at` expressions.
+Result tensor dimensions get fresh axes. A backward discovery pass uses each
+visited `linalg.generic` output indexing map to assign those axes to loop
+dimensions. Input maps then project loop axes onto operand dimensions. When the
+same tensor value is reached from multiple users, the importer unifies the
+corresponding axis IDs instead of re-importing the producer with fresh axes.
 
 For attention-like programs, this recovers axes corresponding to:
 
@@ -718,25 +722,17 @@ empty-domain behavior is compatible
 
 ---
 
-## Current Limitations
+## Remaining Limitations
 
-1. Global axis discovery with union-find across an entire tensor subgraph.
-   The current importer propagates axes backward from each use; it can assign
-   distinct fresh reduction axes to equivalent producer computations.
-2. Shared expression DAG import and CSE. Reused tensor producers may currently
-   be cloned when demanded under different axis contexts.
-3. Multi-result import, including multi-output reductions such as max+argmax.
-4. Affine access expressions for non-projection maps, needed for direct
-   convolution-style indexing.
-5. Additional algebraic rewrite rules beyond the current exp-to-exp2 pattern
-   set.
-6. Scope placement after rewrites: splitting, fusing, or reusing original
-   `linalg` boundaries.
-7. Lowering `ta.scope` back to `linalg.generic` / `scf` / vector form.
-8. Fastmath and floating-point legality policy.
-9. Transform-interpreted rewrite patterns, so users can supply rewrite rules
+1. Multi-result import, including multi-output reductions such as max+argmax.
+1. Affine access expressions for non-projection maps, needed for direct convolution-style indexing.
+1. Additional algebraic rewrite rules beyond the current exp-to-exp2 pattern set.
+1. Scope placement after rewrites: splitting, fusing, or reusing original `linalg` boundaries.
+1. Lowering `ta.scope` back to `linalg.generic` / `scf` / vector form.
+1. Fastmath and floating-point legality policy.
+1. Transform-interpreted rewrite patterns, so users can supply rewrite rules
    from transform IR instead of precompiling every PDLL pattern into the plugin.
-10. A compact custom rewrite syntax, for example:
+1. A compact custom rewrite syntax, for example:
 
     ```text
     match reduce($x{$axes_x} / $d{$axes_d} * $y{$axes_y},

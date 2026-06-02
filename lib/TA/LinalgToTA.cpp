@@ -30,6 +30,9 @@ namespace {
 
 using AxisPack = SmallVector<std::string, 2>;
 using TensorAxes = SmallVector<AxisPack, 4>;
+using AxisId = unsigned;
+using AxisIdPack = SmallVector<AxisId, 2>;
+using TensorAxisIds = SmallVector<AxisIdPack, 4>;
 
 static RankedTensorType rankedTensor(Type type) { return dyn_cast<RankedTensorType>(type); }
 
@@ -38,10 +41,6 @@ static SmallVector<std::string> flattenAxes(const TensorAxes &axes) {
   for (const AxisPack &pack : axes)
     flat.append(pack.begin(), pack.end());
   return flat;
-}
-
-static bool samePack(const AxisPack &lhs, const AxisPack &rhs) {
-  return lhs.size() == rhs.size() && llvm::equal(lhs, rhs);
 }
 
 class ScopedTABuilder {
@@ -84,8 +83,12 @@ public:
 
   AxesAttr getAxes(ArrayRef<std::string> names) const {
     SmallVector<Attribute> axes;
-    for (StringRef name : names)
+    DenseSet<StringRef> seen;
+    for (StringRef name : names) {
+      if (!seen.insert(name).second)
+        continue;
       axes.push_back(AxisAttr::get(context, name));
+    }
     return AxesAttr::get(context, ArrayAttr::get(context, axes));
   }
 
@@ -218,13 +221,21 @@ public:
     if (!resultType)
       return func.emitOpError("ta importer expects a ranked tensor result");
 
-    TensorAxes resultAxes = makeResultAxes(resultType);
-    FailureOr<Value> expr = translateTensor(returnOp.getOperand(0), resultAxes);
-    if (failed(expr))
+    if (failed(discoverAxes(resultType)))
       return failure();
 
-    ta->yield(*expr);
+    materializeScopeAxes();
+
+    if (failed(emitForward()))
+      return failure();
+
+    Value expr = lookupTensorExpr(returnOp.getOperand(0));
+    if (!expr)
+      return emitError(returnOp.getLoc()) << "failed to translate returned tensor";
+
+    ta->yield(expr);
     returnOp.getOperation()->setOperands(ta->getScope().getResult());
+    eraseUnusedScopeOps();
     return success();
   }
 
@@ -244,42 +255,79 @@ private:
     std::optional<int64_t> oldGroup;
   };
 
-  TensorAxes makeResultAxes(RankedTensorType type) {
-    TensorAxes axes;
+  AxisId newAxis(StringRef prefix) {
+    AxisId id = parents.size();
+    parents.push_back(id);
+    axisNames.push_back((prefix + std::to_string(id)).str());
+    return id;
+  }
+
+  AxisId find(AxisId id) {
+    AxisId parent = parents[id];
+    if (parent == id)
+      return id;
+    parents[id] = find(parent);
+    return parents[id];
+  }
+
+  void unite(AxisId lhs, AxisId rhs) {
+    lhs = find(lhs);
+    rhs = find(rhs);
+    if (lhs == rhs)
+      return;
+    if (lhs > rhs)
+      std::swap(lhs, rhs);
+    parents[rhs] = lhs;
+  }
+
+  TensorAxisIds makeResultAxes(RankedTensorType type) {
+    TensorAxisIds axes;
     for (int64_t i = 0; i < type.getRank(); ++i)
-      axes.push_back(AxisPack{ta->createAxis("a")});
+      axes.push_back(AxisIdPack{newAxis("a")});
     return axes;
   }
 
-  FailureOr<Value> translateTensor(Value value, const TensorAxes &desiredAxes) {
+  bool mergeAxisPack(AxisIdPack &existing, const AxisIdPack &desired) {
+    if (desired.empty())
+      return false;
+    if (existing.empty()) {
+      existing = desired;
+      return true;
+    }
+    if (existing.size() != desired.size())
+      return false;
+    for (auto [lhs, rhs] : zip_equal(existing, desired))
+      unite(lhs, rhs);
+    return false;
+  }
+
+  FailureOr<bool> mergeValueAxes(Value value, const TensorAxisIds &desired) {
     auto type = rankedTensor(value.getType());
     if (!type)
       return emitError(value.getLoc()) << "expected ranked tensor value";
-    if (static_cast<int64_t>(desiredAxes.size()) != type.getRank())
+    if (static_cast<int64_t>(desired.size()) != type.getRank())
       return emitError(value.getLoc()) << "axis rank does not match tensor rank";
 
-    if (auto arg = dyn_cast<BlockArgument>(value)) {
-      if (arg.getOwner()->getParentOp() != func)
-        return emitError(value.getLoc()) << "unsupported tensor block argument";
-      return ta->at(value, desiredAxes, type.getElementType());
-    }
-
-    Operation *def = value.getDefiningOp();
-    if (auto collapse = dyn_cast_or_null<tensor::CollapseShapeOp>(def))
-      return translateCollapse(collapse, desiredAxes);
-    if (auto expand = dyn_cast_or_null<tensor::ExpandShapeOp>(def))
-      return translateExpand(expand, desiredAxes);
-    if (auto generic = dyn_cast_or_null<linalg::GenericOp>(def))
-      return translateGeneric(generic, cast<OpResult>(value).getResultNumber(), desiredAxes);
-
-    return emitError(value.getLoc())
-           << "unsupported tensor producer for ta import: " << def->getName();
+    auto [it, inserted] = valueAxes.try_emplace(value, TensorAxisIds(type.getRank()));
+    TensorAxisIds &existing = it->second;
+    bool changed = inserted;
+    for (auto [axis, desiredAxis] : zip_equal(existing, desired))
+      changed |= mergeAxisPack(axis, desiredAxis);
+    return changed;
   }
 
-  FailureOr<Value> translateCollapse(tensor::CollapseShapeOp op, const TensorAxes &resultAxes) {
-    TensorAxes sourceAxes(op.getSrcType().getRank());
+  FailureOr<TensorAxisIds> getKnownAxes(Value value) {
+    auto it = valueAxes.find(value);
+    if (it == valueAxes.end())
+      return emitError(value.getLoc()) << "missing discovered axes for tensor value";
+    return it->second;
+  }
+
+  FailureOr<TensorAxisIds> sourceAxesForCollapse(tensor::CollapseShapeOp op,
+                                                 const TensorAxisIds &resultAxes) {
+    TensorAxisIds sourceAxes(op.getSrcType().getRank());
     for (auto [resultDim, group] : enumerate(op.getReassociationIndices())) {
-      const AxisPack &collapsed = resultAxes[resultDim];
+      const AxisIdPack &collapsed = resultAxes[resultDim];
       if (group.size() == 1) {
         sourceAxes[group.front()] = collapsed;
         continue;
@@ -287,50 +335,136 @@ private:
       if (collapsed.size() != group.size())
         return op.emitOpError("cannot split collapsed logical axis pack");
       for (auto [axisIndex, sourceDim] : enumerate(group))
-        sourceAxes[sourceDim] = AxisPack{collapsed[axisIndex]};
+        sourceAxes[sourceDim] = AxisIdPack{collapsed[axisIndex]};
     }
-    return translateTensor(op.getSrc(), sourceAxes);
+    return sourceAxes;
   }
 
-  FailureOr<Value> translateExpand(tensor::ExpandShapeOp op, const TensorAxes &resultAxes) {
-    TensorAxes sourceAxes(op.getSrcType().getRank());
+  FailureOr<TensorAxisIds> sourceAxesForExpand(tensor::ExpandShapeOp op,
+                                               const TensorAxisIds &resultAxes) {
+    TensorAxisIds sourceAxes(op.getSrcType().getRank());
     for (auto [sourceDim, group] : enumerate(op.getReassociationIndices())) {
-      AxisPack pack;
+      AxisIdPack pack;
       for (int64_t resultDim : group)
         pack.append(resultAxes[resultDim].begin(), resultAxes[resultDim].end());
       sourceAxes[sourceDim] = pack;
     }
-    return translateTensor(op.getSrc(), sourceAxes);
+    return sourceAxes;
   }
 
-  FailureOr<Value> translateGeneric(linalg::GenericOp op, unsigned resultNumber,
-                                    const TensorAxes &resultAxes) {
-    ImportGroupGuard guard(*ta, getImportGroup(op));
-
+  FailureOr<bool> discoverGenericAxes(linalg::GenericOp op) {
     linalg::LinalgOp linalgOp = cast<linalg::LinalgOp>(op.getOperation());
     SmallVector<AffineMap> maps = linalgOp.getIndexingMapsArray();
     SmallVector<utils::IteratorType> iterators = linalgOp.getIteratorTypesArray();
     unsigned numInputs = op.getInputs().size();
-    unsigned outputMapIndex = numInputs + resultNumber;
-    if (outputMapIndex >= maps.size())
-      return op.emitOpError("missing output indexing map");
 
-    SmallVector<AxisPack> loopAxes(iterators.size());
-    if (failed(assignLoopAxesFromOutputMap(op, maps[outputMapIndex], resultAxes, loopAxes)))
-      return failure();
-    for (auto [index, iterator] : enumerate(iterators)) {
-      if (iterator == utils::IteratorType::reduction && loopAxes[index].empty())
-        loopAxes[index] = AxisPack{ta->createAxis("r")};
+    auto &loopAxes = loopAxisMap[op.getOperation()];
+    if (loopAxes.empty())
+      loopAxes.resize(iterators.size());
+
+    bool changed = false;
+    for (auto [resultNumber, result] : llvm::enumerate(op->getResults())) {
+      auto resultType = rankedTensor(result.getType());
+      if (!resultType)
+        continue;
+
+      auto it = valueAxes.find(result);
+      if (it == valueAxes.end())
+        continue;
+
+      unsigned outputMapIndex = numInputs + resultNumber;
+      if (outputMapIndex >= maps.size())
+        return op.emitOpError("missing output indexing map");
+      if (failed(assignLoopAxesFromOutputMap(op, maps[outputMapIndex], it->second, loopAxes)))
+        return failure();
     }
+
+    for (auto [index, iterator] : enumerate(iterators)) {
+      if (iterator == utils::IteratorType::reduction && loopAxes[index].empty()) {
+        loopAxes[index] = AxisIdPack{newAxis("r")};
+        changed = true;
+      }
+    }
+
+    for (auto [index, input] : llvm::enumerate(op.getInputs())) {
+      if (rankedTensor(input.getType())) {
+        FailureOr<TensorAxisIds> axes = projectMap(op, maps[index], loopAxes);
+        if (failed(axes))
+          return failure();
+        FailureOr<bool> inputChanged = mergeValueAxes(input, *axes);
+        if (failed(inputChanged))
+          return failure();
+        changed |= *inputChanged;
+      }
+    }
+
+    return changed;
+  }
+
+  LogicalResult discoverAxes(RankedTensorType resultType) {
+    TensorAxisIds resultAxes = makeResultAxes(resultType);
+    FailureOr<bool> changed = mergeValueAxes(returnOp.getOperand(0), resultAxes);
+    if (failed(changed))
+      return failure();
+
+    bool keepGoing = true;
+    while (keepGoing) {
+      keepGoing = false;
+      for (Operation &op : llvm::reverse(func.front().without_terminator())) {
+        if (auto collapse = dyn_cast<tensor::CollapseShapeOp>(&op)) {
+          auto it = valueAxes.find(collapse.getResult());
+          if (it == valueAxes.end())
+            continue;
+          FailureOr<TensorAxisIds> sourceAxes = sourceAxesForCollapse(collapse, it->second);
+          if (failed(sourceAxes))
+            return failure();
+          FailureOr<bool> sourceChanged = mergeValueAxes(collapse.getSrc(), *sourceAxes);
+          if (failed(sourceChanged))
+            return failure();
+          keepGoing |= *sourceChanged;
+          continue;
+        }
+
+        if (auto expand = dyn_cast<tensor::ExpandShapeOp>(&op)) {
+          auto it = valueAxes.find(expand.getResult());
+          if (it == valueAxes.end())
+            continue;
+          FailureOr<TensorAxisIds> sourceAxes = sourceAxesForExpand(expand, it->second);
+          if (failed(sourceAxes))
+            return failure();
+          FailureOr<bool> sourceChanged = mergeValueAxes(expand.getSrc(), *sourceAxes);
+          if (failed(sourceChanged))
+            return failure();
+          keepGoing |= *sourceChanged;
+          continue;
+        }
+
+        if (auto generic = dyn_cast<linalg::GenericOp>(&op)) {
+          FailureOr<bool> genericChanged = discoverGenericAxes(generic);
+          if (failed(genericChanged))
+            return failure();
+          keepGoing |= *genericChanged;
+        }
+      }
+    }
+
+    return success();
+  }
+
+  FailureOr<Value> emitGeneric(linalg::GenericOp op, unsigned resultNumber) {
+    ImportGroupGuard guard(*ta, getImportGroup(op));
+
+    linalg::LinalgOp linalgOp = cast<linalg::LinalgOp>(op.getOperation());
+    SmallVector<utils::IteratorType> iterators = linalgOp.getIteratorTypesArray();
+    unsigned numInputs = op.getInputs().size();
+    TensorAxes resultAxes = canonicalize(valueAxes.lookup(op->getResult(resultNumber)));
+    TensorAxes loopAxes = canonicalize(loopAxisMap.lookup(op.getOperation()));
 
     SmallVector<Value> inputExprs;
     inputExprs.reserve(numInputs);
-    for (auto [index, input] : llvm::enumerate(op.getInputs())) {
+    for (Value input : op.getInputs()) {
       if (rankedTensor(input.getType())) {
-        FailureOr<TensorAxes> axes = projectMap(op, maps[index], loopAxes);
-        if (failed(axes))
-          return failure();
-        FailureOr<Value> expr = translateTensor(input, *axes);
+        FailureOr<Value> expr = getTensorExpr(input);
         if (failed(expr))
           return failure();
         inputExprs.push_back(*expr);
@@ -377,6 +511,48 @@ private:
     return ta->reduce(combiner->first, *payload, reductionAxes, elementType, flatResultAxes);
   }
 
+  LogicalResult emitForward() {
+    for (Operation &op : func.front().without_terminator()) {
+      if (isa<arith::ConstantOp, tensor::EmptyOp, ScopeOp>(&op))
+        continue;
+
+      if (auto collapse = dyn_cast<tensor::CollapseShapeOp>(&op)) {
+        FailureOr<Value> expr = getTensorExpr(collapse.getSrc());
+        if (failed(expr))
+          return failure();
+        valueMap[collapse.getResult()] = *expr;
+        continue;
+      }
+
+      if (auto expand = dyn_cast<tensor::ExpandShapeOp>(&op)) {
+        FailureOr<Value> expr = getTensorExpr(expand.getSrc());
+        if (failed(expr))
+          return failure();
+        valueMap[expand.getResult()] = *expr;
+        continue;
+      }
+
+      if (auto generic = dyn_cast<linalg::GenericOp>(&op)) {
+        for (auto [resultNumber, result] : llvm::enumerate(generic->getResults())) {
+          if (!rankedTensor(result.getType()))
+            continue;
+          if (!valueAxes.contains(result))
+            continue;
+          FailureOr<Value> expr = emitGeneric(generic, resultNumber);
+          if (failed(expr))
+            return failure();
+          valueMap[result] = *expr;
+        }
+        continue;
+      }
+
+      if (llvm::any_of(op.getResults(), [](Value value) { return rankedTensor(value.getType()); }))
+        return op.emitOpError("unsupported tensor producer for ta import");
+    }
+
+    return success();
+  }
+
   int64_t getImportGroup(linalg::GenericOp op) {
     auto [it, inserted] = importGroups.try_emplace(op.getOperation(), nextImportGroup);
     if (inserted)
@@ -385,17 +561,15 @@ private:
   }
 
   LogicalResult assignLoopAxesFromOutputMap(Operation *op, AffineMap map,
-                                            const TensorAxes &resultAxes,
-                                            MutableArrayRef<AxisPack> loopAxes) {
+                                            const TensorAxisIds &resultAxes,
+                                            MutableArrayRef<AxisIdPack> loopAxes) {
     if (map.getNumResults() != resultAxes.size())
       return op->emitOpError("output indexing map rank does not match result axis rank");
 
     for (auto [resultIndex, expr] : enumerate(map.getResults())) {
       if (auto dim = dyn_cast<AffineDimExpr>(expr)) {
-        AxisPack &assigned = loopAxes[dim.getPosition()];
-        if (!assigned.empty() && !samePack(assigned, resultAxes[resultIndex]))
-          return op->emitOpError("conflicting logical axes for loop dimension");
-        assigned = resultAxes[resultIndex];
+        AxisIdPack &assigned = loopAxes[dim.getPosition()];
+        mergeAxisPack(assigned, resultAxes[resultIndex]);
         continue;
       }
       if (isa<AffineConstantExpr>(expr))
@@ -405,20 +579,79 @@ private:
     return success();
   }
 
-  FailureOr<TensorAxes> projectMap(Operation *op, AffineMap map, ArrayRef<AxisPack> loopAxes) {
-    TensorAxes axes;
+  FailureOr<TensorAxisIds> projectMap(Operation *op, AffineMap map,
+                                      ArrayRef<AxisIdPack> loopAxes) {
+    TensorAxisIds axes;
     for (AffineExpr expr : map.getResults()) {
       if (auto dim = dyn_cast<AffineDimExpr>(expr)) {
         axes.push_back(loopAxes[dim.getPosition()]);
         continue;
       }
       if (isa<AffineConstantExpr>(expr)) {
-        axes.push_back(AxisPack{});
+        axes.push_back(AxisIdPack{});
         continue;
       }
       return op->emitOpError("non-projected input indexing maps are not supported");
     }
     return axes;
+  }
+
+  TensorAxes canonicalize(const TensorAxisIds &ids) {
+    TensorAxes axes;
+    for (const AxisIdPack &pack : ids) {
+      AxisPack canonicalPack;
+      for (AxisId id : pack)
+        canonicalPack.push_back(axisNames[find(id)]);
+      axes.push_back(canonicalPack);
+    }
+    return axes;
+  }
+
+  void materializeScopeAxes() {
+    DenseSet<AxisId> seen;
+    for (AxisId id = 0, e = parents.size(); id < e; ++id) {
+      AxisId root = find(id);
+      if (!seen.insert(root).second)
+        continue;
+      ta->axis(axisNames[root]);
+    }
+  }
+
+  Value lookupTensorExpr(Value value) const {
+    auto it = valueMap.find(value);
+    if (it == valueMap.end())
+      return Value();
+    return it->second;
+  }
+
+  FailureOr<Value> getTensorExpr(Value value) {
+    if (Value expr = lookupTensorExpr(value))
+      return expr;
+
+    auto type = rankedTensor(value.getType());
+    if (!type)
+      return emitError(value.getLoc()) << "expected ranked tensor value";
+
+    if (auto arg = dyn_cast<BlockArgument>(value)) {
+      if (arg.getOwner()->getParentOp() != func)
+        return emitError(value.getLoc()) << "unsupported tensor block argument";
+      FailureOr<TensorAxisIds> axes = getKnownAxes(value);
+      if (failed(axes))
+        return failure();
+      FailureOr<Value> expr = ta->at(value, canonicalize(*axes), type.getElementType());
+      if (failed(expr))
+        return failure();
+      valueMap[value] = *expr;
+      return *expr;
+    }
+
+    Operation *def = value.getDefiningOp();
+    if (auto collapse = dyn_cast_or_null<tensor::CollapseShapeOp>(def))
+      return getTensorExpr(collapse.getSrc());
+    if (auto expand = dyn_cast_or_null<tensor::ExpandShapeOp>(def))
+      return getTensorExpr(expand.getSrc());
+
+    return emitError(value.getLoc()) << "tensor value was not translated: " << value;
   }
 
   FailureOr<std::pair<ReduceKind, Value>>
@@ -509,10 +742,26 @@ private:
     return def->emitOpError("unsupported scalar op for ta import: ") << def->getName();
   }
 
+  void eraseUnusedScopeOps() {
+    Block &body = ta->getScope().getBody().front();
+    for (Operation &op : llvm::make_early_inc_range(llvm::reverse(body.without_terminator()))) {
+      if (!op.use_empty())
+        continue;
+      if (isa<AtOp, ConstantOp, ExtFOp, TruncFOp, ExpOp, Exp2Op, AddFOp, SubFOp, MulFOp, DivFOp,
+              MaximumFOp, MinimumFOp, ReduceOp>(&op))
+        op.erase();
+    }
+  }
+
   func::FuncOp func;
   func::ReturnOp returnOp;
   OpBuilder insertionBuilder;
   std::unique_ptr<ScopedTABuilder> ta;
+  SmallVector<AxisId> parents;
+  SmallVector<std::string> axisNames;
+  DenseMap<Value, TensorAxisIds> valueAxes;
+  DenseMap<Operation *, SmallVector<AxisIdPack>> loopAxisMap;
+  DenseMap<Value, Value> valueMap;
   DenseMap<Operation *, int64_t> importGroups;
   int64_t nextImportGroup = 0;
 };
