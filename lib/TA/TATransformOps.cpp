@@ -73,9 +73,10 @@ void TARewriteExpToExp2Op::getEffects(SmallVectorImpl<MemoryEffects::EffectInsta
   modifiesPayload(effects);
 }
 
-DiagnosedSilenceableFailure TARewriteExpToExp2Op::applyToOne(
-    TransformRewriter &rewriter, Operation *target, ApplyToEachResultList &results,
-    TransformState &state) {
+DiagnosedSilenceableFailure TARewriteExpToExp2Op::applyToOne(TransformRewriter &rewriter,
+                                                             Operation *target,
+                                                             ApplyToEachResultList &results,
+                                                             TransformState &state) {
   (void)results;
   (void)state;
   RewritePatternSet patterns(getContext());
@@ -94,7 +95,8 @@ DiagnosedSilenceableFailure TARewriteExpToExp2Op::applyToOne(
 namespace ta {
 
 void registerTATransformExtension(mlir::DialectRegistry &registry) {
-  registry.addExtension(+[](mlir::MLIRContext *, mlir::transform::TransformDialect *dialect) {
+  registry.addExtension(+[](mlir::MLIRContext *ctx, mlir::transform::TransformDialect *dialect) {
+    ctx->loadDialect<ta::TADialect>();
     struct TransformDialectAccess : public mlir::transform::TransformDialect {
       using mlir::Dialect::addOperations;
     };

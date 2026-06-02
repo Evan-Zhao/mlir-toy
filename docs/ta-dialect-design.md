@@ -748,13 +748,19 @@ empty-domain behavior is compatible
     requires a custom parser and a lowering into PDL/PDLL or native rewrite
     patterns.
 
-A useful end-to-end demo remains:
+`test/TA/attention.mlir` now demonstrates the implemented half of the intended
+end-to-end flow:
 
 ```text
 plain attention in linalg
   -> ta
   -> exp-to-exp2 rewrite
   -> fold log2(e) into score scale
+```
+
+The next missing pieces are:
+
+```text
   -> choose scope placement
   -> lower back to linalg
 ```
