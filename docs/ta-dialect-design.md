@@ -42,7 +42,7 @@ tensor program
   -> first-class elementwise and reduction ops
 ```
 
-There is also a `ta-import-linalg` pass for supported `linalg.generic` tensor
+There is also a `linalg-to-ta` pass for supported `linalg.generic` tensor
 dataflow, and a small PDLL-backed algebraic rewrite driver for the `exp` to
 `exp2` transformation. Scope placement, lowering back to `linalg`, and a full
 floating-point legality policy remain future work.
@@ -388,7 +388,7 @@ before this should be treated as generally valid for production lowering.
 
 ## Importing from `linalg`
 
-The `ta-import-linalg` pass imports supported pure tensor dataflow rooted at a
+The `linalg-to-ta` pass imports supported pure tensor dataflow rooted at a
 function return value and materializes it as one `ta.scope`.
 
 Example invocation:
@@ -397,7 +397,7 @@ Example invocation:
 mlir-opt \
   --load-dialect-plugin=libTADialect.so \
   --load-pass-plugin=libTADialect.so \
-  --pass-pipeline='builtin.module(func.func(ta-import-linalg))' \
+  --pass-pipeline='builtin.module(func.func(linalg-to-ta))' \
   input.mlir
 ```
 
@@ -532,7 +532,7 @@ but the input-height dimension is not simply the same axis as `oh` or `r`.
 After rewriting, `ta` will need to choose a schedule again.
 
 The importer currently creates one scope for the returned expression graph. The
-`ta-lower-to-linalg` pass provides a conservative lowering back to
+`ta-to-linalg` pass provides a conservative lowering back to
 `linalg.generic`: it uses `ta.import_group` as an initial materialization
 boundary, checks whether each partition can be represented as one structured
 op, and lowers ungrouped rewrite-created ops as their own materializations.

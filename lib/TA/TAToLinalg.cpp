@@ -13,13 +13,10 @@
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
 
-#include <memory>
 #include <optional>
 
 namespace ta {
@@ -276,9 +273,9 @@ private:
     SmallVector<StringRef> loopAxes;
     SmallVector<utils::IteratorType> iterators;
     Value payloadValue;
-    ReduceOp reduce;
+    ReduceOp reduce = dyn_cast<ReduceOp>(root);
 
-    if ((reduce = dyn_cast<ReduceOp>(root))) {
+    if (reduce) {
       payloadValue = reduce.getInput();
       auto payloadExpr = cast<ExprType>(payloadValue.getType());
       loopAxes = axisNames(payloadExpr);
@@ -457,7 +454,7 @@ private:
 struct LowerTAToLinalgPass : public PassWrapper<LowerTAToLinalgPass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerTAToLinalgPass)
 
-  StringRef getArgument() const final { return "ta-lower-to-linalg"; }
+  StringRef getArgument() const final { return "ta-to-linalg"; }
   StringRef getDescription() const final {
     return "Lower supported ta.scope expression graphs to linalg.generic";
   }

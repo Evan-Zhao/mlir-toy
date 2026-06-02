@@ -14,13 +14,13 @@ module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
     %func = transform.structured.match ops{["func.func"]} in %module
         : (!transform.any_op) -> !transform.any_op
-    %ta_func = transform.apply_registered_pass "ta-import-linalg" to %func
+    %ta_func = transform.apply_registered_pass "linalg-to-ta" to %func
         : (!transform.any_op) -> !transform.any_op
     transform.ta.rewrite_exp_to_exp2 %ta_func : !transform.any_op
     transform.apply_patterns to %ta_func {
       transform.apply_patterns.ta.exchange_div_and_matmul
     } : !transform.any_op
-    %linalg_func = transform.apply_registered_pass "ta-lower-to-linalg" to %ta_func
+    %linalg_func = transform.apply_registered_pass "ta-to-linalg" to %ta_func
         : (!transform.any_op) -> !transform.any_op
     transform.yield
   }

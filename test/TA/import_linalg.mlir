@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_ta_plugin --load-pass-plugin=%neptune_ta_plugin --pass-pipeline='builtin.module(func.func(ta-import-linalg))' %s | FileCheck %s
+// RUN: mlir-opt --load-dialect-plugin=%neptune_ta_plugin --load-pass-plugin=%neptune_ta_plugin --pass-pipeline='builtin.module(func.func(linalg-to-ta))' %s | FileCheck %s
 
 #matmul_lhs = affine_map<(d0, d1, d2) -> (d0, d2)>
 #matmul_rhs = affine_map<(d0, d1, d2) -> (d2, d1)>

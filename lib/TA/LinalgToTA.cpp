@@ -824,7 +824,7 @@ struct ImportLinalgToTAPass
     : public PassWrapper<ImportLinalgToTAPass, OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ImportLinalgToTAPass)
 
-  StringRef getArgument() const final { return "ta-import-linalg"; }
+  StringRef getArgument() const final { return "linalg-to-ta"; }
   StringRef getDescription() const final {
     return "Import supported linalg.generic tensor dataflow into the ta dialect";
   }
