@@ -14,12 +14,12 @@
 #map8 = affine_map<(d0, d1, d2, d3) -> ()>
 
 // CHECK-LABEL: func.func @matmul
-// CHECK-NEXT: %[[SCOPE:.+]] = ta.scope axes(%a0 "a0" extent 4, %a1 "a1" extent 16, %r2 "r2" extent 8) {
-// CHECK-NEXT:   %[[LHS:.+]] = ta.at %{{.+}}[%a0, %r2] {axes = #ta.axes<a0, r2>, ta.import_group = 0 : i64} : tensor<4x8xf32> -> !ta.expr<f32, [a0, r2]>
-// CHECK-NEXT:   %[[RHS:.+]] = ta.at %{{.+}}[%r2, %a1] {axes = #ta.axes<r2, a1>, ta.import_group = 0 : i64} : tensor<8x16xf32> -> !ta.expr<f32, [r2, a1]>
-// CHECK-NEXT:   %[[MUL:.+]] = ta.mulf %[[LHS]], %[[RHS]] {ta.import_group = 0 : i64} : (!ta.expr<f32, [a0, r2]>, !ta.expr<f32, [r2, a1]>) -> !ta.expr<f32, [a0, a1, r2]>
-// CHECK-NEXT:   %[[DOT:.+]] = ta.reduce <add> %[[MUL]] {axes = #ta.axes<r2>, ta.import_group = 0 : i64} : !ta.expr<f32, [a0, a1, r2]> -> !ta.expr<f32, [a0, a1]>
-// CHECK-NEXT:   ta.yield %[[DOT]] : !ta.expr<f32, [a0, a1]>
+// CHECK-NEXT: %[[SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 4, %i1 "i1" extent 16, %r0 "r0" extent 8) {
+// CHECK-NEXT:   %[[LHS:.+]] = ta.at %{{.+}}[%i0, %r0] {axes = #ta.axes<i0, r0>, ta.import_group = 0 : i64} : tensor<4x8xf32> -> !ta.expr<f32, [i0, r0]>
+// CHECK-NEXT:   %[[RHS:.+]] = ta.at %{{.+}}[%r0, %i1] {axes = #ta.axes<r0, i1>, ta.import_group = 0 : i64} : tensor<8x16xf32> -> !ta.expr<f32, [r0, i1]>
+// CHECK-NEXT:   %[[MUL:.+]] = ta.mulf %[[LHS]], %[[RHS]] {ta.import_group = 0 : i64} : (!ta.expr<f32, [i0, r0]>, !ta.expr<f32, [r0, i1]>) -> !ta.expr<f32, [i0, i1, r0]>
+// CHECK-NEXT:   %[[DOT:.+]] = ta.reduce <add> %[[MUL]] {axes = #ta.axes<r0>, ta.import_group = 0 : i64} : !ta.expr<f32, [i0, i1, r0]> -> !ta.expr<f32, [i0, i1]>
+// CHECK-NEXT:   ta.yield %[[DOT]] : !ta.expr<f32, [i0, i1]>
 // CHECK-NEXT: } : () -> tensor<4x16xf32>
 // CHECK-NEXT: return %[[SCOPE]] : tensor<4x16xf32>
 func.func @matmul(%arg0: tensor<4x8xf32>, %arg1: tensor<8x16xf32>) -> tensor<4x16xf32> {
@@ -46,26 +46,26 @@ func.func @matmul(%arg0: tensor<4x8xf32>, %arg1: tensor<8x16xf32>) -> tensor<4x1
 }
 
 // CHECK-LABEL: func.func @attention
-// CHECK-NEXT: %[[SCOPE:.+]] = ta.scope axes(%a0 "a0" extent 1, %a1 "a1" extent 2, %a2 "a2" extent 4, %a3 "a3" extent 3, %r4 "r4" extent 4, %r7 "r7" extent 3) {
-// CHECK-NEXT:   %[[Q16:.+]] = ta.at %{{.+}}[%a0, %a1, %a2, %r7] {axes = #ta.axes<a0, a1, a2, r7>, ta.import_group = 0 : i64} : tensor<1x2x4x3xf16> -> !ta.expr<f16, [a0, a1, a2, r7]>
-// CHECK-NEXT:   %[[Q:.+]] = ta.extf %[[Q16]] {ta.import_group = 0 : i64} : (!ta.expr<f16, [a0, a1, a2, r7]>) -> !ta.expr<f32, [a0, a1, a2, r7]>
-// CHECK-NEXT:   %[[K16:.+]] = ta.at %{{.+}}[%a0, %a1, %r4, %r7] {axes = #ta.axes<a0, a1, r4, r7>, ta.import_group = 1 : i64} : tensor<1x2x4x3xf16> -> !ta.expr<f16, [a0, a1, r4, r7]>
-// CHECK-NEXT:   %[[K:.+]] = ta.extf %[[K16]] {ta.import_group = 1 : i64} : (!ta.expr<f16, [a0, a1, r4, r7]>) -> !ta.expr<f32, [a0, a1, r4, r7]>
-// CHECK-NEXT:   %[[QK:.+]] = ta.mulf %[[Q]], %[[K]] {ta.import_group = 3 : i64} : (!ta.expr<f32, [a0, a1, a2, r7]>, !ta.expr<f32, [a0, a1, r4, r7]>) -> !ta.expr<f32, [a0, a1, a2, r4, r7]>
-// CHECK-NEXT:   %[[DOT:.+]] = ta.reduce <add> %[[QK]] {axes = #ta.axes<r7>, ta.import_group = 3 : i64} : !ta.expr<f32, [a0, a1, a2, r4, r7]> -> !ta.expr<f32, [a0, a1, a2, r4]>
+// CHECK-NEXT: %[[SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 1, %i1 "i1" extent 2, %i2 "i2" extent 4, %i3 "i3" extent 3, %r0 "r0" extent 4, %r1 "r1" extent 3) {
+// CHECK-NEXT:   %[[Q16:.+]] = ta.at %{{.+}}[%i0, %i1, %i2, %r1] {axes = #ta.axes<i0, i1, i2, r1>, ta.import_group = 0 : i64} : tensor<1x2x4x3xf16> -> !ta.expr<f16, [i0, i1, i2, r1]>
+// CHECK-NEXT:   %[[Q:.+]] = ta.extf %[[Q16]] {ta.import_group = 0 : i64} : (!ta.expr<f16, [i0, i1, i2, r1]>) -> !ta.expr<f32, [i0, i1, i2, r1]>
+// CHECK-NEXT:   %[[K16:.+]] = ta.at %{{.+}}[%i0, %i1, %r0, %r1] {axes = #ta.axes<i0, i1, r0, r1>, ta.import_group = 1 : i64} : tensor<1x2x4x3xf16> -> !ta.expr<f16, [i0, i1, r0, r1]>
+// CHECK-NEXT:   %[[K:.+]] = ta.extf %[[K16]] {ta.import_group = 1 : i64} : (!ta.expr<f16, [i0, i1, r0, r1]>) -> !ta.expr<f32, [i0, i1, r0, r1]>
+// CHECK-NEXT:   %[[QK:.+]] = ta.mulf %[[Q]], %[[K]] {ta.import_group = 3 : i64} : (!ta.expr<f32, [i0, i1, i2, r1]>, !ta.expr<f32, [i0, i1, r0, r1]>) -> !ta.expr<f32, [i0, i1, i2, r0, r1]>
+// CHECK-NEXT:   %[[DOT:.+]] = ta.reduce <add> %[[QK]] {axes = #ta.axes<r1>, ta.import_group = 3 : i64} : !ta.expr<f32, [i0, i1, i2, r0, r1]> -> !ta.expr<f32, [i0, i1, i2, r0]>
 // CHECK-NEXT:   %[[SCALE:.+]] = ta.constant 0.577350259 : f32 {ta.import_group = 4 : i64} : !ta.expr<f32, []>
-// CHECK-NEXT:   %[[SCORES:.+]] = ta.mulf %[[DOT]], %[[SCALE]] {ta.import_group = 4 : i64} : (!ta.expr<f32, [a0, a1, a2, r4]>, !ta.expr<f32, []>) -> !ta.expr<f32, [a0, a1, a2, r4]>
-// CHECK-NEXT:   %[[MAX:.+]] = ta.reduce <max> %[[SCORES]] {axes = #ta.axes<r4>, ta.import_group = 5 : i64} : !ta.expr<f32, [a0, a1, a2, r4]> -> !ta.expr<f32, [a0, a1, a2]>
-// CHECK-NEXT:   %[[CENTERED:.+]] = ta.subf %[[SCORES]], %[[MAX]] {ta.import_group = 6 : i64} : (!ta.expr<f32, [a0, a1, a2, r4]>, !ta.expr<f32, [a0, a1, a2]>) -> !ta.expr<f32, [a0, a1, a2, r4]>
-// CHECK-NEXT:   %[[EXP:.+]] = ta.exp %[[CENTERED]] {ta.import_group = 7 : i64} : (!ta.expr<f32, [a0, a1, a2, r4]>) -> !ta.expr<f32, [a0, a1, a2, r4]>
-// CHECK-NEXT:   %[[DEN:.+]] = ta.reduce <add> %[[EXP]] {axes = #ta.axes<r4>, ta.import_group = 8 : i64} : !ta.expr<f32, [a0, a1, a2, r4]> -> !ta.expr<f32, [a0, a1, a2]>
-// CHECK-NEXT:   %[[PROB:.+]] = ta.divf %[[EXP]], %[[DEN]] {ta.import_group = 9 : i64} : (!ta.expr<f32, [a0, a1, a2, r4]>, !ta.expr<f32, [a0, a1, a2]>) -> !ta.expr<f32, [a0, a1, a2, r4]>
-// CHECK-NEXT:   %[[V16:.+]] = ta.at %{{.+}}[%a0, %a1, %r4, %a3] {axes = #ta.axes<a0, a1, r4, a3>, ta.import_group = 10 : i64} : tensor<1x2x4x3xf16> -> !ta.expr<f16, [a0, a1, r4, a3]>
-// CHECK-NEXT:   %[[V:.+]] = ta.extf %[[V16]] {ta.import_group = 10 : i64} : (!ta.expr<f16, [a0, a1, r4, a3]>) -> !ta.expr<f32, [a0, a1, a3, r4]>
-// CHECK-NEXT:   %[[PV:.+]] = ta.mulf %[[PROB]], %[[V]] {ta.import_group = 11 : i64} : (!ta.expr<f32, [a0, a1, a2, r4]>, !ta.expr<f32, [a0, a1, a3, r4]>) -> !ta.expr<f32, [a0, a1, a2, a3, r4]>
-// CHECK-NEXT:   %[[NUM:.+]] = ta.reduce <add> %[[PV]] {axes = #ta.axes<r4>, ta.import_group = 11 : i64} : !ta.expr<f32, [a0, a1, a2, a3, r4]> -> !ta.expr<f32, [a0, a1, a2, a3]>
-// CHECK-NEXT:   %[[OUT:.+]] = ta.truncf %[[NUM]] {ta.import_group = 12 : i64} : (!ta.expr<f32, [a0, a1, a2, a3]>) -> !ta.expr<f16, [a0, a1, a2, a3]>
-// CHECK-NEXT:   ta.yield %[[OUT]] : !ta.expr<f16, [a0, a1, a2, a3]>
+// CHECK-NEXT:   %[[SCORES:.+]] = ta.mulf %[[DOT]], %[[SCALE]] {ta.import_group = 4 : i64} : (!ta.expr<f32, [i0, i1, i2, r0]>, !ta.expr<f32, []>) -> !ta.expr<f32, [i0, i1, i2, r0]>
+// CHECK-NEXT:   %[[MAX:.+]] = ta.reduce <max> %[[SCORES]] {axes = #ta.axes<r0>, ta.import_group = 5 : i64} : !ta.expr<f32, [i0, i1, i2, r0]> -> !ta.expr<f32, [i0, i1, i2]>
+// CHECK-NEXT:   %[[CENTERED:.+]] = ta.subf %[[SCORES]], %[[MAX]] {ta.import_group = 6 : i64} : (!ta.expr<f32, [i0, i1, i2, r0]>, !ta.expr<f32, [i0, i1, i2]>) -> !ta.expr<f32, [i0, i1, i2, r0]>
+// CHECK-NEXT:   %[[EXP:.+]] = ta.exp %[[CENTERED]] {ta.import_group = 7 : i64} : (!ta.expr<f32, [i0, i1, i2, r0]>) -> !ta.expr<f32, [i0, i1, i2, r0]>
+// CHECK-NEXT:   %[[DEN:.+]] = ta.reduce <add> %[[EXP]] {axes = #ta.axes<r0>, ta.import_group = 8 : i64} : !ta.expr<f32, [i0, i1, i2, r0]> -> !ta.expr<f32, [i0, i1, i2]>
+// CHECK-NEXT:   %[[PROB:.+]] = ta.divf %[[EXP]], %[[DEN]] {ta.import_group = 9 : i64} : (!ta.expr<f32, [i0, i1, i2, r0]>, !ta.expr<f32, [i0, i1, i2]>) -> !ta.expr<f32, [i0, i1, i2, r0]>
+// CHECK-NEXT:   %[[V16:.+]] = ta.at %{{.+}}[%i0, %i1, %r0, %i3] {axes = #ta.axes<i0, i1, r0, i3>, ta.import_group = 10 : i64} : tensor<1x2x4x3xf16> -> !ta.expr<f16, [i0, i1, r0, i3]>
+// CHECK-NEXT:   %[[V:.+]] = ta.extf %[[V16]] {ta.import_group = 10 : i64} : (!ta.expr<f16, [i0, i1, r0, i3]>) -> !ta.expr<f32, [i0, i1, i3, r0]>
+// CHECK-NEXT:   %[[PV:.+]] = ta.mulf %[[PROB]], %[[V]] {ta.import_group = 11 : i64} : (!ta.expr<f32, [i0, i1, i2, r0]>, !ta.expr<f32, [i0, i1, i3, r0]>) -> !ta.expr<f32, [i0, i1, i2, i3, r0]>
+// CHECK-NEXT:   %[[NUM:.+]] = ta.reduce <add> %[[PV]] {axes = #ta.axes<r0>, ta.import_group = 11 : i64} : !ta.expr<f32, [i0, i1, i2, i3, r0]> -> !ta.expr<f32, [i0, i1, i2, i3]>
+// CHECK-NEXT:   %[[OUT:.+]] = ta.truncf %[[NUM]] {ta.import_group = 12 : i64} : (!ta.expr<f32, [i0, i1, i2, i3]>) -> !ta.expr<f16, [i0, i1, i2, i3]>
+// CHECK-NEXT:   ta.yield %[[OUT]] : !ta.expr<f16, [i0, i1, i2, i3]>
 // CHECK-NEXT: } : () -> tensor<1x2x4x3xf16>
 // CHECK-NEXT: return %[[SCOPE]] : tensor<1x2x4x3xf16>
 func.func @attention(%arg0: tensor<1x2x4x3xf16>,

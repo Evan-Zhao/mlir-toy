@@ -129,9 +129,8 @@ public:
     }
 
     SmallVector<std::string> resultAxes = flattenAxes(dimAxes);
-    auto op =
-        AtOp::create(builder(), loc, expr(elementType, resultAxes), source, indices,
-                     getAxes(resultAxes));
+    auto op = AtOp::create(builder(), loc, expr(elementType, resultAxes), source, indices,
+                           getAxes(resultAxes));
     annotate(op);
     return op.getResult();
   }
@@ -156,8 +155,8 @@ public:
     return op.getResult();
   }
 
-  Value reduce(ReduceKind kind, Value input, ArrayRef<std::string> reductionAxes,
-               Type elementType, ArrayRef<std::string> resultAxes) {
+  Value reduce(ReduceKind kind, Value input, ArrayRef<std::string> reductionAxes, Type elementType,
+               ArrayRef<std::string> resultAxes) {
     auto op = ReduceOp::create(builder(), loc, expr(elementType, resultAxes), kind, input, Value(),
                                getAxes(reductionAxes));
     annotate(op);
@@ -170,8 +169,7 @@ private:
   void annotate(Operation *op) const {
     if (!importGroup)
       return;
-    op->setAttr("ta.import_group", IntegerAttr::get(IntegerType::get(context, 64),
-                                                    *importGroup));
+    op->setAttr("ta.import_group", IntegerAttr::get(IntegerType::get(context, 64), *importGroup));
   }
 
   void addAxis(const std::string &name, int64_t extent) {
@@ -231,6 +229,7 @@ public:
     if (failed(discoverAxisExtents()))
       return failure();
 
+    canonicalizeFinalAxisNames();
     materializeScopeAxes();
 
     if (failed(emitForward()))
@@ -262,10 +261,10 @@ private:
     std::optional<int64_t> oldGroup;
   };
 
-  AxisId newAxis(StringRef prefix) {
+  AxisId newAxis(char prefix) {
     AxisId id = parents.size();
     parents.push_back(id);
-    axisNames.push_back((prefix + std::to_string(id)).str());
+    axisNames.push_back(prefix + std::to_string(id));
     return id;
   }
 
@@ -290,7 +289,7 @@ private:
   TensorAxisIds makeResultAxes(RankedTensorType type) {
     TensorAxisIds axes;
     for (int64_t i = 0; i < type.getRank(); ++i)
-      axes.push_back(AxisIdPack{newAxis("a")});
+      axes.push_back(AxisIdPack{newAxis('i')});
     return axes;
   }
 
@@ -388,7 +387,7 @@ private:
 
     for (auto [index, iterator] : enumerate(iterators)) {
       if (iterator == utils::IteratorType::reduction && loopAxes[index].empty()) {
-        loopAxes[index] = AxisIdPack{newAxis("r")};
+        loopAxes[index] = AxisIdPack{newAxis('r')};
         changed = true;
       }
     }
@@ -586,8 +585,7 @@ private:
     return success();
   }
 
-  FailureOr<TensorAxisIds> projectMap(Operation *op, AffineMap map,
-                                      ArrayRef<AxisIdPack> loopAxes) {
+  FailureOr<TensorAxisIds> projectMap(Operation *op, AffineMap map, ArrayRef<AxisIdPack> loopAxes) {
     TensorAxisIds axes;
     for (AffineExpr expr : map.getResults()) {
       if (auto dim = dyn_cast<AffineDimExpr>(expr)) {
@@ -614,6 +612,31 @@ private:
     return axes;
   }
 
+  void canonicalizeFinalAxisNames() {
+    DenseSet<AxisId> seen;
+    unsigned nextElementwise = 0;
+    unsigned nextReduction = 0;
+    unsigned nextOther = 0;
+
+    for (AxisId id = 0, e = parents.size(); id < e; ++id) {
+      AxisId root = find(id);
+      if (!seen.insert(root).second)
+        continue;
+
+      switch (axisNames[root].front()) {
+      case 'i':
+        axisNames[root] = "i" + std::to_string(nextElementwise++);
+        break;
+      case 'r':
+        axisNames[root] = "r" + std::to_string(nextReduction++);
+        break;
+      default:
+        axisNames[root] = "x" + std::to_string(nextOther++);
+        break;
+      }
+    }
+  }
+
   void materializeScopeAxes() {
     DenseSet<AxisId> seen;
     for (AxisId id = 0, e = parents.size(); id < e; ++id) {
@@ -637,8 +660,8 @@ private:
       return success();
     }
     if (it->second != size)
-      return emitError(func.getLoc()) << "conflicting imported extents for axis '"
-                                      << axisNames[root] << "'";
+      return emitError(func.getLoc())
+             << "conflicting imported extents for axis '" << axisNames[root] << "'";
     return success();
   }
 
