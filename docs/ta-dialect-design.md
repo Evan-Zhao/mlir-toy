@@ -1,14 +1,22 @@
-# The `ta` Dialect: A Tensor Algebra IR for Whole-Program Indexed Rewrites
+# The `ta` Dialect: Tensor Algebra IR for Indexed Rewrites
 
-## Motivation
+`ta` represents pure tensor computations as scalar indexed expressions over
+named axes. It is meant to be a temporary compiler view of a tensor dataflow
+graph: import from `linalg`, expose algebra and reductions across original
+operation boundaries, rewrite, then lower back to structured tensor code.
 
-`ta`, short for **tensor algebra**, represents pure tensor computations as
-scalar indexed expressions over named axes. It gives the compiler a temporary
-view of a tensor dataflow graph where scalar algebra, broadcasts, and reductions
-are visible across individual `linalg.generic` boundaries.
+The core shape is:
 
-The motivating case is scaled dot-product attention, whose usual tensor
-pipeline is:
+```text
+linalg tensor dataflow
+  -> one ta.scope over named axes with extents
+  -> scope-local ta.expr values
+  -> elementwise scalar ops plus bodyless reductions
+  -> rewritten ta
+  -> linalg.generic materializations
+```
+
+The motivating case is scaled dot-product attention:
 
 ```text
 Dot[b,h,i,j] = sum_d Q[b,h,i,d] * K[b,h,j,d]
@@ -20,248 +28,69 @@ Num[b,h,i,e] = sum_j P[b,h,i,j] * V[b,h,j,e]
 O[b,h,i,e]   = Num[b,h,i,e] / L[b,h,i]
 ```
 
-A local rewrite of `exp` gives `P = exp2(log2(e) * (S - M))`. Folding
-`log2(e)` into `scale` then requires facts that span the attention subgraph:
+A local rewrite of `exp` gives:
 
 ```text
-log2(e) > 0,  j not in axes(log2(e))
-log2(e) * max_j S = max_j (log2(e) * S)
+P = exp2(log2(e) * (S - M))
+```
+
+Folding `log2(e)` into the score scale then needs facts that span several
+tensor operations:
+
+```text
+log2(e) * max_j S = max_j (log2(e) * S), when log2(e) > 0
 log2(e) * scale * Dot = (log2(e) * scale) * Dot
 ```
 
-This is not an attention-specific optimization. It is scalar algebra plus
-reduction movement with side conditions. `ta` provides the representation that
-makes those expressions and binders visible together.
+`ta` is not attention-specific. It gives these expressions a common indexed
+form so ordinary scalar algebra and reduction movement can apply across the
+whole subgraph.
 
-The implemented core is:
+## A Small TA Program
 
-```text
-tensor program
-  -> ta.scope over named axes
-  -> scope-local ta.expr values with axis support sets
-  -> first-class elementwise and reduction ops
-```
-
-There is also a `linalg-to-ta` pass for supported `linalg.generic` tensor
-dataflow, and a small PDLL-backed algebraic rewrite driver for the `exp` to
-`exp2` transformation. Scope placement, lowering back to `linalg`, and a full
-floating-point legality policy remain future work.
-
----
-
-## Core Semantic Model
-
-A `ta` program lives inside a `ta.scope`.
-
-A scope declares an ambient set of named axes:
+A `ta` program lives inside a `ta.scope`. The scope declares the symbolic axes
+available in the body, including the extent of each axis:
 
 ```mlir
-ta.scope axes(
-  %b "b" extent 2, %h "h" extent 3,
-  %i "i" extent 4, %j "j" extent 5,
-  %d "d" extent 6, %e "e" extent 7) {
+%O = ta.scope axes(%b "b" extent 2, %h "h" extent 3,
+                   %i "i" extent 4, %j "j" extent 5,
+                   %d "d" extent 6, %e "e" extent 7) {
   ...
-}
+  ta.yield %o : !ta.expr<f32, [b, h, i, e]>
+} : () -> tensor<2x3x4x7xf32>
 ```
 
-These axes are not loops. They are symbolic coordinates available to the scalar
-indexed expressions inside the scope body. The `extent` is the axis size:
-`extent 5` means valid coordinates are `0 <= j < 5`. Extents may also be
-dynamic index operands, for example `%j "j" extent %J`. Internally the block
-arguments are still `index`-typed SSA values, while the quoted strings are the
-stable semantic axis identities used by attributes and `!ta.expr` types. The
-SSA name is only a local handle and must not define the axis identity.
-
-Using ordinary `index` for symbolic coordinates is a pragmatic v1 choice. It
-allows affine-style index expressions such as convolution input coordinates,
-but it also means generic `index`/`arith` operations could accidentally treat
-axis coordinates like runtime loop values. A future version may introduce a
-dedicated coordinate type, such as `!ta.index<[axes]>`, or restrict which ops
-may consume scope axis block arguments.
-
-All expression-level `ta` operations, such as `ta.at`, `ta.map`, and
-`ta.reduce`, must be nested inside a `ta.scope`. They may only use or define
-axes declared by the enclosing scope. This makes every scope a closed indexed
-expression over a known coordinate system.
-
-Inside a scope, most values are indexed scalar expressions. A value has an element type and an axis support set:
+Dynamic extents are also allowed in the syntax:
 
 ```mlir
-!ta.expr<f32, [b,h,i,j]>
+ta.scope axes(%i "i" extent %I, %j "j" extent %J) { ... }
 ```
 
-This means:
+The scope block arguments are `index`-typed coordinate handles. The quoted
+strings are the semantic axis identities used by attributes and `!ta.expr`
+types; the SSA names are local handles only.
 
-```text
-an f32 scalar expression that may vary over axes b,h,i,j
-```
-
-It is not a materialized tensor. It is a scalar-valued function over those axes.
-
-Examples:
-
-```text
-Q[b,h,i,d]       : !ta.expr<f32, [b,h,i,d]>
-K[b,h,j,d]       : !ta.expr<f32, [b,h,j,d]>
-Q[b,h,i,d]*K[...] : !ta.expr<f32, [b,h,i,j,d]>
-sum_d (...)      : !ta.expr<f32, [b,h,i,j]>
-max_j (...)      : !ta.expr<f32, [b,h,i]>
-```
-
-Broadcasting is implicit: combining values takes the union of axis supports.
-
-```text
-x : !ta.expr<f32, [b,h,i,j]>
-y : !ta.expr<f32, [b,h,i]>
-x - y : !ta.expr<f32, [b,h,i,j]>
-```
-
-`y` is constant along `j`.
-
----
-
-## Core Operations
-
-### `ta.scope`
-
-Owns one indexed expression region, declares the allowed body axes, and
-materializes the yielded expression as a tensor result.
+Inside the scope, tensor accesses produce scalar indexed expressions:
 
 ```mlir
-%O = ta.scope axes(%b "b" extent %B, %h "h" extent %H,
-                   %i "i" extent %I, %j "j" extent %J,
-                   %d "d" extent %D, %e "e" extent %E) {
-  ...
-  ta.yield %o : !ta.expr<f32, [b,h,i,e]>
-} : () -> tensor<?x?x?x?xf32>
-```
-
-A scope result is the tensor version of the expression yielded by its terminator.
-The scope axis list is the ambient coordinate universe for the body,
-not necessarily the result shape. Axis extents give lowering and scheduling a
-direct source of loop bounds instead of requiring them to infer every bound from
-uses of `ta.at`.
-The yielded expression may depend on a subset of the scope axes;
-axes used only inside reductions or intermediate expressions
-do not appear in the result expression.
-
-Scopes are the only place where `ta` indexed expression ops may appear.
-
-### `ta.at`
-
-Observes an external tensor at indexed coordinates.
-
-```mlir
-%q = ta.at %Q[%b, %h, %i, %d]
-     : tensor<?x?x?x?xf32> -> !ta.expr<f32, [b,h,i,d]>
-```
-
-`ta.at` is the analog of scalar tensor element access, but it produces a `ta.expr` value rather than an ordinary scalar.
-
----
-
-### `ta.map`
-
-Applies ordinary scalar computation pointwise over the union of operand axis sets.
-
-Sketch:
-
-```mlir
-%centered = ta.map %s, %m {
-^bb0(%s0: f32, %m0: f32):
-  %r = arith.subf %s0, %m0 : f32
-  ta.yield %r : f32
-} : (!ta.expr<f32, [b,h,i,j]>, !ta.expr<f32, [b,h,i]>)
- -> !ta.expr<f32, [b,h,i,j]>
-```
-
-The body computes on ordinary scalar values. The `ta.map` result has the
-yielded scalar element type and the union of all operand axes, ordered by the
-enclosing `ta.scope`.
-
-For rewrite friendliness, common scalar operations also have first-class `ta`
-ops. These are not merely pretty syntax; they are the preferred canonical form
-for algebraic rewrites:
-
-```mlir
-%centered = ta.subf %s, %m
-  : (!ta.expr<f32, [b,h,i,j]>, !ta.expr<f32, [b,h,i]>)
- -> !ta.expr<f32, [b,h,i,j]>
-%p = ta.exp %centered
-  : (!ta.expr<f32, [b,h,i,j]>) -> !ta.expr<f32, [b,h,i,j]>
-```
-
-`ta.map` remains the escape hatch for scalar code without a dedicated `ta` op.
-
----
-
-### `ta.reduce`
-
-Mathematical reduction binder over one or more axes. `ta.reduce` reduces an
-existing expression value.
-
-```mlir
-%q = ta.at %Q[%b, %h, %i, %d]
-     : tensor<?x?x?x?xf32> -> !ta.expr<f32, [b,h,i,d]>
-%k = ta.at %K[%b, %h, %j, %d]
-     : tensor<?x?x?x?xf32> -> !ta.expr<f32, [b,h,j,d]>
+%q = ta.at %Q[%b, %h, %i, %d] {axes = #ta.axes<b, h, i, d>}
+    : tensor<2x3x4x6xf32> -> !ta.expr<f32, [b, h, i, d]>
+%k = ta.at %K[%b, %h, %j, %d] {axes = #ta.axes<b, h, j, d>}
+    : tensor<2x3x5x6xf32> -> !ta.expr<f32, [b, h, j, d]>
 %qk = ta.mulf %q, %k
-      : (!ta.expr<f32, [b,h,i,d]>, !ta.expr<f32, [b,h,j,d]>)
-     -> !ta.expr<f32, [b,h,i,j,d]>
+    : (!ta.expr<f32, [b, h, i, d]>, !ta.expr<f32, [b, h, j, d]>)
+   -> !ta.expr<f32, [b, h, i, j, d]>
 %dot = ta.reduce #ta.reduce_kind<add> %qk {axes = #ta.axes<d>}
-     : !ta.expr<f32, [b,h,i,j,d]> -> !ta.expr<f32, [b,h,i,j]>
+    : !ta.expr<f32, [b, h, i, j, d]> -> !ta.expr<f32, [b, h, i, j]>
 ```
 
-This op is not a loop. It is a mathematical expression.
+`ta.scope` materializes the yielded expression as a tensor. The yielded
+expression may use a subset of the declared axes; axes used only by reductions
+or intermediates do not appear in the result expression.
 
-The reducer kind is a structured enum attribute, not an arbitrary string.
-Built-in reducers include `add`, `mul`, `max`, and `min`.
+## Expressions And Axes
 
-The importer may attach `ta.import_group` attributes to expression ops to record
-that a payload and reduction came from the same source `linalg.generic`. This is
-provenance metadata, not a semantic boundary.
-
-`ta.reduce` intentionally has no payload body. Rewrites over `ta` are expected
-to be expressible in MLIR pattern languages such as PDLL or DRR, which are much
-better at matching and creating ordinary SSA op DAGs than constructing region
-bodies. A contraction therefore appears as elementwise expression ops followed
-by a bodyless `ta.reduce`. This keeps the mathematical payload visible to local
-pattern matching, avoids custom region-building helpers for common rewrites, and
-uses `ta.import_group` when we still need to remember that several ops came from
-one source operation.
-
-Future reduction metadata will likely include:
-
-```text
-reducer kind: add, mul, max, min, later custom
-identity value
-associative / commutative / idempotent flags
-ordered or unordered semantics
-fastmath flags
-NaN policy
-empty-domain semantics
-```
-
-This is what makes rewrites such as the following possible:
-
-```text
-c * reduce_max_j f(j)
-  => reduce_max_j (c * f(j))
-```
-
-with guards:
-
-```text
-c > 0
-j not in axes(c)
-max semantics permit the transform
-```
-
----
-
-## Type System
-
-The key type is:
+The central type is:
 
 ```mlir
 !ta.expr<element_type, axis_set>
@@ -270,358 +99,44 @@ The key type is:
 Examples:
 
 ```mlir
-!ta.expr<f32, []>             // true scalar
-!ta.expr<f32, [b,h,i]>        // row-wise scalar expression
-!ta.expr<f32, [b,h,i,j]>      // score-like expression
-!ta.expr<f32, [b,h,i,e]>      // output-like expression
+!ta.expr<f32, []>             // axisless scalar expression
+!ta.expr<f32, [b, h, i]>      // may vary over b, h, i
+!ta.expr<f32, [b, h, i, j]>   // score-like expression
 ```
 
-Axis sets should be semantic sets, printed in the enclosing scope's canonical
-axis order. The following should not be distinct types:
+An expression is not a materialized tensor. It is a scalar-valued function over
+its axis support set. Axis sets are semantic sets printed in the enclosing
+scope order.
+
+Broadcasting is implicit. Elementwise operations take the union of operand
+axes:
 
 ```text
-[b,h,i,j]
-[j,i,h,b]
+!ta.expr<f32, [i]> + !ta.expr<f32, [i, j]> -> !ta.expr<f32, [i, j]>
+!ta.expr<f32, [i]> + !ta.expr<f32, [j]>    -> !ta.expr<f32, [i, j]>
 ```
 
-The axis support set is best treated as an upper bound on dependency, not necessarily a proven-minimal dependency set. For example:
+This makes standard tensor broadcasts visible as scalar algebra. For example,
+in softmax:
 
 ```text
-x : !ta.expr<f32, [i]>
-x - x : !ta.expr<f32, [i]>
+S : [b, h, i, j]
+M : [b, h, i]
+S - M : [b, h, i, j]
 ```
 
-After simplification, this may become:
+`M` is independent of `j`, so it broadcasts along `j`.
 
-```text
-0 : !ta.expr<f32, []>
-```
+## Rewriting TA
 
-Core typing rules:
+The preferred rewrite surface is an ordinary SSA DAG of first-class `ta`
+elementwise ops and bodyless reductions. This is deliberate: MLIR pattern
+languages such as PDLL and DRR can match and create ordinary ops directly, but
+are awkward for constructing new region bodies. A contraction is therefore
+represented as payload expression ops followed by `ta.reduce`, not as a
+reduction with an embedded payload region.
 
-```text
-axes(constant) = {}
-axes(ta.at T[index_exprs...]) = axes used by index expressions
-axes(ta.map f(x1,...,xn)) = union_i axes(xi)
-axes(ta.elementwise_op(x1,...,xn)) = union_i axes(xi)
-axes(ta.reduce over R x) = axes(x) - R
-axes(ta.select c x y) = axes(c) ∪ axes(x) ∪ axes(y)
-```
-
-The same elementwise rule is used by `ta.map` and by sugar ops such as
-`ta.addf`, `ta.mulf`, `ta.exp`, `ta.cmpf`, and `ta.select`. Binary and ternary
-ops implicitly broadcast operands over missing axes:
-
-```text
-!ta.expr<f32, [i]> + !ta.expr<f32, [i,j]> -> !ta.expr<f32, [i,j]>
-!ta.expr<f32, [i]> + !ta.expr<f32, [j]>   -> !ta.expr<f32, [i,j]>
-```
-
-The result axis order is the enclosing `ta.scope` order, not operand order.
-
----
-
-## Example Rewrite: `exp` to `exp2`
-
-The implemented rewrite target replaces `exp` with `exp2` and uses small
-algebraic rules to move the new `log2(e)` factor through the expression graph.
-The current implementation is in `lib/TA/ExpToExp2.pdll` and is exposed through:
-
-```mlir
-transform.ta.rewrite_exp_to_exp2 %target : !transform.any_op
-```
-
-The same pattern set is also available to `transform.apply_patterns` as:
-
-```mlir
-transform.apply_patterns.ta.exp_to_exp2
-```
-
-The motivating attention fragment inside one `ta.scope` looks like:
-
-```mlir
-%dot = ta.reduce #ta.reduce_kind<add> %qk {axes = #ta.axes<d>}
-     : !ta.expr<f32, [b,h,i,j,d]> -> !ta.expr<f32, [b,h,i,j]>
-%scale_expr = ta.constant 1.250000e-01 : f32 : !ta.expr<f32, []>
-%s = ta.mulf %scale_expr, %dot
-     : (!ta.expr<f32, []>, !ta.expr<f32, [b,h,i,j]>)
-    -> !ta.expr<f32, [b,h,i,j]>
-%m = ta.reduce #ta.reduce_kind<max> %s {axes = #ta.axes<j>}
-     : !ta.expr<f32, [b,h,i,j]> -> !ta.expr<f32, [b,h,i]>
-%centered = ta.subf %s, %m
-     : (!ta.expr<f32, [b,h,i,j]>, !ta.expr<f32, [b,h,i]>)
-    -> !ta.expr<f32, [b,h,i,j]>
-%p = ta.exp %centered
-     : (!ta.expr<f32, [b,h,i,j]>) -> !ta.expr<f32, [b,h,i,j]>
-```
-
-With `c = log2(e)`, the rewrite proceeds as ordinary algebra over the
-score expression:
-
-| Step                       | Rule                                                            | Result                   |
-| -------------------------- | --------------------------------------------------------------- | ------------------------ |
-| Original softmax numerator | definition                                                      | `P = exp(S - M)`         |
-| Change exponential base    | `exp(x) => exp2(c * x)`                                         | `P = exp2(c * (S - M))`  |
-| Distribute scale           | `c * (x - y) => c*x - c*y`                                      | `P = exp2(c*S - c*M)`    |
-| Move through max           | `c * max_j(S) => max_j(c*S)`, for `c > 0` and `j notin axes(c)` | `P = exp2(S2 - M2)`      |
-| Rebase score               | CSE `S2 = c*S`, `M2 = max_j S2`                                 | `P = exp2(S2 - M2)`      |
-| Fold score scale           | `S = scale * Dot`                                               | `S2 = (c * scale) * Dot` |
-
-The current rewrite driver reaches the desired form by repeatedly applying
-these separate PDLL rules and running CSE between greedy iterations.
-
-No attention-specific rule is required. Attention only supplies one graph where
-these general facts compose into:
-
-```text
-S2 = (scale * log2(e)) * Dot
-M2 = max_j S2
-P2 = exp2(S2 - M2)
-```
-
-The current legality checks are still deliberately minimal. The `max` movement
-rule checks that the scaling factor is a finite positive axisless constant, but
-the dialect still needs a broader fastmath / floating-point equivalence policy
-before this should be treated as generally valid for production lowering.
-
----
-
-## Importing from `linalg`
-
-The `linalg-to-ta` pass imports supported pure tensor dataflow rooted at a
-function return value and materializes it as one `ta.scope`.
-
-Example invocation:
-
-```bash
-mlir-opt \
-  --load-dialect-plugin=libTADialect.so \
-  --load-pass-plugin=libTADialect.so \
-  --pass-pipeline='builtin.module(func.func(linalg-to-ta))' \
-  input.mlir
-```
-
-The importer has two phases. First it walks the tensor dataflow rooted at the
-return value to assign canonical axes to tensor dimensions and `linalg.generic`
-loops. Then it emits TA in function order, translating each source
-`linalg.generic` at most once and recording the result in an SSA value map. This
-keeps shared subexpressions, such as the QK score matrix in attention, shared in
-the imported TA program.
-
-Supported producer forms include:
-
-```text
-function tensor arguments
-arith constants
-tensor.collapse_shape
-tensor.expand_shape
-linalg.generic with projected-permutation and broadcast indexing maps
-```
-
-The importer currently emits one `ta.scope` for the returned expression graph.
-This makes cross-op algebra visible immediately, but it is not yet a full
-whole-program scope-placement system.
-
-### Axis Discovery
-
-Result tensor dimensions get fresh axes. A backward discovery pass uses each
-visited `linalg.generic` output indexing map to assign those axes to loop
-dimensions. Input maps then project loop axes onto operand dimensions. When the
-same tensor value is reached from multiple users, the importer unifies the
-corresponding axis IDs instead of re-importing the producer with fresh axes.
-
-For attention-like programs, this recovers axes corresponding to:
-
-```text
-b : Batch
-h : Heads
-i : QuerySeq
-j : KeySeq
-d : QKHeadDim
-e : ValueDim
-```
-
-For a dot product, a typical `linalg.generic` has local loops:
-
-```text
-(b, h, i, j, d)
-```
-
-and maps:
-
-```text
-Q   : (b,h,i,j,d) -> (b,h,i,d)
-K   : (b,h,i,j,d) -> (b,h,j,d)
-Dot : (b,h,i,j,d) -> (b,h,i,j)
-```
-
-When translating this op, the output map assigns user-requested axes to loop
-dimensions:
-
-```text
-loop.b := Dot.axis0
-loop.h := Dot.axis1
-loop.i := Dot.axis2
-loop.j := Dot.axis3
-```
-
-Reduction loop dimensions that do not appear in the output map get fresh
-reduction axes. Input maps then project those loop axes onto operand tensor
-dimensions, producing `ta.at` expressions.
-
-### Broadcasts
-
-Broadcasts appear as missing axes or constant affine-map results.
-
-For:
-
-```text
-P[b,h,i,j] = exp(S[b,h,i,j] - M[b,h,i])
-```
-
-`M` is evaluated with no `j` coordinate, so its expression support is:
-
-```text
-axes(%m) = [b,h,i]
-```
-
-When combined with `S : [b,h,i,j]`, elementwise type inference broadcasts it
-along `j` by taking the union of operand axes in scope order.
-
-### Imported `linalg.generic` Bodies
-
-For each imported `linalg.generic`, the importer translates tensor operands by
-projecting loop axes through input maps, then translates the scalar body to
-first-class `ta` scalar ops.
-
-Recognized scalar ops currently include floating-point constants,
-`arith.extf`, `arith.truncf`, `arith.addf`, `arith.subf`, `arith.mulf`,
-`arith.divf`, `arith.maximumf`, `arith.minimumf`, and `math.exp`. Recognized
-reduction combiners are add, multiply, maximum, and minimum. Reduction bodies
-with those accumulator forms are imported as elementwise payload ops followed by
-`ta.reduce`. The importer annotates ops created from each source
-`linalg.generic` with `ta.import_group = N : i64`.
-
-### Unsupported Maps
-
-The current importer supports projected permutations and broadcasts. Affine
-index expressions are a remaining goal.
-
-For affine maps such as convolution indexing:
-
-```text
-X[n, oh + r, ow + s, c]
-```
-
-do not over-unify all involved axes. Preserve the affine index expression:
-
-```mlir
-%x = ta.at %X[%n, %oh + %r, %ow + %s, %c]
-```
-
-The dependency set of this access includes all axes used in the index expressions:
-
-```text
-axes(%x) = {n, oh, r, ow, s, c}
-```
-
-but the input-height dimension is not simply the same axis as `oh` or `r`.
-
-## Scope Placement and Lowering
-
-After rewriting, `ta` will need to choose a schedule again.
-
-The importer currently creates one scope for the returned expression graph. The
-`ta-to-linalg` pass provides a conservative lowering back to
-`linalg.generic`: it uses `ta.import_group` as an initial materialization
-boundary, checks whether each partition can be represented as one structured
-op, and lowers ungrouped rewrite-created ops as their own materializations.
-This is enough for the current attention demo after the exp-to-exp2 and
-division/matmul rewrites.
-
-Original `linalg` boundaries remain useful placement hints:
-
-```text
-one original linalg op -> one imported ta.scope
-```
-
-This is useful, but it must not be mandatory. Rewrites may delete, fuse, split,
-or create groups.
-
-Each lowered partition has structured form:
-
-```text
-scope axes       -> parallel iterators
-reduce axes      -> reduction iterators
-at/eval accesses -> affine indexing maps
-scalar body      -> linalg region
-```
-
-A partition may not lower cleanly to one `linalg.generic` if it contains:
-
-```text
-nested dependent reductions
-scan/recurrence
-sort/top-k
-scatter or data-dependent writes
-non-affine indexing
-multiple incompatible reduction structures
-```
-
-In those cases, a more general lowering pass could:
-
-```text
-1. split the partition,
-2. create additional ta.scope materialization boundaries,
-3. lower to scf loops,
-4. lower to a custom/fused op,
-5. or reject the transformation if no legal lowering is available.
-```
-
-The important invariant is:
-
-```text
-ta.scope body        = algebraic scalar expression over declared axes
-lowering partition   = tensor materialization boundary
-```
-
----
-
-## Developer Notes
-
-### Types and Attributes
-
-The core expression type is:
-
-```mlir
-!ta.expr<element_type, axis_set>
-```
-
-Axis identity is stored in attributes:
-
-```mlir
-#ta.axis<"b">
-#ta.axis<"h">
-#ta.axis<"i">
-#ta.axes<b, h, i>
-```
-
-Types refer to axis identities as attributes, not directly to SSA values.
-
-The enclosing `ta.scope` declares the axis identities its body may use with
-axis block arguments. The quoted axis name is stored as an attribute; the SSA
-name is a printable handle for the coordinate in the body. The scope result
-tensor type carries the materialized shape.
-
-### Sugar vs Primitive Ops
-
-Escape hatch:
-
-```text
-ta.map with scalar region
-```
-
-Canonical scalar rewrite surface:
+Implemented scalar ops include:
 
 ```text
 ta.constant
@@ -656,150 +171,337 @@ ta.cmpf
 ta.select
 ```
 
-These ops share the same type rule as `ta.map`: result axes are the union of
-operand axes in the enclosing scope order. Rewriters should primarily match
-these first-class ops. `ta.map` is available for imported scalar regions that
-have not been canonicalized to a known operation.
+These ops share the same axis rule: result axes are the union of operand axes
+in scope order. `ta.map` remains available as an escape hatch for scalar code
+without a dedicated `ta` op.
 
-### Rewriter Requirements
+The current rewrite support is compiled into the plugin:
 
-The current rewrite support is intentionally small: PDLL pattern sets are
-compiled into the plugin, and transform ops populate those patterns into MLIR's
-greedy rewrite driver. `transform.ta.rewrite_exp_to_exp2` applies the
-exp-to-exp2 algebra rules repeatedly and runs CSE between iterations.
-
-A more general rewrite engine will need:
-
-```text
-axis-support queries
-axis independence checks
-elementwise op queries
-reduction algebra metadata
-positivity/nonnegativity facts
-fastmath/NaN policy checks
-scope-transparent eval/build beta-reduction
+```mlir
+transform.apply_patterns to %target {
+  transform.apply_patterns.ta.exp_to_exp2
+  transform.apply_patterns.ta.exchange_div_and_matmul
+} : !transform.any_op
 ```
 
-Elementwise `ta` ops expose a common interface with operand axes and result
-axes. Future rewrites should use that interface to choose between matching
-specific ops such as `ta.mulf` and reasoning generically about
-axis-broadcasted elementwise computation.
+There is also a greedy driver for the `exp` to `exp2` algebra rules:
 
-Useful side-condition query:
-
-```text
-isIndependent(value, axis) := axis not in axes(value)
+```mlir
+transform.ta.rewrite_exp_to_exp2 %target : !transform.any_op
 ```
 
-Useful fact query:
+### `exp` To `exp2`
+
+The `exp` rewrite is expressed as several small PDLL algebra rules. In an
+attention fragment:
 
 ```text
-isPositive(value)
+S = scale * Dot
+M = max_j S
+P = exp(S - M)
 ```
 
-For constants like `log2(e)`, positivity should eventually be known
-immediately.
+the rules compose into:
 
-### Not Implemented Yet: Floating-Point Legality
+| Step | Rule | Result |
+| --- | --- | --- |
+| Change base | `exp(x) => exp2(c * x)`, where `c = log2(e)` | `P = exp2(c * (S - M))` |
+| Distribute | `c * (x - y) => c*x - c*y` | `P = exp2(c*S - c*M)` |
+| Move through max | `c * max_j(S) => max_j(c*S)`, for finite `c > 0` and `j notin axes(c)` | `P = exp2(S2 - M2)` |
+| Fold constants | `c * (scale * Dot) => (c * scale) * Dot` | `S2 = (c * scale) * Dot` |
 
-Many desirable rewrites are not bitwise-preserving over IEEE floating point.
+The driver repeatedly applies the rules and runs CSE between greedy iterations.
+No single rule needs to match the full attention graph.
 
-Examples:
+### Division And Matmul
+
+The PDLL pattern set also includes a focused rewrite for:
 
 ```text
-sum_j (c*x_j) = c * sum_j x_j
-exp(x) = exp2(log2(e)*x)
+reduce_add_k((x / d) * y) => reduce_add_k(x * y) / d
 ```
 
-The dialect will need an equivalence mode or fastmath flags. Rewrites should be
-guarded by those flags.
+when `d` is independent of the reduced axes. This is representative of the
+intended TA rewrite style: match a small expression DAG, query axis
+side-conditions, create new ordinary `ta` ops, and let later lowering decide
+materialization boundaries.
 
-For max movement:
+## Importing From Linalg
+
+The `linalg-to-ta` pass imports supported pure tensor dataflow rooted at a
+function return value and materializes it as one `ta.scope`.
+
+```bash
+mlir-opt \
+  --load-dialect-plugin=libTADialect.so \
+  --load-pass-plugin=libTADialect.so \
+  --pass-pipeline='builtin.module(func.func(linalg-to-ta))' \
+  input.mlir
+```
+
+The importer walks the tensor dataflow graph, assigns canonical axes to tensor
+dimensions and `linalg.generic` loops, then emits each source operation once in
+dominance order using a value-to-value map. Shared producers stay shared in the
+TA program.
+
+Supported producer forms:
 
 ```text
-c * max_j x_j = max_j (c*x_j)
+function tensor arguments
+arith constants
+tensor.collapse_shape
+tensor.expand_shape
+linalg.generic with projected-permutation and broadcast indexing maps
 ```
 
-require:
+Recognized scalar body ops:
 
 ```text
-c > 0
-c independent of j
-no-NaN semantics or compatible fastmath policy
-empty-domain behavior is compatible
+arith.extf
+arith.truncf
+arith.addf
+arith.subf
+arith.mulf
+arith.divf
+arith.maximumf
+arith.minimumf
+math.exp
 ```
 
----
+Recognized reduction combiners are add, multiply, maximum, and minimum.
+Reduction bodies with those accumulator forms are imported as elementwise
+payload ops followed by `ta.reduce`.
 
-## Remaining Limitations
+The importer annotates ops created from each source `linalg.generic` with:
 
-1. Multi-result import, including multi-output reductions such as max+argmax.
-1. Affine access expressions for non-projection maps, needed for direct convolution-style indexing.
-1. Additional algebraic rewrite rules beyond the current exp-to-exp2 pattern set.
-1. Scope placement after rewrites: splitting, fusing, or reusing original `linalg` boundaries.
-1. General lowering beyond the current conservative `linalg.generic`
-   partitioner, including `scf` / vector forms.
-1. Fastmath and floating-point legality policy.
-1. Transform-interpreted rewrite patterns, so users can supply rewrite rules
-   from transform IR instead of precompiling every PDLL pattern into the plugin.
-1. A compact custom rewrite syntax, for example:
+```mlir
+{ta.import_group = N : i64}
+```
 
-    ```text
-    match reduce($x{$axes_x} / $d{$axes_d} * $y{$axes_y},
-                 axes=$axes_k, reducer="add")
-      if intersect($axes_k, $axes_d).empty()
-    ```
+This is provenance metadata. It is useful for lowering and debugging, but it is
+not part of the mathematical semantics.
 
-    This syntax would be closer to tensor-algebra notation than PDLL, but it
-    requires a custom parser and a lowering into PDL/PDLL or native rewrite
-    patterns.
+### Axis Discovery
 
-`test/TA/attention.mlir` now demonstrates the implemented half of the intended
-end-to-end flow:
+Result tensor dimensions receive axes first. The importer then propagates those
+axes backward through output indexing maps to loop dimensions, and through input
+indexing maps to operand tensor dimensions. If a tensor value is reached from
+multiple users, equivalent dimensions are unified so the producer is not
+re-imported with fresh axes.
+
+For a dot product with local loops:
 
 ```text
-plain attention in linalg
-  -> ta
-  -> exp-to-exp2 rewrite
-  -> fold log2(e) into score scale
+(b, h, i, j, d)
 ```
 
-The next missing pieces are:
+and maps:
 
 ```text
-  -> choose scope placement
-  -> lower back to linalg
+Q   : (b,h,i,j,d) -> (b,h,i,d)
+K   : (b,h,i,j,d) -> (b,h,j,d)
+Dot : (b,h,i,j,d) -> (b,h,i,j)
 ```
 
-Expected before/after:
+the output map assigns axes to `b`, `h`, `i`, and `j`; the missing reduction
+loop gets a fresh axis `d`; input maps project those loop axes onto `Q` and
+`K`.
+
+Broadcasts appear as missing axes or constant affine-map results. For:
 
 ```text
-Before:
-  S = scale * Dot
-  M = max_j S
-  P = exp(S - M)
-  L = sum_j P
-  Num = sum_j P*V
-  O = Num / L
-
-After:
-  S2 = (scale * log2(e)) * Dot
-  M2 = max_j S2
-  P2 = exp2(S2 - M2)
-  L2 = sum_j P2
-  Num2 = sum_j P2*V
-  O2 = Num2 / L2
+P[b,h,i,j] = exp(S[b,h,i,j] - M[b,h,i])
 ```
 
----
+`M` imports as an expression over `[b, h, i]`; combining it with `S` broadcasts
+it by unioning axis sets.
 
-## Open Questions
+## Lowering Back To Linalg
 
-1. Should `ta.scope` be multi-result, or should multi-output linalg ops be split into separate scopes?
-2. Should reduction ops support custom reducer definitions in v1, or only built-in reducers?
-3. How much fastmath policy should live on `ta.scope` versus individual ops?
-4. Should `ta.expr` axis sets be exact dependencies or conservative supports?
-5. How should scope placement be represented: a separate schedule dialect, or transform annotations?
-6. How should materialization costs be estimated after rewrites?
-7. How should the dialect represent masks: as ordinary selects, or as semantic extended-real masked logits?
-8. Should `ta.scan` be part of v1, or added later for recurrence-like models such as Mamba?
+The `ta-to-linalg` pass lowers a `ta.scope` back to `linalg.generic`
+materializations.
+
+```bash
+mlir-opt \
+  --load-dialect-plugin=libTADialect.so \
+  --load-pass-plugin=libTADialect.so \
+  --pass-pipeline='builtin.module(func.func(ta-to-linalg))' \
+  input.mlir
+```
+
+Lowering uses `ta.import_group` as an initial partitioning hint. A grouped
+payload and reduction can often become one `linalg.generic`, preserving the
+shape of the imported program. Ungrouped rewrite-created ops are materialized
+as their own structured ops when needed.
+
+Axis sizes come from `ta.scope` extents. The lowering does not infer or
+cross-check them from downstream tensor shapes.
+
+Each lowered partition has this structure:
+
+```text
+scope axes       -> parallel iterators
+reduce axes      -> reduction iterators
+ta.at accesses   -> affine indexing maps
+scalar TA ops     -> linalg region scalar ops
+```
+
+The current lowering is conservative. It handles the attention demo after
+`linalg-to-ta`, `exp` to `exp2`, and division/matmul exchange, but more complex
+partitions may need to be split or lowered through a more general path such as
+`scf`.
+
+## End-To-End Demo Shape
+
+`test/TA/attention.mlir` demonstrates the implemented flow:
+
+```mlir
+transform.named_sequence @__transform_main(%module: !transform.any_op) {
+  %func = transform.structured.match ops{["func.func"]} in %module
+      : (!transform.any_op) -> !transform.any_op
+  %ta_func = transform.apply_registered_pass "linalg-to-ta" to %func
+      : (!transform.any_op) -> !transform.any_op
+  transform.ta.rewrite_exp_to_exp2 %ta_func : !transform.any_op
+  transform.apply_patterns to %ta_func {
+    transform.apply_patterns.ta.exchange_div_and_matmul
+  } : !transform.any_op
+  %linalg_func = transform.apply_registered_pass "ta-to-linalg" to %ta_func
+      : (!transform.any_op) -> !transform.any_op
+  transform.yield
+}
+```
+
+The resulting program has the same high-level tensor computation, but the
+softmax numerator uses `exp2`, and the score scale has absorbed the `log2(e)`
+factor.
+
+## Operation Reference
+
+### `ta.scope`
+
+Declares axes and materializes the yielded expression as a tensor.
+
+```mlir
+%out = ta.scope axes(%i "i" extent 16, %j "j" extent 32) {
+  ...
+  ta.yield %expr : !ta.expr<f32, [i, j]>
+} : () -> tensor<16x32xf32>
+```
+
+All expression-level `ta` ops must be nested inside a scope, and may only use
+axes declared by that scope.
+
+### `ta.at`
+
+Reads a tensor at symbolic coordinates and returns a `ta.expr`.
+
+```mlir
+%x = ta.at %tensor[%i, %j] {axes = #ta.axes<i, j>}
+    : tensor<16x32xf32> -> !ta.expr<f32, [i, j]>
+```
+
+### `ta.eval`
+
+Evaluates a materialized tensor expression at symbolic coordinates. This is the
+scope-local equivalent of re-accessing a tensor result.
+
+```mlir
+%x = ta.eval %tensor[%i, %j] {axes = #ta.axes<i, j>}
+    : tensor<16x32xf32> -> !ta.expr<f32, [i, j]>
+```
+
+### `ta.map`
+
+Runs a scalar region pointwise over the union of operand axes.
+
+```mlir
+%diff = ta.map %x, %y {
+^bb0(%sx : f32, %sy : f32):
+  %r = arith.subf %sx, %sy : f32
+  ta.yield %r : f32
+} : (!ta.expr<f32, [i]>, !ta.expr<f32, [j]>)
+ -> !ta.expr<f32, [i, j]>
+```
+
+Prefer first-class scalar TA ops when one exists; use `ta.map` for scalar code
+that has not been canonicalized.
+
+### `ta.reduce`
+
+Reduces an expression over one or more axes.
+
+```mlir
+%sum = ta.reduce #ta.reduce_kind<add> %payload {axes = #ta.axes<k>}
+    : !ta.expr<f32, [i, j, k]> -> !ta.expr<f32, [i, j]>
+```
+
+Built-in reducer kinds are `add`, `mul`, `max`, and `min`. The reducer kind is
+a structured enum attribute, not a string.
+
+`ta.reduce` has no payload body. Its input is an ordinary expression value, so
+the payload remains visible to standard op-DAG pattern matching.
+
+## Types And Attributes
+
+Axis identities are attributes:
+
+```mlir
+#ta.axis<"b">
+#ta.axes<b, h, i>
+```
+
+Expression types refer to these identities:
+
+```mlir
+!ta.expr<f32, [b, h, i]>
+```
+
+The enclosing `ta.scope` declares the allowed axis identities and provides
+block arguments that can be used as coordinates. The scope result tensor type
+is the materialized type of its yielded expression.
+
+Core typing rules:
+
+```text
+axes(ta.constant) = {}
+axes(ta.at T[index_exprs...]) = axes named by its axes attribute
+axes(ta.map f(x1,...,xn)) = union_i axes(xi)
+axes(ta.elementwise_op(x1,...,xn)) = union_i axes(xi)
+axes(ta.reduce over R x) = axes(x) - R
+axes(ta.select c x y) = axes(c) union axes(x) union axes(y)
+```
+
+The result axis order is the enclosing `ta.scope` order.
+
+The axis support set is a conservative dependency support, not necessarily a
+minimal dependency set. For example, `x - x` may initially keep `axes(x)` even
+though simplification can later produce an axisless zero.
+
+## Current Limitations
+
+The implemented dialect and passes cover the current attention rewrite demo,
+but several areas remain intentionally narrow:
+
+1. Import is limited to projected-permutation and broadcast indexing maps.
+   Affine access expressions such as convolution indices are not imported yet.
+1. Import and lowering are single-result oriented. Multi-output reductions such
+   as max+argmax still need a representation strategy.
+1. Lowering is conservative and targets `linalg.generic`; complex partitions
+   may need splitting or non-linalg lowering.
+1. Dynamic scope extents parse, but `ta-to-linalg` currently requires static
+   extents.
+1. Floating-point legality is minimal. Rewrites such as `exp -> exp2` and
+   moving positive factors through `max` need a fuller fastmath / NaN policy
+   before they are generally legal.
+1. PDLL patterns are compiled into the plugin. Transform-interpreted rewrite
+   patterns would let users provide rules without rebuilding.
+1. A more compact custom rewrite syntax could sit above PDLL, for example:
+
+   ```text
+   match reduce($x{$axes_x} / $d{$axes_d} * $y{$axes_y},
+                axes=$axes_k, reducer="add")
+     if intersect($axes_k, $axes_d).empty()
+   ```
+
+   That syntax is closer to tensor-algebra notation, but would require a
+   custom parser and a lowering into PDL/PDLL or native rewrite patterns.
