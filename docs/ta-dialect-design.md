@@ -400,16 +400,6 @@ Reads a tensor at symbolic coordinates and returns a `ta.expr`.
     : tensor<16x32xf32> -> !ta.expr<f32, [i, j]>
 ```
 
-### `ta.eval`
-
-Evaluates a materialized tensor expression at symbolic coordinates. This is the
-scope-local equivalent of re-accessing a tensor result.
-
-```mlir
-%x = ta.eval %tensor[%i, %j] {axes = #ta.axes<i, j>}
-    : tensor<16x32xf32> -> !ta.expr<f32, [i, j]>
-```
-
 ### `ta.map`
 
 Runs a scalar region pointwise over the union of operand axes.

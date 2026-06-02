@@ -64,17 +64,6 @@ def TA_AtOp : TA_Op<"at", [Pure]> {
   let hasVerifier = 1;
 }
 
-def TA_EvalOp : TA_Op<"eval", [Pure]> {
-  let summary = "evaluate a scoped tensor expression at indexed coordinates";
-  let arguments = (ins AnyRankedTensor:$source,
-                       Variadic<Index>:$indices,
-                       OptionalAttr<TA_AxesAttr>:$axes);
-  let results = (outs TA_ExprType:$result);
-
-  let assemblyFormat = "$source `[` $indices `]` attr-dict `:` type($source) `->` type($result)";
-  let hasVerifier = 1;
-}
-
 def TA_MapOp : TA_Op<"map", [
     SingleBlockImplicitTerminator<"YieldOp">,
     InferTypeOpAdaptor,
@@ -144,16 +133,7 @@ def TA_SelectOp : TA_ElementwiseOp<"select", [InferTypeOpAdaptor]> {
   let assemblyFormat = "operands attr-dict `:` functional-type(operands, results)";
 }
 
-class TA_ReduceLikeOp<string mnemonic, list<Trait> traits = []>
-    : TA_Op<mnemonic, [Pure,
-                       InferTypeOpAdaptor,
-                       TA_ReduceLikeOpInterface,
-                       DeclareOpInterfaceMethods<TA_ReduceLikeOpInterface,
-                                                 ["getPayloadExprType"]>] # traits> {
-  let hasVerifier = 1;
-}
-
-def TA_ReduceOp : TA_ReduceLikeOp<"reduce"> {
+def TA_ReduceOp : TA_Op<"reduce", [Pure, InferTypeOpAdaptor]> {
   let summary = "mathematical reduction over expression axes";
   let arguments = (ins TA_ReduceKindEnumAttr:$kind,
                        TA_ExprType:$input,
@@ -163,6 +143,7 @@ def TA_ReduceOp : TA_ReduceLikeOp<"reduce"> {
 
   let assemblyFormat = "$kind $input (`identity` `(` $identity^ `:` type($identity) `)`)? "
                        "attr-dict `:` type($input) `->` type($result)";
+  let hasVerifier = 1;
 }
 
 def TA_ScopeOp : TA_Op<"scope", [

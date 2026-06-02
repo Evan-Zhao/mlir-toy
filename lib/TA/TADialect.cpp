@@ -519,20 +519,6 @@ LogicalResult AtOp::verify() {
   return verifyExprAxes(getOperation(), scope, getResult().getType(), "result");
 }
 
-LogicalResult EvalOp::verify() {
-  auto scopeOr = verifyInsideScope(getOperation());
-  if (failed(scopeOr))
-    return failure();
-
-  ScopeOp scope = *scopeOr;
-  if (auto axes = getAxes()) {
-    if (failed(verifyAxesSubset(getOperation(), scope.getAxes(), *axes, "eval")))
-      return failure();
-  }
-
-  return verifyExprAxes(getOperation(), scope, getResult().getType(), "result");
-}
-
 LogicalResult MapOp::verify() {
   auto scopeOr = verifyInsideScope(getOperation());
   if (failed(scopeOr))
@@ -686,8 +672,6 @@ static LogicalResult verifyReducePayload(Operation *op, ScopeOp scope, AxesAttr 
 
   return success();
 }
-
-ExprType ReduceOp::getPayloadExprType() { return cast<ExprType>(getInput().getType()); }
 
 LogicalResult ReduceOp::verify() {
   auto scopeOr = verifyInsideScope(getOperation());
