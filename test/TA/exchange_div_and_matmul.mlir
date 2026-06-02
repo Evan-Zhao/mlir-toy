@@ -14,7 +14,7 @@ module attributes {transform.with_named_sequence} {
   func.func @ta_exchange_div_and_matmul(%scores: tensor<2x3xf32>, %den: tensor<2xf32>,
                                         %values: tensor<3x4xf32>) -> tensor<2x4xf32> {
     // CHECK: %[[OUT:.+]] = ta.scope
-    %out = ta.scope axes(%i "i" : index, %j "j" : index, %d "d" : index) {
+    %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3, %d "d" extent 4) {
       // CHECK: %[[NUM:.+]] = ta.at %{{.+}}[%i, %j]
       %num = ta.at %scores[%i, %j] {axes = #ta.axes<i, j>}
           : tensor<2x3xf32> -> !ta.expr<f32, [i, j]>
@@ -47,7 +47,7 @@ module attributes {transform.with_named_sequence} {
   func.func @ta_exchange_div_and_matmul_reject_reduction_axis(%scores: tensor<2x3xf32>,
                                                              %den: tensor<3xf32>,
                                                              %values: tensor<3x4xf32>) -> tensor<2x4xf32> {
-    %out = ta.scope axes(%i "i" : index, %j "j" : index, %d "d" : index) {
+    %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3, %d "d" extent 4) {
       // CHECK: %[[NUM:.+]] = ta.at %{{.+}}[%i, %j]
       %num = ta.at %scores[%i, %j] {axes = #ta.axes<i, j>}
           : tensor<2x3xf32> -> !ta.expr<f32, [i, j]>

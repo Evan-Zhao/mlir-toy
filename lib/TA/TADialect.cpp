@@ -251,8 +251,7 @@ static LogicalResult inferSameElementwiseReturnTypes(MLIRContext *context,
     if (!expr)
       return emitInferError(location, "expected ta.expr operands for elementwise type inference");
     if (expr.getElementType() != first.getElementType())
-      return emitInferError(location,
-                            "expected matching operand element types for type inference");
+      return emitInferError(location, "expected matching operand element types for type inference");
   }
 
   FailureOr<AxesAttr> axes = inferUnionAxesFromOperands(context, location, operands);
@@ -366,8 +365,7 @@ static LogicalResult verifyFloatCastElementwiseOp(Operation *op, bool widening) 
 }
 
 LogicalResult MapOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
-                                      Adaptor adaptor,
-                                      SmallVectorImpl<Type> &inferredReturnTypes) {
+                                      Adaptor adaptor, SmallVectorImpl<Type> &inferredReturnTypes) {
   FailureOr<AxesAttr> axes = inferUnionAxesFromOperands(context, location, adaptor.getInputs());
   if (failed(axes))
     return failure();
@@ -405,7 +403,7 @@ LogicalResult ConstantOp::inferReturnTypes(MLIRContext *context, std::optional<L
   LogicalResult OP::inferReturnTypes(MLIRContext *context, std::optional<Location> location,       \
                                      Adaptor adaptor,                                              \
                                      SmallVectorImpl<Type> &inferredReturnTypes) {                 \
-    return inferSameElementwiseReturnTypes(context, location, adaptor.getOperands(),                \
+    return inferSameElementwiseReturnTypes(context, location, adaptor.getOperands(),               \
                                            inferredReturnTypes);                                   \
   }
 
@@ -704,6 +702,8 @@ LogicalResult ReduceOp::verify() {
 ParseResult ScopeOp::parse(OpAsmParser &parser, OperationState &result) {
   SmallVector<OpAsmParser::Argument> axisArgs;
   SmallVector<Attribute> axes;
+  SmallVector<int64_t> staticExtents;
+  SmallVector<OpAsmParser::UnresolvedOperand> dynamicExtents;
   if (parser.parseKeyword("axes") || parser.parseLParen())
     return failure();
 
@@ -712,13 +712,28 @@ ParseResult ScopeOp::parse(OpAsmParser &parser, OperationState &result) {
       OpAsmParser::Argument arg;
       std::string axisName;
       if (parser.parseArgument(arg) || parser.parseString(&axisName) ||
-          parser.parseColonType(arg.type))
+          parser.parseKeyword("extent"))
         return failure();
-      if (!arg.type.isIndex())
-        return parser.emitError(arg.ssaName.location, "expected axis to have index type");
+      arg.type = parser.getBuilder().getIndexType();
+
+      int64_t staticExtent = ShapedType::kDynamic;
+      OptionalParseResult parsedInteger = parser.parseOptionalInteger(staticExtent);
+      if (parsedInteger.has_value()) {
+        if (failed(*parsedInteger))
+          return failure();
+        if (staticExtent < 0)
+          return parser.emitError(parser.getCurrentLocation(),
+                                  "expected non-negative static axis extent");
+      } else {
+        OpAsmParser::UnresolvedOperand dynamicExtent;
+        if (parser.parseOperand(dynamicExtent))
+          return failure();
+        dynamicExtents.push_back(dynamicExtent);
+      }
 
       axisArgs.push_back(arg);
       axes.push_back(AxisAttr::get(parser.getContext(), axisName));
+      staticExtents.push_back(staticExtent);
     } while (succeeded(parser.parseOptionalComma()));
 
     if (parser.parseRParen())
@@ -728,6 +743,8 @@ ParseResult ScopeOp::parse(OpAsmParser &parser, OperationState &result) {
   result.addAttribute(
       getAxesAttrName(result.name),
       AxesAttr::get(parser.getContext(), ArrayAttr::get(parser.getContext(), axes)));
+  result.addAttribute(getStaticExtentsAttrName(result.name),
+                      parser.getBuilder().getDenseI64ArrayAttr(staticExtents));
 
   Region *body = result.addRegion();
   if (parser.parseRegion(*body, axisArgs))
@@ -742,6 +759,9 @@ ParseResult ScopeOp::parse(OpAsmParser &parser, OperationState &result) {
     return failure();
   if (resultTypes.size() != 1)
     return parser.emitError(parser.getCurrentLocation(), "expected one result type");
+  if (parser.resolveOperands(dynamicExtents, parser.getBuilder().getIndexType(),
+                             parser.getCurrentLocation(), result.operands))
+    return failure();
 
   result.addTypes(resultTypes);
   return success();
@@ -751,18 +771,24 @@ void ScopeOp::print(OpAsmPrinter &printer) {
   printer << " axes(";
   Block &block = getBody().front();
   ArrayAttr axes = getAxes().getAxes();
+  ArrayRef<int64_t> staticExtents = getStaticExtents();
+  OperandRange dynamicExtents = getDynamicExtents();
+  unsigned dynamicIndex = 0;
   interleaveComma(llvm::seq<unsigned>(0, block.getNumArguments()), printer, [&](unsigned i) {
     BlockArgument arg = block.getArgument(i);
     printer.printOperand(arg);
     printer << " \"";
     printer << cast<AxisAttr>(axes[i]).getName().getValue();
-    printer << "\" : ";
-    printer.printType(arg.getType());
+    printer << "\" extent ";
+    if (staticExtents[i] == ShapedType::kDynamic)
+      printer.printOperand(dynamicExtents[dynamicIndex++]);
+    else
+      printer << staticExtents[i];
   });
   printer << ") ";
   printer.printRegion(getBody(), /*printEntryBlockArgs=*/false,
                       /*printBlockTerminators=*/true);
-  printer.printOptionalAttrDict((*this)->getAttrs(), {"axes"});
+  printer.printOptionalAttrDict((*this)->getAttrs(), {"axes", "static_extents"});
   printer << " : () -> ";
   printer.printType(getResult().getType());
 }
@@ -771,6 +797,21 @@ LogicalResult ScopeOp::verify() {
   Block &block = getBody().front();
   if (block.getNumArguments() != getAxes().getAxes().size())
     return emitOpError("expected one region argument per axis");
+  if (getStaticExtents().size() != getAxes().getAxes().size())
+    return emitOpError("expected one static extent entry per axis");
+
+  unsigned dynamicCount = 0;
+  for (int64_t extent : getStaticExtents()) {
+    if (extent == ShapedType::kDynamic) {
+      ++dynamicCount;
+      continue;
+    }
+    if (extent < 0)
+      return emitOpError("static axis extents must be non-negative or dynamic");
+  }
+  if (dynamicCount != getDynamicExtents().size())
+    return emitOpError("expected one dynamic extent operand per dynamic static extent entry");
+
   for (BlockArgument arg : block.getArguments()) {
     if (!arg.getType().isIndex())
       return emitOpError("expected axis region arguments to have index type");
@@ -793,6 +834,24 @@ LogicalResult ScopeOp::verify() {
 
   if (failed(verifyAxesSubset(getOperation(), getAxes(), expr.getAxes(), "yielded expression")))
     return failure();
+
+  if (resultType.getRank() == static_cast<int64_t>(expr.getAxes().getAxes().size())) {
+    for (auto [dim, axisAttr] : llvm::zip_equal(resultType.getShape(), expr.getAxes().getAxes())) {
+      if (dim == ShapedType::kDynamic)
+        continue;
+      AxisAttr axis = cast<AxisAttr>(axisAttr);
+      std::optional<int64_t> extent;
+      for (auto [scopeAxis, scopeExtent] :
+           llvm::zip_equal(getAxes().getAxes(), getStaticExtents())) {
+        if (cast<AxisAttr>(scopeAxis).getName() == axis.getName()) {
+          extent = scopeExtent;
+          break;
+        }
+      }
+      if (extent && *extent != ShapedType::kDynamic && dim != *extent)
+        return emitOpError("result tensor dimension does not match yielded axis extent");
+    }
+  }
 
   return success();
 }

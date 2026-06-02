@@ -10,7 +10,7 @@ func.func @at_outside_scope(%tensor: tensor<16xf32>, %i: index) {
 func.func @axis_outside_scope(%tensor: tensor<16x32xf32>, %j: index)
     -> tensor<16x32xf32> {
   // expected-error @+1 {{'ta.scope' op yielded expression uses axis 'j' outside enclosing ta.scope axes}}
-  %0 = ta.scope axes(%i "i" : index) {
+  %0 = ta.scope axes(%i "i" extent 16) {
     %1 = ta.at %tensor[%i, %j] {axes = #ta.axes<i, j>}
         : tensor<16x32xf32> -> !ta.expr<f32, [i, j]>
     ta.yield %1 : !ta.expr<f32, [i, j]>
@@ -20,7 +20,7 @@ func.func @axis_outside_scope(%tensor: tensor<16x32xf32>, %j: index)
 
 func.func @bad_elementwise_result_axes(%rows: tensor<16xf32>, %cols: tensor<32xf32>)
     -> tensor<16x32xf32> {
-  %0 = ta.scope axes(%row "i" : index, %col "j" : index) {
+  %0 = ta.scope axes(%row "i" extent 16, %col "j" extent 32) {
     %x = ta.at %rows[%row] {axes = #ta.axes<i>}
         : tensor<16xf32> -> !ta.expr<f32, [i]>
     %y = ta.at %cols[%col] {axes = #ta.axes<j>}
@@ -36,7 +36,7 @@ func.func @bad_elementwise_result_axes(%rows: tensor<16xf32>, %cols: tensor<32xf
 
 func.func @bad_map_body_type(%rows: tensor<16xf32>, %cols: tensor<32xf32>)
     -> tensor<16x32xf32> {
-  %0 = ta.scope axes(%row "i" : index, %col "j" : index) {
+  %0 = ta.scope axes(%row "i" extent 16, %col "j" extent 32) {
     %x = ta.at %rows[%row] {axes = #ta.axes<i>}
         : tensor<16xf32> -> !ta.expr<f32, [i]>
     %y = ta.at %cols[%col] {axes = #ta.axes<j>}
@@ -55,7 +55,7 @@ func.func @bad_map_body_type(%rows: tensor<16xf32>, %cols: tensor<32xf32>)
 
 func.func @bad_reduce_result_axes(%tensor: tensor<16x32xf32>)
     -> tensor<16x32xf32> {
-  %0 = ta.scope axes(%row "i" : index, %col "j" : index) {
+  %0 = ta.scope axes(%row "i" extent 16, %col "j" extent 32) {
     %x = ta.at %tensor[%row, %col] {axes = #ta.axes<i, j>}
         : tensor<16x32xf32> -> !ta.expr<f32, [i, j]>
     // expected-error @+1 {{'ta.reduce' op result axes must be payload axes minus reduction axes; expected #ta.axes<i>}}
@@ -67,7 +67,7 @@ func.func @bad_reduce_result_axes(%tensor: tensor<16x32xf32>)
 }
 
 func.func @bad_extf_width(%tensor: tensor<16xf32>) -> tensor<16xf16> {
-  %0 = ta.scope axes(%coord "i" : index) {
+  %0 = ta.scope axes(%coord "i" extent 16) {
     %x = ta.at %tensor[%coord] {axes = #ta.axes<i>}
         : tensor<16xf32> -> !ta.expr<f32, [i]>
     // expected-error @+1 {{'ta.extf' op result element type must be wider than operand element type}}

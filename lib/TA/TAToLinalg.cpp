@@ -28,8 +28,6 @@ using namespace mlir;
 
 namespace {
 
-static RankedTensorType rankedTensor(Type type) { return dyn_cast<RankedTensorType>(type); }
-
 static std::optional<int64_t> getImportGroup(Operation *op) {
   auto attr = op->getAttrOfType<IntegerAttr>("ta.import_group");
   if (!attr)
@@ -133,47 +131,16 @@ private:
   }
 
   LogicalResult discoverAxisSizes() {
-    Block &body = scope.getBody().front();
-    DenseMap<Value, StringRef> blockArgToAxis;
-    for (auto [arg, attr] : llvm::zip_equal(body.getArguments(), scope.getAxes().getAxes()))
-      blockArgToAxis[arg] = cast<AxisAttr>(attr).getName().getValue();
-
-    auto yield = cast<YieldOp>(body.getTerminator());
-    auto yieldedExpr = cast<ExprType>(yield.getValues().front().getType());
-    auto resultType = cast<RankedTensorType>(scope.getResult().getType());
-    for (auto [axis, dim] : llvm::zip_equal(axisNames(yieldedExpr), resultType.getShape())) {
-      if (failed(recordAxisSize(axis, dim)))
-        return failure();
+    for (auto [axisAttr, extent] :
+         llvm::zip_equal(scope.getAxes().getAxes(), scope.getStaticExtents())) {
+      StringRef axis = cast<AxisAttr>(axisAttr).getName().getValue();
+      if (extent == ShapedType::kDynamic)
+        return scope.emitOpError(
+                   "ta-to-linalg lowering does not yet support dynamic extent for axis '")
+               << axis << "'";
+      axisSizes[axis] = extent;
     }
 
-    for (AtOp at : body.getOps<AtOp>()) {
-      auto sourceType = rankedTensor(at.getSource().getType());
-      if (!sourceType)
-        return at.emitOpError("lowering expects ranked tensor sources");
-      for (auto [index, dim] : llvm::zip_equal(at.getIndices(), sourceType.getShape())) {
-        auto it = blockArgToAxis.find(index);
-        if (it == blockArgToAxis.end())
-          continue;
-        if (failed(recordAxisSize(it->second, dim)))
-          return failure();
-      }
-    }
-
-    return success();
-  }
-
-  LogicalResult recordAxisSize(StringRef axis, int64_t size) {
-    if (size == ShapedType::kDynamic)
-      return emitError(loc) << "ta-to-linalg lowering does not infer dynamic axis size for '"
-                            << axis << "'";
-
-    auto it = axisSizes.find(axis);
-    if (it == axisSizes.end()) {
-      axisSizes[axis] = size;
-      return success();
-    }
-    if (it->second != size)
-      return emitError(loc) << "conflicting sizes for axis '" << axis << "'";
     return success();
   }
 
@@ -238,8 +205,7 @@ private:
         if (arg.getOwner() != &scope.getBody().front() ||
             argNumber >= scope.getAxes().getAxes().size())
           return at.emitOpError("lowering only supports scope-axis indices");
-        StringRef axis =
-            cast<AxisAttr>(scope.getAxes().getAxes()[argNumber]).getName().getValue();
+        StringRef axis = cast<AxisAttr>(scope.getAxes().getAxes()[argNumber]).getName().getValue();
         FailureOr<unsigned> position = findAxis(at.getOperation(), loopAxes, axis);
         if (failed(position))
           return failure();
@@ -361,13 +327,13 @@ private:
 
   Value createInitTensor(Operation *root, RankedTensorType resultType, ReduceOp reduce) {
     auto empty = tensor::EmptyOp::create(builder, root->getLoc(), resultType.getShape(),
-                                        resultType.getElementType());
+                                         resultType.getElementType());
     if (!reduce)
       return empty.getResult();
 
     Value identity = createIdentity(root->getLoc(), resultType.getElementType(), reduce.getKind());
     auto fill = linalg::FillOp::create(builder, root->getLoc(), TypeRange{resultType},
-                                      ValueRange{identity}, ValueRange{empty.getResult()});
+                                       ValueRange{identity}, ValueRange{empty.getResult()});
     return fill.getResult(0);
   }
 

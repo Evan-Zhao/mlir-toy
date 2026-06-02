@@ -14,7 +14,7 @@
 #map8 = affine_map<(d0, d1, d2, d3) -> ()>
 
 // CHECK-LABEL: func.func @matmul
-// CHECK-NEXT: %[[SCOPE:.+]] = ta.scope axes(%a0 "a0" : index, %a1 "a1" : index, %r2 "r2" : index) {
+// CHECK-NEXT: %[[SCOPE:.+]] = ta.scope axes(%a0 "a0" extent 4, %a1 "a1" extent 16, %r2 "r2" extent 8) {
 // CHECK-NEXT:   %[[LHS:.+]] = ta.at %{{.+}}[%a0, %r2] {axes = #ta.axes<a0, r2>, ta.import_group = 0 : i64} : tensor<4x8xf32> -> !ta.expr<f32, [a0, r2]>
 // CHECK-NEXT:   %[[RHS:.+]] = ta.at %{{.+}}[%r2, %a1] {axes = #ta.axes<r2, a1>, ta.import_group = 0 : i64} : tensor<8x16xf32> -> !ta.expr<f32, [r2, a1]>
 // CHECK-NEXT:   %[[MUL:.+]] = ta.mulf %[[LHS]], %[[RHS]] {ta.import_group = 0 : i64} : (!ta.expr<f32, [a0, r2]>, !ta.expr<f32, [r2, a1]>) -> !ta.expr<f32, [a0, a1, r2]>
@@ -46,7 +46,7 @@ func.func @matmul(%arg0: tensor<4x8xf32>, %arg1: tensor<8x16xf32>) -> tensor<4x1
 }
 
 // CHECK-LABEL: func.func @attention
-// CHECK-NEXT: %[[SCOPE:.+]] = ta.scope axes(%a0 "a0" : index, %a1 "a1" : index, %a2 "a2" : index, %a3 "a3" : index, %r4 "r4" : index, %r7 "r7" : index) {
+// CHECK-NEXT: %[[SCOPE:.+]] = ta.scope axes(%a0 "a0" extent 1, %a1 "a1" extent 2, %a2 "a2" extent 4, %a3 "a3" extent 3, %r4 "r4" extent 4, %r7 "r7" extent 3) {
 // CHECK-NEXT:   %[[Q16:.+]] = ta.at %{{.+}}[%a0, %a1, %a2, %r7] {axes = #ta.axes<a0, a1, a2, r7>, ta.import_group = 0 : i64} : tensor<1x2x4x3xf16> -> !ta.expr<f16, [a0, a1, a2, r7]>
 // CHECK-NEXT:   %[[Q:.+]] = ta.extf %[[Q16]] {ta.import_group = 0 : i64} : (!ta.expr<f16, [a0, a1, a2, r7]>) -> !ta.expr<f32, [a0, a1, a2, r7]>
 // CHECK-NEXT:   %[[K16:.+]] = ta.at %{{.+}}[%a0, %a1, %r4, %r7] {axes = #ta.axes<a0, a1, r4, r7>, ta.import_group = 1 : i64} : tensor<1x2x4x3xf16> -> !ta.expr<f16, [a0, a1, r4, r7]>

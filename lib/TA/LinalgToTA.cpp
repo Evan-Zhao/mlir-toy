@@ -47,7 +47,8 @@ class ScopedTABuilder {
 public:
   ScopedTABuilder(OpBuilder &builder, Location loc, RankedTensorType resultType)
       : context(builder.getContext()), loc(loc), indexType(builder.getIndexType()) {
-    scope = ScopeOp::create(builder, loc, resultType, getAxes({}));
+    scope = ScopeOp::create(builder, loc, resultType, ValueRange{}, getAxes({}),
+                            DenseI64ArrayAttr::get(context, {}));
     Block *body = new Block();
     scope.getBody().push_back(body);
     bodyBuilder = std::make_unique<OpBuilder>(context);
@@ -64,20 +65,20 @@ public:
 
   std::optional<int64_t> getImportGroup() const { return importGroup; }
 
-  std::string createAxis(StringRef prefix) {
+  std::string createAxis(StringRef prefix, int64_t extent = ShapedType::kDynamic) {
     std::string name;
     do {
       name = (prefix + std::to_string(nextAxis++)).str();
     } while (axisValues.contains(name));
-    addAxis(name);
+    addAxis(name, extent);
     return name;
   }
 
-  Value axis(StringRef name) {
+  Value axis(StringRef name, int64_t extent = ShapedType::kDynamic) {
     auto it = axisValues.find(name);
     if (it != axisValues.end())
       return it->second;
-    addAxis(name.str());
+    addAxis(name.str(), extent);
     return axisValues.lookup(name);
   }
 
@@ -173,15 +174,17 @@ private:
                                                     *importGroup));
   }
 
-  void addAxis(const std::string &name) {
+  void addAxis(const std::string &name, int64_t extent) {
     if (axisValues.contains(name))
       return;
 
     Block &body = scope.getBody().front();
     BlockArgument arg = body.addArgument(indexType, loc);
     axisNames.push_back(name);
+    staticExtents.push_back(extent);
     axisValues.try_emplace(axisNames.back(), arg);
     scope.setAxesAttr(getAxes(axisNames));
+    scope.setStaticExtentsAttr(DenseI64ArrayAttr::get(context, staticExtents));
   }
 
   Value indexZero() {
@@ -198,6 +201,7 @@ private:
   Type indexType;
   ScopeOp scope;
   SmallVector<std::string> axisNames;
+  SmallVector<int64_t> staticExtents;
   llvm::StringMap<Value> axisValues;
   std::unique_ptr<OpBuilder> bodyBuilder;
   Value zero;
@@ -222,6 +226,9 @@ public:
       return func.emitOpError("ta importer expects a ranked tensor result");
 
     if (failed(discoverAxes(resultType)))
+      return failure();
+
+    if (failed(discoverAxisExtents()))
       return failure();
 
     materializeScopeAxes();
@@ -613,8 +620,41 @@ private:
       AxisId root = find(id);
       if (!seen.insert(root).second)
         continue;
-      ta->axis(axisNames[root]);
+      auto extent = axisExtents.find(root);
+      ta->axis(axisNames[root],
+               extent == axisExtents.end() ? ShapedType::kDynamic : extent->second);
     }
+  }
+
+  LogicalResult recordAxisExtent(AxisId id, int64_t size) {
+    if (size == ShapedType::kDynamic)
+      return success();
+
+    AxisId root = find(id);
+    auto it = axisExtents.find(root);
+    if (it == axisExtents.end()) {
+      axisExtents[root] = size;
+      return success();
+    }
+    if (it->second != size)
+      return emitError(func.getLoc()) << "conflicting imported extents for axis '"
+                                      << axisNames[root] << "'";
+    return success();
+  }
+
+  LogicalResult discoverAxisExtents() {
+    for (auto &[value, axes] : valueAxes) {
+      auto type = rankedTensor(value.getType());
+      if (!type)
+        continue;
+      for (auto [pack, dim] : llvm::zip_equal(axes, type.getShape())) {
+        if (pack.size() != 1)
+          continue;
+        if (failed(recordAxisExtent(pack.front(), dim)))
+          return failure();
+      }
+    }
+    return success();
   }
 
   Value lookupTensorExpr(Value value) const {
@@ -761,6 +801,7 @@ private:
   SmallVector<std::string> axisNames;
   DenseMap<Value, TensorAxisIds> valueAxes;
   DenseMap<Operation *, SmallVector<AxisIdPack>> loopAxisMap;
+  DenseMap<AxisId, int64_t> axisExtents;
   DenseMap<Value, Value> valueMap;
   DenseMap<Operation *, int64_t> importGroups;
   int64_t nextImportGroup = 0;

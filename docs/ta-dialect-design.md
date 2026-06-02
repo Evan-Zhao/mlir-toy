@@ -57,18 +57,20 @@ A scope declares an ambient set of named axes:
 
 ```mlir
 ta.scope axes(
-  %b "b" : index, %h "h" : index,
-  %i "i" : index, %j "j" : index,
-  %d "d" : index, %e "e" : index) {
+  %b "b" extent 2, %h "h" extent 3,
+  %i "i" extent 4, %j "j" extent 5,
+  %d "d" extent 6, %e "e" extent 7) {
   ...
 }
 ```
 
 These axes are not loops. They are symbolic coordinates available to the scalar
-indexed expressions inside the scope body. In the current syntax the block
-arguments are `index`-typed SSA values, while the quoted strings are the stable
-semantic axis identities used by attributes and `!ta.expr` types. The SSA name
-is only a local handle and must not define the axis identity.
+indexed expressions inside the scope body. The `extent` is the axis size:
+`extent 5` means valid coordinates are `0 <= j < 5`. Extents may also be
+dynamic index operands, for example `%j "j" extent %J`. Internally the block
+arguments are still `index`-typed SSA values, while the quoted strings are the
+stable semantic axis identities used by attributes and `!ta.expr` types. The
+SSA name is only a local handle and must not define the axis identity.
 
 Using ordinary `index` for symbolic coordinates is a pragmatic v1 choice. It
 allows affine-style index expressions such as convolution input coordinates,
@@ -126,9 +128,9 @@ Owns one indexed expression region, declares the allowed body axes, and
 materializes the yielded expression as a tensor result.
 
 ```mlir
-%O = ta.scope axes(%b "b" : index, %h "h" : index,
-                   %i "i" : index, %j "j" : index,
-                   %d "d" : index, %e "e" : index) {
+%O = ta.scope axes(%b "b" extent %B, %h "h" extent %H,
+                   %i "i" extent %I, %j "j" extent %J,
+                   %d "d" extent %D, %e "e" extent %E) {
   ...
   ta.yield %o : !ta.expr<f32, [b,h,i,e]>
 } : () -> tensor<?x?x?x?xf32>
@@ -136,7 +138,9 @@ materializes the yielded expression as a tensor result.
 
 A scope result is the tensor version of the expression yielded by its terminator.
 The scope axis list is the ambient coordinate universe for the body,
-not necessarily the result shape.
+not necessarily the result shape. Axis extents give lowering and scheduling a
+direct source of loop bounds instead of requiring them to infer every bound from
+uses of `ta.at`.
 The yielded expression may depend on a subset of the scope axes;
 axes used only inside reductions or intermediate expressions
 do not appear in the result expression.

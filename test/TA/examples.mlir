@@ -2,7 +2,7 @@
 
 // CHECK-LABEL: func.func @minimal_ta
 func.func @minimal_ta(%tensor: tensor<16xf32>) -> tensor<16xf32> {
-  %0 = ta.scope axes(%coord "i" : index) {
+  %0 = ta.scope axes(%coord "i" extent 16) {
     %1 = ta.at %tensor[%coord] {axes = #ta.axes<i>}
         : tensor<16xf32> -> !ta.expr<f32, [i]>
     %2 = ta.reduce #ta.reduce_kind<add> %1 {axes = #ta.axes<i>}
@@ -15,7 +15,7 @@ func.func @minimal_ta(%tensor: tensor<16xf32>) -> tensor<16xf32> {
 // CHECK-LABEL: func.func @two_axis_ta
 func.func @two_axis_ta(%tensor: tensor<16x32xf32>)
     -> tensor<16x32xf32> {
-  %0 = ta.scope axes(%row "i" : index, %col "j" : index) {
+  %0 = ta.scope axes(%row "i" extent 16, %col "j" extent 32) {
     %1 = ta.at %tensor[%row, %col] {axes = #ta.axes<i, j>}
         : tensor<16x32xf32> -> !ta.expr<f32, [i, j]>
     %2 = ta.reduce #ta.reduce_kind<add> %1 {axes = #ta.axes<j>}
@@ -28,7 +28,7 @@ func.func @two_axis_ta(%tensor: tensor<16x32xf32>)
 // CHECK-LABEL: func.func @matmul_ta
 func.func @matmul_ta(%lhs: tensor<16x64xf32>, %rhs: tensor<64x32xf32>)
     -> tensor<16x32xf32> {
-  %0 = ta.scope axes(%row "i" : index, %col "j" : index, %red "k" : index) {
+  %0 = ta.scope axes(%row "i" extent 16, %col "j" extent 32, %red "k" extent 64) {
     %x = ta.at %lhs[%row, %red] {axes = #ta.axes<i, k>}
         : tensor<16x64xf32> -> !ta.expr<f32, [i, k]>
     %y = ta.at %rhs[%red, %col] {axes = #ta.axes<k, j>}
@@ -46,7 +46,7 @@ func.func @matmul_ta(%lhs: tensor<16x64xf32>, %rhs: tensor<64x32xf32>)
 // CHECK-LABEL: func.func @elementwise_ta
 func.func @elementwise_ta(%rows: tensor<16xf32>, %cols: tensor<32xf32>)
     -> tensor<16x32xf32> {
-  %0 = ta.scope axes(%row "i" : index, %col "j" : index) {
+  %0 = ta.scope axes(%row "i" extent 16, %col "j" extent 32) {
     %x = ta.at %rows[%row] {axes = #ta.axes<i>}
         : tensor<16xf32> -> !ta.expr<f32, [i]>
     %y = ta.at %cols[%col] {axes = #ta.axes<j>}
@@ -73,7 +73,7 @@ func.func @elementwise_ta(%rows: tensor<16xf32>, %cols: tensor<32xf32>)
 
 // CHECK-LABEL: func.func @float_cast_ta
 func.func @float_cast_ta(%tensor: tensor<16xf16>) -> tensor<16xf16> {
-  %0 = ta.scope axes(%coord "i" : index) {
+  %0 = ta.scope axes(%coord "i" extent 16) {
     %x = ta.at %tensor[%coord] {axes = #ta.axes<i>}
         : tensor<16xf16> -> !ta.expr<f16, [i]>
     %wide = ta.extf %x
@@ -85,10 +85,21 @@ func.func @float_cast_ta(%tensor: tensor<16xf16>) -> tensor<16xf16> {
   return %0 : tensor<16xf16>
 }
 
+// CHECK-LABEL: func.func @dynamic_extent_ta
+func.func @dynamic_extent_ta(%tensor: tensor<?xf32>, %n: index) -> tensor<?xf32> {
+  // CHECK: ta.scope axes(%i "i" extent %{{.+}})
+  %0 = ta.scope axes(%coord "i" extent %n) {
+    %x = ta.at %tensor[%coord] {axes = #ta.axes<i>}
+        : tensor<?xf32> -> !ta.expr<f32, [i]>
+    ta.yield %x : !ta.expr<f32, [i]>
+  } : () -> tensor<?xf32>
+  return %0 : tensor<?xf32>
+}
+
 // CHECK-LABEL: func.func @map_ta
 func.func @map_ta(%rows: tensor<16xf32>, %cols: tensor<32xf32>)
     -> tensor<16x32xf32> {
-  %0 = ta.scope axes(%row "i" : index, %col "j" : index) {
+  %0 = ta.scope axes(%row "i" extent 16, %col "j" extent 32) {
     %x = ta.at %rows[%row] {axes = #ta.axes<i>}
         : tensor<16xf32> -> !ta.expr<f32, [i]>
     %y = ta.at %cols[%col] {axes = #ta.axes<j>}
@@ -112,9 +123,9 @@ func.func @attention_ta(%Q: tensor<2x3x4x6xf32>,
                         %K: tensor<2x3x5x6xf32>,
                         %V: tensor<2x3x5x7xf32>)
     -> tensor<2x3x4x7xf32> {
-  %O = ta.scope axes(%b "b" : index, %h "h" : index,
-                     %i "i" : index, %j "j" : index,
-                     %d "d" : index, %e "e" : index) {
+  %O = ta.scope axes(%b "b" extent 2, %h "h" extent 3,
+                     %i "i" extent 4, %j "j" extent 5,
+                     %d "d" extent 6, %e "e" extent 7) {
     %q = ta.at %Q[%b, %h, %i, %d] {axes = #ta.axes<b, h, i, d>}
         : tensor<2x3x4x6xf32> -> !ta.expr<f32, [b, h, i, d]>
     %k = ta.at %K[%b, %h, %j, %d] {axes = #ta.axes<b, h, j, d>}

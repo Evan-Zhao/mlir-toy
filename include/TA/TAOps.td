@@ -169,7 +169,9 @@ def TA_ScopeOp : TA_Op<"scope", [
     SingleBlockImplicitTerminator<"YieldOp">,
     DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmBlockArgumentNames"]>]> {
   let summary = "materialize a scoped indexed expression";
-  let arguments = (ins TA_AxesAttr:$axes);
+  let arguments = (ins Variadic<Index>:$dynamic_extents,
+                       TA_AxesAttr:$axes,
+                       DenseI64ArrayAttr:$static_extents);
   let results = (outs AnyRankedTensor:$result);
   let regions = (region SizedRegion<1>:$body);
 
