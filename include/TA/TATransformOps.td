@@ -1,6 +1,64 @@
 include "mlir/Dialect/Transform/IR/TransformDialect.td"
+include "mlir/Dialect/Transform/Interfaces/MatchInterfaces.td"
 include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
+
+def TAMatchEinsumOp
+    : Op<Transform_Dialect, "match.ta.einsum",
+         [SingleOpMatcher, MatchOpInterface, MemoryEffectsOpInterface]> {
+  let summary = "Match a TA expression against a small einsum equation";
+
+  let description = [{
+    Matches a `ta.reduce <add>` whose payload is a `ta.mulf` against a
+    whitespace-separated two-input einsum equation. For example:
+
+    ```
+      transform.match.ta.einsum %candidate
+          {equation = "b h i d, b h j d -> b h i j"}
+          : (!transform.any_op) -> !transform.any_op
+    ```
+
+    The operation succeeds on the matched `ta.reduce` and returns the same
+    payload handle. It emits a silenceable failure when the target is not an
+    add-reduced multiply with operand and result axis supports matching the
+    equation.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$operand_handle, StrAttr:$equation);
+  let results = (outs TransformHandleTypeInterface:$matched);
+
+  let assemblyFormat = "$operand_handle attr-dict `:` functional-type(operands, results)";
+
+  let extraClassDeclaration = SingleOpMatcher.extraDeclaration;
+}
+
+def TAToLinalgOp
+    : Op<Transform_Dialect, "ta.to_linalg",
+         [TransformOpInterface,
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+          ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Lower TA scopes to linalg while best-effort preserving handles";
+
+  let description = [{
+    Lowers `ta.scope` operations nested in the target payload to `linalg.generic`
+    materializations. Any existing transform handles to TA expression roots that
+    have a clear lowered linalg op are updated in-place. Handles to internal TA
+    ops that lower only to linalg region scalar ops or indexing maps are not
+    guaranteed to survive.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$target);
+  let results = (outs);
+
+  let assemblyFormat = "$target attr-dict `:` type($target)";
+
+  let extraClassDeclaration = [{
+    ::mlir::DiagnosedSilenceableFailure apply(
+        ::mlir::transform::TransformRewriter &rewriter,
+        ::mlir::transform::TransformResults &results,
+        ::mlir::transform::TransformState &state);
+  }];
+}
 
 def TAExchangeDivAndMatmulPatternsOp
     : Op<Transform_Dialect, "apply_patterns.ta.exchange_div_and_matmul",

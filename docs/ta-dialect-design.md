@@ -351,6 +351,35 @@ The current lowering is conservative. It handles the attention demo after
 partitions may need to be split or lowered through a more general path such as
 `scf`.
 
+Transform schedules that need to keep handles across the TA-to-linalg boundary
+can use a TA-side einsum matcher and the transform lowering op:
+
+```mlir
+transform.named_sequence @match_ta_matmul(%candidate: !transform.any_op {transform.readonly})
+    -> !transform.any_op {
+  %matched = transform.match.ta.einsum %candidate
+      {equation = "i k, k j -> i j"}
+      : (!transform.any_op) -> !transform.any_op
+  transform.yield %matched : !transform.any_op
+}
+
+%ta_matmuls = transform.collect_matching @match_ta_matmul in %ta_func
+    : (!transform.any_op) -> !transform.any_op
+transform.ta.to_linalg %ta_func : !transform.any_op
+
+// `%ta_matmuls` now points at the lowered `linalg.generic` ops when there is a
+// clear TA-root-to-linalg-op mapping.
+transform.structured.tile_using_forall %ta_matmuls tile_sizes [64, 64, 0]
+    : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+```
+
+The matcher currently recognizes two-input add reductions of a multiply. This
+is enough to select matmul-like contractions in TA without re-matching the
+lowered `linalg.generic` region body. Handle preservation is best effort:
+handles to expression roots that materialize as linalg ops survive; handles to
+internal TA ops that lower into indexing maps or linalg-region scalar ops may
+be dropped.
+
 ## End-To-End Demo Shape
 
 `test/TA/attention.mlir` demonstrates the implemented flow:

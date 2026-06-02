@@ -61,8 +61,13 @@ static FailureOr<unsigned> findAxis(Operation *op, ArrayRef<StringRef> axes, Str
 
 class ScopeLowering {
 public:
-  ScopeLowering(ScopeOp scope, OpBuilder &builder)
-      : scope(scope), builder(builder), context(builder.getContext()), loc(scope.getLoc()) {}
+  ScopeLowering(ScopeOp scope, OpBuilder &builder,
+                DenseMap<Operation *, Operation *> *loweredOps = nullptr,
+                llvm::function_ref<void(Operation *,
+                                        const DenseMap<Operation *, Operation *> &)> beforeErase =
+                    nullptr)
+      : scope(scope), builder(builder), context(builder.getContext()), loc(scope.getLoc()),
+        loweredOps(loweredOps), beforeErase(beforeErase) {}
 
   LogicalResult run() {
     if (failed(discoverAxisSizes()))
@@ -88,6 +93,14 @@ public:
       return failure();
 
     scope.replaceAllUsesWith(*result);
+    if (beforeErase) {
+      if (loweredOps) {
+        beforeErase(scope.getOperation(), *loweredOps);
+      } else {
+        DenseMap<Operation *, Operation *> empty;
+        beforeErase(scope.getOperation(), empty);
+      }
+    }
     scope.erase();
     return success();
   }
@@ -312,14 +325,14 @@ private:
     maps.push_back(*outputMap);
 
     Value init = createInitTensor(root, *resultType, reduce);
-    Value result = linalg::GenericOp::create(
-                       builder, root->getLoc(), TypeRange{*resultType}, inputTensors,
-                       ValueRange{init}, maps, iterators,
-                       [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
-                         buildLinalgBody(nestedBuilder, nestedLoc, args, root, reduce);
-                       })
-                       ->getResult(0);
-    return result;
+    auto generic = linalg::GenericOp::create(
+        builder, root->getLoc(), TypeRange{*resultType}, inputTensors, ValueRange{init}, maps,
+        iterators, [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
+          buildLinalgBody(nestedBuilder, nestedLoc, args, root, reduce);
+        });
+    if (loweredOps)
+      (*loweredOps)[root] = generic.getOperation();
+    return generic->getResult(0);
   }
 
   Value createInitTensor(Operation *root, RankedTensorType resultType, ReduceOp reduce) {
@@ -449,6 +462,8 @@ private:
   DenseMap<Value, Value> valueToTensor;
   SmallVector<InputDescriptor> inputs;
   DenseMap<Value, Value> scalarValues;
+  DenseMap<Operation *, Operation *> *loweredOps;
+  llvm::function_ref<void(Operation *, const DenseMap<Operation *, Operation *> &)> beforeErase;
 };
 
 struct LowerTAToLinalgPass : public PassWrapper<LowerTAToLinalgPass, OperationPass<func::FuncOp>> {
@@ -465,22 +480,42 @@ struct LowerTAToLinalgPass : public PassWrapper<LowerTAToLinalgPass, OperationPa
   }
 
   void runOnOperation() final {
-    func::FuncOp func = getOperation();
-    SmallVector<ScopeOp> scopes;
-    func.walk([&](ScopeOp scope) { scopes.push_back(scope); });
-
-    for (ScopeOp scope : scopes) {
-      OpBuilder builder(scope);
-      ScopeLowering lowering(scope, builder);
-      if (failed(lowering.run())) {
-        signalPassFailure();
-        return;
-      }
+    OpBuilder builder(getOperation());
+    if (failed(lowerTAToLinalg(getOperation(), builder))) {
+      signalPassFailure();
+      return;
     }
   }
 };
 
 } // namespace
+
+LogicalResult lowerTAToLinalg(
+    Operation *target, OpBuilder &builder, DenseMap<Operation *, Operation *> *loweredOps,
+    llvm::function_ref<void(Operation *, const DenseMap<Operation *, Operation *> &)> beforeErase) {
+  SmallVector<ScopeOp> scopes;
+  if (auto scope = dyn_cast<ScopeOp>(target)) {
+    scopes.push_back(scope);
+  } else {
+    target->walk([&](ScopeOp scope) { scopes.push_back(scope); });
+  }
+
+  for (ScopeOp scope : scopes) {
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPoint(scope);
+    DenseMap<Operation *, Operation *> scopeLoweredOps;
+    DenseMap<Operation *, Operation *> *activeLoweredOps =
+        (loweredOps || beforeErase) ? &scopeLoweredOps : nullptr;
+    ScopeLowering lowering(scope, builder, activeLoweredOps, beforeErase);
+    if (failed(lowering.run()))
+      return failure();
+    if (loweredOps) {
+      for (auto [taOp, linalgOp] : scopeLoweredOps)
+        (*loweredOps)[taOp] = linalgOp;
+    }
+  }
+  return success();
+}
 
 void registerTAToLinalgPass() { PassRegistration<LowerTAToLinalgPass>(); }
 
