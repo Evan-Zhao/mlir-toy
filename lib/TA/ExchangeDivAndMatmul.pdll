@@ -1,0 +1,35 @@
+#include "TA/TAOps.td"
+
+Constraint DivisorAxesDisjointFromReduction(den: Value, reductionAxes: Attr) [{
+  auto denType = dyn_cast<ta::ExprType>(den.getType());
+  auto reducedAxes = dyn_cast<ta::AxesAttr>(reductionAxes);
+  if (!denType || !reducedAxes)
+    return failure();
+
+  for (Attribute divisorAxis : denType.getAxes().getAxes()) {
+    auto divisorAxisAttr = cast<ta::AxisAttr>(divisorAxis);
+    for (Attribute reducedAxis : reducedAxes.getAxes()) {
+      auto reducedAxisAttr = cast<ta::AxisAttr>(reducedAxis);
+      if (divisorAxisAttr.getName() == reducedAxisAttr.getName())
+        return failure();
+    }
+  }
+  return success();
+}];
+
+Pattern ExchangeDivAndMatmul {
+  let axes: Attr;
+  let kind: Attr;
+  let resultType: Type;
+
+  let div = op<ta.divf>(num: Value, den: Value);
+  let prod = op<ta.mulf>(div, rhs: Value);
+  let reduce = op<ta.reduce>(prod) {kind = kind, axes = axes} -> (resultType);
+  DivisorAxesDisjointFromReduction(den, axes);
+
+  rewrite reduce with {
+    let newProd = op<ta.mulf>(num, rhs);
+    let newReduce = op<ta.reduce>(newProd) {kind = kind, axes = axes} -> (resultType);
+    replace reduce with op<ta.divf>(newReduce, den);
+  };
+}

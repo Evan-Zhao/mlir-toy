@@ -1,0 +1,146 @@
+#include "TA/TAOps.td"
+
+Constraint AxislessConstant(value: Value) [{
+  auto constant = value.getDefiningOp<ta::ConstantOp>();
+  if (!constant)
+    return failure();
+
+  auto expr = dyn_cast<ta::ExprType>(value.getType());
+  return success(expr && expr.getAxes().getAxes().empty());
+}];
+
+Constraint PositiveAxislessConstant(value: Value) [{
+  auto constant = value.getDefiningOp<ta::ConstantOp>();
+  if (!constant)
+    return failure();
+
+  auto expr = dyn_cast<ta::ExprType>(value.getType());
+  if (!expr || !expr.getAxes().getAxes().empty())
+    return failure();
+
+  auto floatValue = dyn_cast<FloatAttr>(constant.getValue());
+  return success(floatValue && floatValue.getValue().isFinite() &&
+                 !floatValue.getValue().isNegative() && !floatValue.getValue().isZero());
+}];
+
+Constraint MaxReduceKind(kind: Attr) [{
+  auto reduceKind = dyn_cast<ta::ReduceKindAttr>(kind);
+  return success(reduceKind && reduceKind.getValue() == ta::ReduceKind::Max);
+}];
+
+Rewrite MakeLog2EConstant(input: Value) -> Value [{
+  auto expr = dyn_cast<ta::ExprType>(input.getType());
+  if (!expr)
+    return Value();
+
+  auto floatType = dyn_cast<FloatType>(expr.getElementType());
+  if (!floatType)
+    return Value();
+
+  APFloat value(floatType.getFloatSemantics(),
+                "1.442695040888963407359924681001892137");
+  auto attr = FloatAttr::get(floatType, value);
+  auto axes = ta::AxesAttr::get(rewriter.getContext(),
+                                ArrayAttr::get(rewriter.getContext(), {}));
+  auto resultType = ta::ExprType::get(rewriter.getContext(), floatType, axes);
+  return ta::ConstantOp::create(rewriter, input.getLoc(), resultType, attr).getResult();
+}];
+
+Rewrite FoldMulfConstants(lhs: Op, rhs: Op) -> Value [{
+  auto lhsConstant = dyn_cast<ta::ConstantOp>(lhs);
+  auto rhsConstant = dyn_cast<ta::ConstantOp>(rhs);
+  if (!lhsConstant || !rhsConstant)
+    return Value();
+
+  auto lhsAttr = dyn_cast<FloatAttr>(lhsConstant.getValue());
+  auto rhsAttr = dyn_cast<FloatAttr>(rhsConstant.getValue());
+  if (!lhsAttr || !rhsAttr || lhsAttr.getType() != rhsAttr.getType())
+    return Value();
+
+  APFloat value = lhsAttr.getValue();
+  value.multiply(rhsAttr.getValue(), APFloat::rmNearestTiesToEven);
+  auto foldedAttr = FloatAttr::get(lhsAttr.getType(), value);
+  return ta::ConstantOp::create(rewriter, lhs->getLoc(), lhsConstant.getResult().getType(),
+                                foldedAttr)
+      .getResult();
+}];
+
+// exp(x) => exp2(log2(e) * x)
+Pattern ExpToExp2IntroduceLog2E {
+  let input: Value;
+  let exp = op<ta.exp>(input);
+
+  rewrite exp with {
+    let log2e = MakeLog2EConstant(input);
+    let scaled = op<ta.mulf>(log2e, input);
+    replace exp with op<ta.exp2>(scaled);
+  };
+}
+
+// c * (x - y) => (c * x) - (c * y)
+Pattern DistributeConstantMulOverSubF {
+  let sub = op<ta.subf>(lhs: Value, rhs: Value);
+  let mul = op<ta.mulf>(constant: Value, sub);
+  AxislessConstant(constant);
+
+  rewrite mul with {
+    let scaledLhs = op<ta.mulf>(constant, lhs);
+    let scaledRhs = op<ta.mulf>(constant, rhs);
+    replace mul with op<ta.subf>(scaledLhs, scaledRhs);
+  };
+}
+
+// c * max_axes(x) => max_axes(c * x), for finite c > 0
+Pattern PushPositiveScaleThroughMaxReduce {
+  let kind: Attr;
+  let axes: Attr;
+  let resultType: Type;
+
+  let reduce = op<ta.reduce>(input: Value) {kind = kind, axes = axes};
+  let mul = op<ta.mulf>(constant: Value, reduce) -> (resultType);
+  PositiveAxislessConstant(constant);
+  MaxReduceKind(kind);
+
+  rewrite mul with {
+    let scaledInput = op<ta.mulf>(constant, input);
+    replace mul with op<ta.reduce>(scaledInput) {kind = kind, axes = axes} -> (resultType);
+  };
+}
+
+// c0 * (c1 * x) => (c0 * c1) * x
+Pattern ReassociateLeftNestedConstantMulf {
+  let inner = op<ta.mulf>(innerConstant: Value, payload: Value);
+  let outer = op<ta.mulf>(outerConstant: Value, inner);
+  AxislessConstant(innerConstant);
+  AxislessConstant(outerConstant);
+
+  rewrite outer with {
+    let combined = op<ta.mulf>(outerConstant, innerConstant);
+    replace outer with op<ta.mulf>(combined, payload);
+  };
+}
+
+// c0 * (x * c1) => (c0 * c1) * x
+Pattern ReassociateRightNestedConstantMulf {
+  let inner = op<ta.mulf>(payload: Value, innerConstant: Value);
+  let outer = op<ta.mulf>(outerConstant: Value, inner);
+  AxislessConstant(innerConstant);
+  AxislessConstant(outerConstant);
+
+  rewrite outer with {
+    let combined = op<ta.mulf>(outerConstant, innerConstant);
+    replace outer with op<ta.mulf>(combined, payload);
+  };
+}
+
+// c0 * c1 => constant(c0 * c1)
+Pattern FoldConstantMulf {
+  let lhs = op<ta.constant>;
+  let rhs = op<ta.constant>;
+  let mul = op<ta.mulf>(lhs, rhs);
+
+  rewrite mul with {
+    let folded = FoldMulfConstants(lhs, rhs);
+    replace mul with folded;
+  };
+}

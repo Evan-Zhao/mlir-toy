@@ -43,8 +43,9 @@ tensor program
 ```
 
 There is also a `ta-import-linalg` pass for supported `linalg.generic` tensor
-dataflow. Algebraic rewrite passes, scope placement, and lowering back to
-`linalg` are future work.
+dataflow, and a small PDLL-backed algebraic rewrite driver for the `exp` to
+`exp2` transformation. Scope placement, lowering back to `linalg`, and a full
+floating-point legality policy remain future work.
 
 ---
 
@@ -316,164 +317,68 @@ The result axis order is the enclosing `ta.scope` order, not operand order.
 
 ---
 
-## Attention in `ta`
+## Example Rewrite: `exp` to `exp2`
 
-This section sketches the target representation for plain attention inside one
-ambient `ta.scope`. The full executable MLIR example lives in
-`test/TA/attention.mlir`.
-
-Symbolic axes:
-
-```text
-b : Batch
-h : Heads
-i : QuerySeq
-j : KeySeq
-d : QKHeadDim
-e : ValueDim
-```
-
-Inputs:
-
-```text
-Q : tensor<Batch x Heads x QuerySeq x QKHeadDim x f32>
-K : tensor<Batch x Heads x KeySeq   x QKHeadDim x f32>
-V : tensor<Batch x Heads x KeySeq   x ValueDim  x f32>
-scale : f32 constant
-```
-
-Program shape:
+The implemented rewrite target replaces `exp` with `exp2` and uses small
+algebraic rules to move the new `log2(e)` factor through the expression graph.
+The current implementation is in `lib/TA/ExpToExp2.pdll` and is exposed through:
 
 ```mlir
-%O = ta.scope axes(%b "b" : index, %h "h" : index,
-                   %i "i" : index, %j "j" : index,
-                   %d "d" : index, %e "e" : index) {
-  ...
-  %qk = ta.mulf %q, %k
-       : (!ta.expr<f32, [b,h,i,d]>, !ta.expr<f32, [b,h,j,d]>)
-      -> !ta.expr<f32, [b,h,i,j,d]>
-  %dot = ta.reduce #ta.reduce_kind<add> %qk {axes = #ta.axes<d>}
-       : !ta.expr<f32, [b,h,i,j,d]> -> !ta.expr<f32, [b,h,i,j]>
-
-  %scale_expr = ta.constant 1.250000e-01 : f32 : !ta.expr<f32, []>
-  %s = ta.mulf %scale_expr, %dot
-       : (!ta.expr<f32, []>, !ta.expr<f32, [b,h,i,j]>)
-      -> !ta.expr<f32, [b,h,i,j]>
-
-  %m = ta.reduce #ta.reduce_kind<max> %s {axes = #ta.axes<j>}
-       : !ta.expr<f32, [b,h,i,j]> -> !ta.expr<f32, [b,h,i]>
-
-  %centered = ta.subf %s, %m
-       : (!ta.expr<f32, [b,h,i,j]>, !ta.expr<f32, [b,h,i]>)
-      -> !ta.expr<f32, [b,h,i,j]>
-  %p = ta.exp %centered
-       : (!ta.expr<f32, [b,h,i,j]>) -> !ta.expr<f32, [b,h,i,j]>
-
-  %l = ta.reduce #ta.reduce_kind<add> %p {axes = #ta.axes<j>}
-       : !ta.expr<f32, [b,h,i,j]> -> !ta.expr<f32, [b,h,i]>
-
-  ...
-  %pv = ta.mulf %p, %v
-       : (!ta.expr<f32, [b,h,i,j]>, !ta.expr<f32, [b,h,j,e]>)
-      -> !ta.expr<f32, [b,h,i,j,e]>
-  %num = ta.reduce #ta.reduce_kind<add> %pv {axes = #ta.axes<j>}
-       : !ta.expr<f32, [b,h,i,j,e]> -> !ta.expr<f32, [b,h,i,e]>
-
-  %o = ta.divf %num, %l
-       : (!ta.expr<f32, [b,h,i,e]>, !ta.expr<f32, [b,h,i]>)
-      -> !ta.expr<f32, [b,h,i,e]>
-  ta.yield %o : !ta.expr<f32, [b,h,i,e]>
-} : () -> tensor<Batch x Heads x QuerySeq x ValueDim x f32>
+transform.ta.rewrite_exp_to_exp2 %target : !transform.any_op
 ```
 
-One `ta.scope` can expose the whole attention computation as a scalar indexed
-expression graph. Intermediate reductions over `d` and `j` are internal binders;
-only the final yielded expression axes `[b,h,i,e]` determine the materialized
-tensor result.
+The same pattern set is also available to `transform.apply_patterns` as:
 
----
-
-## Not Implemented Yet: Example Rewrite Target
-
-One intended rewrite target is replacing `exp` with `exp2` in attention while
-folding the `log2(e)` factor into the score scale. Let:
-
-```text
-c = log2(e)
+```mlir
+transform.apply_patterns.ta.exp_to_exp2
 ```
 
-The local rule is:
+The motivating attention fragment inside one `ta.scope` looks like:
 
-```text
-exp(x) => exp2(c * x)
+```mlir
+%dot = ta.reduce #ta.reduce_kind<add> %qk {axes = #ta.axes<d>}
+     : !ta.expr<f32, [b,h,i,j,d]> -> !ta.expr<f32, [b,h,i,j]>
+%scale_expr = ta.constant 1.250000e-01 : f32 : !ta.expr<f32, []>
+%s = ta.mulf %scale_expr, %dot
+     : (!ta.expr<f32, []>, !ta.expr<f32, [b,h,i,j]>)
+    -> !ta.expr<f32, [b,h,i,j]>
+%m = ta.reduce #ta.reduce_kind<max> %s {axes = #ta.axes<j>}
+     : !ta.expr<f32, [b,h,i,j]> -> !ta.expr<f32, [b,h,i]>
+%centered = ta.subf %s, %m
+     : (!ta.expr<f32, [b,h,i,j]>, !ta.expr<f32, [b,h,i]>)
+    -> !ta.expr<f32, [b,h,i,j]>
+%p = ta.exp %centered
+     : (!ta.expr<f32, [b,h,i,j]>) -> !ta.expr<f32, [b,h,i,j]>
 ```
 
-Inside `%P`:
+With `c = log2(e)`, the rewrite proceeds as ordinary algebra over the
+score expression:
+
+| Step | Rule | Result |
+| --- | --- | --- |
+| Original softmax numerator | definition | `P = exp(S - M)` |
+| Change exponential base | `exp(x) => exp2(c * x)` | `P = exp2(c * (S - M))` |
+| Distribute scale | `c * (x - y) => c*x - c*y` | `P = exp2(c*S - c*M)` |
+| Move through max | `c * max_j(S) => max_j(c*S)`, for `c > 0` and `j notin axes(c)` | `P = exp2(S2 - M2)` |
+| Rebase score | CSE `S2 = c*S`, `M2 = max_j S2` | `P = exp2(S2 - M2)` |
+| Fold score scale | `S = scale * Dot` | `S2 = (c * scale) * Dot` |
+
+The current rewrite driver reaches the desired form by repeatedly applying
+these separate PDLL rules and running CSE between greedy iterations.
+
+No attention-specific rule is required. Attention only supplies one graph where
+these general facts compose into:
 
 ```text
-P = exp(S - M)
-```
-
-becomes:
-
-```text
-P = exp2(c * (S - M))
-```
-
-Distribute:
-
-```text
-c * (S - M) => c*S - c*M
-```
-
-Since:
-
-```text
-M = reduce_max_j S
-```
-
-and `c > 0` and `j ∉ axes(c)`, apply:
-
-```text
-c * reduce_max_j S => reduce_max_j (c*S)
-```
-
-Introduce or CSE the rebased score:
-
-```text
-S2 = c * S
-M2 = reduce_max_j S2
+S2 = (scale * log2(e)) * Dot
+M2 = max_j S2
 P2 = exp2(S2 - M2)
 ```
 
-Since:
-
-```text
-S = scale * Dot
-```
-
-fold:
-
-```text
-S2 = c * scale * Dot
-   = (c * scale) * Dot
-```
-
-The final scoped structure can remain almost identical:
-
-```text
-Dot  = sum_d Q*K
-S2   = (scale * log2(e)) * Dot
-M2   = max_j S2
-P2   = exp2(S2 - M2)
-L2   = sum_j P2
-Num2 = sum_j P2*V
-O2   = Num2 / L2
-```
-
-No attention-specific rule should be required. The necessary general rules are
-scalar distributivity, constant folding, CSE, and reduction movement with side
-conditions. These rewrite passes and legality checks are not implemented yet.
+The current legality checks are still deliberately minimal. The `max` movement
+rule checks that the scaling factor is a finite positive axisless constant, but
+the dialect still needs a broader fastmath / floating-point equivalence policy
+before this should be treated as generally valid for production lowering.
 
 ---
 
@@ -743,9 +648,14 @@ operand axes in the enclosing scope order. Rewriters should primarily match
 these first-class ops. `ta.map` is available for imported scalar regions that
 have not been canonicalized to a known operation.
 
-### Not Implemented Yet: Rewriter Requirements
+### Rewriter Requirements
 
-The rewrite engine is not implemented yet. It will need:
+The current rewrite support is intentionally small: PDLL pattern sets are
+compiled into the plugin, and transform ops populate those patterns into MLIR's
+greedy rewrite driver. `transform.ta.rewrite_exp_to_exp2` applies the
+exp-to-exp2 algebra rules repeatedly and runs CSE between iterations.
+
+A more general rewrite engine will need:
 
 ```text
 axis-support queries
@@ -754,7 +664,6 @@ elementwise op queries
 reduction algebra metadata
 positivity/nonnegativity facts
 fastmath/NaN policy checks
-CSE across scopes
 scope-transparent eval/build beta-reduction
 ```
 
@@ -819,12 +728,25 @@ empty-domain behavior is compatible
 3. Multi-result import, including multi-output reductions such as max+argmax.
 4. Affine access expressions for non-projection maps, needed for direct
    convolution-style indexing.
-5. `ta` rewrite passes, including the reduction movement needed for
-   `exp -> exp2`.
+5. Additional algebraic rewrite rules beyond the current exp-to-exp2 pattern
+   set.
 6. Scope placement after rewrites: splitting, fusing, or reusing original
    `linalg` boundaries.
 7. Lowering `ta.scope` back to `linalg.generic` / `scf` / vector form.
 8. Fastmath and floating-point legality policy.
+9. Transform-interpreted rewrite patterns, so users can supply rewrite rules
+   from transform IR instead of precompiling every PDLL pattern into the plugin.
+10. A compact custom rewrite syntax, for example:
+
+    ```text
+    match reduce($x{$axes_x} / $d{$axes_d} * $y{$axes_y},
+                 axes=$axes_k, reducer="add")
+      if intersect($axes_k, $axes_d).empty()
+    ```
+
+    This syntax would be closer to tensor-algebra notation than PDLL, but it
+    requires a custom parser and a lowering into PDL/PDLL or native rewrite
+    patterns.
 
 A useful end-to-end demo remains:
 

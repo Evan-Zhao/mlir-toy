@@ -114,6 +114,16 @@ mlir_tablegen(TATransformOps.h.inc -gen-op-decls)
 mlir_tablegen(TATransformOps.cpp.inc -gen-op-defs)
 add_public_tablegen_target(TATransformOpsIncGen)
 
+add_mlir_pdll_library(TAExchangeDivAndMatmulPDLL
+  lib/TA/ExchangeDivAndMatmul.pdll
+  ExchangeDivAndMatmul.cpp.inc
+)
+
+add_mlir_pdll_library(TAExpToExp2PDLL
+  lib/TA/ExpToExp2.pdll
+  ExpToExp2.cpp.inc
+)
+
 function(make_mlir_opt_plugin)
   cmake_parse_arguments(ARG "" "TARGET" "SOURCES;DEPS" ${ARGN})
   # Shared plugin for `mlir-opt --load-dialect-plugin=<path>/libHTileDialect.so`
@@ -167,7 +177,14 @@ make_mlir_opt_plugin(
 make_mlir_opt_plugin(
   TARGET TADialect
   SOURCES lib/TA/TADialect.cpp lib/TA/LinalgToTA.cpp lib/TA/TATransformOps.cpp
-  DEPS TAOpsIncGen TAInterfacesIncGen TAAttrsIncGen TATypesIncGen TATransformOpsIncGen
+  DEPS
+    TAOpsIncGen
+    TAInterfacesIncGen
+    TAAttrsIncGen
+    TATypesIncGen
+    TATransformOpsIncGen
+    TAExchangeDivAndMatmulPDLL
+    TAExpToExp2PDLL
 )
 make_mlir_opt_plugin(
   TARGET LoopTransform

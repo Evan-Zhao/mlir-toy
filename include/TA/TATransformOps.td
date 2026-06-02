@@ -2,43 +2,71 @@ include "mlir/Dialect/Transform/IR/TransformDialect.td"
 include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
-def TAExchangeDivAndMatmulOp
-    : Op<Transform_Dialect, "ta.exchange_div_and_matmul",
-         [FunctionalStyleTransformOpTrait, TransformOpInterface, TransformEachOpTrait,
-          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
-          ReportTrackingListenerFailuresOpTrait]> {
-  let summary = "Exchange an invariant division with a ta.reduce matmul";
+def TAExchangeDivAndMatmulPatternsOp
+    : Op<Transform_Dialect, "apply_patterns.ta.exchange_div_and_matmul",
+         [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
+  let summary = "Collect TA exchange-div-and-matmul rewrite patterns";
 
   let description = [{
-    Rewrites an add-reduction whose payload multiplies one operand by a
-    reduction-invariant division:
+    Collects PDLL-authored TA rewrite patterns that exchange a division with a
+    reduction:
 
     ```
       sum((num / den) * rhs)  ->  sum(num * rhs) / den
     ```
 
-    The target must be a `ta.reduce <add>` whose input is produced by a
-    `ta.mulf`. The selected multiply operand must be produced by `ta.divf`.
-    The divisor expression must not depend on any axis reduced by the
-    `ta.reduce`.
-
-    `operand_number` selects which multiply operand is expected to be the
-    division. It defaults to 0, matching the usual `(softmax_probs @ V)` shape.
-    The original map-reduction is replaced by the trailing `ta.divf`. The op
-    returns handles to the rebuilt reduction and the trailing division.
+    This is intentionally narrow: it matches a `ta.reduce` marked with a
+    `target` unit attribute whose input is a `ta.mulf` with a `ta.divf` on its
+    left-hand side. The pattern preserves the matched reducer kind, axes, and
+    result type.
   }];
 
-  let arguments = (ins TransformHandleTypeInterface:$target,
-      DefaultValuedOptionalAttr<I64Attr, "0">:$operand_number);
-  let results = (outs TransformHandleTypeInterface:$reduction,
-      TransformHandleTypeInterface:$division);
+  let assemblyFormat = "attr-dict";
+}
 
-  let assemblyFormat = "$target attr-dict `:` functional-type(operands, results)";
+def TAExpToExp2PatternsOp
+    : Op<Transform_Dialect, "apply_patterns.ta.exp_to_exp2",
+         [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
+  let summary = "Collect TA algebraic rewrite patterns for exp-to-exp2";
+
+  let description = [{
+    Collects PDLL-authored TA patterns for the rewrite:
+
+    ```
+      exp(x) -> exp2(log2(e) * x)
+    ```
+
+    The pattern set also contains the minimal scalar algebra needed to push the
+    new positive scalar factor through a softmax-like expression graph:
+    distribution through `ta.subf`, movement through `ta.reduce <max>`,
+    reassociation through `ta.mulf`, and multiplication folding for scalar
+    `ta.constant` values.
+  }];
+
+  let assemblyFormat = "attr-dict";
+}
+
+def TARewriteExpToExp2Op
+    : Op<Transform_Dialect, "ta.rewrite_exp_to_exp2",
+         [TransformOpInterface, TransformEachOpTrait,
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+          ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Greedily apply TA exp-to-exp2 algebraic rewrites";
+
+  let description = [{
+    Applies the `apply_patterns.ta.exp_to_exp2` pattern set greedily to the
+    targeted payload operation until convergence.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$target);
+  let results = (outs);
+
+  let assemblyFormat = "$target attr-dict `:` type($target)";
 
   let extraClassDeclaration = [{
     ::mlir::DiagnosedSilenceableFailure applyToOne(
         ::mlir::transform::TransformRewriter &rewriter,
-        ::ta::ReduceOp target,
+        ::mlir::Operation *target,
         ::mlir::transform::ApplyToEachResultList &results,
         ::mlir::transform::TransformState &state);
   }];

@@ -1,122 +1,91 @@
 #include "TA/TATransformOps.h"
 
-#include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
+#include "mlir/Dialect/Transform/IR/TransformDialect.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Dominance.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/Parser/Parser.h"
+#include "mlir/Transforms/CSE.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 using namespace mlir;
 
+namespace ta_exchange_div_and_matmul_pdl {
+using namespace mlir;
+#include "ExchangeDivAndMatmul.cpp.inc"
+} // namespace ta_exchange_div_and_matmul_pdl
+
+namespace ta_exp_to_exp2_pdl {
+using namespace mlir;
+using llvm::APFloat;
+#include "ExpToExp2.cpp.inc"
+} // namespace ta_exp_to_exp2_pdl
+
 namespace mlir::transform {
+
 namespace {
 
-#define BAIL(message) return emitSilenceableFailure(transform, message)
+LogicalResult rewriteGreedily(TransformRewriter &rewriter, RewritePatternSet patterns,
+                              Operation *target) {
+  GreedyRewriteConfig config;
+  config.setListener(static_cast<RewriterBase::Listener *>(rewriter.getListener()));
+  config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
+  FrozenRewritePatternSet frozenPatterns(std::move(patterns));
 
-bool containsAxis(ta::AxesAttr axes, Attribute axis) {
-  return llvm::is_contained(axes.getAxes(), axis);
-}
+  bool cseChanged = false;
+  constexpr int64_t maxIterations = 50;
+  int64_t iteration = 0;
+  do {
+    LogicalResult result = failure();
+    if (target->hasTrait<OpTrait::IsIsolatedFromAbove>()) {
+      result = applyPatternsGreedily(target, frozenPatterns, config);
+    } else {
+      SmallVector<Operation *> ops;
+      target->walk([&](Operation *nestedOp) {
+        if (target != nestedOp)
+          ops.push_back(nestedOp);
+      });
+      result = applyOpPatternsGreedily(ops, frozenPatterns, config);
+    }
+    if (failed(result))
+      return failure();
 
-bool intersects(ta::AxesAttr lhs, ta::AxesAttr rhs) {
-  return llvm::any_of(lhs.getAxes(), [&](Attribute axis) { return containsAxis(rhs, axis); });
-}
+    DominanceInfo domInfo;
+    cseChanged = false;
+    eliminateCommonSubExpressions(rewriter, domInfo, target, &cseChanged);
+  } while (cseChanged && ++iteration < maxIterations);
 
-ta::AxesAttr unionAxesInScopeOrder(MLIRContext *context, ta::ScopeOp scope, ValueRange values) {
-  SmallVector<Attribute> axes;
-  for (Attribute scopeAxis : scope.getAxes().getAxes()) {
-    bool used = llvm::any_of(values, [&](Value value) {
-      auto expr = dyn_cast<ta::ExprType>(value.getType());
-      return expr && containsAxis(expr.getAxes(), scopeAxis);
-    });
-    if (used)
-      axes.push_back(scopeAxis);
-  }
-  return ta::AxesAttr::get(context, ArrayAttr::get(context, axes));
-}
-
-ta::AxesAttr subtractAxes(MLIRContext *context, ta::AxesAttr axes, ta::AxesAttr remove) {
-  SmallVector<Attribute> kept;
-  for (Attribute axis : axes.getAxes()) {
-    if (!containsAxis(remove, axis))
-      kept.push_back(axis);
-  }
-  return ta::AxesAttr::get(context, ArrayAttr::get(context, kept));
-}
-
-ta::ExprType exprType(Type elementType, ta::AxesAttr axes) {
-  return ta::ExprType::get(elementType.getContext(), elementType, axes);
+  return success(iteration < maxIterations);
 }
 
 } // namespace
 
-void TAExchangeDivAndMatmulOp::getEffects(
-    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  consumesHandle(getTargetMutable(), effects);
-  producesHandle(getOperation()->getResults(), effects);
+void TAExchangeDivAndMatmulPatternsOp::populatePatterns(RewritePatternSet &patterns) {
+  ta_exchange_div_and_matmul_pdl::populateGeneratedPDLLPatterns(patterns);
+}
+
+void TAExpToExp2PatternsOp::populatePatterns(RewritePatternSet &patterns) {
+  ta_exp_to_exp2_pdl::populateGeneratedPDLLPatterns(patterns);
+}
+
+void TARewriteExpToExp2Op::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  onlyReadsHandle(getTargetMutable(), effects);
   modifiesPayload(effects);
 }
 
-DiagnosedSilenceableFailure TAExchangeDivAndMatmulOp::applyToOne(
-    TransformRewriter &rewriter, ta::ReduceOp target, ApplyToEachResultList &results,
+DiagnosedSilenceableFailure TARewriteExpToExp2Op::applyToOne(
+    TransformRewriter &rewriter, Operation *target, ApplyToEachResultList &results,
     TransformState &state) {
+  (void)results;
   (void)state;
-  auto transform = cast<TransformOpInterface>(getOperation());
+  RewritePatternSet patterns(getContext());
+  ta_exp_to_exp2_pdl::populateGeneratedPDLLPatterns(patterns);
 
-  if (target.getKind() != ta::ReduceKind::Add)
-    BAIL("expected a ta.reduce <add>");
+  if (failed(rewriteGreedily(rewriter, std::move(patterns), target))) {
+    auto transform = cast<TransformOpInterface>(getOperation());
+    return emitSilenceableFailure(transform, "exp-to-exp2 rewrite did not converge");
+  }
 
-  uint64_t operandNumber = getOperandNumber();
-  if (operandNumber >= 2)
-    BAIL("operand_number must select operand 0 or 1 of the payload ta.mulf");
-
-  auto mul = target.getInput().getDefiningOp<ta::MulFOp>();
-  if (!mul)
-    BAIL("expected ta.reduce input to be produced by ta.mulf");
-
-  Value selected = mul->getOperand(static_cast<unsigned>(operandNumber));
-  auto div = selected.getDefiningOp<ta::DivFOp>();
-  if (!div)
-    BAIL("expected selected ta.mulf operand to be produced by ta.divf");
-
-  Value numerator = div.getLhs();
-  Value divisor = div.getRhs();
-  auto numeratorType = dyn_cast<ta::ExprType>(numerator.getType());
-  auto divisorType = dyn_cast<ta::ExprType>(divisor.getType());
-  if (!numeratorType || !divisorType)
-    BAIL("expected ta.divf operands to be ta.expr values");
-  if (intersects(divisorType.getAxes(), target.getAxes()))
-    BAIL("expected divisor not to depend on reduced axes");
-
-  Value other = mul->getOperand(operandNumber == 0 ? 1 : 0);
-  auto otherType = dyn_cast<ta::ExprType>(other.getType());
-  if (!otherType)
-    BAIL("expected non-division ta.mulf operand to be a ta.expr value");
-
-  auto scope = target->getParentOfType<ta::ScopeOp>();
-  if (!scope)
-    BAIL("expected ta.reduce to be nested in ta.scope");
-
-  MLIRContext *context = target.getContext();
-  ta::AxesAttr newPayloadAxes = unionAxesInScopeOrder(context, scope, ValueRange{numerator, other});
-  ta::AxesAttr newReductionAxes = subtractAxes(context, newPayloadAxes, target.getAxes());
-  auto originalResultType = cast<ta::ExprType>(target.getResult().getType());
-
-  Location loc = target.getLoc();
-  rewriter.setInsertionPoint(target);
-  Value lhs = operandNumber == 0 ? numerator : other;
-  Value rhs = operandNumber == 0 ? other : numerator;
-  auto product = ta::MulFOp::create(rewriter, loc, lhs, rhs);
-  auto newReduction = ta::ReduceOp::create(
-      rewriter, loc, exprType(originalResultType.getElementType(), newReductionAxes),
-      target.getKindAttr(), product.getResult(), target.getIdentity(), target.getAxes());
-
-  rewriter.setInsertionPointAfter(newReduction);
-  auto division = ta::DivFOp::create(rewriter, loc, newReduction.getResult(), divisor);
-
-  rewriter.replaceOp(target, division.getResult());
-  if (mul->use_empty())
-    rewriter.eraseOp(mul);
-  if (div->use_empty())
-    rewriter.eraseOp(div);
-
-  results.push_back(newReduction.getOperation());
-  results.push_back(division.getOperation());
   return DiagnosedSilenceableFailure::success();
 }
 
@@ -130,7 +99,9 @@ void registerTATransformExtension(mlir::DialectRegistry &registry) {
       using mlir::Dialect::addOperations;
     };
     static_cast<TransformDialectAccess *>(dialect)
-        ->addOperations<mlir::transform::TAExchangeDivAndMatmulOp>();
+        ->addOperations<mlir::transform::TAExchangeDivAndMatmulPatternsOp,
+                        mlir::transform::TAExpToExp2PatternsOp,
+                        mlir::transform::TARewriteExpToExp2Op>();
   });
 }
 
