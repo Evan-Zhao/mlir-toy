@@ -523,23 +523,28 @@ axes(%x) = {n, oh, r, ow, s, c}
 
 but the input-height dimension is not simply the same axis as `oh` or `r`.
 
-## Not Implemented Yet: Scope Placement and Lowering
+## Scope Placement and Lowering
 
 After rewriting, `ta` will need to choose a schedule again.
 
-The importer currently creates one scope for the returned expression graph.
-Longer term, original `linalg` boundaries can provide useful initial placement
-hints:
+The importer currently creates one scope for the returned expression graph. The
+`ta-lower-to-linalg` pass provides a conservative lowering back to
+`linalg.generic`: it uses `ta.import_group` as an initial materialization
+boundary, checks whether each partition can be represented as one structured
+op, and lowers ungrouped rewrite-created ops as their own materializations.
+This is enough for the current attention demo after the exp-to-exp2 and
+division/matmul rewrites.
+
+Original `linalg` boundaries remain useful placement hints:
 
 ```text
 one original linalg op -> one imported ta.scope
 ```
 
 This is useful, but it must not be mandatory. Rewrites may delete, fuse, split,
-or create scopes.
+or create groups.
 
-A future lowering pass can lower a scope to one `linalg.generic` when it has
-structured form:
+Each lowered partition has structured form:
 
 ```text
 scope axes       -> parallel iterators
@@ -548,7 +553,7 @@ at/eval accesses -> affine indexing maps
 scalar body      -> linalg region
 ```
 
-A scope may not lower cleanly to one `linalg.generic` if it contains:
+A partition may not lower cleanly to one `linalg.generic` if it contains:
 
 ```text
 nested dependent reductions
@@ -559,10 +564,10 @@ non-affine indexing
 multiple incompatible reduction structures
 ```
 
-In those cases, the lowering pass could:
+In those cases, a more general lowering pass could:
 
 ```text
-1. split the scope,
+1. split the partition,
 2. create additional ta.scope materialization boundaries,
 3. lower to scf loops,
 4. lower to a custom/fused op,
@@ -572,8 +577,8 @@ In those cases, the lowering pass could:
 The important invariant is:
 
 ```text
-ta.scope body = algebraic scalar expression over declared axes
-ta.scope op   = tensor materialization boundary
+ta.scope body        = algebraic scalar expression over declared axes
+lowering partition   = tensor materialization boundary
 ```
 
 ---
@@ -728,7 +733,8 @@ empty-domain behavior is compatible
 1. Affine access expressions for non-projection maps, needed for direct convolution-style indexing.
 1. Additional algebraic rewrite rules beyond the current exp-to-exp2 pattern set.
 1. Scope placement after rewrites: splitting, fusing, or reusing original `linalg` boundaries.
-1. Lowering `ta.scope` back to `linalg.generic` / `scf` / vector form.
+1. General lowering beyond the current conservative `linalg.generic`
+   partitioner, including `scf` / vector forms.
 1. Fastmath and floating-point legality policy.
 1. Transform-interpreted rewrite patterns, so users can supply rewrite rules
    from transform IR instead of precompiling every PDLL pattern into the plugin.

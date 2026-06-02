@@ -20,18 +20,45 @@ module attributes {transform.with_named_sequence} {
     transform.apply_patterns to %ta_func {
       transform.apply_patterns.ta.exchange_div_and_matmul
     } : !transform.any_op
+    %linalg_func = transform.apply_registered_pass "ta-lower-to-linalg" to %ta_func
+        : (!transform.any_op) -> !transform.any_op
     transform.yield
   }
 
   // CHECK-LABEL: func.func @attention(
-  // CHECK: ta.scope axes(
-  // CHECK: ta.reduce <add>
-  // CHECK: ta.constant 0.83294034 : f32
-  // CHECK: ta.reduce <max>
-  // CHECK: ta.exp2
-  // CHECK: ta.reduce <add>
-  // CHECK: ta.divf
-  // CHECK: ta.truncf
+  // CHECK-NOT: ta.scope
+  // CHECK: linalg.generic
+  // CHECK-SAME: iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+  // CHECK: arith.extf
+  // CHECK: linalg.generic
+  // CHECK-SAME: iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+  // CHECK: arith.extf
+  // CHECK: linalg.fill
+  // CHECK: linalg.generic
+  // CHECK-SAME: iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction"]
+  // CHECK: arith.mulf
+  // CHECK: arith.addf
+  // CHECK: arith.constant 0.83294034 : f32
+  // CHECK: arith.mulf
+  // CHECK: linalg.fill
+  // CHECK: linalg.generic
+  // CHECK-SAME: iterator_types = ["parallel", "parallel", "parallel", "reduction"]
+  // CHECK: arith.maximumf
+  // CHECK: arith.subf
+  // CHECK: math.exp2
+  // CHECK: linalg.fill
+  // CHECK: linalg.generic
+  // CHECK-SAME: iterator_types = ["parallel", "parallel", "parallel", "reduction"]
+  // CHECK: arith.addf
+  // CHECK: linalg.generic
+  // CHECK: arith.extf
+  // CHECK: linalg.fill
+  // CHECK: linalg.generic
+  // CHECK-SAME: iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction"]
+  // CHECK: arith.mulf
+  // CHECK: arith.addf
+  // CHECK: arith.divf
+  // CHECK: arith.truncf
   // CHECK: return {{.*}} : tensor<1x2x4x3xf16>
   func.func @attention(%arg0: tensor<1x2x4x3xf16>,
                        %arg1: tensor<1x2x4x3xf16>,

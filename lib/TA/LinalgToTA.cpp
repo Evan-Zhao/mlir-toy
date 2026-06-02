@@ -827,6 +827,7 @@ void registerTAPasses() {
     return;
   registered = true;
   PassRegistration<ImportLinalgToTAPass>();
+  registerTAToLinalgPass();
 }
 
 } // namespace ta

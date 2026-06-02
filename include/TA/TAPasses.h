@@ -4,6 +4,7 @@
 namespace ta {
 
 void registerTAPasses();
+void registerTAToLinalgPass();
 
 } // namespace ta
 
