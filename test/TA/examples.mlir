@@ -29,16 +29,15 @@ func.func @two_axis_ta(%tensor: tensor<16x32xf32>)
 func.func @matmul_ta(%lhs: tensor<16x64xf32>, %rhs: tensor<64x32xf32>)
     -> tensor<16x32xf32> {
   %0 = ta.scope axes(%row "i" : index, %col "j" : index, %red "k" : index) {
-    %dot = ta.map_reduce #ta.reduce_kind<add> {
-      %x = ta.at %lhs[%row, %red] {axes = #ta.axes<i, k>}
-          : tensor<16x64xf32> -> !ta.expr<f32, [i, k]>
-      %y = ta.at %rhs[%red, %col] {axes = #ta.axes<k, j>}
-          : tensor<64x32xf32> -> !ta.expr<f32, [k, j]>
-      %xy = ta.mulf %x, %y
-          : (!ta.expr<f32, [i, k]>, !ta.expr<f32, [k, j]>)
-         -> !ta.expr<f32, [i, j, k]>
-      ta.yield %xy : !ta.expr<f32, [i, j, k]>
-    } {axes = #ta.axes<k>} : !ta.expr<f32, [i, j]>
+    %x = ta.at %lhs[%row, %red] {axes = #ta.axes<i, k>}
+        : tensor<16x64xf32> -> !ta.expr<f32, [i, k]>
+    %y = ta.at %rhs[%red, %col] {axes = #ta.axes<k, j>}
+        : tensor<64x32xf32> -> !ta.expr<f32, [k, j]>
+    %xy = ta.mulf %x, %y
+        : (!ta.expr<f32, [i, k]>, !ta.expr<f32, [k, j]>)
+       -> !ta.expr<f32, [i, j, k]>
+    %dot = ta.reduce #ta.reduce_kind<add> %xy {axes = #ta.axes<k>}
+        : !ta.expr<f32, [i, j, k]> -> !ta.expr<f32, [i, j]>
     ta.yield %dot : !ta.expr<f32, [i, j]>
   } : () -> tensor<16x32xf32>
   return %0 : tensor<16x32xf32>

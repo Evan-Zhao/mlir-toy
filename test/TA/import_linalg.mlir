@@ -15,10 +15,10 @@
 
 // CHECK-LABEL: func.func @matmul
 // CHECK: ta.scope axes(%a0 "a0" : index, %a1 "a1" : index, %r2 "r2" : index)
-// CHECK: ta.at {{.*}}[%a0, %r2]
-// CHECK: ta.at {{.*}}[%r2, %a1]
-// CHECK: ta.map_reduce <add>
-// CHECK: ta.mulf
+// CHECK: ta.at {{.*}}[%a0, %r2] {{.*}}ta.import_group = 0 : i64
+// CHECK: ta.at {{.*}}[%r2, %a1] {{.*}}ta.import_group = 0 : i64
+// CHECK: ta.mulf {{.*}}ta.import_group = 0 : i64
+// CHECK: ta.reduce <add> {{.*}}{axes = #ta.axes<r2>, ta.import_group = 0 : i64}
 // CHECK: return {{.*}} : tensor<4x16xf32>
 func.func @matmul(%arg0: tensor<4x8xf32>, %arg1: tensor<8x16xf32>) -> tensor<4x16xf32> {
   %cst = arith.constant 0.000000e+00 : f32
@@ -46,10 +46,10 @@ func.func @matmul(%arg0: tensor<4x8xf32>, %arg1: tensor<8x16xf32>) -> tensor<4x1
 // CHECK-LABEL: func.func @attention
 // CHECK: ta.scope axes(
 // CHECK: tensor<1x2x4x3xf16>
-// CHECK: ta.map_reduce <add>
-// CHECK: ta.map_reduce <max>
+// CHECK: ta.reduce <add>
+// CHECK: ta.reduce <max>
 // CHECK: ta.exp
-// CHECK: ta.map_reduce <add>
+// CHECK: ta.reduce <add>
 // CHECK: ta.divf
 // CHECK: ta.truncf
 // CHECK: return {{.*}} : tensor<1x2x4x3xf16>

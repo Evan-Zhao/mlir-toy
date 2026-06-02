@@ -165,18 +165,6 @@ def TA_ReduceOp : TA_ReduceLikeOp<"reduce"> {
                        "attr-dict `:` type($input) `->` type($result)";
 }
 
-def TA_MapReduceOp : TA_ReduceLikeOp<"map_reduce"> {
-  let summary = "map payload region followed by mathematical reduction";
-  let arguments = (ins TA_ReduceKindEnumAttr:$kind,
-                       Optional<AnyType>:$identity,
-                       TA_AxesAttr:$axes);
-  let results = (outs TA_ExprType:$result);
-  let regions = (region SizedRegion<1>:$body);
-
-  let assemblyFormat = "$kind (`identity` `(` $identity^ `:` type($identity) `)`)? "
-                       "$body attr-dict `:` type($result)";
-}
-
 def TA_ScopeOp : TA_Op<"scope", [
     SingleBlockImplicitTerminator<"YieldOp">,
     DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmBlockArgumentNames"]>]> {

@@ -1,7 +1,6 @@
 #include "TA/TATransformOps.h"
 
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
-#include "mlir/IR/IRMapping.h"
 
 using namespace mlir;
 
@@ -54,30 +53,21 @@ void TAExchangeDivAndMatmulOp::getEffects(
 }
 
 DiagnosedSilenceableFailure TAExchangeDivAndMatmulOp::applyToOne(
-    TransformRewriter &rewriter, ta::MapReduceOp target, ApplyToEachResultList &results,
+    TransformRewriter &rewriter, ta::ReduceOp target, ApplyToEachResultList &results,
     TransformState &state) {
   (void)state;
   auto transform = cast<TransformOpInterface>(getOperation());
 
   if (target.getKind() != ta::ReduceKind::Add)
-    BAIL("expected a ta.map_reduce <add>");
+    BAIL("expected a ta.reduce <add>");
 
   uint64_t operandNumber = getOperandNumber();
   if (operandNumber >= 2)
     BAIL("operand_number must select operand 0 or 1 of the payload ta.mulf");
 
-  Block &body = target.getBody().front();
-  auto yield = dyn_cast<ta::YieldOp>(body.getTerminator());
-  if (!yield || yield.getValues().size() != 1)
-    BAIL("expected ta.map_reduce to yield one value");
-
-  auto mul = yield.getValues().front().getDefiningOp<ta::MulFOp>();
+  auto mul = target.getInput().getDefiningOp<ta::MulFOp>();
   if (!mul)
-    BAIL("expected ta.map_reduce payload to yield ta.mulf");
-  if (mul->getBlock() != &body)
-    BAIL("expected yielded ta.mulf to be inside the ta.map_reduce body");
-  if (mul->getNextNode() != body.getTerminator())
-    BAIL("expected yielded ta.mulf to be immediately before ta.yield");
+    BAIL("expected ta.reduce input to be produced by ta.mulf");
 
   Value selected = mul->getOperand(static_cast<unsigned>(operandNumber));
   auto div = selected.getDefiningOp<ta::DivFOp>();
@@ -100,7 +90,7 @@ DiagnosedSilenceableFailure TAExchangeDivAndMatmulOp::applyToOne(
 
   auto scope = target->getParentOfType<ta::ScopeOp>();
   if (!scope)
-    BAIL("expected ta.map_reduce to be nested in ta.scope");
+    BAIL("expected ta.reduce to be nested in ta.scope");
 
   MLIRContext *context = target.getContext();
   ta::AxesAttr newPayloadAxes = unionAxesInScopeOrder(context, scope, ValueRange{numerator, other});
@@ -109,42 +99,20 @@ DiagnosedSilenceableFailure TAExchangeDivAndMatmulOp::applyToOne(
 
   Location loc = target.getLoc();
   rewriter.setInsertionPoint(target);
-  auto newReduction = ta::MapReduceOp::create(
+  Value lhs = operandNumber == 0 ? numerator : other;
+  Value rhs = operandNumber == 0 ? other : numerator;
+  auto product = ta::MulFOp::create(rewriter, loc, lhs, rhs);
+  auto newReduction = ta::ReduceOp::create(
       rewriter, loc, exprType(originalResultType.getElementType(), newReductionAxes),
-      target.getKindAttr(), target.getIdentity(), target.getAxes());
-
-  Block *newBody = new Block();
-  newReduction.getBody().push_back(newBody);
-
-  {
-    OpBuilder::InsertionGuard guard(rewriter);
-    rewriter.setInsertionPointToStart(newBody);
-    IRMapping mapping;
-
-    for (Operation &op : body.without_terminator()) {
-      if (&op == div.getOperation()) {
-        mapping.map(div.getResult(), mapping.lookupOrDefault(numerator));
-        continue;
-      }
-      if (&op == mul.getOperation())
-        continue;
-      rewriter.clone(op, mapping);
-    }
-
-    Value mappedNumerator = mapping.lookupOrDefault(numerator);
-    Value mappedOther = mapping.lookupOrDefault(other);
-    Value lhs = operandNumber == 0 ? mappedNumerator : mappedOther;
-    Value rhs = operandNumber == 0 ? mappedOther : mappedNumerator;
-    auto product = ta::MulFOp::create(rewriter, loc, lhs, rhs);
-    ta::YieldOp::create(rewriter, loc, product.getResult());
-  }
+      target.getKindAttr(), product.getResult(), target.getIdentity(), target.getAxes());
 
   rewriter.setInsertionPointAfter(newReduction);
   auto division = ta::DivFOp::create(rewriter, loc, newReduction.getResult(), divisor);
 
-  bool divIsInsideTarget = div->getBlock() == &body;
   rewriter.replaceOp(target, division.getResult());
-  if (!divIsInsideTarget && div->use_empty())
+  if (mul->use_empty())
+    rewriter.eraseOp(mul);
+  if (div->use_empty())
     rewriter.eraseOp(div);
 
   results.push_back(newReduction.getOperation());

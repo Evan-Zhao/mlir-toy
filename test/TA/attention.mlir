@@ -8,16 +8,15 @@ func.func @attention_ta(%Q: tensor<2x3x4x6xf32>,
   %O = ta.scope axes(%b "b" : index, %h "h" : index,
                      %i "i" : index, %j "j" : index,
                      %d "d" : index, %e "e" : index) {
-    %dot = ta.map_reduce #ta.reduce_kind<add> {
-      %q = ta.at %Q[%b, %h, %i, %d] {axes = #ta.axes<b, h, i, d>}
-          : tensor<2x3x4x6xf32> -> !ta.expr<f32, [b, h, i, d]>
-      %k = ta.at %K[%b, %h, %j, %d] {axes = #ta.axes<b, h, j, d>}
-          : tensor<2x3x5x6xf32> -> !ta.expr<f32, [b, h, j, d]>
-      %qk = ta.mulf %q, %k
-          : (!ta.expr<f32, [b, h, i, d]>, !ta.expr<f32, [b, h, j, d]>)
-         -> !ta.expr<f32, [b, h, i, j, d]>
-      ta.yield %qk : !ta.expr<f32, [b, h, i, j, d]>
-    } {axes = #ta.axes<d>} : !ta.expr<f32, [b, h, i, j]>
+    %q = ta.at %Q[%b, %h, %i, %d] {axes = #ta.axes<b, h, i, d>}
+        : tensor<2x3x4x6xf32> -> !ta.expr<f32, [b, h, i, d]>
+    %k = ta.at %K[%b, %h, %j, %d] {axes = #ta.axes<b, h, j, d>}
+        : tensor<2x3x5x6xf32> -> !ta.expr<f32, [b, h, j, d]>
+    %qk = ta.mulf %q, %k
+        : (!ta.expr<f32, [b, h, i, d]>, !ta.expr<f32, [b, h, j, d]>)
+       -> !ta.expr<f32, [b, h, i, j, d]>
+    %dot = ta.reduce #ta.reduce_kind<add> %qk {axes = #ta.axes<d>}
+        : !ta.expr<f32, [b, h, i, j, d]> -> !ta.expr<f32, [b, h, i, j]>
 
     %scale = ta.constant 4.082482904638630e-01 : f32 : !ta.expr<f32, []>
     %s = ta.mulf %scale, %dot
@@ -36,14 +35,13 @@ func.func @attention_ta(%Q: tensor<2x3x4x6xf32>,
     %l = ta.reduce #ta.reduce_kind<add> %p {axes = #ta.axes<j>}
         : !ta.expr<f32, [b, h, i, j]> -> !ta.expr<f32, [b, h, i]>
 
-    %num = ta.map_reduce #ta.reduce_kind<add> {
-      %v = ta.at %V[%b, %h, %j, %e] {axes = #ta.axes<b, h, j, e>}
-          : tensor<2x3x5x7xf32> -> !ta.expr<f32, [b, h, j, e]>
-      %pv = ta.mulf %p, %v
-          : (!ta.expr<f32, [b, h, i, j]>, !ta.expr<f32, [b, h, j, e]>)
-         -> !ta.expr<f32, [b, h, i, j, e]>
-      ta.yield %pv : !ta.expr<f32, [b, h, i, j, e]>
-    } {axes = #ta.axes<j>} : !ta.expr<f32, [b, h, i, e]>
+    %v = ta.at %V[%b, %h, %j, %e] {axes = #ta.axes<b, h, j, e>}
+        : tensor<2x3x5x7xf32> -> !ta.expr<f32, [b, h, j, e]>
+    %pv = ta.mulf %p, %v
+        : (!ta.expr<f32, [b, h, i, j]>, !ta.expr<f32, [b, h, j, e]>)
+       -> !ta.expr<f32, [b, h, i, j, e]>
+    %num = ta.reduce #ta.reduce_kind<add> %pv {axes = #ta.axes<j>}
+        : !ta.expr<f32, [b, h, i, j, e]> -> !ta.expr<f32, [b, h, i, e]>
 
     %o = ta.divf %num, %l
         : (!ta.expr<f32, [b, h, i, e]>, !ta.expr<f32, [b, h, i]>)

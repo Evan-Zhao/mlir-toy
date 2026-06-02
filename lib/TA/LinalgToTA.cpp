@@ -61,6 +61,10 @@ public:
 
   ArrayRef<std::string> getScopeAxisNames() const { return axisNames; }
 
+  void setImportGroup(std::optional<int64_t> group) { importGroup = group; }
+
+  std::optional<int64_t> getImportGroup() const { return importGroup; }
+
   std::string createAxis(StringRef prefix) {
     std::string name;
     do {
@@ -121,48 +125,51 @@ public:
     }
 
     SmallVector<std::string> resultAxes = flattenAxes(dimAxes);
-    return AtOp::create(builder(), loc, expr(elementType, resultAxes), source, indices,
-                        getAxes(resultAxes))
-        .getResult();
+    auto op =
+        AtOp::create(builder(), loc, expr(elementType, resultAxes), source, indices,
+                     getAxes(resultAxes));
+    annotate(op);
+    return op.getResult();
   }
 
   Value constant(TypedAttr value) {
-    return ConstantOp::create(builder(), loc, expr(value.getType(), {}), value).getResult();
+    auto op = ConstantOp::create(builder(), loc, expr(value.getType(), {}), value);
+    annotate(op);
+    return op.getResult();
   }
 
   template <typename OpTy> Value unary(Type elementType, Value input) {
     SmallVector<std::string> axes = unionAxes({input});
-    return OpTy::create(builder(), loc, expr(elementType, axes), input).getResult();
+    auto op = OpTy::create(builder(), loc, expr(elementType, axes), input);
+    annotate(op);
+    return op.getResult();
   }
 
   template <typename OpTy> Value binary(Type elementType, Value lhs, Value rhs) {
     SmallVector<std::string> axes = unionAxes({lhs, rhs});
-    return OpTy::create(builder(), loc, expr(elementType, axes), lhs, rhs).getResult();
+    auto op = OpTy::create(builder(), loc, expr(elementType, axes), lhs, rhs);
+    annotate(op);
+    return op.getResult();
   }
 
-  template <typename BodyFn>
-  FailureOr<Value> mapReduce(ReduceKind kind, ArrayRef<std::string> reductionAxes, Type elementType,
-                             ArrayRef<std::string> resultAxes, BodyFn bodyFn) {
-    auto op = MapReduceOp::create(builder(), loc, expr(elementType, resultAxes), kind, Value(),
-                                  getAxes(reductionAxes));
-
-    Block *block = new Block();
-    op.getBody().push_back(block);
-
-    OpBuilder::InsertionGuard guard(builder());
-    builder().setInsertionPointToStart(block);
-    FailureOr<Value> payload = bodyFn();
-    if (failed(payload)) {
-      op.erase();
-      return failure();
-    }
-    YieldOp::create(builder(), loc, *payload);
+  Value reduce(ReduceKind kind, Value input, ArrayRef<std::string> reductionAxes,
+               Type elementType, ArrayRef<std::string> resultAxes) {
+    auto op = ReduceOp::create(builder(), loc, expr(elementType, resultAxes), kind, input, Value(),
+                               getAxes(reductionAxes));
+    annotate(op);
     return op.getResult();
   }
 
   void yield(Value value) { YieldOp::create(builder(), loc, value); }
 
 private:
+  void annotate(Operation *op) const {
+    if (!importGroup)
+      return;
+    op->setAttr("ta.import_group", IntegerAttr::get(IntegerType::get(context, 64),
+                                                    *importGroup));
+  }
+
   void addAxis(const std::string &name) {
     if (axisValues.contains(name))
       return;
@@ -191,6 +198,7 @@ private:
   llvm::StringMap<Value> axisValues;
   std::unique_ptr<OpBuilder> bodyBuilder;
   Value zero;
+  std::optional<int64_t> importGroup;
   unsigned nextAxis = 0;
 };
 
@@ -223,6 +231,19 @@ public:
   ScopeOp getScope() const { return ta->getScope(); }
 
 private:
+  class ImportGroupGuard {
+  public:
+    ImportGroupGuard(ScopedTABuilder &ta, std::optional<int64_t> group)
+        : ta(ta), oldGroup(ta.getImportGroup()) {
+      ta.setImportGroup(group);
+    }
+    ~ImportGroupGuard() { ta.setImportGroup(oldGroup); }
+
+  private:
+    ScopedTABuilder &ta;
+    std::optional<int64_t> oldGroup;
+  };
+
   TensorAxes makeResultAxes(RankedTensorType type) {
     TensorAxes axes;
     for (int64_t i = 0; i < type.getRank(); ++i)
@@ -284,6 +305,8 @@ private:
 
   FailureOr<Value> translateGeneric(linalg::GenericOp op, unsigned resultNumber,
                                     const TensorAxes &resultAxes) {
+    ImportGroupGuard guard(*ta, getImportGroup(op));
+
     linalg::LinalgOp linalgOp = cast<linalg::LinalgOp>(op.getOperation());
     SmallVector<AffineMap> maps = linalgOp.getIndexingMapsArray();
     SmallVector<utils::IteratorType> iterators = linalgOp.getIteratorTypesArray();
@@ -346,9 +369,19 @@ private:
     if (failed(combiner))
       return failure();
 
+    FailureOr<Value> payload = translateScalar(combiner->second, env);
+    if (failed(payload))
+      return failure();
+
     Type elementType = rankedTensor(op->getResult(resultNumber).getType()).getElementType();
-    return ta->mapReduce(combiner->first, reductionAxes, elementType, flatResultAxes,
-                         [&]() { return translateScalar(combiner->second, env); });
+    return ta->reduce(combiner->first, *payload, reductionAxes, elementType, flatResultAxes);
+  }
+
+  int64_t getImportGroup(linalg::GenericOp op) {
+    auto [it, inserted] = importGroups.try_emplace(op.getOperation(), nextImportGroup);
+    if (inserted)
+      ++nextImportGroup;
+    return it->second;
   }
 
   LogicalResult assignLoopAxesFromOutputMap(Operation *op, AffineMap map,
@@ -480,6 +513,8 @@ private:
   func::ReturnOp returnOp;
   OpBuilder insertionBuilder;
   std::unique_ptr<ScopedTABuilder> ta;
+  DenseMap<Operation *, int64_t> importGroups;
+  int64_t nextImportGroup = 0;
 };
 
 static SmallVector<Operation *> collectOldBodyOps(func::FuncOp func) {

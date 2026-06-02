@@ -262,20 +262,6 @@ static LogicalResult inferSameElementwiseReturnTypes(MLIRContext *context,
   return success();
 }
 
-static FailureOr<ExprType> inferMapReducePayload(std::optional<Location> location,
-                                                 RegionRange regions) {
-  if (regions.size() != 1 || regions[0]->empty())
-    return emitInferError(location, "expected one non-empty region for type inference");
-  Block &block = regions[0]->front();
-  auto yield = dyn_cast_or_null<YieldOp>(block.getTerminator());
-  if (!yield || yield.getValues().size() != 1)
-    return emitInferError(location, "expected region to yield one value for type inference");
-  auto payload = dyn_cast<ExprType>(yield.getValues().front().getType());
-  if (!payload)
-    return emitInferError(location, "expected region to yield a ta.expr value");
-  return payload;
-}
-
 static AxesAttr subtractAxes(MLIRContext *context, AxesAttr source, AxesAttr removed) {
   StringSet<> removedNames;
   for (Attribute attr : removed.getAxes()) {
@@ -487,19 +473,6 @@ LogicalResult ReduceOp::inferReturnTypes(MLIRContext *context, std::optional<Loc
   return success();
 }
 
-LogicalResult MapReduceOp::inferReturnTypes(MLIRContext *context,
-                                            std::optional<Location> location, Adaptor adaptor,
-                                            SmallVectorImpl<Type> &inferredReturnTypes) {
-  FailureOr<ExprType> payload = inferMapReducePayload(location, adaptor.getRegions());
-  if (failed(payload))
-    return failure();
-
-  inferredReturnTypes.push_back(
-      ExprType::get(context, payload->getElementType(),
-                    subtractAxes(context, payload->getAxes(), adaptor.getAxes())));
-  return success();
-}
-
 LogicalResult YieldOp::verify() {
   auto scopeOr = verifyInsideScope(getOperation());
   if (failed(scopeOr))
@@ -513,17 +486,6 @@ LogicalResult YieldOp::verify() {
     auto result = cast<ExprType>(map.getResult().getType());
     if (getValues().front().getType() != result.getElementType())
       return emitOpError("terminating ta.map must yield the map result element type");
-  } else if (auto reduce = dyn_cast<MapReduceOp>(parent)) {
-    if (getValues().size() != 1)
-      return emitOpError("terminating ta.map_reduce must yield exactly one value");
-
-    auto expr = dyn_cast<ExprType>(getValues().front().getType());
-    if (!expr)
-      return emitOpError("terminating ta.map_reduce must yield a ta.expr value");
-
-    auto result = cast<ExprType>(reduce.getResult().getType());
-    if (expr.getElementType() != result.getElementType())
-      return emitOpError("terminating ta.map_reduce must yield the reduce result element type");
   } else if (auto scope = dyn_cast<ScopeOp>(parent)) {
     if (getValues().size() != 1)
       return emitOpError("terminating ta.scope must yield exactly one value");
@@ -729,40 +691,12 @@ static LogicalResult verifyReducePayload(Operation *op, ScopeOp scope, AxesAttr 
 
 ExprType ReduceOp::getPayloadExprType() { return cast<ExprType>(getInput().getType()); }
 
-ExprType MapReduceOp::getPayloadExprType() {
-  auto yield = cast<YieldOp>(getBody().front().getTerminator());
-  return cast<ExprType>(yield.getValues().front().getType());
-}
-
 LogicalResult ReduceOp::verify() {
   auto scopeOr = verifyInsideScope(getOperation());
   if (failed(scopeOr))
     return failure();
 
   auto payload = cast<ExprType>(getInput().getType());
-  auto result = cast<ExprType>(getResult().getType());
-  return verifyReducePayload(getOperation(), *scopeOr, getAxes(), payload, result, getIdentity());
-}
-
-LogicalResult MapReduceOp::verify() {
-  auto scopeOr = verifyInsideScope(getOperation());
-  if (failed(scopeOr))
-    return failure();
-
-  Block &block = getBody().front();
-  if (block.getNumArguments() != 0)
-    return emitOpError("body must not have arguments");
-
-  auto yield = dyn_cast<YieldOp>(block.getTerminator());
-  if (!yield)
-    return emitOpError("body must terminate with ta.yield");
-  if (yield.getValues().size() != 1)
-    return emitOpError("body must yield exactly one value");
-
-  auto payload = dyn_cast<ExprType>(yield.getValues().front().getType());
-  if (!payload)
-    return emitOpError("body must yield a ta.expr value");
-
   auto result = cast<ExprType>(getResult().getType());
   return verifyReducePayload(getOperation(), *scopeOr, getAxes(), payload, result, getIdentity());
 }

@@ -190,48 +190,40 @@ for algebraic rewrites:
 
 ---
 
-### `ta.reduce` and `ta.map_reduce`
+### `ta.reduce`
 
-Mathematical reduction binders over one or more axes. `ta.reduce` reduces an
-existing expression value. `ta.map_reduce` computes a local payload expression
-region and reduces the yielded value.
+Mathematical reduction binder over one or more axes. `ta.reduce` reduces an
+existing expression value.
 
 ```mlir
-%dot = ta.map_reduce #ta.reduce_kind<add> {
-  %q = ta.at %Q[%b, %h, %i, %d]
-       : tensor<?x?x?x?xf32> -> !ta.expr<f32, [b,h,i,d]>
-  %k = ta.at %K[%b, %h, %j, %d]
-       : tensor<?x?x?x?xf32> -> !ta.expr<f32, [b,h,j,d]>
-  %qk = ta.mulf %q, %k
-        : (!ta.expr<f32, [b,h,i,d]>, !ta.expr<f32, [b,h,j,d]>)
-       -> !ta.expr<f32, [b,h,i,j,d]>
-  ta.yield %qk : !ta.expr<f32, [b,h,i,j,d]>
-} {axes = #ta.axes<d>} : !ta.expr<f32, [b,h,i,j]>
+%q = ta.at %Q[%b, %h, %i, %d]
+     : tensor<?x?x?x?xf32> -> !ta.expr<f32, [b,h,i,d]>
+%k = ta.at %K[%b, %h, %j, %d]
+     : tensor<?x?x?x?xf32> -> !ta.expr<f32, [b,h,j,d]>
+%qk = ta.mulf %q, %k
+      : (!ta.expr<f32, [b,h,i,d]>, !ta.expr<f32, [b,h,j,d]>)
+     -> !ta.expr<f32, [b,h,i,j,d]>
+%dot = ta.reduce #ta.reduce_kind<add> %qk {axes = #ta.axes<d>}
+     : !ta.expr<f32, [b,h,i,j,d]> -> !ta.expr<f32, [b,h,i,j]>
 ```
 
-These ops are not loops. They are mathematical expressions.
+This op is not a loop. It is a mathematical expression.
 
 The reducer kind is a structured enum attribute, not an arbitrary string.
 Built-in reducers include `add`, `mul`, `max`, and `min`.
 
-`ta.map_reduce` preserves a single structured contraction-like unit.
-`ta.reduce` is equivalent when the payload already exists:
+The importer may attach `ta.import_group` attributes to expression ops to record
+that a payload and reduction came from the same source `linalg.generic`. This is
+provenance metadata, not a semantic boundary.
 
-```mlir
-%qk = ta.mulf %q, %k
-  : (!ta.expr<f32, [b,h,i,d]>, !ta.expr<f32, [b,h,j,d]>)
- -> !ta.expr<f32, [b,h,i,j,d]>
-%dot = ta.reduce #ta.reduce_kind<add> %qk {axes = #ta.axes<d>}
-  : !ta.expr<f32, [b,h,i,j,d]> -> !ta.expr<f32, [b,h,i,j]>
-```
-
-Both ops represent the same mathematical binder and share the same verifier
-rule through a reduce-like interface. The implemented reducer metadata is the
-structured reducer kind. `ta.map_reduce` maps more directly to and from one
-`linalg.generic` reduction. `ta.reduce` is a more normalized expression DAG node
-and is convenient when the payload is shared or already exists as a value. A
-`ta.map_reduce` body that only yields an existing value is expected to
-canonicalize to `ta.reduce`.
+`ta.reduce` intentionally has no payload body. Rewrites over `ta` are expected
+to be expressible in MLIR pattern languages such as PDLL or DRR, which are much
+better at matching and creating ordinary SSA op DAGs than constructing region
+bodies. A contraction therefore appears as elementwise expression ops followed
+by a bodyless `ta.reduce`. This keeps the mathematical payload visible to local
+pattern matching, avoids custom region-building helpers for common rewrites, and
+uses `ta.import_group` when we still need to remember that several ops came from
+one source operation.
 
 Future reduction metadata will likely include:
 
@@ -307,7 +299,6 @@ axes(constant) = {}
 axes(ta.at T[index_exprs...]) = axes used by index expressions
 axes(ta.map f(x1,...,xn)) = union_i axes(xi)
 axes(ta.elementwise_op(x1,...,xn)) = union_i axes(xi)
-axes(ta.map_reduce over R { yield x }) = axes(x) - R
 axes(ta.reduce over R x) = axes(x) - R
 axes(ta.select c x y) = axes(c) ∪ axes(x) ∪ axes(y)
 ```
@@ -357,10 +348,12 @@ Program shape:
 %O = ta.scope axes(%b "b" : index, %h "h" : index,
                    %i "i" : index, %j "j" : index,
                    %d "d" : index, %e "e" : index) {
-  %dot = ta.map_reduce #ta.reduce_kind<add> {
-    ...
-    ta.yield %qk : !ta.expr<f32, [b,h,i,j,d]>
-  } {axes = #ta.axes<d>} : !ta.expr<f32, [b,h,i,j]>
+  ...
+  %qk = ta.mulf %q, %k
+       : (!ta.expr<f32, [b,h,i,d]>, !ta.expr<f32, [b,h,j,d]>)
+      -> !ta.expr<f32, [b,h,i,j,d]>
+  %dot = ta.reduce #ta.reduce_kind<add> %qk {axes = #ta.axes<d>}
+       : !ta.expr<f32, [b,h,i,j,d]> -> !ta.expr<f32, [b,h,i,j]>
 
   %scale_expr = ta.constant 1.250000e-01 : f32 : !ta.expr<f32, []>
   %s = ta.mulf %scale_expr, %dot
@@ -379,10 +372,12 @@ Program shape:
   %l = ta.reduce #ta.reduce_kind<add> %p {axes = #ta.axes<j>}
        : !ta.expr<f32, [b,h,i,j]> -> !ta.expr<f32, [b,h,i]>
 
-  %num = ta.map_reduce #ta.reduce_kind<add> {
-    ...
-    ta.yield %pv : !ta.expr<f32, [b,h,i,j,e]>
-  } {axes = #ta.axes<j>} : !ta.expr<f32, [b,h,i,e]>
+  ...
+  %pv = ta.mulf %p, %v
+       : (!ta.expr<f32, [b,h,i,j]>, !ta.expr<f32, [b,h,j,e]>)
+      -> !ta.expr<f32, [b,h,i,j,e]>
+  %num = ta.reduce #ta.reduce_kind<add> %pv {axes = #ta.axes<j>}
+       : !ta.expr<f32, [b,h,i,j,e]> -> !ta.expr<f32, [b,h,i,e]>
 
   %o = ta.divf %num, %l
        : (!ta.expr<f32, [b,h,i,e]>, !ta.expr<f32, [b,h,i]>)
@@ -590,7 +585,9 @@ Recognized scalar ops currently include floating-point constants,
 `arith.extf`, `arith.truncf`, `arith.addf`, `arith.subf`, `arith.mulf`,
 `arith.divf`, `arith.maximumf`, `arith.minimumf`, and `math.exp`. Recognized
 reduction combiners are add, multiply, maximum, and minimum. Reduction bodies
-with those accumulator forms are imported as `ta.map_reduce`.
+with those accumulator forms are imported as elementwise payload ops followed by
+`ta.reduce`. The importer annotates ops created from each source
+`linalg.generic` with `ta.import_group = N : i64`.
 
 ### Unsupported Maps
 

@@ -7,7 +7,7 @@ def TAExchangeDivAndMatmulOp
          [FunctionalStyleTransformOpTrait, TransformOpInterface, TransformEachOpTrait,
           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
           ReportTrackingListenerFailuresOpTrait]> {
-  let summary = "Exchange an invariant division with a ta.map_reduce matmul";
+  let summary = "Exchange an invariant division with a ta.reduce matmul";
 
   let description = [{
     Rewrites an add-reduction whose payload multiplies one operand by a
@@ -17,10 +17,10 @@ def TAExchangeDivAndMatmulOp
       sum((num / den) * rhs)  ->  sum(num * rhs) / den
     ```
 
-    The target must be a `ta.map_reduce <add>` whose yielded value is a
+    The target must be a `ta.reduce <add>` whose input is produced by a
     `ta.mulf`. The selected multiply operand must be produced by `ta.divf`.
     The divisor expression must not depend on any axis reduced by the
-    `ta.map_reduce`.
+    `ta.reduce`.
 
     `operand_number` selects which multiply operand is expected to be the
     division. It defaults to 0, matching the usual `(softmax_probs @ V)` shape.
@@ -38,7 +38,7 @@ def TAExchangeDivAndMatmulOp
   let extraClassDeclaration = [{
     ::mlir::DiagnosedSilenceableFailure applyToOne(
         ::mlir::transform::TransformRewriter &rewriter,
-        ::ta::MapReduceOp target,
+        ::ta::ReduceOp target,
         ::mlir::transform::ApplyToEachResultList &results,
         ::mlir::transform::TransformState &state);
   }];
