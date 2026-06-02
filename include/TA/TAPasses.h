@@ -3,7 +3,7 @@
 
 namespace ta {
 
-void registerTAPasses();
+void registerLinalgToTAPass();
 void registerTAToLinalgPass();
 
 } // namespace ta

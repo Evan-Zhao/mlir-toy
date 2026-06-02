@@ -856,13 +856,16 @@ extern "C" LLVM_ATTRIBUTE_WEAK mlir::DialectPluginLibraryInfo mlirGetDialectPlug
           [](mlir::DialectRegistry *registry) {
             registry->insert<ta::TADialect>();
             ta::registerTATransformExtension(*registry);
-            ta::registerTAPasses();
+            ta::registerLinalgToTAPass();
+            ta::registerTAToLinalgPass();
           }};
 }
 
 extern "C" LLVM_ATTRIBUTE_WEAK mlir::PassPluginLibraryInfo mlirGetPassPluginInfo() {
-  return {MLIR_PLUGIN_API_VERSION, "TAPassPlugin", LLVM_VERSION_STRING,
-          []() { ta::registerTAPasses(); }};
+  return {MLIR_PLUGIN_API_VERSION, "TAPassPlugin", LLVM_VERSION_STRING, []() {
+            ta::registerLinalgToTAPass();
+            ta::registerTAToLinalgPass();
+          }};
 }
 
 #include "mlir/IR/DialectImplementation.h"

@@ -885,13 +885,6 @@ struct ImportLinalgToTAPass
 
 } // namespace
 
-void registerTAPasses() {
-  static bool registered = false;
-  if (registered)
-    return;
-  registered = true;
-  PassRegistration<ImportLinalgToTAPass>();
-  registerTAToLinalgPass();
-}
+void registerLinalgToTAPass() { PassRegistration<ImportLinalgToTAPass>(); }
 
 } // namespace ta
