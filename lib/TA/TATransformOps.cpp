@@ -9,7 +9,6 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringExtras.h"
-#include "llvm/ADT/StringMap.h"
 
 using namespace mlir;
 
@@ -87,40 +86,15 @@ SmallVector<std::string> axisAttrNames(ta::AxesAttr axes) {
   return names;
 }
 
-bool sameAxisSet(ArrayRef<std::string> lhs, ArrayRef<std::string> rhs) {
-  llvm::SmallSetVector<StringRef, 8> lhsSet;
-  llvm::SmallSetVector<StringRef, 8> rhsSet;
-  for (StringRef axis : lhs)
-    lhsSet.insert(axis);
-  for (StringRef axis : rhs)
-    rhsSet.insert(axis);
-  if (lhsSet.size() != rhsSet.size())
-    return false;
-  for (StringRef axis : lhsSet) {
-    if (!rhsSet.contains(axis))
-      return false;
-  }
-  return true;
-}
-
-bool matchPatternAxes(ArrayRef<std::string> patternAxes, ArrayRef<std::string> actualAxes,
-                      llvm::StringMap<std::string> &axisMapping,
-                      SmallVectorImpl<std::string> &usedActualAxes) {
+bool sameAxisEqualityPattern(ArrayRef<std::string> patternAxes,
+                             ArrayRef<std::string> actualAxes) {
   if (patternAxes.size() != actualAxes.size())
     return false;
 
-  for (auto [patternAxis, actualAxis] : llvm::zip_equal(patternAxes, actualAxes)) {
-    auto mapped = axisMapping.find(patternAxis);
-    if (mapped != axisMapping.end())
-      return mapped->second == actualAxis;
-
-    if (llvm::is_contained(usedActualAxes, actualAxis))
-      return false;
-
-    axisMapping[patternAxis] = actualAxis;
-    usedActualAxes.push_back(actualAxis);
-  }
-
+  for (size_t i = 0, e = patternAxes.size(); i < e; ++i)
+    for (size_t j = i + 1; j < e; ++j)
+      if ((patternAxes[i] == patternAxes[j]) != (actualAxes[i] == actualAxes[j]))
+        return false;
   return true;
 }
 
@@ -138,19 +112,6 @@ SmallVector<std::string> reductionAxesForEquation(const ParsedEinsum &equation) 
   for (StringRef axis : reductionAxes)
     axes.push_back(axis.str());
   return axes;
-}
-
-bool matchReductionAxes(ArrayRef<std::string> patternReductionAxes,
-                        ArrayRef<std::string> actualReductionAxes,
-                        const llvm::StringMap<std::string> &axisMapping) {
-  SmallVector<std::string> mappedReductionAxes;
-  for (StringRef patternAxis : patternReductionAxes) {
-    auto mapped = axisMapping.find(patternAxis);
-    if (mapped == axisMapping.end())
-      return false;
-    mappedReductionAxes.push_back(mapped->second);
-  }
-  return sameAxisSet(mappedReductionAxes, actualReductionAxes);
 }
 
 LogicalResult rewriteGreedily(TransformRewriter &rewriter, RewritePatternSet patterns,
@@ -212,20 +173,20 @@ DiagnosedSilenceableFailure TAMatchEinsumOp::matchOperation(Operation *target,
   auto rhsType = cast<ta::ExprType>(mul.getRhs().getType());
   auto resultType = cast<ta::ExprType>(reduce.getResult().getType());
 
-  llvm::StringMap<std::string> axisMapping;
-  SmallVector<std::string> usedActualAxes;
-  if (!matchPatternAxes((*parsed).inputs[0], exprAxisNames(lhsType), axisMapping,
-                        usedActualAxes))
-    return emitSilenceableFailure(transform, "lhs axes do not match einsum structure");
-  if (!matchPatternAxes((*parsed).inputs[1], exprAxisNames(rhsType), axisMapping,
-                        usedActualAxes))
-    return emitSilenceableFailure(transform, "rhs axes do not match einsum structure");
-  if (!matchPatternAxes((*parsed).result, exprAxisNames(resultType), axisMapping,
-                        usedActualAxes))
-    return emitSilenceableFailure(transform, "result axes do not match einsum structure");
-  if (!matchReductionAxes(reductionAxesForEquation(*parsed), axisAttrNames(reduce.getAxes()),
-                          axisMapping))
-    return emitSilenceableFailure(transform, "reduction axes do not match einsum equation");
+  SmallVector<std::string> patternAxes;
+  patternAxes.append((*parsed).inputs[0]);
+  patternAxes.append((*parsed).inputs[1]);
+  patternAxes.append((*parsed).result);
+  patternAxes.append(reductionAxesForEquation(*parsed));
+
+  SmallVector<std::string> actualAxes;
+  actualAxes.append(exprAxisNames(lhsType));
+  actualAxes.append(exprAxisNames(rhsType));
+  actualAxes.append(exprAxisNames(resultType));
+  actualAxes.append(axisAttrNames(reduce.getAxes()));
+
+  if (!sameAxisEqualityPattern(patternAxes, actualAxes))
+    return emitSilenceableFailure(transform, "axes do not match einsum structure");
 
   results.set(getOperation()->getResult(0), {target});
   return DiagnosedSilenceableFailure::success();

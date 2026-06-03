@@ -32,10 +32,9 @@ module attributes {transform.with_named_sequence} {
       %y = ta.at %rhs[%k, %j] {axes = #ta.axes<k, j>}
           : tensor<8x16xf32> -> !ta.expr<f32, [k, j]>
       %xy = ta.mulf %x, %y
-          : (!ta.expr<f32, [i, k]>, !ta.expr<f32, [k, j]>)
-         -> !ta.expr<f32, [i, j, k]>
+          : (!ta.expr<f32, [i, k]>, !ta.expr<f32, [k, j]>) -> !ta.expr<f32, [i, k, j]>
       %dot = ta.reduce #ta.reduce_kind<add> %xy {axes = #ta.axes<k>}
-          : !ta.expr<f32, [i, j, k]> -> !ta.expr<f32, [i, j]>
+          : !ta.expr<f32, [i, k, j]> -> !ta.expr<f32, [i, j]>
       ta.yield %dot : !ta.expr<f32, [i, j]>
     } : () -> tensor<4x16xf32>
     return %out : tensor<4x16xf32>

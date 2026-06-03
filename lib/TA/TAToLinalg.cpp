@@ -2,6 +2,7 @@
 #include "TA/TAOps.h"
 #include "TA/TAPasses.h"
 #include "TA/TATypes.h"
+#include "TA/TAUtils.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -209,24 +210,23 @@ private:
 
   FailureOr<AffineMap> mapForAt(AtOp at, ArrayRef<StringRef> loopAxes) {
     SmallVector<AffineExpr> results;
-    for (Value index : at.getIndices()) {
-      if (auto arg = dyn_cast<BlockArgument>(index)) {
-        unsigned argNumber = arg.getArgNumber();
-        if (arg.getOwner() != &scope.getBody().front() ||
-            argNumber >= scope.getAxes().getAxes().size())
-          return at.emitOpError("lowering only supports scope-axis indices");
-        StringRef axis = cast<AxisAttr>(scope.getAxes().getAxes()[argNumber]).getName().getValue();
-        FailureOr<unsigned> position = findAxis(at.getOperation(), loopAxes, axis);
+    FailureOr<SmallVector<ScopeIndexOperand>> indices =
+        decodeScopeIndexOperands(at.getOperation(), scope, at.getIndices(),
+                                 "lowering only supports scope-axis or constant indices");
+    if (failed(indices))
+      return failure();
+
+    for (const ScopeIndexOperand &index : *indices) {
+      if (index.isAxis()) {
+        FailureOr<unsigned> position =
+            findAxis(at.getOperation(), loopAxes, index.axis.getName().getValue());
         if (failed(position))
           return failure();
         results.push_back(builder.getAffineDimExpr(*position));
         continue;
       }
 
-      auto constant = index.getDefiningOp<arith::ConstantIndexOp>();
-      if (!constant)
-        return at.emitOpError("lowering only supports scope-axis or constant indices");
-      results.push_back(builder.getAffineConstantExpr(constant.value()));
+      results.push_back(builder.getAffineConstantExpr(*index.constant));
     }
     return AffineMap::get(loopAxes.size(), 0, results, context);
   }
@@ -290,12 +290,14 @@ private:
 
     if (reduce) {
       payloadValue = reduce.getInput();
-      auto payloadExpr = cast<ExprType>(payloadValue.getType());
-      loopAxes = axisNames(payloadExpr);
       SmallVector<StringRef> reductionAxes = axisNames(reduce.getAxes());
-      for (StringRef axis : loopAxes) {
-        iterators.push_back(containsAxis(reductionAxes, axis) ? utils::IteratorType::reduction
-                                                              : utils::IteratorType::parallel);
+      loopAxes = axisNames(resultExpr);
+      iterators.assign(loopAxes.size(), utils::IteratorType::parallel);
+      for (StringRef axis : reductionAxes) {
+        if (containsAxis(loopAxes, axis))
+          continue;
+        loopAxes.push_back(axis);
+        iterators.push_back(utils::IteratorType::reduction);
       }
       if (failed(collectInputs(payloadValue, root, loopAxes)))
         return failure();

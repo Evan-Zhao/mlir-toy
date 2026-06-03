@@ -2,7 +2,7 @@
 
 func.func @at_outside_scope(%tensor: tensor<16xf32>, %i: index) {
   // expected-error @+1 {{'ta.at' op must be nested inside a ta.scope}}
-  %0 = ta.at %tensor[%i] {axes = #ta.axes<i>}
+  %0 = ta.at %tensor[%i]
       : tensor<16xf32> -> !ta.expr<f32, [i]>
   return
 }
@@ -11,7 +11,7 @@ func.func @axis_outside_scope(%tensor: tensor<16x32xf32>, %j: index)
     -> tensor<16x32xf32> {
   // expected-error @+1 {{'ta.scope' op yielded expression uses axis 'j' outside enclosing ta.scope axes}}
   %0 = ta.scope axes(%i "i" extent 16) {
-    %1 = ta.at %tensor[%i, %j] {axes = #ta.axes<i, j>}
+    %1 = ta.at %tensor[%i, %j]
         : tensor<16x32xf32> -> !ta.expr<f32, [i, j]>
     ta.yield %1 : !ta.expr<f32, [i, j]>
   } : () -> tensor<16x32xf32>
@@ -21,11 +21,11 @@ func.func @axis_outside_scope(%tensor: tensor<16x32xf32>, %j: index)
 func.func @bad_elementwise_result_axes(%rows: tensor<16xf32>, %cols: tensor<32xf32>)
     -> tensor<16x32xf32> {
   %0 = ta.scope axes(%row "i" extent 16, %col "j" extent 32) {
-    %x = ta.at %rows[%row] {axes = #ta.axes<i>}
+    %x = ta.at %rows[%row]
         : tensor<16xf32> -> !ta.expr<f32, [i]>
-    %y = ta.at %cols[%col] {axes = #ta.axes<j>}
+    %y = ta.at %cols[%col]
         : tensor<32xf32> -> !ta.expr<f32, [j]>
-    // expected-error @+1 {{'ta.addf' op result axes must be the union of operand axes in enclosing ta.scope order; expected #ta.axes<i, j>}}
+    // expected-error @+1 {{'ta.addf' op result axes must be the ordered union of operand axes; expected #ta.axes<i, j>}}
     %bad = ta.addf %x, %y
         : (!ta.expr<f32, [i]>, !ta.expr<f32, [j]>)
        -> !ta.expr<f32, [i]>
@@ -34,12 +34,34 @@ func.func @bad_elementwise_result_axes(%rows: tensor<16xf32>, %cols: tensor<32xf
   return %0 : tensor<16x32xf32>
 }
 
+func.func @bad_at_result_axes(%tensor: tensor<16x32xf32>)
+    -> tensor<32x16xf32> {
+  %0 = ta.scope axes(%row "i" extent 16, %col "j" extent 32) {
+    // expected-error @+1 {{'ta.at' op result axes must match scope-axis indices; expected #ta.axes<i, j>}}
+    %x = ta.at %tensor[%row, %col]
+        : tensor<16x32xf32> -> !ta.expr<f32, [j, i]>
+    ta.yield %x : !ta.expr<f32, [j, i]>
+  } : () -> tensor<32x16xf32>
+  return %0 : tensor<32x16xf32>
+}
+
+func.func @bad_at_non_scope_index(%tensor: tensor<16xf32>, %j: index)
+    -> tensor<f32> {
+  %0 = ta.scope axes(%coord "i" extent 16) {
+    // expected-error @+1 {{'ta.at' op index operands must be ta.scope axes or constant indices}}
+    %x = ta.at %tensor[%j]
+        : tensor<16xf32> -> !ta.expr<f32, []>
+    ta.yield %x : !ta.expr<f32, []>
+  } : () -> tensor<f32>
+  return %0 : tensor<f32>
+}
+
 func.func @bad_map_body_type(%rows: tensor<16xf32>, %cols: tensor<32xf32>)
     -> tensor<16x32xf32> {
   %0 = ta.scope axes(%row "i" extent 16, %col "j" extent 32) {
-    %x = ta.at %rows[%row] {axes = #ta.axes<i>}
+    %x = ta.at %rows[%row]
         : tensor<16xf32> -> !ta.expr<f32, [i]>
-    %y = ta.at %cols[%col] {axes = #ta.axes<j>}
+    %y = ta.at %cols[%col]
         : tensor<32xf32> -> !ta.expr<f32, [j]>
     // expected-error @+1 {{'ta.map' op body yield type must match result expression element type}}
     %bad = ta.map %x, %y {
@@ -56,7 +78,7 @@ func.func @bad_map_body_type(%rows: tensor<16xf32>, %cols: tensor<32xf32>)
 func.func @bad_reduce_result_axes(%tensor: tensor<16x32xf32>)
     -> tensor<16x32xf32> {
   %0 = ta.scope axes(%row "i" extent 16, %col "j" extent 32) {
-    %x = ta.at %tensor[%row, %col] {axes = #ta.axes<i, j>}
+    %x = ta.at %tensor[%row, %col]
         : tensor<16x32xf32> -> !ta.expr<f32, [i, j]>
     // expected-error @+1 {{'ta.reduce' op result axes must be payload axes minus reduction axes; expected #ta.axes<i>}}
     %bad = ta.reduce #ta.reduce_kind<add> %x {axes = #ta.axes<j>}
@@ -68,7 +90,7 @@ func.func @bad_reduce_result_axes(%tensor: tensor<16x32xf32>)
 
 func.func @bad_extf_width(%tensor: tensor<16xf32>) -> tensor<16xf16> {
   %0 = ta.scope axes(%coord "i" extent 16) {
-    %x = ta.at %tensor[%coord] {axes = #ta.axes<i>}
+    %x = ta.at %tensor[%coord]
         : tensor<16xf32> -> !ta.expr<f32, [i]>
     // expected-error @+1 {{'ta.extf' op result element type must be wider than operand element type}}
     %bad = ta.extf %x

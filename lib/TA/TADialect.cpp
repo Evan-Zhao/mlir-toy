@@ -4,6 +4,7 @@
 #include "TA/TAPasses.h"
 #include "TA/TATransformOps.h"
 #include "TA/TATypes.h"
+#include "TA/TAUtils.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Tools/Plugins/DialectPlugin.h"
@@ -176,21 +177,17 @@ static bool sameAxes(AxesAttr lhs, AxesAttr rhs) {
   return true;
 }
 
-static AxesAttr inferUnionAxes(MLIRContext *context, AxesAttr scopeAxes, ValueRange operands) {
-  llvm::StringSet<> used;
+static AxesAttr inferOrderedUnionAxes(MLIRContext *context, ValueRange operands) {
+  llvm::StringSet<> seen;
+  SmallVector<Attribute> inferred;
   for (Value operand : operands) {
     auto expr = cast<ExprType>(operand.getType());
     for (Attribute attr : expr.getAxes().getAxes()) {
       AxisAttr axis = cast<AxisAttr>(attr);
-      used.insert(axis.getName().getValue());
-    }
-  }
-
-  SmallVector<Attribute> inferred;
-  for (Attribute attr : scopeAxes.getAxes()) {
-    AxisAttr axis = cast<AxisAttr>(attr);
-    if (used.contains(axis.getName().getValue()))
+      if (!seen.insert(axis.getName().getValue()).second)
+        continue;
       inferred.push_back(attr);
+    }
   }
 
   return AxesAttr::get(context, ArrayAttr::get(context, inferred));
@@ -202,37 +199,19 @@ static LogicalResult emitInferError(std::optional<Location> location, StringRef 
   return failure();
 }
 
-static ScopeOp findScope(Value value) {
-  if (Operation *definingOp = value.getDefiningOp())
-    return definingOp->getParentOfType<ScopeOp>();
-
-  Block *block = cast<BlockArgument>(value).getOwner();
-  Operation *parent = block->getParentOp();
-  if (!parent)
-    return {};
-  if (auto scope = dyn_cast<ScopeOp>(parent))
-    return scope;
-  return parent->getParentOfType<ScopeOp>();
-}
-
 static FailureOr<AxesAttr> inferUnionAxesFromOperands(MLIRContext *context,
                                                       std::optional<Location> location,
                                                       ValueRange operands) {
   if (operands.empty())
     return emitInferError(location, "cannot infer expression axes without operands");
 
-  ScopeOp scope;
   for (Value operand : operands) {
     auto expr = dyn_cast<ExprType>(operand.getType());
     if (!expr)
       return emitInferError(location, "expected ta.expr operands for type inference");
-    if (!scope)
-      scope = findScope(operand);
   }
-  if (!scope)
-    return emitInferError(location, "expected operands to be nested in ta.scope");
 
-  return inferUnionAxes(context, scope.getAxes(), operands);
+  return inferOrderedUnionAxes(context, operands);
 }
 
 static LogicalResult inferSameElementwiseReturnTypes(MLIRContext *context,
@@ -288,11 +267,10 @@ static LogicalResult verifyElementwiseAxes(Operation *op, ScopeOp scope) {
     return failure();
 
   auto result = cast<ExprType>(op->getResult(0).getType());
-  AxesAttr expected = inferUnionAxes(op->getContext(), scope.getAxes(), op->getOperands());
+  AxesAttr expected = inferOrderedUnionAxes(op->getContext(), op->getOperands());
   if (!sameAxes(result.getAxes(), expected))
     return op->emitOpError()
-           << "result axes must be the union of operand axes in enclosing ta.scope order; "
-           << "expected " << expected;
+           << "result axes must be the ordered union of operand axes; expected " << expected;
 
   return success();
 }
@@ -511,12 +489,18 @@ LogicalResult AtOp::verify() {
     return failure();
 
   ScopeOp scope = *scopeOr;
-  if (auto axes = getAxes()) {
-    if (failed(verifyAxesSubset(getOperation(), scope.getAxes(), *axes, "access")))
-      return failure();
-  }
+  auto result = cast<ExprType>(getResult().getType());
+  if (failed(verifyExprAxes(getOperation(), scope, result, "result")))
+    return failure();
 
-  return verifyExprAxes(getOperation(), scope, getResult().getType(), "result");
+  FailureOr<AxesAttr> expected =
+      inferAxesFromScopeIndexOperands(getOperation(), scope, getIndices());
+  if (failed(expected))
+    return failure();
+  if (!sameAxes(result.getAxes(), *expected))
+    return emitOpError() << "result axes must match scope-axis indices; expected " << *expected;
+
+  return success();
 }
 
 LogicalResult MapOp::verify() {

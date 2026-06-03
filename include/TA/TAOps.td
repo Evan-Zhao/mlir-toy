@@ -56,8 +56,7 @@ def TA_YieldOp : TA_Op<"yield", [Pure, ReturnLike, Terminator]> {
 def TA_AtOp : TA_Op<"at", [Pure]> {
   let summary = "observe a tensor at indexed coordinates";
   let arguments = (ins AnyType:$source,
-                       Variadic<Index>:$indices,
-                       OptionalAttr<TA_AxesAttr>:$axes);
+                       Variadic<Index>:$indices);
   let results = (outs TA_ExprType:$result);
 
   let assemblyFormat = "$source `[` $indices `]` attr-dict `:` type($source) `->` type($result)";

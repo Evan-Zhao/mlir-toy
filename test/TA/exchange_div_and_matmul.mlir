@@ -16,16 +16,16 @@ module attributes {transform.with_named_sequence} {
     // CHECK: %[[OUT:.+]] = ta.scope
     %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3, %d "d" extent 4) {
       // CHECK: %[[NUM:.+]] = ta.at %{{.+}}[%i, %j]
-      %num = ta.at %scores[%i, %j] {axes = #ta.axes<i, j>}
+      %num = ta.at %scores[%i, %j]
           : tensor<2x3xf32> -> !ta.expr<f32, [i, j]>
       // CHECK: %[[DEN:.+]] = ta.at %{{.+}}[%i]
-      %den_expr = ta.at %den[%i] {axes = #ta.axes<i>}
+      %den_expr = ta.at %den[%i]
           : tensor<2xf32> -> !ta.expr<f32, [i]>
       %prob = ta.divf %num, %den_expr {ta.import_group = 9 : i64}
           : (!ta.expr<f32, [i, j]>, !ta.expr<f32, [i]>)
          -> !ta.expr<f32, [i, j]>
       // CHECK: %[[V:.+]] = ta.at %{{.+}}[%j, %d]
-      %v = ta.at %values[%j, %d] {axes = #ta.axes<j, d>}
+      %v = ta.at %values[%j, %d]
           : tensor<3x4xf32> -> !ta.expr<f32, [j, d]>
       // CHECK: %[[PROD:.+]] = ta.mulf %[[NUM]], %[[V]]
       // CHECK: %[[RED:.+]] = ta.reduce <add> %[[PROD]]
@@ -49,16 +49,16 @@ module attributes {transform.with_named_sequence} {
                                                              %values: tensor<3x4xf32>) -> tensor<2x4xf32> {
     %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3, %d "d" extent 4) {
       // CHECK: %[[NUM:.+]] = ta.at %{{.+}}[%i, %j]
-      %num = ta.at %scores[%i, %j] {axes = #ta.axes<i, j>}
+      %num = ta.at %scores[%i, %j]
           : tensor<2x3xf32> -> !ta.expr<f32, [i, j]>
       // CHECK: %[[DEN:.+]] = ta.at %{{.+}}[%j]
-      %den_expr = ta.at %den[%j] {axes = #ta.axes<j>}
+      %den_expr = ta.at %den[%j]
           : tensor<3xf32> -> !ta.expr<f32, [j]>
       // CHECK: %[[PROB:.+]] = ta.divf %[[NUM]], %[[DEN]]
       %prob = ta.divf %num, %den_expr {ta.import_group = 9 : i64}
           : (!ta.expr<f32, [i, j]>, !ta.expr<f32, [j]>)
          -> !ta.expr<f32, [i, j]>
-      %v = ta.at %values[%j, %d] {axes = #ta.axes<j, d>}
+      %v = ta.at %values[%j, %d]
           : tensor<3x4xf32> -> !ta.expr<f32, [j, d]>
       // CHECK: %[[PROD:.+]] = ta.mulf %[[PROB]], %{{.+}}
       %prod = ta.mulf %prob, %v {ta.import_group = 11 : i64}
