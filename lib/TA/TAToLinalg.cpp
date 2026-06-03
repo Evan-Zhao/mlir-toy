@@ -124,11 +124,14 @@ private:
   }
 
   bool shouldMaterialize(Operation *op) {
+    if (isa<AtOp>(op))
+      return false;
+
     if (isa<ConstantOp>(op))
       return isYielded(op->getResult(0));
 
     if (!getImportGroup(op))
-      return !isa<AtOp>(op);
+      return true;
 
     Value result = op->getResult(0);
     if (isYielded(result))
@@ -219,10 +222,27 @@ private:
     for (const ScopeIndexOperand &index : *indices) {
       if (index.isAxis()) {
         FailureOr<unsigned> position =
-            findAxis(at.getOperation(), loopAxes, index.axis.getName().getValue());
+            findAxis(at.getOperation(), loopAxes, index.axes.front().getName().getValue());
         if (failed(position))
           return failure();
         results.push_back(builder.getAffineDimExpr(*position));
+        continue;
+      }
+
+      if (index.isLinearized()) {
+        AffineExpr linearized = builder.getAffineConstantExpr(0);
+        for (auto [axisIndex, axis] : llvm::enumerate(index.axes)) {
+          FailureOr<unsigned> position =
+              findAxis(at.getOperation(), loopAxes, axis.getName().getValue());
+          if (failed(position))
+            return failure();
+
+          int64_t stride = 1;
+          for (int64_t basis : ArrayRef(index.staticBasis).drop_front(axisIndex))
+            stride *= basis;
+          linearized = linearized + builder.getAffineDimExpr(*position) * stride;
+        }
+        results.push_back(linearized);
         continue;
       }
 

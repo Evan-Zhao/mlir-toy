@@ -15,10 +15,12 @@
 namespace ta {
 
 struct ScopeIndexOperand {
-  AxisAttr axis;
+  llvm::SmallVector<AxisAttr, 2> axes;
+  llvm::SmallVector<int64_t, 2> staticBasis;
   std::optional<int64_t> constant;
 
-  bool isAxis() const { return static_cast<bool>(axis); }
+  bool isAxis() const { return axes.size() == 1 && staticBasis.empty(); }
+  bool isLinearized() const { return !axes.empty() && !staticBasis.empty(); }
   bool isConstant() const { return constant.has_value(); }
 };
 

@@ -3,6 +3,7 @@
 #include "TA/TAPasses.h"
 #include "TA/TATypes.h"
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -120,10 +121,24 @@ public:
         indices.push_back(indexZero());
         continue;
       }
-      if (pack.size() != 1)
-        return emitError(loc) << "cannot index one tensor dimension with multiple "
-                              << "logical axes";
-      indices.push_back(axis(pack.front()));
+      if (pack.size() == 1) {
+        indices.push_back(axis(pack.front()));
+        continue;
+      }
+
+      SmallVector<Value> multiIndex;
+      SmallVector<int64_t> basis;
+      for (StringRef axisName : pack) {
+        int64_t extent = axisExtent(axisName);
+        if (extent == ShapedType::kDynamic)
+          return emitError(loc) << "cannot linearize multiple dynamic logical axes into "
+                                << "one tensor dimension";
+        multiIndex.push_back(axis(axisName));
+        basis.push_back(extent);
+      }
+      indices.push_back(
+          affine::AffineLinearizeIndexOp::create(builder(), loc, multiIndex, basis,
+                                                 /*disjoint=*/true));
     }
 
     SmallVector<std::string> resultAxes = flattenAxes(dimAxes);
@@ -180,6 +195,14 @@ private:
     axisValues.try_emplace(axisNames.back(), arg);
     scope.setAxesAttr(getAxes(axisNames));
     scope.setStaticExtentsAttr(DenseI64ArrayAttr::get(context, staticExtents));
+  }
+
+  int64_t axisExtent(StringRef name) const {
+    for (auto [axisName, extent] : llvm::zip_equal(axisNames, staticExtents)) {
+      if (axisName == name)
+        return extent;
+    }
+    return ShapedType::kDynamic;
   }
 
   Value indexZero() {
@@ -850,8 +873,8 @@ struct ImportLinalgToTAPass
   }
 
   void getDependentDialects(DialectRegistry &registry) const final {
-    registry.insert<TADialect, arith::ArithDialect, func::FuncDialect, linalg::LinalgDialect,
-                    math::MathDialect, tensor::TensorDialect>();
+    registry.insert<TADialect, affine::AffineDialect, arith::ArithDialect, func::FuncDialect,
+                    linalg::LinalgDialect, math::MathDialect, tensor::TensorDialect>();
   }
 
   void runOnOperation() final {

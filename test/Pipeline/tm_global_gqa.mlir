@@ -22,13 +22,13 @@ module attributes {transform.with_named_sequence} {
 
   transform.named_sequence @match_4d_matmul_transb(%candidate: !any {transform.readonly}) -> !any {
     %matched = transform.match.ta.einsum %candidate
-        {equation = "b h i d, b h j d -> b h i j"} : (!any) -> !any
+        {equation = "b g h i d, b g j d -> b g h i j"} : (!any) -> !any
     transform.yield %matched : !any
   }
 
   transform.named_sequence @match_4d_matmul(%candidate: !any {transform.readonly}) -> !any {
     %matched = transform.match.ta.einsum %candidate
-        {equation = "b h i j, b h j d -> b h i d"} : (!any) -> !any
+        {equation = "b g h i j, b g j d -> b g h i d"} : (!any) -> !any
     transform.yield %matched : !any
   }
 
@@ -50,7 +50,6 @@ module attributes {transform.with_named_sequence} {
 
     transform.linalg.greedy_inline_elementwise %bmm0 : !any
     transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any
-    transform.print %func : !any
 
     %_1, %forall_loop = transform.structured.tile_using_forall
         %bmm0 tile_sizes [1, 1, 1, 128, 64, 0] : (!any) -> (!any, !any)
@@ -205,14 +204,13 @@ module attributes {transform.with_named_sequence} {
 // CHECK-NOT: tensor.empty() : tensor<1x2x2x128x64xf32>
 // CHECK: %[[LOOP:[0-9]+]] = scf.forall (%{{.*}}, %{{.*}}) in (2, 2) shared_outs(%{{.*}} = %{{.*}}) -> (tensor<1x2x2x128x64xf16>)
 // CHECK: tensor.empty() : tensor<1x1x1x128x64xf32>
-// CHECK: linalg.fill ins(%cst : f32) outs(%{{.*}} : tensor<1x1x1x128x64xf32>)
+// CHECK: linalg.fill ins(%{{.*}} : f32) outs(%{{.*}} : tensor<1x1x1x128x64xf32>)
 // CHECK: %{{.*}}:3 = scf.for %{{.*}} = %c0 to %c2 step %c1 iter_args(
-// CHECK: affine.linearize_index disjoint [%{{.*}}, %{{.*}}] by (2, 2) : index
+// CHECK: affine.apply
 // CHECK: tensor.extract_slice %arg0[0, %{{.*}}, 0, 0] [1, 1, 128, 64] [1, 1, 1, 1]
-// CHECK: tensor.expand_shape %{{.*}} output_shape [1, 1, 1, 128, 64]
-// CHECK: linalg.generic {indexing_maps = [#map1, #map2, #map3], iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel", "reduction"]}
-// CHECK: math.exp
-// CHECK: linalg.generic {indexing_maps = [#map4, #map5, #map4], iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]} ins(%{{.*}}#1, %{{.*}}#2 : tensor<1x1x1x128x64xf32>, tensor<1x1x1x128xf32>)
+// CHECK: linalg.generic {{.*}}iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel", "reduction"]
+// CHECK: math.exp2
+// CHECK: linalg.generic {{.*}}iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]} ins(%{{.*}}#1, %{{.*}}#2 : tensor<1x1x1x128x64xf32>, tensor<1x1x1x128xf32>)
 // CHECK: arith.divf %{{.*}}, %{{.*}} : f32
-// CHECK: linalg.generic {indexing_maps = [#map4, #map4], iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]} ins(%{{.*}} : tensor<1x1x1x128x64xf32>) outs(%{{.*}} : tensor<1x1x1x128x64xf16>)
+// CHECK: linalg.generic {{.*}}iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]} ins(%{{.*}} : tensor<1x1x1x128x64xf32>) outs(%{{.*}} : tensor<1x1x1x128x64xf16>)
 // CHECK: tensor.parallel_insert_slice %{{.*}} into %{{.*}}[0, %{{.*}}, %{{.*}}, 0, 0] [1, 1, 1, 128, 64] [1, 1, 1, 1, 1] : tensor<1x1x1x128x64xf16> into tensor<1x2x2x128x64xf16>
