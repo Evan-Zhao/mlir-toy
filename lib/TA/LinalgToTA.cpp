@@ -98,19 +98,17 @@ public:
   }
 
   SmallVector<std::string> unionAxes(ValueRange operands) const {
-    DenseSet<StringRef> used;
+    DenseSet<StringRef> seen;
+    SmallVector<std::string> result;
     for (Value operand : operands) {
       auto exprType = cast<ExprType>(operand.getType());
       for (Attribute attr : exprType.getAxes().getAxes()) {
         auto axis = cast<AxisAttr>(attr);
-        used.insert(axis.getName().getValue());
-      }
-    }
-
-    SmallVector<std::string> result;
-    for (StringRef name : axisNames) {
-      if (used.contains(name))
+        StringRef name = axis.getName().getValue();
+        if (!seen.insert(name).second)
+          continue;
         result.push_back(name.str());
+      }
     }
     return result;
   }

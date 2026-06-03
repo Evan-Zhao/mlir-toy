@@ -277,12 +277,14 @@ private:
 
     if (reduce) {
       payloadValue = reduce.getInput();
-      auto payloadExpr = cast<ExprType>(payloadValue.getType());
-      loopAxes = axisNames(payloadExpr);
       SmallVector<StringRef> reductionAxes = axisNames(reduce.getAxes());
-      for (StringRef axis : loopAxes) {
-        iterators.push_back(containsAxis(reductionAxes, axis) ? utils::IteratorType::reduction
-                                                              : utils::IteratorType::parallel);
+      loopAxes = axisNames(resultExpr);
+      iterators.assign(loopAxes.size(), utils::IteratorType::parallel);
+      for (StringRef axis : reductionAxes) {
+        if (containsAxis(loopAxes, axis))
+          continue;
+        loopAxes.push_back(axis);
+        iterators.push_back(utils::IteratorType::reduction);
       }
       if (failed(collectInputs(payloadValue, root, loopAxes)))
         return failure();

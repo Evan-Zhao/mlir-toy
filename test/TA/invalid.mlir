@@ -25,13 +25,24 @@ func.func @bad_elementwise_result_axes(%rows: tensor<16xf32>, %cols: tensor<32xf
         : tensor<16xf32> -> !ta.expr<f32, [i]>
     %y = ta.at %cols[%col] {axes = #ta.axes<j>}
         : tensor<32xf32> -> !ta.expr<f32, [j]>
-    // expected-error @+1 {{'ta.addf' op result axes must be the union of operand axes in enclosing ta.scope order; expected #ta.axes<i, j>}}
+    // expected-error @+1 {{'ta.addf' op result axes must be the ordered union of operand axes; expected #ta.axes<i, j>}}
     %bad = ta.addf %x, %y
         : (!ta.expr<f32, [i]>, !ta.expr<f32, [j]>)
        -> !ta.expr<f32, [i]>
     ta.yield %bad : !ta.expr<f32, [i]>
   } : () -> tensor<16x32xf32>
   return %0 : tensor<16x32xf32>
+}
+
+func.func @bad_at_result_axes(%tensor: tensor<16x32xf32>)
+    -> tensor<32x16xf32> {
+  %0 = ta.scope axes(%row "i" extent 16, %col "j" extent 32) {
+    // expected-error @+1 {{'ta.at' op result axes must match access axes; expected #ta.axes<i, j>}}
+    %x = ta.at %tensor[%row, %col] {axes = #ta.axes<i, j>}
+        : tensor<16x32xf32> -> !ta.expr<f32, [j, i]>
+    ta.yield %x : !ta.expr<f32, [j, i]>
+  } : () -> tensor<32x16xf32>
+  return %0 : tensor<32x16xf32>
 }
 
 func.func @bad_map_body_type(%rows: tensor<16xf32>, %cols: tensor<32xf32>)

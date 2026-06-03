@@ -79,9 +79,9 @@ Inside the scope, tensor accesses produce scalar indexed expressions:
     : tensor<2x3x5x6xf32> -> !ta.expr<f32, [b, h, j, d]>
 %qk = ta.mulf %q, %k
     : (!ta.expr<f32, [b, h, i, d]>, !ta.expr<f32, [b, h, j, d]>)
-   -> !ta.expr<f32, [b, h, i, j, d]>
+   -> !ta.expr<f32, [b, h, i, d, j]>
 %dot = ta.reduce #ta.reduce_kind<add> %qk {axes = #ta.axes<d>}
-    : !ta.expr<f32, [b, h, i, j, d]> -> !ta.expr<f32, [b, h, i, j]>
+    : !ta.expr<f32, [b, h, i, d, j]> -> !ta.expr<f32, [b, h, i, j]>
 ```
 
 `ta.scope` materializes the yielded expression as a tensor. The yielded
@@ -104,16 +104,16 @@ Examples:
 !ta.expr<f32, [b, h, i, j]>   // score-like expression
 ```
 
-An expression is not a materialized tensor. It is a scalar-valued function over
-its axis support set. Axis sets are semantic sets printed in the enclosing
-scope order.
+An expression is not a materialized tensor. It is a scalar-valued function over its axes.
+The order of the axes is significant and corresponds to the dimension order of the tensor.
 
 Broadcasting is implicit. Elementwise operations take the union of operand
-axes:
+axes while preserving operand order:
 
 ```text
 !ta.expr<f32, [i]> + !ta.expr<f32, [i, j]> -> !ta.expr<f32, [i, j]>
 !ta.expr<f32, [i]> + !ta.expr<f32, [j]>    -> !ta.expr<f32, [i, j]>
+!ta.expr<f32, [j]> + !ta.expr<f32, [i]>    -> !ta.expr<f32, [j, i]>
 ```
 
 This makes standard tensor broadcasts visible as scalar algebra. For example,
@@ -171,9 +171,10 @@ ta.cmpf
 ta.select
 ```
 
-These ops share the same axis rule: result axes are the union of operand axes
-in scope order. `ta.map` remains available as an escape hatch for scalar code
-without a dedicated `ta` op.
+These ops share the same axis rule: result axes are the ordered union of operand axes,
+taking first occurrence from operands left-to-right.
+Unary ops therefore preserve operand axis orde.
+`ta.map` remains available as an escape hatch for scalar code without a dedicated `ta` op.
 
 The current rewrite support is compiled into the plugin:
 
@@ -203,12 +204,12 @@ P = exp(S - M)
 
 the rules compose into:
 
-| Step | Rule | Result |
-| --- | --- | --- |
-| Change base | `exp(x) => exp2(c * x)`, where `c = log2(e)` | `P = exp2(c * (S - M))` |
-| Distribute | `c * (x - y) => c*x - c*y` | `P = exp2(c*S - c*M)` |
-| Move through max | `c * max_j(S) => max_j(c*S)`, for finite `c > 0` and `j notin axes(c)` | `P = exp2(S2 - M2)` |
-| Fold constants | `c * (scale * Dot) => (c * scale) * Dot` | `S2 = (c * scale) * Dot` |
+| Step             | Rule                                                                   | Result                   |
+| ---------------- | ---------------------------------------------------------------------- | ------------------------ |
+| Change base      | `exp(x) => exp2(c * x)`, where `c = log2(e)`                           | `P = exp2(c * (S - M))`  |
+| Distribute       | `c * (x - y) => c*x - c*y`                                             | `P = exp2(c*S - c*M)`    |
+| Move through max | `c * max_j(S) => max_j(c*S)`, for finite `c > 0` and `j notin axes(c)` | `P = exp2(S2 - M2)`      |
+| Fold constants   | `c * (scale * Dot) => (c * scale) * Dot`                               | `S2 = (c * scale) * Dot` |
 
 The driver repeatedly applies the rules and runs CSE between greedy iterations.
 No single rule needs to match the full attention graph.
@@ -422,7 +423,7 @@ Reduces an expression over one or more axes.
 
 ```mlir
 %sum = ta.reduce #ta.reduce_kind<add> %payload {axes = #ta.axes<k>}
-    : !ta.expr<f32, [i, j, k]> -> !ta.expr<f32, [i, j]>
+    : !ta.expr<f32, [i, k, j]> -> !ta.expr<f32, [i, j]>
 ```
 
 Built-in reducer kinds are `add`, `mul`, `max`, and `min`. The reducer kind is
@@ -454,14 +455,12 @@ Core typing rules:
 
 ```text
 axes(ta.constant) = {}
-axes(ta.at T[index_exprs...]) = axes named by its axes attribute
-axes(ta.map f(x1,...,xn)) = union_i axes(xi)
-axes(ta.elementwise_op(x1,...,xn)) = union_i axes(xi)
-axes(ta.reduce over R x) = axes(x) - R
-axes(ta.select c x y) = axes(c) union axes(x) union axes(y)
+axes(ta.at T[index_exprs...]) = axes named by its axes attribute, in that order
+axes(ta.map f(x1,...,xn)) = ordered_union_i axes(xi)
+axes(ta.elementwise_op(x1,...,xn)) = ordered_union_i axes(xi)
+axes(ta.reduce over R x) = axes(x) with R removed in-place
+axes(ta.select c x y) = ordered_union(axes(c), axes(x), axes(y))
 ```
-
-The result axis order is the enclosing `ta.scope` order.
 
 The axis support set is a conservative dependency support, not necessarily a
 minimal dependency set. For example, `x - x` may initially keep `axes(x)` even
@@ -487,11 +486,11 @@ but several areas remain intentionally narrow:
    patterns would let users provide rules without rebuilding.
 1. A more compact custom rewrite syntax could sit above PDLL, for example:
 
-   ```text
-   match reduce($x{$axes_x} / $d{$axes_d} * $y{$axes_y},
-                axes=$axes_k, reducer="add")
-     if intersect($axes_k, $axes_d).empty()
-   ```
+    ```text
+    match reduce($x{$axes_x} / $d{$axes_d} * $y{$axes_y},
+                 axes=$axes_k, reducer="add")
+      if intersect($axes_k, $axes_d).empty()
+    ```
 
-   That syntax is closer to tensor-algebra notation, but would require a
-   custom parser and a lowering into PDL/PDLL or native rewrite patterns.
+    That syntax is closer to tensor-algebra notation, but would require a
+    custom parser and a lowering into PDL/PDLL or native rewrite patterns.

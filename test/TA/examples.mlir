@@ -35,9 +35,9 @@ func.func @matmul_ta(%lhs: tensor<16x64xf32>, %rhs: tensor<64x32xf32>)
         : tensor<64x32xf32> -> !ta.expr<f32, [k, j]>
     %xy = ta.mulf %x, %y
         : (!ta.expr<f32, [i, k]>, !ta.expr<f32, [k, j]>)
-       -> !ta.expr<f32, [i, j, k]>
+       -> !ta.expr<f32, [i, k, j]>
     %dot = ta.reduce #ta.reduce_kind<add> %xy {axes = #ta.axes<k>}
-        : !ta.expr<f32, [i, j, k]> -> !ta.expr<f32, [i, j]>
+        : !ta.expr<f32, [i, k, j]> -> !ta.expr<f32, [i, j]>
     ta.yield %dot : !ta.expr<f32, [i, j]>
   } : () -> tensor<16x32xf32>
   return %0 : tensor<16x32xf32>
@@ -132,9 +132,9 @@ func.func @attention_ta(%Q: tensor<2x3x4x6xf32>,
         : tensor<2x3x5x6xf32> -> !ta.expr<f32, [b, h, j, d]>
     %qk = ta.mulf %q, %k
         : (!ta.expr<f32, [b, h, i, d]>, !ta.expr<f32, [b, h, j, d]>)
-       -> !ta.expr<f32, [b, h, i, j, d]>
+       -> !ta.expr<f32, [b, h, i, d, j]>
     %dot = ta.reduce #ta.reduce_kind<add> %qk {axes = #ta.axes<d>}
-        : !ta.expr<f32, [b, h, i, j, d]> -> !ta.expr<f32, [b, h, i, j]>
+        : !ta.expr<f32, [b, h, i, d, j]> -> !ta.expr<f32, [b, h, i, j]>
 
     %scale = ta.constant 4.082482904638630e-01 : f32 : !ta.expr<f32, []>
     %s = ta.mulf %scale, %dot
