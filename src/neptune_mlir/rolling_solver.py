@@ -1,10 +1,10 @@
-from collections import Counter, defaultdict
 from typing import Any, Iterable, Mapping, cast
 
 import sympy as sp
 from sympy import Expr, Symbol
 
 JsonExpr = dict[str, Any]
+Subs = dict[Symbol, Expr]
 
 
 def _prime_symbol(symbol: Symbol) -> Symbol:
@@ -27,56 +27,72 @@ def solve_rolling_updater_json(
     symtab: dict[str, Symbol] = {}
     f = _json_expr_to_sympy(f_expr, symtab)
     g = _json_expr_to_sympy(g_expr, symtab)
-    acc = symtab.setdefault(acc_var_name, sp.Symbol(acc_var_name, real=True, nonzero=True))
+    acc = {v.name: v for v in _free_vars_symbols(f)}[acc_var_name]
     r_var_name_set = set(r_var_names)
     g_free_vars = _free_vars_symbols(g)
     r_vars = [sym for sym in g_free_vars if sym.name in r_var_name_set]
     r_vars = sorted(r_vars, key=lambda sym: sym.name)
     c_vars = sorted(g_free_vars - set(r_vars), key=lambda sym: sym.name)
-    r_to_rp = {r: symtab.setdefault(_prime_symbol(r).name, _prime_symbol(r)) for r in r_vars}
+    r_to_rp = {r: _prime_symbol(r) for r in r_vars}
 
-    h_expr = sympy_solve_rolling_updater(g, r_to_rp, c_vars, acc)
-    c_variables = set(c_vars).intersection(h_expr.free_symbols)
-    if c_variables:
-        raise ValueError(
-            "Cannot find a valid solution for the rolling-update updater function "
-            f"`H`: attempt to solve produced expression {h_expr} with remaining "
-            f"`c`-variables: {c_variables}"
-        )
-    _prove_repair_term_distribute(h_expr, f, acc)
+    h_expr = sympy_solve_rolling_updater(f, g, r_to_rp, c_vars, acc)
     return _sympy_to_json_expr(h_expr, _expr_type(g_expr))
 
 
 def sympy_solve_rolling_updater(
-    g_expr: sp.Expr, r_to_rp: Mapping[Symbol, Symbol], c_vars: list[Symbol], t: Symbol
+    f_expr: sp.Expr,
+    g_expr: sp.Expr,
+    r_to_rp: Mapping[Symbol, Symbol],
+    c_vars: list[Symbol],
+    t: Symbol,
 ) -> sp.Expr:
-    """Solve for H(t, R, R') such that reduce(g(R', C)) can repair reduce(g(R, C)).
+    """Solve for H(t, R, R') such that reduce(f, g(R', C)) can repair reduce(f, g(R, C)).
 
-    This is the TVM algorithm with the TIR conversion layer removed:
-      1. Separate g(R, C) into gcomb(g1(R), g2(C)).
-      2. Invert t = gcomb(r, c) with respect to c.
-      3. Return gcomb(g1(R'), gcomb^{-1}(g1(R), t)).
+    This implements the paper's Eq. 5 directly:
+      1. Invert t = g(R, C) with respect to C.
+      2. Calculate and simplify g(R', g_c^{-1}(R, t)).
+      3. Prove that the resulting H distributes over f.
+
+    C can represent multiple variables. In that case, our algorithm inverts g over one each `c in C`,
+    finding partial inverses. E.g. for `t = r + c0 + c1`, it can find `c0 = t - r - c1`.
+    This may still work, because when we use this solution, it may also cancel c1 out.
+    In our example, replacing c0 in `g(R', C) = r' + c0 + c1` gives
+    `t - r + r'`, which does not contain any C variables.
+
+    If raw-C inversion cannot produce a useful repair, we also try the paper's variable-substitution
+    trick. We discover large subexpressions that depend only on C, such as `Max(0, c)**2` in
+    `exp(r - Max(0, c)**2)`, replace one with a fresh `c'`, and solve the simpler
+    `t = g(R, c')` problem.
     """
-    r, c = Symbol("r"), Symbol("c")
-    r_vars = list(r_to_rp.keys())
-    g1, _, gcomb = separate_vars(g_expr, r_vars, c_vars, r, c)
+    if not c_vars:
+        raise ValueError(f"Cannot invert {g_expr} with respect to an empty C-variable set")
 
-    gcomb_inv = invert_binary_function(gcomb, c, t)
-    term1 = g1.subs(r_to_rp)  # type: ignore
-    term2 = gcomb_inv.subs({r: g1})
-    h_expr = cast(Expr, gcomb.subs({r: term1, c: term2}))
+    cand_substs = list(_partial_inverse_by_substitution(g_expr, c_vars, t))
+    c_var_set = set(c_vars)
+    valid_candidates: set[sp.Expr] = set()
+    for c_subst in cand_substs:
+        h_expr = cast(Expr, g_expr.subs(r_to_rp).xreplace(c_subst))  # type: ignore
+        h_expr = sp.simplify(h_expr)
+        if c_var_set.intersection(h_expr.free_symbols):
+            continue
+        if _prove_repair_term_distribute(h_expr, f_expr, t):
+            valid_candidates.add(h_expr)
+    if not valid_candidates:
+        raise ValueError(f"Cannot find a valid solution for the rolling-update updater ({g_expr=})")
+    if len(valid_candidates) > 1:
+        raise ValueError(
+            f"Multiple valid solutions found for the rolling-update updater ({g_expr=}): {valid_candidates}"
+        )
+    return valid_candidates.pop()
 
-    h_expr = sp.simplify(_simplify_abs_sqrt(h_expr))
-    return _prefer_quotient_power_form(h_expr)
 
-
-def _prove_repair_term_distribute(h_expr: Expr, f_expr: Expr, acc: Symbol) -> None:
+def _prove_repair_term_distribute(h_expr: Expr, f_expr: Expr, acc: Symbol) -> bool:
     f_free_vars = sorted(_free_vars_symbols(f_expr), key=lambda sym: sym.name)
     other_vars = [sym for sym in f_free_vars if sym != acc]
     if len(other_vars) != 1:
         raise ValueError(
-            "Cannot validate the rolling-update updater function `H`: expected `f_expr` "
-            f"to depend on exactly one non-accumulator variable, got {other_vars} in {f_expr}"
+            "Expected `f_expr` to have exactly two free variables, one being the `acc` variable provided; "
+            f"got {f_expr=} ({acc=}), free vars: {f_free_vars})"
         )
     reduce_var = other_vars[0]
     y1 = sp.Symbol("y1", real=True)
@@ -86,186 +102,63 @@ def _prove_repair_term_distribute(h_expr: Expr, f_expr: Expr, acc: Symbol) -> No
     def h_subst(acc_value: Expr) -> Expr:
         return sp.simplify(h_expr.subs({acc: acc_value}))
 
-    lhs = _simplify_for_proof(h_subst(reducer_expr))
-    rhs = _simplify_for_proof(f_expr.subs({acc: h_subst(y1), reduce_var: h_subst(y2)}))
-    if not _prove_expr(lhs, rhs, "eq"):
-        raise ValueError(
-            "Cannot prove the correctness of the global updater `H`: "
-            f"failed to prove {lhs} == {rhs}"
-        )
+    lhs = sp.simplify(h_subst(reducer_expr))
+    rhs = sp.simplify(f_expr.subs({acc: h_subst(y1), reduce_var: h_subst(y2)}))
+    return _prove_eq(lhs, rhs)
 
 
-def separate_vars(
-    f: Expr, xs: list[Symbol], us: list[Symbol], s: Symbol, t: Symbol
-) -> tuple[Expr, Expr, Expr]:
-    """Separate f(xs, us) as fcomb(fx(xs), fu(us)).
+def _partial_inverse_by_substitution(
+    g_expr: Expr, c_vars: list[Symbol], t: Symbol
+) -> Iterable[Subs]:
+    """Invert `t = g(R, C)` by finding change-of-variable candidates: each candidate is a
+    subexpression `e(C)` that depends only on C variables, which we can replace with a fresh variable `c'`.
 
-    SymPy's separatevars handles the useful multiplicative cases. As in TVM, if
-    separation fails for a single x and a single u, fall back to the direct
-    binary combiner fcomb(s, t) = f(s, t).
+    `c'` is not required to capture all C-dependence in `g`, so this substitution produces a
+    `t = g'(R, c', C)`, but it can make the inversion problem easier, because `g'` is now a simpler
+    expression with fewer c-terms.
     """
-    d = sp.separatevars(f, symbols=xs + us, dict=True, force=True)
-    if d is None:
-        if len(xs) == 1 and len(us) == 1:
-            return xs[0], us[0], f.subs({xs[0]: s, us[0]: t})
-        raise ValueError(f"Failed to separate variables for {f} over {xs} and {us}")
-
-    d = cast(dict[Symbol | str, sp.Expr], d)
-    fx = sp.simplify(sp.Mul(*[d.get(v, 1) for v in xs]))
-    fu = sp.simplify(sp.Mul(*[d.get(v, 1) for v in us]))
-    coeff = d.get("coeff", 1)
-    fcomb = cast(Expr, coeff * s * t)
-    return fx, fu, fcomb
+    for c_expr in _candidate_c_subexpressions(g_expr, c_vars):
+        synthetic_c = sp.Dummy("c_sub", real=True)
+        substituted_g = cast(Expr, g_expr.xreplace({c_expr: synthetic_c}))
+        try:
+            solutions = sp.solve(sp.Eq(substituted_g, t), synthetic_c)
+        except NotImplementedError:
+            continue
+        for solution in solutions:
+            yield {c_expr: solution}
 
 
-def invert_binary_function(expr: sp.Expr, y: Symbol, z: Symbol) -> sp.Expr:
-    """Find y = f^{-1}(z, ...) for z = expr."""
-    solutions = sp.solve(sp.Eq(expr, z), y)
-    if not solutions:
-        raise ValueError(f"No solution found for {expr} == {z} with respect to {y}")
-    return cast(Expr, solutions[0])
+def _candidate_c_subexpressions(g_expr: Expr, c_vars: list[Symbol]) -> list[Expr]:
+    c_var_set = set(c_vars)
+    candidates: list[Expr] = []
+    seen: set[Expr] = set()
+    for subexpr in sp.preorder_traversal(g_expr):
+        assert isinstance(subexpr, Expr)
+        if subexpr in seen:
+            continue
+        seen.add(subexpr)
+        free_vars = _free_vars_symbols(subexpr)
+        if not free_vars or not free_vars <= c_var_set:
+            continue
+        candidates.append(subexpr)
+
+    def size(expr: Expr) -> tuple[int, int, int]:
+        return (len(_free_vars_symbols(expr)), sp.count_ops(expr), len(str(expr)))
+
+    return sorted(candidates, key=size, reverse=True)
 
 
-def _prove_expr(lhs: sp.Expr, rhs: sp.Expr, cmp: str = "eq") -> bool:
-    cmp_builders = {
-        "eq": sp.Eq,
-        "ne": sp.Ne,
-        "lt": sp.Lt,
-        "le": sp.Le,
-        "gt": sp.Gt,
-        "ge": sp.Ge,
-    }
-    if cmp not in cmp_builders:
-        raise ValueError(f"unsupported comparison: {cmp}")
-
-    if cmp == "eq":
-        diff = _simplify_for_proof(cast(Expr, lhs - rhs))
-        if diff == 0 or diff.is_zero is True:
-            return True
-        if diff.is_zero is False:
-            return False
-        return False
-
-    try:
-        simplified = sp.simplify(cmp_builders[cmp](lhs, rhs))
-    except ValueError:
-        return False
-    return simplified is sp.true
+def _is_homogeneous_scaling_in_t(expr: Expr, t: Symbol) -> bool:
+    return t in expr.free_symbols and t not in sp.simplify(expr / t).free_symbols
 
 
-def _prefer_quotient_power_form(expr: sp.Expr) -> sp.Expr:
-    """Rewrite a**k / b**k-style products into (a / b)**k."""
-
-    def _sort_by_float_val(xs: Iterable[sp.Rational]) -> list[sp.Rational]:
-        return cast(list[sp.Rational], sorted(xs, key=float))
-
-    def _rewrite_mul(mul_expr: sp.Expr) -> sp.Expr:
-        if not isinstance(mul_expr, sp.Mul):
-            return mul_expr
-
-        num_by_exp: dict[sp.Rational, list[sp.Expr]] = defaultdict(list)
-        den_by_exp: dict[sp.Rational, list[sp.Expr]] = defaultdict(list)
-        other_factors: list[sp.Expr] = []
-
-        for factor in sp.Mul.make_args(mul_expr):
-            if isinstance(factor, sp.Pow) and isinstance(factor.exp, sp.Rational):
-                exp = factor.exp
-                if exp > 0 and exp != 1:
-                    num_by_exp[exp].append(factor.base)
-                    continue
-                if exp < 0 and exp != -1:
-                    den_by_exp[cast(sp.Rational, -exp)].append(factor.base)
-                    continue
-            other_factors.append(factor)
-
-        changed = False
-        for exp in _sort_by_float_val(set(num_by_exp) & set(den_by_exp)):
-            num = sp.Mul(*num_by_exp.pop(exp), evaluate=False)
-            den = sp.Mul(*den_by_exp.pop(exp), evaluate=False)
-            ratio = sp.Mul(num, sp.Pow(den, -1, evaluate=False), evaluate=False)
-            other_factors.append(cast(Expr, sp.Pow(ratio, exp, evaluate=False)))
-            changed = True
-
-        for exp in _sort_by_float_val(num_by_exp):
-            other_factors.extend(
-                [cast(Expr, sp.Pow(base, exp, evaluate=False)) for base in num_by_exp[exp]]
-            )
-        for exp in _sort_by_float_val(den_by_exp):
-            other_factors.extend(
-                [cast(Expr, sp.Pow(base, -exp, evaluate=False)) for base in den_by_exp[exp]]
-            )
-
-        if not changed:
-            return mul_expr
-        return sp.Mul(*other_factors, evaluate=False)
-
-    return cast(Expr, expr.replace(lambda e: isinstance(e, sp.Mul), _rewrite_mul))
-
-
-def _simplify_abs_sqrt(expr: sp.Expr) -> sp.Expr:
-    sqrt_exprs = {
-        cast(Expr, subexpr)
-        for subexpr in sp.preorder_traversal(expr)
-        if isinstance(subexpr, sp.Pow) and subexpr.exp == sp.Rational(1, 2)
-    }
-    if not sqrt_exprs:
-        return expr
-    assumptions = [sp.Q.real(sqrt_expr) & sp.Q.nonnegative(sqrt_expr) for sqrt_expr in sqrt_exprs]
-    return cast(Expr, sp.refine(expr, sp.And(*assumptions)))
-
-
-def _is_nonnegative_by_construction(expr: Expr) -> bool:
-    if expr.is_nonnegative is True or expr.is_positive is True:
+def _prove_eq(lhs: sp.Expr, rhs: sp.Expr) -> bool:
+    diff = sp.simplify(cast(Expr, lhs - rhs))
+    if diff == 0 or diff.is_zero is True:
         return True
-    if isinstance(expr, sp.Number):
-        return bool(expr >= 0)
-    if isinstance(expr, sp.Pow):
-        if expr.exp == sp.Rational(1, 2):
-            return True
-        if isinstance(expr.exp, sp.Rational) and expr.exp.q == 2:
-            return True
-        if expr.exp == -1:
-            return _is_nonnegative_by_construction(expr.base)
-    if isinstance(expr, sp.Mul):
-        return all(_is_nonnegative_by_construction(factor) for factor in expr.args)
+    if diff.is_zero is False:
+        return False
     return False
-
-
-def _pull_common_nonnegative_max_factor(expr: sp.Expr) -> sp.Expr:
-    def _rewrite_max(max_expr: sp.Expr) -> sp.Expr:
-        if not isinstance(max_expr, sp.Max) or not max_expr.args:
-            return max_expr
-
-        counters = [Counter(sp.Mul.make_args(cast(Expr, arg))) for arg in max_expr.args]
-        common = counters[0].copy()
-        for counter in counters[1:]:
-            for factor in list(common):
-                common[factor] = min(common[factor], counter.get(factor, 0))
-                if common[factor] == 0:
-                    del common[factor]
-        if not common:
-            return max_expr
-
-        pulled: list[Expr] = []
-        for factor, count in common.items():
-            if _is_nonnegative_by_construction(factor):
-                pulled.extend([factor] * count)
-        if not pulled:
-            return max_expr
-
-        factor = sp.Mul(*pulled)
-        if factor == 1:
-            return max_expr
-        reduced_args = [sp.simplify(arg / factor) for arg in max_expr.args]
-        return cast(Expr, sp.simplify(factor * sp.Max(*reduced_args)))
-
-    return cast(Expr, expr.replace(lambda e: isinstance(e, sp.Max), _rewrite_max))
-
-
-def _simplify_for_proof(expr: sp.Expr) -> sp.Expr:
-    expr = _simplify_abs_sqrt(expr)
-    expr = _pull_common_nonnegative_max_factor(expr)
-    return sp.simplify(expr)
 
 
 def _expr_type(expr: JsonExpr) -> str:
