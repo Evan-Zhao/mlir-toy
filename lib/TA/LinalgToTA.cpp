@@ -127,8 +127,7 @@ public:
     }
 
     SmallVector<std::string> resultAxes = flattenAxes(dimAxes);
-    auto op = AtOp::create(builder(), loc, expr(elementType, resultAxes), source, indices,
-                           getAxes(resultAxes));
+    auto op = AtOp::create(builder(), loc, expr(elementType, resultAxes), source, indices);
     annotate(op);
     return op.getResult();
   }

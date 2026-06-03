@@ -12,7 +12,7 @@ module attributes {transform.with_named_sequence} {
   func.func @ta_exp_to_exp2_softmax_core(%scores: tensor<2x3xf32>) -> tensor<2x3xf32> {
     %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3) {
       // CHECK: %[[X:.+]] = ta.at %{{.+}}[%i, %j]
-      %x = ta.at %scores[%i, %j] {axes = #ta.axes<i, j>}
+      %x = ta.at %scores[%i, %j]
           : tensor<2x3xf32> -> !ta.expr<f32, [i, j]>
       %scale = ta.constant 5.000000e-01 : f32 : !ta.expr<f32, []>
       %s = ta.mulf %scale, %x

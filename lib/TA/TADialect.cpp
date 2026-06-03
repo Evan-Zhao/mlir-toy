@@ -4,6 +4,7 @@
 #include "TA/TAPasses.h"
 #include "TA/TATransformOps.h"
 #include "TA/TATypes.h"
+#include "TA/TAUtils.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Tools/Plugins/DialectPlugin.h"
@@ -488,15 +489,18 @@ LogicalResult AtOp::verify() {
     return failure();
 
   ScopeOp scope = *scopeOr;
-  if (auto axes = getAxes()) {
-    if (failed(verifyAxesSubset(getOperation(), scope.getAxes(), *axes, "access")))
-      return failure();
-    auto result = cast<ExprType>(getResult().getType());
-    if (!sameAxes(result.getAxes(), *axes))
-      return emitOpError() << "result axes must match access axes; expected " << *axes;
-  }
+  auto result = cast<ExprType>(getResult().getType());
+  if (failed(verifyExprAxes(getOperation(), scope, result, "result")))
+    return failure();
 
-  return verifyExprAxes(getOperation(), scope, getResult().getType(), "result");
+  FailureOr<AxesAttr> expected =
+      inferAxesFromScopeIndexOperands(getOperation(), scope, getIndices());
+  if (failed(expected))
+    return failure();
+  if (!sameAxes(result.getAxes(), *expected))
+    return emitOpError() << "result axes must match scope-axis indices; expected " << *expected;
+
+  return success();
 }
 
 LogicalResult MapOp::verify() {

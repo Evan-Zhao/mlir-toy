@@ -73,9 +73,9 @@ types; the SSA names are local handles only.
 Inside the scope, tensor accesses produce scalar indexed expressions:
 
 ```mlir
-%q = ta.at %Q[%b, %h, %i, %d] {axes = #ta.axes<b, h, i, d>}
+%q = ta.at %Q[%b, %h, %i, %d]
     : tensor<2x3x4x6xf32> -> !ta.expr<f32, [b, h, i, d]>
-%k = ta.at %K[%b, %h, %j, %d] {axes = #ta.axes<b, h, j, d>}
+%k = ta.at %K[%b, %h, %j, %d]
     : tensor<2x3x5x6xf32> -> !ta.expr<f32, [b, h, j, d]>
 %qk = ta.mulf %q, %k
     : (!ta.expr<f32, [b, h, i, d]>, !ta.expr<f32, [b, h, j, d]>)
@@ -397,9 +397,14 @@ axes declared by that scope.
 Reads a tensor at symbolic coordinates and returns a `ta.expr`.
 
 ```mlir
-%x = ta.at %tensor[%i, %j] {axes = #ta.axes<i, j>}
+%x = ta.at %tensor[%i, %j]
     : tensor<16x32xf32> -> !ta.expr<f32, [i, j]>
 ```
+
+The result type is the authoritative axis order. In the current simple
+indexing form, each index must be either a `ta.scope` axis block argument,
+which contributes that axis in index order, or a constant index, which
+contributes no axis.
 
 ### `ta.map`
 
@@ -455,7 +460,7 @@ Core typing rules:
 
 ```text
 axes(ta.constant) = {}
-axes(ta.at T[index_exprs...]) = axes named by its axes attribute, in that order
+axes(ta.at T[index_exprs...]) = scope-axis indices in index order
 axes(ta.map f(x1,...,xn)) = ordered_union_i axes(xi)
 axes(ta.elementwise_op(x1,...,xn)) = ordered_union_i axes(xi)
 axes(ta.reduce over R x) = axes(x) with R removed in-place
