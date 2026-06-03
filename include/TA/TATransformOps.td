@@ -20,8 +20,10 @@ def TAMatchEinsumOp
 
     The operation succeeds on the matched `ta.reduce` and returns the same
     payload handle. It emits a silenceable failure when the target is not an
-    add-reduced multiply with operand and result axis supports matching the
-    equation.
+    add-reduced multiply with operand and result axis structure matching the equation.
+
+    Axis names in the equation are pattern symbols: they do not have
+    to match the concrete TA axis names, but repeated symbols must map to the same concrete axis.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$operand_handle, StrAttr:$equation);

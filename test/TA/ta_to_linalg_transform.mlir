@@ -4,7 +4,7 @@ module attributes {transform.with_named_sequence} {
   transform.named_sequence @match_ta_matmul(%candidate: !transform.any_op {transform.readonly})
       -> !transform.any_op {
     %matched = transform.match.ta.einsum %candidate
-        {equation = "i k, k j -> i j"}
+        {equation = "m k, k n -> m n"}
         : (!transform.any_op) -> !transform.any_op
     transform.yield %matched : !transform.any_op
   }

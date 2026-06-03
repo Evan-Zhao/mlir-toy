@@ -9,6 +9,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringMap.h"
 
 using namespace mlir;
 
@@ -86,10 +87,6 @@ SmallVector<std::string> axisAttrNames(ta::AxesAttr axes) {
   return names;
 }
 
-bool sameAxes(ArrayRef<std::string> lhs, ArrayRef<std::string> rhs) {
-  return lhs.size() == rhs.size() && llvm::equal(lhs, rhs);
-}
-
 bool sameAxisSet(ArrayRef<std::string> lhs, ArrayRef<std::string> rhs) {
   llvm::SmallSetVector<StringRef, 8> lhsSet;
   llvm::SmallSetVector<StringRef, 8> rhsSet;
@@ -103,6 +100,27 @@ bool sameAxisSet(ArrayRef<std::string> lhs, ArrayRef<std::string> rhs) {
     if (!rhsSet.contains(axis))
       return false;
   }
+  return true;
+}
+
+bool matchPatternAxes(ArrayRef<std::string> patternAxes, ArrayRef<std::string> actualAxes,
+                      llvm::StringMap<std::string> &axisMapping,
+                      SmallVectorImpl<std::string> &usedActualAxes) {
+  if (patternAxes.size() != actualAxes.size())
+    return false;
+
+  for (auto [patternAxis, actualAxis] : llvm::zip_equal(patternAxes, actualAxes)) {
+    auto mapped = axisMapping.find(patternAxis);
+    if (mapped != axisMapping.end())
+      return mapped->second == actualAxis;
+
+    if (llvm::is_contained(usedActualAxes, actualAxis))
+      return false;
+
+    axisMapping[patternAxis] = actualAxis;
+    usedActualAxes.push_back(actualAxis);
+  }
+
   return true;
 }
 
@@ -120,6 +138,19 @@ SmallVector<std::string> reductionAxesForEquation(const ParsedEinsum &equation) 
   for (StringRef axis : reductionAxes)
     axes.push_back(axis.str());
   return axes;
+}
+
+bool matchReductionAxes(ArrayRef<std::string> patternReductionAxes,
+                        ArrayRef<std::string> actualReductionAxes,
+                        const llvm::StringMap<std::string> &axisMapping) {
+  SmallVector<std::string> mappedReductionAxes;
+  for (StringRef patternAxis : patternReductionAxes) {
+    auto mapped = axisMapping.find(patternAxis);
+    if (mapped == axisMapping.end())
+      return false;
+    mappedReductionAxes.push_back(mapped->second);
+  }
+  return sameAxisSet(mappedReductionAxes, actualReductionAxes);
 }
 
 LogicalResult rewriteGreedily(TransformRewriter &rewriter, RewritePatternSet patterns,
@@ -180,13 +211,20 @@ DiagnosedSilenceableFailure TAMatchEinsumOp::matchOperation(Operation *target,
   auto lhsType = cast<ta::ExprType>(mul.getLhs().getType());
   auto rhsType = cast<ta::ExprType>(mul.getRhs().getType());
   auto resultType = cast<ta::ExprType>(reduce.getResult().getType());
-  if (!sameAxes(exprAxisNames(lhsType), (*parsed).inputs[0]))
-    return emitSilenceableFailure(transform, "lhs axes do not match einsum equation");
-  if (!sameAxes(exprAxisNames(rhsType), (*parsed).inputs[1]))
-    return emitSilenceableFailure(transform, "rhs axes do not match einsum equation");
-  if (!sameAxes(exprAxisNames(resultType), (*parsed).result))
-    return emitSilenceableFailure(transform, "result axes do not match einsum equation");
-  if (!sameAxisSet(axisAttrNames(reduce.getAxes()), reductionAxesForEquation(*parsed)))
+
+  llvm::StringMap<std::string> axisMapping;
+  SmallVector<std::string> usedActualAxes;
+  if (!matchPatternAxes((*parsed).inputs[0], exprAxisNames(lhsType), axisMapping,
+                        usedActualAxes))
+    return emitSilenceableFailure(transform, "lhs axes do not match einsum structure");
+  if (!matchPatternAxes((*parsed).inputs[1], exprAxisNames(rhsType), axisMapping,
+                        usedActualAxes))
+    return emitSilenceableFailure(transform, "rhs axes do not match einsum structure");
+  if (!matchPatternAxes((*parsed).result, exprAxisNames(resultType), axisMapping,
+                        usedActualAxes))
+    return emitSilenceableFailure(transform, "result axes do not match einsum structure");
+  if (!matchReductionAxes(reductionAxesForEquation(*parsed), axisAttrNames(reduce.getAxes()),
+                          axisMapping))
     return emitSilenceableFailure(transform, "reduction axes do not match einsum equation");
 
   results.set(getOperation()->getResult(0), {target});

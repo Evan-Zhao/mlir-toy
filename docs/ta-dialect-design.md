@@ -373,12 +373,14 @@ transform.structured.tile_using_forall %ta_matmuls tile_sizes [64, 64, 0]
     : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
 ```
 
-The matcher currently recognizes two-input add reductions of a multiply. This
-is enough to select matmul-like contractions in TA without re-matching the
-lowered `linalg.generic` region body. Handle preservation is best effort:
-handles to expression roots that materialize as linalg ops survive; handles to
-internal TA ops that lower into indexing maps or linalg-region scalar ops may
-be dropped.
+The matcher currently recognizes two-input add reductions of a multiply. Axis
+names in the equation are pattern symbols, so the equation above can match TA
+axes named `%i0`, `%r0`, or anything else as long as the reuse structure is the
+same. This is enough to select matmul-like contractions in TA without
+re-matching the lowered `linalg.generic` region body. Handle preservation is
+best effort: handles to expression roots that materialize as linalg ops
+survive; handles to internal TA ops that lower into indexing maps or
+linalg-region scalar ops may be dropped.
 
 ## End-To-End Demo Shape
 
