@@ -123,6 +123,23 @@ def TA_CmpFOp : TA_ElementwiseOp<"cmpf", [InferTypeOpAdaptor]> {
   let assemblyFormat = "$predicate `,` operands attr-dict `:` functional-type(operands, results)";
 }
 
+def TA_IndexOp : TA_Op<"index", [Pure]> {
+  let summary = "lift a scope axis coordinate to a ta.expr";
+  let arguments = (ins Index:$axis);
+  let results = (outs TA_ExprType:$result);
+  let assemblyFormat = "$axis attr-dict `:` type($result)";
+  let hasVerifier = 1;
+}
+
+def TA_CmpIOp : TA_ElementwiseOp<"cmpi", [InferTypeOpAdaptor]> {
+  let summary = "integer comparison lifted over ta.expr axes";
+  let arguments = (ins Arith_CmpIPredicateAttr:$predicate,
+                       TA_ExprType:$lhs,
+                       TA_ExprType:$rhs);
+  let results = (outs TA_ExprType:$result);
+  let assemblyFormat = "$predicate `,` operands attr-dict `:` functional-type(operands, results)";
+}
+
 def TA_SelectOp : TA_ElementwiseOp<"select", [InferTypeOpAdaptor]> {
   let summary = "select lifted over ta.expr axes";
   let arguments = (ins TA_ExprType:$condition,

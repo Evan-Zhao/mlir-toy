@@ -12,6 +12,8 @@
 #map6 = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>
 #map7 = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, 0)>
 #map8 = affine_map<(d0, d1, d2, d3) -> ()>
+#mask = affine_map<(d0, d1) -> (d0, d1)>
+#scalar = affine_map<(d0, d1) -> ()>
 
 // CHECK-LABEL: func.func @matmul
 // CHECK-NEXT: %[[SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 4, %i1 "i1" extent 16, %r0 "r0" extent 8) {
@@ -217,4 +219,79 @@ func.func @attention(%arg0: tensor<1x2x4x3xf16>,
     linalg.yield %25 : f16
   } -> tensor<1x2x4x3xf16>
   return %24 : tensor<1x2x4x3xf16>
+}
+
+// CHECK-LABEL: func.func @causal_mask
+// CHECK: ta.scope axes(%i0 "i0" extent 4, %i1 "i1" extent 4)
+// CHECK: ta.constant true
+// CHECK: ta.constant 0xFF800000 : f32
+// CHECK: ta.index %i1{{.*}}!ta.expr<i64, [i1]>
+// CHECK: ta.index %i0{{.*}}!ta.expr<i64, [i0]>
+// CHECK: ta.cmpi sle{{.*}}-> !ta.expr<i1, [i1, i0]>
+// CHECK: ta.select
+// CHECK: ta.select{{.*}}-> !ta.expr<f32, [i0, i1]>
+// CHECK: return {{.*}} : tensor<4x4xf32>
+func.func @causal_mask(%scores: tensor<4x4xf32>) -> tensor<4x4xf32> {
+  %false = arith.constant false
+  %true = arith.constant dense<true> : tensor<4x4xi1>
+  %neg_inf = arith.constant dense<0xFF800000> : tensor<f32>
+  %empty = tensor.empty() : tensor<4x4xf32>
+  %0 = linalg.generic {
+      indexing_maps = [#mask, #mask, #scalar, #mask],
+      iterator_types = ["parallel", "parallel"]}
+      ins(%true, %scores, %neg_inf : tensor<4x4xi1>, tensor<4x4xf32>, tensor<f32>)
+      outs(%empty : tensor<4x4xf32>) {
+  ^bb0(%in: i1, %score: f32, %masked: f32, %out: f32):
+    %i = linalg.index 0 : index
+    %ii = arith.index_cast %i : index to i64
+    %j = linalg.index 1 : index
+    %jj = arith.index_cast %j : index to i64
+    %live = arith.cmpi sle, %jj, %ii : i64
+    %pred = arith.select %live, %in, %false : i1
+    %selected = arith.select %pred, %score, %masked : f32
+    linalg.yield %selected : f32
+  } -> tensor<4x4xf32>
+  return %0 : tensor<4x4xf32>
+}
+
+// CHECK-LABEL: func.func @packed_unit_linalg_index_mask
+// CHECK: ta.scope axes(%i0 "i0" extent 1, %i1 "i1" extent 4, %i2 "i2" extent 4)
+// CHECK: ta.index %i2{{.*}}!ta.expr<i64, [i2]>
+// CHECK: ta.index %i1{{.*}}!ta.expr<i64, [i1]>
+// CHECK-NOT: ta.index %i0
+// CHECK: ta.select{{.*}}-> !ta.expr<f32, [i0, i1, i2]>
+// CHECK: return {{.*}} : tensor<1x4x4xf32>
+func.func @packed_unit_linalg_index_mask(%scores: tensor<1x4x4xf32>)
+    -> tensor<1x4x4xf32> {
+  %false = arith.constant false
+  %true = arith.constant dense<true> : tensor<4x4xi1>
+  %neg_inf = arith.constant dense<0xFF800000> : tensor<f32>
+  %mask_empty = tensor.empty() : tensor<4x4xi1>
+  %mask = linalg.generic {
+      indexing_maps = [#mask, #mask],
+      iterator_types = ["parallel", "parallel"]}
+      ins(%true : tensor<4x4xi1>) outs(%mask_empty : tensor<4x4xi1>) {
+  ^bb0(%in: i1, %out: i1):
+    %i = linalg.index 0 : index
+    %ii = arith.index_cast %i : index to i64
+    %j = linalg.index 1 : index
+    %jj = arith.index_cast %j : index to i64
+    %live = arith.cmpi sle, %jj, %ii : i64
+    %pred = arith.select %live, %in, %false : i1
+    linalg.yield %pred : i1
+  } -> tensor<4x4xi1>
+  %expanded = tensor.expand_shape %mask [[0, 1], [2]] output_shape [1, 4, 4]
+      : tensor<4x4xi1> into tensor<1x4x4xi1>
+  %empty = tensor.empty() : tensor<1x4x4xf32>
+  %0 = linalg.generic {
+      indexing_maps = [#map3, #map3, #map2, #map3],
+      iterator_types = ["parallel", "parallel", "parallel"]}
+      ins(%expanded, %scores, %neg_inf
+          : tensor<1x4x4xi1>, tensor<1x4x4xf32>, tensor<f32>)
+      outs(%empty : tensor<1x4x4xf32>) {
+  ^bb0(%pred: i1, %score: f32, %masked: f32, %out: f32):
+    %selected = arith.select %pred, %score, %masked : f32
+    linalg.yield %selected : f32
+  } -> tensor<1x4x4xf32>
+  return %0 : tensor<1x4x4xf32>
 }

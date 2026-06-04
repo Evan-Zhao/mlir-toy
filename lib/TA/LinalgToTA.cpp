@@ -37,6 +37,13 @@ using TensorAxisIds = SmallVector<AxisIdPack, 4>;
 
 static RankedTensorType rankedTensor(Type type) { return dyn_cast<RankedTensorType>(type); }
 
+static TypedAttr splatScalarConstant(arith::ConstantOp constant) {
+  auto elements = dyn_cast<DenseElementsAttr>(constant.getValue());
+  if (!elements || !elements.isSplat())
+    return {};
+  return dyn_cast<TypedAttr>(elements.getSplatValue<Attribute>());
+}
+
 static SmallVector<std::string> flattenAxes(const TensorAxes &axes) {
   SmallVector<std::string> flat;
   for (const AxisPack &pack : axes)
@@ -149,6 +156,32 @@ public:
 
   Value constant(TypedAttr value) {
     auto op = ConstantOp::create(builder(), loc, expr(value.getType(), {}), value);
+    annotate(op);
+    return op.getResult();
+  }
+
+  Value index(StringRef axisName, Type elementType = Type()) {
+    if (!elementType)
+      elementType = indexType;
+    auto op = IndexOp::create(builder(), loc, expr(elementType, {axisName.str()}), axis(axisName));
+    annotate(op);
+    return op.getResult();
+  }
+
+  Value cmpi(arith::CmpIPredicate predicate, Value lhs, Value rhs) {
+    SmallVector<std::string> axes = unionAxes({lhs, rhs});
+    auto op =
+        CmpIOp::create(builder(), loc, expr(IntegerType::get(context, 1), axes), predicate, lhs,
+                       rhs);
+    annotate(op);
+    return op.getResult();
+  }
+
+  Value select(Value condition, Value trueValue, Value falseValue) {
+    SmallVector<std::string> axes = unionAxes({trueValue, falseValue, condition});
+    auto trueType = cast<ExprType>(trueValue.getType());
+    auto op = SelectOp::create(builder(), loc, expr(trueType.getElementType(), axes), condition,
+                               trueValue, falseValue);
     annotate(op);
     return op.getResult();
   }
@@ -496,7 +529,7 @@ private:
         inputExprs.push_back(*expr);
       } else {
         DenseMap<Value, Value> emptyEnv;
-        FailureOr<Value> expr = translateScalar(input, emptyEnv);
+        FailureOr<Value> expr = translateScalar(input, emptyEnv, loopAxes);
         if (failed(expr))
           return failure();
         inputExprs.push_back(*expr);
@@ -522,14 +555,14 @@ private:
     SmallVector<std::string> flatResultAxes = flattenAxes(resultAxes);
     Value yielded = yield.getOperand(resultNumber);
     if (reductionAxes.empty())
-      return translateScalar(yielded, env);
+      return translateScalar(yielded, env, loopAxes);
 
     FailureOr<std::pair<ReduceKind, Value>> combiner =
         peelReductionCombiner(op, yielded, block.getArguments().drop_front(numInputs));
     if (failed(combiner))
       return failure();
 
-    FailureOr<Value> payload = translateScalar(combiner->second, env);
+    FailureOr<Value> payload = translateScalar(combiner->second, env, loopAxes);
     if (failed(payload))
       return failure();
 
@@ -700,6 +733,54 @@ private:
     return success();
   }
 
+  int64_t getAxisExtent(StringRef axisName) {
+    for (AxisId id = 0, e = parents.size(); id < e; ++id) {
+      AxisId root = find(id);
+      if (axisNames[root] != axisName)
+        continue;
+      auto extent = axisExtents.find(root);
+      if (extent == axisExtents.end())
+        return ShapedType::kDynamic;
+      return extent->second;
+    }
+    return ShapedType::kDynamic;
+  }
+
+  FailureOr<Value> translateLinalgIndex(linalg::IndexOp index, ArrayRef<AxisPack> loopAxes,
+                                        Type elementType = Type()) {
+    if (!elementType)
+      elementType = index.getResult().getType();
+
+    unsigned dim = index.getDim();
+    if (dim >= loopAxes.size())
+      return index.emitOpError("linalg.index dimension is outside the loop rank");
+
+    const AxisPack &packedAxes = loopAxes[dim];
+    if (packedAxes.empty())
+      return index.emitOpError("cannot import linalg.index for a constant-indexed dimension");
+
+    if (packedAxes.size() == 1)
+      return ta->index(packedAxes.front(), elementType);
+
+    SmallVector<StringRef> nonUnitAxes;
+    for (StringRef axis : packedAxes) {
+      if (getAxisExtent(axis) != 1)
+        nonUnitAxes.push_back(axis);
+    }
+
+    if (nonUnitAxes.empty()) {
+      if (elementType.isIndex())
+        return ta->constant(ta->builder().getIndexAttr(0));
+      return ta->constant(ta->builder().getIntegerAttr(elementType, 0));
+    }
+
+    if (nonUnitAxes.size() == 1)
+      return ta->index(nonUnitAxes.front(), elementType);
+
+    return index.emitOpError("cannot import linalg.index for a packed tensor dimension with "
+                             "multiple non-unit axes");
+  }
+
   Value lookupTensorExpr(Value value) const {
     auto it = valueMap.find(value);
     if (it == valueMap.end())
@@ -714,6 +795,15 @@ private:
     auto type = rankedTensor(value.getType());
     if (!type)
       return emitError(value.getLoc()) << "expected ranked tensor value";
+
+    if (auto constant = dyn_cast_or_null<arith::ConstantOp>(value.getDefiningOp())) {
+      if (TypedAttr scalar = splatScalarConstant(constant)) {
+        Value expr = ta->constant(scalar);
+        valueMap[value] = expr;
+        return expr;
+      }
+      return constant.emitOpError("only splat tensor constants are supported by ta import");
+    }
 
     if (auto arg = dyn_cast<BlockArgument>(value)) {
       if (arg.getOwner()->getParentOp() != func)
@@ -768,23 +858,26 @@ private:
   }
 
   template <typename OpTy>
-  FailureOr<Value> translateUnaryScalarOp(Operation *def, const DenseMap<Value, Value> &env) {
-    FailureOr<Value> input = translateScalar(def->getOperand(0), env);
+  FailureOr<Value> translateUnaryScalarOp(Operation *def, const DenseMap<Value, Value> &env,
+                                          ArrayRef<AxisPack> loopAxes) {
+    FailureOr<Value> input = translateScalar(def->getOperand(0), env, loopAxes);
     if (failed(input))
       return failure();
     return ta->unary<OpTy>(def->getResult(0).getType(), *input);
   }
 
   template <typename OpTy>
-  FailureOr<Value> translateBinaryScalarOp(Operation *def, const DenseMap<Value, Value> &env) {
-    FailureOr<Value> lhs = translateScalar(def->getOperand(0), env);
-    FailureOr<Value> rhs = translateScalar(def->getOperand(1), env);
+  FailureOr<Value> translateBinaryScalarOp(Operation *def, const DenseMap<Value, Value> &env,
+                                           ArrayRef<AxisPack> loopAxes) {
+    FailureOr<Value> lhs = translateScalar(def->getOperand(0), env, loopAxes);
+    FailureOr<Value> rhs = translateScalar(def->getOperand(1), env, loopAxes);
     if (failed(lhs) || failed(rhs))
       return failure();
     return ta->binary<OpTy>(def->getResult(0).getType(), *lhs, *rhs);
   }
 
-  FailureOr<Value> translateScalar(Value value, const DenseMap<Value, Value> &env) {
+  FailureOr<Value> translateScalar(Value value, const DenseMap<Value, Value> &env,
+                                   ArrayRef<AxisPack> loopAxes) {
     auto it = env.find(value);
     if (it != env.end())
       return it->second;
@@ -800,27 +893,51 @@ private:
       return ta->constant(typed);
     }
 
+    if (auto index = dyn_cast<linalg::IndexOp>(def)) {
+      return translateLinalgIndex(index, loopAxes);
+    }
+
     if (def->getNumResults() != 1)
       return def->emitOpError("unsupported scalar op with multiple results");
 
     if (isa<arith::ExtFOp>(def))
-      return translateUnaryScalarOp<ExtFOp>(def, env);
+      return translateUnaryScalarOp<ExtFOp>(def, env, loopAxes);
     if (isa<arith::TruncFOp>(def))
-      return translateUnaryScalarOp<TruncFOp>(def, env);
+      return translateUnaryScalarOp<TruncFOp>(def, env, loopAxes);
+    if (auto indexCast = dyn_cast<arith::IndexCastOp>(def)) {
+      if (auto index = indexCast.getIn().getDefiningOp<linalg::IndexOp>())
+        return translateLinalgIndex(index, loopAxes, indexCast.getResult().getType());
+      return def->emitOpError("only index_cast of linalg.index is supported by ta import");
+    }
     if (isa<math::ExpOp>(def))
-      return translateUnaryScalarOp<ExpOp>(def, env);
+      return translateUnaryScalarOp<ExpOp>(def, env, loopAxes);
     if (isa<arith::AddFOp>(def))
-      return translateBinaryScalarOp<AddFOp>(def, env);
+      return translateBinaryScalarOp<AddFOp>(def, env, loopAxes);
     if (isa<arith::SubFOp>(def))
-      return translateBinaryScalarOp<SubFOp>(def, env);
+      return translateBinaryScalarOp<SubFOp>(def, env, loopAxes);
     if (isa<arith::MulFOp>(def))
-      return translateBinaryScalarOp<MulFOp>(def, env);
+      return translateBinaryScalarOp<MulFOp>(def, env, loopAxes);
     if (isa<arith::DivFOp>(def))
-      return translateBinaryScalarOp<DivFOp>(def, env);
+      return translateBinaryScalarOp<DivFOp>(def, env, loopAxes);
     if (isa<arith::MaximumFOp>(def))
-      return translateBinaryScalarOp<MaximumFOp>(def, env);
+      return translateBinaryScalarOp<MaximumFOp>(def, env, loopAxes);
     if (isa<arith::MinimumFOp>(def))
-      return translateBinaryScalarOp<MinimumFOp>(def, env);
+      return translateBinaryScalarOp<MinimumFOp>(def, env, loopAxes);
+    if (auto cmpi = dyn_cast<arith::CmpIOp>(def)) {
+      FailureOr<Value> lhs = translateScalar(def->getOperand(0), env, loopAxes);
+      FailureOr<Value> rhs = translateScalar(def->getOperand(1), env, loopAxes);
+      if (failed(lhs) || failed(rhs))
+        return failure();
+      return ta->cmpi(cmpi.getPredicate(), *lhs, *rhs);
+    }
+    if (isa<arith::SelectOp>(def)) {
+      FailureOr<Value> condition = translateScalar(def->getOperand(0), env, loopAxes);
+      FailureOr<Value> trueValue = translateScalar(def->getOperand(1), env, loopAxes);
+      FailureOr<Value> falseValue = translateScalar(def->getOperand(2), env, loopAxes);
+      if (failed(condition) || failed(trueValue) || failed(falseValue))
+        return failure();
+      return ta->select(*condition, *trueValue, *falseValue);
+    }
 
     return def->emitOpError("unsupported scalar op for ta import: ") << def->getName();
   }
@@ -830,8 +947,8 @@ private:
     for (Operation &op : llvm::make_early_inc_range(llvm::reverse(body.without_terminator()))) {
       if (!op.use_empty())
         continue;
-      if (isa<AtOp, ConstantOp, ExtFOp, TruncFOp, ExpOp, Exp2Op, AddFOp, SubFOp, MulFOp, DivFOp,
-              MaximumFOp, MinimumFOp, ReduceOp>(&op))
+      if (isa<AtOp, ConstantOp, IndexOp, CmpIOp, SelectOp, ExtFOp, TruncFOp, ExpOp, Exp2Op, AddFOp,
+              SubFOp, MulFOp, DivFOp, MaximumFOp, MinimumFOp, ReduceOp>(&op))
         op.erase();
     }
   }

@@ -214,6 +214,17 @@ static FailureOr<AxesAttr> inferUnionAxesFromOperands(MLIRContext *context,
   return inferOrderedUnionAxes(context, operands);
 }
 
+static FailureOr<AxesAttr> inferSelectAxes(MLIRContext *context, std::optional<Location> location,
+                                           Value condition, Value trueValue, Value falseValue) {
+  if (!isa<ExprType>(condition.getType()) || !isa<ExprType>(trueValue.getType()) ||
+      !isa<ExprType>(falseValue.getType()))
+    return emitInferError(location, "expected ta.expr operands for select type inference");
+
+  // The selected value determines the result layout. A condition may be broadcast over
+  // extra axes, but it should not reorder value axes.
+  return inferOrderedUnionAxes(context, ValueRange{trueValue, falseValue, condition});
+}
+
 static LogicalResult inferSameElementwiseReturnTypes(MLIRContext *context,
                                                      std::optional<Location> location,
                                                      ValueRange operands,
@@ -419,6 +430,16 @@ LogicalResult CmpFOp::inferReturnTypes(MLIRContext *context, std::optional<Locat
   return success();
 }
 
+LogicalResult CmpIOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
+                                       Adaptor adaptor,
+                                       SmallVectorImpl<Type> &inferredReturnTypes) {
+  FailureOr<AxesAttr> axes = inferUnionAxesFromOperands(context, location, adaptor.getOperands());
+  if (failed(axes))
+    return failure();
+  inferredReturnTypes.push_back(ExprType::get(context, IntegerType::get(context, 1), *axes));
+  return success();
+}
+
 LogicalResult SelectOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
                                          Adaptor adaptor,
                                          SmallVectorImpl<Type> &inferredReturnTypes) {
@@ -429,7 +450,9 @@ LogicalResult SelectOp::inferReturnTypes(MLIRContext *context, std::optional<Loc
   if (trueValue.getElementType() != falseValue.getElementType())
     return emitInferError(location, "expected matching select value element types");
 
-  FailureOr<AxesAttr> axes = inferUnionAxesFromOperands(context, location, adaptor.getOperands());
+  FailureOr<AxesAttr> axes =
+      inferSelectAxes(context, location, adaptor.getCondition(), adaptor.getTrueValue(),
+                      adaptor.getFalseValue());
   if (failed(axes))
     return failure();
   inferredReturnTypes.push_back(ExprType::get(context, trueValue.getElementType(), *axes));
@@ -613,17 +636,72 @@ LogicalResult CmpFOp::verify() {
   return success();
 }
 
-LogicalResult SelectOp::verify() {
+LogicalResult IndexOp::verify() {
+  auto scopeOr = verifyInsideScope(getOperation());
+  if (failed(scopeOr))
+    return failure();
+
+  auto result = cast<ExprType>(getResult().getType());
+  Type elementType = result.getElementType();
+  if (!(elementType.isIndex() || elementType.isSignlessInteger()))
+    return emitOpError("result element type must be index or signless integer");
+
+  FailureOr<AxesAttr> expected =
+      inferAxesFromScopeIndexOperands(getOperation(), *scopeOr, ValueRange{getAxis()});
+  if (failed(expected))
+    return failure();
+  if (!sameAxes(result.getAxes(), *expected))
+    return emitOpError() << "result axes must match indexed scope axis; expected " << *expected;
+
+  return success();
+}
+
+LogicalResult CmpIOp::verify() {
   auto scopeOr = verifyInsideScope(getOperation());
   if (failed(scopeOr))
     return failure();
   if (failed(verifyElementwiseAxes(getOperation(), *scopeOr)))
     return failure();
 
+  auto lhs = cast<ExprType>(getLhs().getType());
+  auto rhs = cast<ExprType>(getRhs().getType());
+  auto result = cast<ExprType>(getResult().getType());
+  Type lhsElement = lhs.getElementType();
+  Type rhsElement = rhs.getElementType();
+  if (!(lhsElement.isIndex() || lhsElement.isSignlessInteger()))
+    return emitOpError("requires index or signless integer operand element types");
+  if (lhsElement != rhsElement)
+    return emitOpError("requires matching operand element types");
+  if (!result.getElementType().isInteger(1))
+    return emitOpError("result element type must be i1");
+
+  return success();
+}
+
+LogicalResult SelectOp::verify() {
+  auto scopeOr = verifyInsideScope(getOperation());
+  if (failed(scopeOr))
+    return failure();
+
   auto condition = cast<ExprType>(getCondition().getType());
   auto trueValue = cast<ExprType>(getTrueValue().getType());
   auto falseValue = cast<ExprType>(getFalseValue().getType());
   auto result = cast<ExprType>(getResult().getType());
+
+  for (Value operand : getOperation()->getOperands()) {
+    if (failed(verifyExprAxes(getOperation(), *scopeOr, operand.getType(), "operand")))
+      return failure();
+  }
+  if (failed(verifyExprAxes(getOperation(), *scopeOr, getResult().getType(), "result")))
+    return failure();
+
+  FailureOr<AxesAttr> expected = inferSelectAxes(
+      getContext(), getOperation()->getLoc(), getCondition(), getTrueValue(), getFalseValue());
+  if (failed(expected))
+    return failure();
+  if (!sameAxes(result.getAxes(), *expected))
+    return emitOpError()
+           << "result axes must be the selected-value ordered union; expected " << *expected;
 
   if (!condition.getElementType().isInteger(1))
     return emitOpError("condition element type must be i1");

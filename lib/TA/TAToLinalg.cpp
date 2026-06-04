@@ -64,9 +64,8 @@ class ScopeLowering {
 public:
   ScopeLowering(ScopeOp scope, OpBuilder &builder,
                 DenseMap<Operation *, Operation *> *loweredOps = nullptr,
-                llvm::function_ref<void(Operation *,
-                                        const DenseMap<Operation *, Operation *> &)> beforeErase =
-                    nullptr)
+                llvm::function_ref<void(Operation *, const DenseMap<Operation *, Operation *> &)>
+                    beforeErase = nullptr)
       : scope(scope), builder(builder), context(builder.getContext()), loc(scope.getLoc()),
         loweredOps(loweredOps), beforeErase(beforeErase) {}
 
@@ -350,7 +349,7 @@ private:
     auto generic = linalg::GenericOp::create(
         builder, root->getLoc(), TypeRange{*resultType}, inputTensors, ValueRange{init}, maps,
         iterators, [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
-          buildLinalgBody(nestedBuilder, nestedLoc, args, root, reduce);
+          buildLinalgBody(nestedBuilder, nestedLoc, args, root, reduce, loopAxes);
         });
     if (loweredOps)
       (*loweredOps)[root] = generic.getOperation();
@@ -391,7 +390,7 @@ private:
   }
 
   void buildLinalgBody(OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args,
-                       Operation *root, ReduceOp reduce) {
+                       Operation *root, ReduceOp reduce, ArrayRef<StringRef> loopAxes) {
     scalarValues.clear();
     for (auto [index, descriptor] : llvm::enumerate(inputs)) {
       if (descriptor.at)
@@ -402,16 +401,17 @@ private:
 
     Value yielded;
     if (reduce) {
-      Value payload = buildScalar(nestedBuilder, nestedLoc, reduce.getInput(), root);
+      Value payload = buildScalar(nestedBuilder, nestedLoc, reduce.getInput(), root, loopAxes);
       Value accumulator = args[inputs.size()];
       yielded = buildCombiner(nestedBuilder, nestedLoc, reduce.getKind(), accumulator, payload);
     } else {
-      yielded = buildScalar(nestedBuilder, nestedLoc, root->getResult(0), root);
+      yielded = buildScalar(nestedBuilder, nestedLoc, root->getResult(0), root, loopAxes);
     }
     linalg::YieldOp::create(nestedBuilder, nestedLoc, yielded);
   }
 
-  Value buildScalar(OpBuilder &nestedBuilder, Location nestedLoc, Value value, Operation *root) {
+  Value buildScalar(OpBuilder &nestedBuilder, Location nestedLoc, Value value, Operation *root,
+                    ArrayRef<StringRef> loopAxes) {
     auto it = scalarValues.find(value);
     if (it != scalarValues.end())
       return it->second;
@@ -423,11 +423,24 @@ private:
       return scalar;
     }
 
+    if (auto index = dyn_cast<IndexOp>(def)) {
+      StringRef axis = axisNames(cast<ExprType>(index.getResult().getType())).front();
+      FailureOr<unsigned> position = findAxis(index.getOperation(), loopAxes, axis);
+      if (failed(position))
+        llvm_unreachable("verified ta.index axis was not present in lowering loop axes");
+      Value scalar = linalg::IndexOp::create(nestedBuilder, nestedLoc, *position);
+      Type elementType = cast<ExprType>(index.getResult().getType()).getElementType();
+      if (!elementType.isIndex())
+        scalar = arith::IndexCastOp::create(nestedBuilder, nestedLoc, elementType, scalar);
+      scalarValues[value] = scalar;
+      return scalar;
+    }
+
     SmallVector<Value> operands;
     operands.reserve(def->getNumOperands());
     for (Value operand : def->getOperands()) {
       if (isa<ExprType>(operand.getType()))
-        operands.push_back(buildScalar(nestedBuilder, nestedLoc, operand, root));
+        operands.push_back(buildScalar(nestedBuilder, nestedLoc, operand, root, loopAxes));
     }
 
     Value scalar;
@@ -437,6 +450,12 @@ private:
     } else if (isa<TruncFOp>(def)) {
       auto resultType = cast<ExprType>(def->getResult(0).getType()).getElementType();
       scalar = arith::TruncFOp::create(nestedBuilder, nestedLoc, resultType, operands[0]);
+    } else if (auto cmpi = dyn_cast<CmpIOp>(def)) {
+      scalar = arith::CmpIOp::create(nestedBuilder, nestedLoc, cmpi.getPredicate(), operands[0],
+                                     operands[1]);
+    } else if (isa<SelectOp>(def)) {
+      scalar =
+          arith::SelectOp::create(nestedBuilder, nestedLoc, operands[0], operands[1], operands[2]);
     } else if (isa<AddFOp>(def)) {
       scalar = arith::AddFOp::create(nestedBuilder, nestedLoc, operands[0], operands[1]);
     } else if (isa<SubFOp>(def)) {
