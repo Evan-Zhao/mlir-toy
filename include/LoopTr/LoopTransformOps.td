@@ -36,22 +36,6 @@ def LinalgEraseUnusedOperandsAndResultsOp
   }];
 }
 
-def ApplyFoldExpandingReshapePatternsOp
-    : Op<Transform_Dialect, "apply_patterns.linalg.fold_expanding_reshape",
-         [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
-  let summary = "Collect patterns that expand linalg iteration spaces to fold reshapes into the op";
-
-  let description = [{
-    Collects patterns that create one or more size-one dimensions in the
-    iteration space of a `linalg` op when that makes it possible to fold
-    reshapes into the op, including:
-    - `tensor.expand_shape` on the producer (operand) side
-    - `tensor.collapse_shape` on the consumer (result) side
-  }];
-
-  let assemblyFormat = "attr-dict";
-}
-
 def LinalgGreedyInlineElementwiseOp : Op<Transform_Dialect, "linalg.greedy_inline_elementwise",
                                          [TransformOpInterface, TransformEachOpTrait,
                                           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
@@ -85,84 +69,6 @@ def LinalgGreedyInlineElementwiseOp : Op<Transform_Dialect, "linalg.greedy_inlin
     ::mlir::DiagnosedSilenceableFailure applyToOne(
         ::mlir::transform::TransformRewriter &rewriter,
         ::mlir::linalg::GenericOp target,
-        ::mlir::transform::ApplyToEachResultList &results,
-        ::mlir::transform::TransformState &state);
-  }];
-}
-
-def LinalgExchangeDivAndMatmulOp
-    : Op<Transform_Dialect, "linalg.exchange_div_and_matmul",
-         [FunctionalStyleTransformOpTrait, TransformOpInterface, TransformEachOpTrait,
-          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
-          ReportTrackingListenerFailuresOpTrait]> {
-  let summary = "Exchange an invariant division with a matmul-like linalg reduction";
-
-  let description = [{
-    Rewrites a matmul-like `linalg.generic` that consumes an elementwise
-    division by a value invariant along the contraction reduction dimension:
-
-    ```
-      sum((num / den) * rhs)  ->  sum(num * rhs) / den
-    ```
-
-    This is intended for the attention softmax normalization before the second
-    matmul. The transform is deliberately narrow: the target must be a
-    single-result `linalg.generic` with one reduction iterator, a zero fill
-    destination, and an `addf(acc, mulf(...))` scalar body. The selected operand
-    must be produced by an all-parallel two-input `linalg.generic` whose body
-    yields `arith.divf`.
-
-    `operand_number` defaults to 0, matching the usual `(softmax_probs @ V)`
-    layout. The original reduction is replaced by the trailing division. The op
-    returns handles to the rebuilt reduction and the trailing division.
-  }];
-
-  let arguments = (ins TransformHandleTypeInterface:$target,
-      DefaultValuedOptionalAttr<I64Attr, "0">:$operand_number);
-  let results = (outs TransformHandleTypeInterface:$reduction,
-      TransformHandleTypeInterface:$division);
-
-  let assemblyFormat = "$target attr-dict `:` functional-type(operands, results)";
-
-  let extraClassDeclaration = [{
-    ::mlir::DiagnosedSilenceableFailure applyToOne(
-        ::mlir::transform::TransformRewriter &rewriter,
-        ::mlir::linalg::GenericOp target,
-        ::mlir::transform::ApplyToEachResultList &results,
-        ::mlir::transform::TransformState &state);
-  }];
-}
-
-def LinalgFoldZeroIndexedUnitDimsOp : Op<Transform_Dialect, "linalg.fold_zero_indexed_unit_dims",
-                                         [TransformOpInterface, TransformEachOpTrait,
-                                          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
-                                          ReportTrackingListenerFailuresOpTrait]> {
-  let summary = "Drop unit tensor dims implicated by zero-valued indexing-map results";
-
-  let description = [{
-    Removes unit-extent dimensions from the iteration space of a `linalg.generic` op.
-    Compared to the upstream `linalg::dropUnitDims(...)`, this transform only removes dims
-    that are implicated by `0`-valued indexing map results,
-    e.g. maps like `(d0, d1, d2, d3) -> (d0, d1, d2, 0)`.
-
-    This transform is designed to convert keepdim-style reductions to non-keepdim ones,
-    and remove `(d0, d1, d2, 0)` indexing maps, which many MLIR upstream transforms
-    don't recognize or like.
-
-    This transform recursively visits the target op and ops inside it.
-    While it preserves the target handle and remaps it to the rewritten op,
-    it can invalidate handles that point to operations inside it.
-  }];
-
-  let arguments = (ins TransformHandleTypeInterface:$target);
-  let results = (outs);
-
-  let assemblyFormat = "$target attr-dict `:` type($target)";
-
-  let extraClassDeclaration = [{
-    ::mlir::DiagnosedSilenceableFailure applyToOne(
-        ::mlir::transform::TransformRewriter &rewriter,
-        ::mlir::Operation *target,
         ::mlir::transform::ApplyToEachResultList &results,
         ::mlir::transform::TransformState &state);
   }];

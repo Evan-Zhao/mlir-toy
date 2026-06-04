@@ -17,12 +17,9 @@ void registerLoopTransformExtension(mlir::DialectRegistry &registry) {
     };
     static_cast<TransformDialectAccess *>(dialect)
         ->addOperations<
-            mlir::transform::ApplyFoldExpandingReshapePatternsOp,
             mlir::transform::ScfLocalizeScratchTensorsOp,
-            mlir::transform::LinalgFoldZeroIndexedUnitDimsOp,
             mlir::transform::LinalgEraseUnusedOperandsAndResultsOp,
-            mlir::transform::LinalgGreedyInlineElementwiseOp,
-            mlir::transform::LinalgExchangeDivAndMatmulOp, mlir::transform::FusionIntoProducerOp,
+            mlir::transform::LinalgGreedyInlineElementwiseOp, mlir::transform::FusionIntoProducerOp,
             mlir::transform::ScfFuseReductionIntoForallOp,
             mlir::transform::FusionFindNextReductionOp, mlir::transform::FusionCloneFuseElemwiseOp,
             mlir::transform::FusionRepairReductionFrontierOp,
