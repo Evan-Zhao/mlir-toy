@@ -50,12 +50,12 @@ module attributes {transform.with_named_sequence} {
 
     transform.linalg.greedy_inline_elementwise %bmm0 : !any
     transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any
-
     %_1, %forall_loop = transform.structured.tile_using_forall
         %bmm0 tile_sizes [1, 1, 1, 128, 64, 0] : (!any) -> (!any, !any)
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     %bscale = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
-    %fused_bscale = transform.fusion.into_producer %bscale into %forall_loop : (!any, !any) -> !any
+    transform.fusion.into_producer %bscale into %forall_loop : (!any, !any) -> !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     %consumers = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
@@ -87,13 +87,8 @@ module attributes {transform.with_named_sequence} {
     %trunc = transform.get_consumers_of_result %forall_loop[2] : (!any) -> !any
     transform.fusion.into_producer %trunc into %forall_loop : (!any, !any) -> !any
 
-    transform.apply_patterns to %func {
-      transform.apply_patterns.tensor.bubble_up_extract_slice
-      transform.apply_patterns.canonicalization
-    } : !any
-    transform.apply_cse to %func : !any
-    transform.scf.localize_scratch_tensors %func : !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+    transform.scf.localize_scratch_tensors %func : !any
     transform.apply_cse to %func : !any
 
     transform.yield

@@ -68,6 +68,10 @@ module attributes {transform.with_named_sequence} {
     // We'll fuse everything else into this loop nest.
     %_1, %forall_loop = transform.structured.tile_using_forall
         %bmm0 tile_sizes [1, 1, 128, 64, 0] : (!any) -> (!any, !any)
+    // Canonicalization removes trivial (size-1) dimensions. This copies the loop and invalidates
+    // all handles pointing to ops inside the loop body.
+    // So we want to do this before we start fusion.
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     // Fusion 1. Match an element-wise op that is a consumer of mm0, and fuse it into mm0.
     //   TVM: sch.reverse_compute_at(bscale, j0)

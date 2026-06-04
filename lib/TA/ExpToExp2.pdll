@@ -90,6 +90,19 @@ Pattern DistributeConstantMulOverSubF {
   };
 }
 
+// c * select(p, x, y) => select(p, c * x, c * y), for finite c > 0
+Pattern PushPositiveScaleThroughSelect {
+  let select = op<ta.select>(condition: Value, trueValue: Value, falseValue: Value);
+  let mul = op<ta.mulf>(constant: Value, select);
+  PositiveAxislessConstant(constant);
+
+  rewrite mul with {
+    let scaledTrue = op<ta.mulf>(constant, trueValue);
+    let scaledFalse = op<ta.mulf>(constant, falseValue);
+    replace mul with op<ta.select>(condition, scaledTrue, scaledFalse);
+  };
+}
+
 // c * max_axes(x) => max_axes(c * x), for finite c > 0
 Pattern PushPositiveScaleThroughMaxReduce {
   let kind: Attr;
