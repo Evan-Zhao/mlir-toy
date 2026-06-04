@@ -217,9 +217,9 @@ LinalgGreedyInlineElementwiseOp::applyToOne(TransformRewriter &rewriter, linalg:
   (void)state;
   auto transform = cast<TransformOpInterface>(getOperation());
   std::optional<int64_t> operandNumber = getOperandNumber();
-  if (operandNumber && (*operandNumber < 0 || *operandNumber >= target.getNumOperands())) {
-    target.emitError() << "this operation has " << target.getNumOperands()
-                       << " operands, but operand_number is " << *operandNumber;
+  if (operandNumber && (*operandNumber < 0 || *operandNumber >= target.getNumDpsInputs())) {
+    target.emitError() << "this operation has " << target.getNumDpsInputs()
+                       << " DPS input operands, but operand_number is " << *operandNumber;
     BAIL("operand_number is out of range");
   }
 
@@ -227,7 +227,7 @@ LinalgGreedyInlineElementwiseOp::applyToOne(TransformRewriter &rewriter, linalg:
   bool applied = false;
   while (true) {
     size_t beginOprndNum = operandNumber ? *operandNumber : 0,
-           endOprndNum = operandNumber ? beginOprndNum + 1 : currentOp.getNumOperands();
+           endOprndNum = operandNumber ? beginOprndNum + 1 : currentOp.getNumDpsInputs();
     bool changed = false;
     for (size_t i = beginOprndNum; i < endOprndNum; ++i) {
       auto folded = tryDirectElementwiseFusion(rewriter, currentOp, i);
@@ -237,6 +237,7 @@ LinalgGreedyInlineElementwiseOp::applyToOne(TransformRewriter &rewriter, linalg:
       if (*folded) {
         currentOp = cast<GenericOp>(*folded);
         changed = applied = true;
+        break;
       }
     }
     if (!changed)
