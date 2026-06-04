@@ -960,9 +960,28 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
   (void)transformResults;
   auto transform = cast<TransformOpInterface>(getOperation());
 
-  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getProducerOp, "producer", producer,
-                               linalg::GenericOp);
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getLoop, "loop", loop, scf::ForOp);
+
+  SmallVector<Operation *> producerOps = llvm::to_vector(state.getPayloadOps(getProducerOp()));
+  linalg::GenericOp producer;
+  bool producerWasTracked = llvm::hasSingleElement(producerOps);
+  if (llvm::hasSingleElement(producerOps)) {
+    producer = dyn_cast<linalg::GenericOp>(producerOps.front());
+    if (!producer)
+      BAIL("expected producer to be a linalg::GenericOp");
+  } else if (producerOps.empty()) {
+    SmallVector<linalg::GenericOp> candidates;
+    loop.walk([&](linalg::GenericOp generic) {
+      if (succeeded(matchDeadSelect(generic, getDeadValue())))
+        candidates.push_back(generic);
+    });
+    if (!llvm::hasSingleElement(candidates))
+      BAIL("expected exactly one dead-select producer in loop when producer handle is empty");
+    producer = candidates.front();
+  } else {
+    return emitSilenceableFailure(transform, "expected exactly one producer payload op, got " +
+                                                 std::to_string(producerOps.size()));
+  }
 
   FailureOr<MatchedDeadSelect> match = matchDeadSelect(producer, getDeadValue());
   if (failed(match))
@@ -1022,7 +1041,7 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
     BAIL("failed to clone the mixed loop");
   if (!mixedProducer)
     BAIL("failed to clone the producer into the mixed loop");
-  if (failed(rewriter.notifyPayloadOperationReplaced(producer, mixedProducer)))
+  if (producerWasTracked && failed(rewriter.notifyPayloadOperationReplaced(producer, mixedProducer)))
     BAIL("failed to preserve the producer handle");
 
   if (loop.getNumResults() == 0)
