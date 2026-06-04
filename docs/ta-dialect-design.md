@@ -39,6 +39,7 @@ tensor operations:
 
 ```text
 log2(e) * max_j S = max_j (log2(e) * S), when log2(e) > 0
+log2(e) * select(mask, x, y) = select(mask, log2(e) * x, log2(e) * y)
 log2(e) * scale * Dot = (log2(e) * scale) * Dot
 ```
 
@@ -168,12 +169,16 @@ ta.powf
 ta.fma
 
 ta.cmpf
+ta.index
+ta.cmpi
 ta.select
 ```
 
-These ops share the same axis rule: result axes are the ordered union of operand axes,
-taking first occurrence from operands left-to-right.
-Unary ops therefore preserve operand axis orde.
+Most elementwise ops share the same axis rule: result axes are the ordered
+union of operand axes, taking first occurrence from operands left-to-right.
+Unary ops therefore preserve operand axis order. `ta.select` is slightly
+different: selected value operands determine the result layout first, and the
+condition axes are appended if needed.
 `ta.map` remains available as an escape hatch for scalar code without a dedicated `ta` op.
 
 The current rewrite support is compiled into the plugin:
@@ -204,12 +209,13 @@ P = exp(S - M)
 
 the rules compose into:
 
-| Step             | Rule                                                                   | Result                   |
-| ---------------- | ---------------------------------------------------------------------- | ------------------------ |
-| Change base      | `exp(x) => exp2(c * x)`, where `c = log2(e)`                           | `P = exp2(c * (S - M))`  |
-| Distribute       | `c * (x - y) => c*x - c*y`                                             | `P = exp2(c*S - c*M)`    |
-| Move through max | `c * max_j(S) => max_j(c*S)`, for finite `c > 0` and `j notin axes(c)` | `P = exp2(S2 - M2)`      |
-| Fold constants   | `c * (scale * Dot) => (c * scale) * Dot`                               | `S2 = (c * scale) * Dot` |
+| Step           | Rule                                                                   | Result                   |
+| -------------- | ---------------------------------------------------------------------- | ------------------------ |
+| Change base    | `exp(x) => exp2(c * x)`, where `c = log2(e)`                           | `P = exp2(c * (S - M))`  |
+| Distribute     | `c * (x - y) => c*x - c*y`                                             | `P = exp2(c*S - c*M)`    |
+| Push thru mask | `c * select(p, x, y) => select(p, c*x, c*y)`, for finite `c > 0`       | masked scores rescaled   |
+| Move thru max  | `c * max_j(S) => max_j(c*S)`, for finite `c > 0` and `j notin axes(c)` | `P = exp2(S2 - M2)`      |
+| Fold constants | `c * (scale * Dot) => (c * scale) * Dot`                               | `S2 = (c * scale) * Dot` |
 
 The driver repeatedly applies the rules and runs CSE between greedy iterations.
 No single rule needs to match the full attention graph.
@@ -266,6 +272,10 @@ arith.mulf
 arith.divf
 arith.maximumf
 arith.minimumf
+arith.cmpi
+arith.select
+linalg.index
+arith.index_cast of linalg.index
 math.exp
 ```
 
@@ -383,9 +393,9 @@ best effort: handles to expression roots that materialize as linalg ops
 survive; handles to internal TA ops that lower into indexing maps or
 linalg-region scalar ops may be dropped.
 
-## End-To-End Demo Shape
+## End-To-End Demos
 
-`test/TA/attention.mlir` demonstrates the implemented flow:
+`test/TA/attention.mlir` demonstrates the basic implemented flow:
 
 ```mlir
 transform.named_sequence @__transform_main(%module: !transform.any_op) {
@@ -406,6 +416,11 @@ transform.named_sequence @__transform_main(%module: !transform.any_op) {
 The resulting program has the same high-level tensor computation, but the
 softmax numerator uses `exp2`, and the score scale has absorbed the `log2(e)`
 factor.
+
+The `test/Pipeline` directory contains the fuller transform schedules that use
+TA matching and rewrites before lowering back to linalg and continuing with
+loop-level scheduling. It currently covers global attention, grouped-query
+attention, and causal attention.
 
 ## Operation Reference
 
@@ -436,6 +451,18 @@ The result type is the authoritative axis order. In the current simple
 indexing form, each index must be either a `ta.scope` axis block argument,
 which contributes that axis in index order, or a constant index, which
 contributes no axis.
+
+### `ta.index`
+
+Returns the current coordinate for one scope axis as a `ta.expr`.
+
+```mlir
+%i64 = ta.index %i : !ta.expr<i64, [i]>
+```
+
+The result element type may be `index` or a signless integer type. During
+lowering, integer-typed `ta.index` becomes `linalg.index` followed by
+`arith.index_cast` inside the generated `linalg.generic` body.
 
 ### `ta.map`
 
@@ -495,7 +522,7 @@ axes(ta.at T[index_exprs...]) = scope-axis indices in index order
 axes(ta.map f(x1,...,xn)) = ordered_union_i axes(xi)
 axes(ta.elementwise_op(x1,...,xn)) = ordered_union_i axes(xi)
 axes(ta.reduce over R x) = axes(x) with R removed in-place
-axes(ta.select c x y) = ordered_union(axes(c), axes(x), axes(y))
+axes(ta.select c x y) = ordered_union(axes(x), axes(y), axes(c))
 ```
 
 The axis support set is a conservative dependency support, not necessarily a
@@ -504,7 +531,7 @@ though simplification can later produce an axisless zero.
 
 ## Current Limitations
 
-The implemented dialect and passes cover the current attention rewrite demo,
+The implemented dialect and passes cover the current attention pipeline demos,
 but several areas remain intentionally narrow:
 
 1. Import is limited to projected-permutation and broadcast indexing maps.
