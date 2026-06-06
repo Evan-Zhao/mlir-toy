@@ -933,8 +933,6 @@ extern "C" LLVM_ATTRIBUTE_WEAK mlir::PassPluginLibraryInfo mlirGetPassPluginInfo
 #include "mlir/IR/DialectImplementation.h"
 #include "llvm/ADT/TypeSwitch.h"
 
-#include "TAInterfaces.cpp.inc"
-
 #include "TAEnums.cpp.inc"
 
 #define GET_ATTRDEF_CLASSES

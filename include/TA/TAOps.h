@@ -2,7 +2,6 @@
 #define TA_TAOPS_H
 
 #include "TA/TADialect.h"
-#include "TA/TAInterfaces.h"
 #include "TA/TATypes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Bytecode/BytecodeOpInterface.h"

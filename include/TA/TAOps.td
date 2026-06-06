@@ -1,5 +1,4 @@
 include "TA/TATypes.td"
-include "TA/TAInterfaces.td"
 include "mlir/Dialect/Arith/IR/ArithBase.td"
 include "mlir/IR/CommonTypeConstraints.td"
 include "mlir/IR/CommonAttrConstraints.td"
@@ -12,7 +11,7 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 class TA_Op<string mnemonic, list<Trait> traits = []> : Op<TA_Dialect, mnemonic, traits>;
 
 class TA_ElementwiseOp<string mnemonic, list<Trait> traits = []>
-    : TA_Op<mnemonic, [Pure, TA_ElementwiseOpInterface]#traits> {
+    : TA_Op<mnemonic, [Pure]#traits> {
   let hasVerifier = 1;
 }
 
@@ -62,7 +61,7 @@ def TA_AtOp : TA_Op<"at", [Pure]> {
 }
 
 def TA_MapOp : TA_Op<"map", [SingleBlockImplicitTerminator<"YieldOp">, InferTypeOpAdaptor,
-                             TA_ElementwiseOpInterface]> {
+                             Pure]> {
   let summary = "pointwise scalar map over expression operands";
   let description = [{
     Applies a scalar region pointwise over the union of operand axis supports.
