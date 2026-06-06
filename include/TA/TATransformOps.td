@@ -4,8 +4,8 @@ include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
 def TAMatchEinsumOp
-    : Op<Transform_Dialect, "match.ta.einsum",
-         [SingleOpMatcher, MatchOpInterface, MemoryEffectsOpInterface]> {
+    : Op<Transform_Dialect,
+         "match.ta.einsum", [SingleOpMatcher, MatchOpInterface, MemoryEffectsOpInterface]> {
   let summary = "Match a TA expression against a small einsum equation";
 
   let description = [{
@@ -34,11 +34,9 @@ def TAMatchEinsumOp
   let extraClassDeclaration = SingleOpMatcher.extraDeclaration;
 }
 
-def TAToLinalgOp
-    : Op<Transform_Dialect, "ta.to_linalg",
-         [TransformOpInterface,
-          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
-          ReportTrackingListenerFailuresOpTrait]> {
+def TAToLinalgOp : Op<Transform_Dialect, "ta.to_linalg",
+                      [TransformOpInterface, DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+                       ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Lower TA scopes to linalg while best-effort preserving handles";
 
   let description = [{
@@ -84,9 +82,8 @@ def TAExchangeDivAndMatmulPatternsOp
   let assemblyFormat = "attr-dict";
 }
 
-def TAExpToExp2PatternsOp
-    : Op<Transform_Dialect, "apply_patterns.ta.exp_to_exp2",
-         [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
+def TAExpToExp2PatternsOp : Op<Transform_Dialect, "apply_patterns.ta.exp_to_exp2",
+                               [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
   let summary = "Collect TA algebraic rewrite patterns for exp-to-exp2";
 
   let description = [{
@@ -106,11 +103,10 @@ def TAExpToExp2PatternsOp
   let assemblyFormat = "attr-dict";
 }
 
-def TARewriteExpToExp2Op
-    : Op<Transform_Dialect, "ta.rewrite_exp_to_exp2",
-         [TransformOpInterface, TransformEachOpTrait,
-          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
-          ReportTrackingListenerFailuresOpTrait]> {
+def TARewriteExpToExp2Op : Op<Transform_Dialect, "ta.rewrite_exp_to_exp2",
+                              [TransformOpInterface, TransformEachOpTrait,
+                               DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+                               ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Greedily apply TA exp-to-exp2 algebraic rewrites";
 
   let description = [{

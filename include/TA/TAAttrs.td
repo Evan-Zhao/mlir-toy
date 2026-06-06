@@ -2,14 +2,10 @@ include "TA/TADialect.td"
 include "mlir/IR/AttrTypeBase.td"
 include "mlir/IR/EnumAttr.td"
 
-def TA_ReduceKindAttr : I32EnumAttr<
-    "ReduceKind", "built-in tensor algebra reducer",
-    [
-      I32EnumAttrCase<"Add", 0, "add">,
-      I32EnumAttrCase<"Mul", 1, "mul">,
-      I32EnumAttrCase<"Max", 2, "max">,
-      I32EnumAttrCase<"Min", 3, "min">
-    ]> {
+def TA_ReduceKindAttr
+    : I32EnumAttr<"ReduceKind", "built-in tensor algebra reducer",
+                  [I32EnumAttrCase<"Add", 0, "add">, I32EnumAttrCase<"Mul", 1, "mul">,
+                   I32EnumAttrCase<"Max", 2, "max">, I32EnumAttrCase<"Min", 3, "min">]> {
   let cppNamespace = "::ta";
   let genSpecializedAttr = 0;
 }
@@ -30,11 +26,9 @@ def TA_AxisAttr : AttrDef<TA_Dialect, "Axis"> {
   let parameters = (ins "::mlir::StringAttr":$name);
   let assemblyFormat = "`<` $name `>`";
 
-  let builders = [
-    AttrBuilder<(ins "::llvm::StringRef":$name), [{
+  let builders = [AttrBuilder<(ins "::llvm::StringRef":$name), [{
       return $_get($_ctxt, ::mlir::StringAttr::get($_ctxt, name));
-    }]>
-  ];
+    }]>];
 
   let genVerifyDecl = 1;
 }
