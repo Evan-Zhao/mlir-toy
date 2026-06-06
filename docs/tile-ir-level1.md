@@ -58,6 +58,10 @@ This is intentionally close to a Triton-style FlashAttention program: one
 program instance per output tile, one sequential loop over K/V blocks, and
 explicit tile-local online-softmax state.
 
+The current transform-generated pipeline tests may use `scf.for` for the
+streaming loop even when the bounds are static. The handwritten example uses
+`affine.for` as the canonical static form.
+
 ## Structured Tile Bodies
 
 Level 1 should preserve high-level tile computations instead of immediately

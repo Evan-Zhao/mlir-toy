@@ -1,7 +1,8 @@
 # Attention Rolling Update Design
 
 This note describes the rolling-update operator fusion transformation in its current MLIR form.
-An integrated attention example using it is in `test/Loop/torch_mlir_attention.mlir`.
+Integrated attention examples using it live under `test/Pipeline`, starting with
+`test/Pipeline/tm_global_attention.mlir`.
 
 Rolling update is a generalized form of operator fusion that can put pairs of reductions together
 under the same loop. Since that breaks the usual producer-consumer dependencies,
@@ -47,11 +48,9 @@ consumed). It returns:
   sorted in producer-to-consumer order.
 
 The op fails if no reduction is reachable or if any op on the path is not a
-supported single-result elementwise op.
-
-- The later rolling-update steps are implemented to only support `linalg.generic`,
-  so tensor `arith` / `math` elementwise ops are not supported even though they may pass this step.
-  They can be normalized first, e.g. with `convert-elementwise-to-linalg`.
+supported single-result elementwise `linalg.generic`.
+Tensor `arith` / `math` elementwise ops must be normalized first, e.g. with
+`convert-elementwise-to-linalg`.
 
 ### `transform.fusion.clone_fuse_elemwise`
 
@@ -87,12 +86,12 @@ It performs the following steps:
 1. Inline the sidecars into `reduce_op` with repeated `linalg::fuseElementwiseOps`,
    until the frontier becomes a single `linalg.generic`.
 1. Inspect that fused body and classify scalar inputs:
-    - `r0`, `r1`, ... for values produced by earlier reductions `producer_reduce_ops`,
-    - `c0`, `c1`, ... for ordinary values,
+   - `r0`, `r1`, ... for values produced by earlier reductions `producer_reduce_ops`,
+   - `c0`, `c1`, ... for ordinary values,
 1. Extract:
-    - `f_expr` from the `reduce_op`, which should be a simple reduction combiner, such as `a + b`
-    - `g_expr` from the non-accumulator side of the reduction combiner,
-      which should coinside with the combined computation of `elemwise_sidecar_ops`.
+   - `f_expr` from the `reduce_op`, which should be a simple reduction combiner, such as `a + b`
+   - `g_expr` from the non-accumulator side of the reduction combiner,
+     which should coincide with the combined computation of `elemwise_sidecar_ops`.
 1. Call the Python/SymPy solver on these two expressions to derive a repair term `H`,
    and prove that `H` is valid for the combiner `f`.
 1. Materialize `H` as an elementwise `linalg.generic` (call it `update_op`),
@@ -119,9 +118,9 @@ For the current attention schedule, the intended flow is:
 1. build the outer `scf.forall` over output tiles and the inner streaming loop over K/V blocks,
 2. fuse QK and score scaling under that streaming loop,
 3. find the nearest reduction frontier from the loop-local score tile,
-4. force-fuse the elementwise chain under the loop as sidecar ops,
+4. clone and fuse the elementwise chain under the loop as sidecar ops,
 5. repair the frontier reduction by deriving and applying `H`,
-6. repeat for later frontiers as more rolling-update cases are implemented.
+6. repeat for later frontiers such as `P @ V` accumulation and row sum.
 
 For row sum and output accumulation this yields the usual FlashAttention
 recurrences:
@@ -136,21 +135,21 @@ out      = acc_final / l_final
 
 ## Transform-Dialect Notes
 
-- `rolling_update_next_reduction` is analysis-only and does not consume its input handle.
+- `transform.fusion.find_next_reduction` is analysis-only and does not consume its input handle.
 - `clone_fuse_elemwise` and `repair_reduction_frontier` rewrite explicit ops in functional style,
   while loop handles are read-only inputs remapped to rebuilt loops.
 - Ordered multi-op handles are part of the contract: the elementwise chain is
   not treated as an unordered set.
-- TODO: upstream `scf::tileAndFuseConsumer` expects loop results to be
-  published through `tensor.insert_slice` / `tensor.parallel_insert_slice`.
-  If canonicalization removes those relays, rebuild minimal slices just before
-  fusion or call `tileAndFuseConsumerOfSlices` with explicit slices.
+- The fusion helpers depend on loop results being traceable through
+  `tensor.insert_slice` / `tensor.parallel_insert_slice` relays. The integrated
+  schedules run canonicalization at points where those relays are still
+  recoverable by later fusion steps.
 
 ## Testing
 
 Useful coverage is:
 
-1. analysis-only tests for `rolling_update_next_reduction`,
-2. synthetic tests for force-fused elementwise chains,
-3. reduction-frontier repair tests for the supported unary reduction case,
+1. analysis-only tests for `transform.fusion.find_next_reduction`,
+2. synthetic tests for cloned and fused elementwise sidecar chains,
+3. reduction-frontier repair tests for supported single-result reduction cases,
 4. end-to-end attention tests that check the repaired loop-carried recurrence shape.

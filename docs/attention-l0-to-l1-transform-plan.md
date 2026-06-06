@@ -2,24 +2,24 @@
 
 ## Goal
 
-Implement an MLIR Transform dialect schedule that lowers the algorithm-only
-attention form in `test/Loop/torch_mlir_attention.mlir` into the scheduled tile-level
-FlashAttention form in `test/python/data/flash_attention_l1.mlir`.
+Implement an MLIR Transform dialect schedule that lowers an algorithm-only attention
+into a scheduled, tile-level FlashAttention-like form.
+The canonical handwritten reference for the tile-level program is
+`test/python/data/flash_attention_l1.mlir`.
 
-The implementation should be a real structural transformation, not a
-replacement pass that materializes a known output module.
+Currently the test cases under [`test/Pipeline`](../test/Pipeline) move toward that goal.
+Each test contains a payload module in the algorithmic form, and a `transform` region with the schedule.
 
-Here, "L0" means a "math-like" algorithmic program:
-the whole computation is spelled directly in terms of linalg operations,
-(elementwise, reduction, etc.).
+We will refer to this "math-like" algorithmic program as "L0", and the scheduled, tile-level program as "L1".
+"L0" means the whole computation is spelled directly in terms of linalg operations (elementwise, reduction, etc.).
 No tiling, no explicit streaming loop, and no online-softmax recurrence.
-The payload in `test/Loop/torch_mlir_attention.mlir` is exactly this form.
+The payloads embedded in `test/Pipeline` test cases are in this form.
 
 "L1" means the scheduled, target-independent tile form used by the rest of the project:
 output tiling is explicit, the outer parallel grid and inner sequential streaming loop are explicit,
 and the online-softmax state is carried explicitly as loop state.
 GPU hierarchy, memory placement, and other hardware-specific choices are still absent.
-See also `docs/tile-ir-level1.md`.
+See also [`docs/tile-ir-level1.md`](./tile-ir-level1.md).
 
 ## Scheduling Model
 
@@ -43,23 +43,25 @@ Note: `ts.` is short for `transform.structured.` (MLIR builtin transforms).
 
 | TVM primitive                            | MLIR plan                                                                                                                           |
 | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `get_block(name)`                        | Avoid relying on frontend block names. Match structurally using Transform dialect matchers and navigation ops [1].                  |
+| `get_block(name)`                        | Avoid frontend block names. Use linalg structural matchers and TA einsum matching [1].                                              |
 | `tile_loops([i, j])`                     | Works differently from TVM. `ts.tile_using_forall` applies tiling and produces `scf.forall`, which also implies parallel execution. |
-| `bind_block_idx([*axes, i0])`            | Implied by `scf.forall` (parallel) or `scf.for` (serial). Correspondence to GPU block/thread is not recorded in L1.                 |
+| `bind_block_idx([*axes, i0])`            | Implied by `scf.forall` (parallel) or `scf.for` (serial). GPU block/thread is not recorded in L1.                                   |
 | `reverse_compute_at`                     | Two custom upward-fusion transforms for elementwise consumers and reduction consumers respectively [2].                             |
 | `rolling_update`                         | Implement as a sequence of three custom operations, one analysis and two transformations [3].                                       |
 | `split_scan_buffer`                      | Not needed in L1. MLIR rolling-update does not generate scan dependency (`x[t] = f(x[t-1], ...)`).                                  |
-| `decompose_reduction`                    | _**TBD**_ Likely not needed in L1. Neptune TVM needed it to guide translation from a mem-based IR to value-based tile languages.    |
+| `decompose_reduction`                    | Not a separate schedule step. Neptune TVM needed it to guide translation from a mem-based IR to value-based tile languages.         |
 | `set_scope`, `cache_read`, `cache_write` | Not represented in L1. Defer memory placement to L1-to-HTile lowering.                                                              |
 | `to_tile_expr_form`, `mem2reg`           | L1 is already value-based over tile tensors.                                                                                        |
-| `cse`                                    | Use MLIR builtins for CSE and canonicalization.                                                                                     |
-| `rewrite_expr`                           | Use MLIR pattern rewrites [4].                                                                                                      |
+| `cse`                                    | Use MLIR canonicalization and CSE, including `transform.apply_patterns ... canonicalization` and `transform.apply_cse`.             |
+| `rewrite_expr`                           | Use our TA dialect [4] for rewrites: import linalg to TA, run TA expression rewrites, then lower back to linalg.                    |
 
-1. We may want custom match ops (to match einsum patterns, for example).
-1. See the document on [upward fusion design](upward-fusion-design.md).
-1. See the document on [rolling update design](rolling-update-design.md).
-1. MLIR pattern rewriter allows expression rewrite to be rather easily implemented in a custom pass,
-   but we may need something more powerful and available at the `transform` dialect level later.
+1. The schedule generalizes named linalg ops, imports the computation into TA,
+   and uses the TA expression view for `transform.ta.rewrite_exp_to_exp2`,
+   `transform.apply_patterns.ta.exchange_div_and_matmul`, and
+   `transform.match.ta.einsum`. See [the TA dialect design](ta-dialect-design.md).
+2. See the document on [upward fusion design](upward-fusion-design.md).
+3. See the document on [rolling update design](rolling-update-design.md).
+4. See [the TA dialect design](ta-dialect-design.md).
 
 ## Structural Matching Strategy
 
@@ -77,12 +79,12 @@ The useful constraints here are:
    by following producers and consumers than by re-matching from scratch.
    - This also means transform operations should try to not invalidate handles.
 
-1. Use custom match ops only where indexing-map structure really matters.
-   The most plausible future example is an einsum-style matcher for contraction
-   shapes such as `...ik,...jk->...ij`.
+1. Use custom match ops where indexing-map structure really matters.
+   The current schedule uses `transform.match.ta.einsum` to identify both
+   attention contractions before lowering TA back to linalg.
 
 For an established example of this strategy, see the
-[integrated attention transform test](../test/Loop/torch_mlir_attention.mlir) in the codebase.
+[integrated attention transform test](../test/Pipeline/tm_global_attention.mlir) in the codebase.
 
 ## Upward Fusion
 
@@ -114,14 +116,30 @@ The detailed rolling update design is documented in a
 
 ## Current Status
 
-The transform stack now has the main custom pieces needed for this schedule:
-
-- custom upward fusion for pointwise and reduction consumers,
-- rolling-update analysis plus repair for the softmax and `P @ V` frontiers,
-- a working integrated attention transform test in
-  [test/Loop/torch_mlir_attention.mlir](../test/Loop/torch_mlir_attention.mlir).
-
-The remaining work is mostly cleanup and generalization to new computation patterns.
+- [x] TA prepass imports linalg attention into expression form, rewrites `exp`
+      to `exp2`, exchanges division and matmul where needed, and lowers back to linalg.
+- [x] TA einsum matching identifies the two attention contractions and keeps
+      useful handles alive across TA-to-linalg lowering.
+- [x] QK is tiled with `transform.structured.tile_using_forall`, producing the
+      outer parallel `scf.forall` tile grid.
+- [x] Pointwise score scaling is fused into the tiled producer loop.
+- [x] Row-max is fused under the outer loop and creates the inner streaming
+      `scf.for` over K/V blocks.
+- [x] Rolling update repairs the softmax row-sum and `P @ V` frontiers into
+      loop-carried online-softmax state.
+- [x] Trailing normalization and FP32-to-FP16 cast are fused into the outer
+      loop after the streaming loop.
+- [x] The integrated global-attention test checks the FlashAttention-like
+      structural shape in `test/Pipeline/tm_global_attention.mlir`.
+- [ ] Automatic L1-to-HTile lowering is still separate work. L1 deliberately
+      omits memory placement, cache staging, and hardware-specific tile scopes.
+- [ ] HTile/backend integration should consume the scheduled L1 form rather
+      than relying on handwritten HTile examples.
+- [ ] The generated L1 is not normalized to the exact handwritten
+      `test/python/data/flash_attention_l1.mlir` style; it still uses details such
+      as singleton tile dimensions and generic linalg bodies.
+- [ ] More general attention variants and shapes still need cleanup and
+      generalization beyond the current fixed global-attention pipeline.
 
 ## Testing Strategy
 
@@ -130,7 +148,7 @@ Use layered tests:
 1. Small synthetic tests for upward fusion and rolling update, especially on
    max, sum, and matmul-like reductions.
 2. End-to-end structural tests from the payload in
-   `test/Loop/torch_mlir_attention.mlir` to the scheduled L1 shape:
+   `test/Pipeline/tm_global_attention.mlir` to the scheduled L1 shape:
    - contains `scf.forall`,
    - contains `scf.for` with `iter_args`,
    - contains repaired row max and row sum recurrences,

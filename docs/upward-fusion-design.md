@@ -3,7 +3,8 @@
 ## Goal
 
 This note documents the custom upward-fusion primitives used by the attention
-L0-to-L1 schedule in `test/Loop/torch_mlir_attention.mlir`.
+L0-to-L1 schedules under `test/Pipeline`, starting with
+`test/Pipeline/tm_global_attention.mlir`.
 
 The intent is the same as TVM `reverse_compute_at`: move a consumer under the
 loop nest that already materializes tiles of its input. In MLIR, this is not a
@@ -29,7 +30,7 @@ The implementation is intentionally thin. It delegates most of the real work to
 upstream `scf::tileAndFuseConsumer` after checking that the consumer is
 elementwise and that the supplied loop is the root of a supported tiled loop nest.
 
-For attention, this is used to fused the score-scaling step into the main loop nest:
+For attention, this is used to fuse the score-scaling step into the main loop nest:
 
 ```text
 qk = Q @ K^T
