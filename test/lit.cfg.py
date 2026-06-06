@@ -40,6 +40,15 @@ config.substitutions.append(
 )
 config.substitutions.append(
     (
+        "%neptune_htile_plugin",
+        os.path.join(
+            config.neptune_mlir_obj_root,
+            "libHTileDialect" + config.neptune_mlir_shared_library_suffix,
+        ),
+    )
+)
+config.substitutions.append(
+    (
         "%neptune_ta_plugin",
         os.path.join(
             config.neptune_mlir_obj_root,

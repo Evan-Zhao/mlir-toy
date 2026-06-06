@@ -2,6 +2,7 @@
 #include "HTile/HTileAttrs.h"
 #include "HTile/HTileOps.h"
 #include "HTile/HTilePasses.h"
+#include "HTile/HTileTransformOps.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Tools/Plugins/DialectPlugin.h"
@@ -29,6 +30,7 @@ extern "C" LLVM_ATTRIBUTE_WEAK mlir::DialectPluginLibraryInfo mlirGetDialectPlug
           [](mlir::DialectRegistry *registry) {
             registry->insert<htile::HTileDialect>();
             htile::registerHTilePasses();
+            htile::registerHTileTransformExtension(*registry);
           }};
 }
 

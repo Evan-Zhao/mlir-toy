@@ -80,6 +80,11 @@ mlir_tablegen(HTileEnums.h.inc -gen-enum-decls)
 mlir_tablegen(HTileEnums.cpp.inc -gen-enum-defs)
 add_public_tablegen_target(HTileAttrsIncGen)
 
+set(LLVM_TARGET_DEFINITIONS include/HTile/HTileTransformOps.td)
+mlir_tablegen(HTileTransformOps.h.inc -gen-op-decls)
+mlir_tablegen(HTileTransformOps.cpp.inc -gen-op-defs)
+add_public_tablegen_target(HTileTransformOpsIncGen)
+
 set(LLVM_TARGET_DEFINITIONS include/LoopTr/LoopTransformOps.td)
 mlir_tablegen(LoopTransformOps.h.inc -gen-op-decls)
 mlir_tablegen(LoopTransformOps.cpp.inc -gen-op-defs)
@@ -166,8 +171,15 @@ endfunction()
 
 make_mlir_opt_plugin(
   TARGET HTileDialect
-  SOURCES lib/HTile/HTileDialect.cpp lib/HTile/HTilePasses.cpp
-  DEPS HTileOpsIncGen HTileAttrsIncGen
+  SOURCES
+    lib/HTile/HTileDialect.cpp
+    lib/HTile/HTilePasses.cpp
+    lib/HTile/HTileTransformOps.cpp
+    lib/LoopTr/Utils.cpp
+  DEPS
+    HTileOpsIncGen
+    HTileAttrsIncGen
+    HTileTransformOpsIncGen
 )
 make_mlir_opt_plugin(
   TARGET TADialect
