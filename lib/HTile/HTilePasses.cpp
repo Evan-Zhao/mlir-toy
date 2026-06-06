@@ -94,8 +94,8 @@ struct DotTransposeToLoadOrderPass
         return dot.emitOpError("transpose_a fission expects a rank-2 lhs");
       auto type = cast<RankedTensorType>(dot.getLhs().getType());
       auto permutedType = permuteTensorType(type, transpose);
-      auto permute = builder.create<PermuteOp>(dot.getLoc(), permutedType, dot.getLhs(),
-                                               builder.getDenseI64ArrayAttr(transpose));
+      auto permute = PermuteOp::create(builder, dot.getLoc(), permutedType, dot.getLhs(),
+                                       builder.getDenseI64ArrayAttr(transpose));
       dot->setOperand(0, permute.getResult());
       dot->removeAttr("transpose_a");
     }
@@ -105,8 +105,8 @@ struct DotTransposeToLoadOrderPass
         return dot.emitOpError("transpose_b fission expects a rank-2 rhs");
       auto type = cast<RankedTensorType>(dot.getRhs().getType());
       auto permutedType = permuteTensorType(type, transpose);
-      auto permute = builder.create<PermuteOp>(dot.getLoc(), permutedType, dot.getRhs(),
-                                               builder.getDenseI64ArrayAttr(transpose));
+      auto permute = PermuteOp::create(builder, dot.getLoc(), permutedType, dot.getRhs(),
+                                       builder.getDenseI64ArrayAttr(transpose));
       dot->setOperand(1, permute.getResult());
       dot->removeAttr("transpose_b");
     }
@@ -121,8 +121,8 @@ struct DotTransposeToLoadOrderPass
 
     ArrayRef<int64_t> permutation = permute.getPermutation();
     OpBuilder builder(permute);
-    auto fusedLoad = builder.create<LoadOp>(permute.getLoc(), permute.getResult().getType(),
-                                            load.getSource(), load.getOffsets());
+    auto fusedLoad = LoadOp::create(builder, permute.getLoc(), permute.getResult().getType(),
+                                    load.getSource(), load.getOffsets());
     fusedLoad->setAttrs(load->getAttrDictionary());
     fusedLoad->setAttr(kDimensionOrderAttrName, composeDimensionOrder(builder, load, permutation));
 

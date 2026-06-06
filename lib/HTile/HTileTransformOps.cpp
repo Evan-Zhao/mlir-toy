@@ -97,10 +97,10 @@ FailureOr<Value> createBroadcastToResultShape(OpBuilder &builder, Location loc, 
     return failure();
   }
 
-  Value empty = builder.create<tensor::EmptyOp>(
-      loc, targetType.getShape(), targetType.getElementType(), targetType.getEncoding());
+  Value empty = tensor::EmptyOp::create(builder, loc, targetType.getShape(),
+                                        targetType.getElementType(), targetType.getEncoding());
   createdOps.push_back(empty.getDefiningOp());
-  auto broadcast = builder.create<linalg::BroadcastOp>(loc, input, empty, broadcastDims);
+  auto broadcast = linalg::BroadcastOp::create(builder, loc, input, empty, broadcastDims);
   createdOps.push_back(broadcast);
   return broadcast->getResult(0);
 }
@@ -112,7 +112,7 @@ FailureOr<Value> materializeScalarAsTile(OpBuilder &builder, Location loc, Value
     return failure();
   auto resultType =
       RankedTensorType::get(shapeType.getShape(), scalar.getType(), shapeType.getEncoding());
-  auto full = builder.create<htile::FullOp>(loc, resultType, scalar);
+  auto full = htile::FullOp::create(builder, loc, resultType, scalar);
   createdOps.push_back(full);
   return full.getResult();
 }
@@ -130,11 +130,11 @@ FailureOr<Value> materializeIndexTile(OpBuilder &builder, Location loc, linalg::
 
   auto indexType = builder.getIndexType();
   auto arangeType = RankedTensorType::get({extent}, indexType, resultType.getEncoding());
-  Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
+  Value zero = arith::ConstantIndexOp::create(builder, loc, 0);
   createdOps.push_back(zero.getDefiningOp());
-  Value end = builder.create<arith::ConstantIndexOp>(loc, extent);
+  Value end = arith::ConstantIndexOp::create(builder, loc, extent);
   createdOps.push_back(end.getDefiningOp());
-  auto arange = builder.create<htile::ArangeOp>(loc, arangeType, zero, end);
+  auto arange = htile::ArangeOp::create(builder, loc, arangeType, zero, end);
   createdOps.push_back(arange);
 
   SmallVector<AffineExpr> exprs;
@@ -164,7 +164,7 @@ FailureOr<Value> createTensorScalarLikeOp(OpBuilder &builder, Location loc, Oper
     auto resultType = RankedTensorType::get(resultShape.getShape(), constant.getType(),
                                             resultShape.getEncoding());
     auto splat = DenseElementsAttr::get(resultType, constant.getValue());
-    auto created = builder.create<arith::ConstantOp>(loc, splat);
+    auto created = arith::ConstantOp::create(builder, loc, splat);
     createdOps.push_back(created);
     return created.getResult();
   }
@@ -220,7 +220,7 @@ LogicalResult rewriteFill(RewriterBase &rewriter, linalg::FillOp op) {
   if (!resultType)
     return failure();
   rewriter.setInsertionPoint(op);
-  auto full = rewriter.create<htile::FullOp>(op.getLoc(), resultType, op.getInputs().front());
+  auto full = htile::FullOp::create(rewriter, op.getLoc(), resultType, op.getInputs().front());
   rewriter.replaceOp(op, full.getResult());
   return success();
 }
@@ -270,10 +270,11 @@ LogicalResult rewriteContraction(RewriterBase &rewriter, linalg::GenericOp op) {
     return failure();
 
   rewriter.setInsertionPoint(op);
-  auto dot = rewriter.create<htile::DotOp>(
-      op.getLoc(), op.getResult(0).getType(), op.getInputs()[0], op.getInputs()[1],
-      op.getDpsInits()[0], transposeA ? rewriter.getUnitAttr() : UnitAttr{},
-      transposeB ? rewriter.getUnitAttr() : UnitAttr{}, StringAttr{});
+  auto lhsAttr = transposeA ? rewriter.getUnitAttr() : UnitAttr{},
+       rhsAttr = transposeB ? rewriter.getUnitAttr() : UnitAttr{};
+  auto dot =
+      htile::DotOp::create(rewriter, op.getLoc(), op.getResult(0).getType(), op.getInputs()[0],
+                           op.getInputs()[1], op.getDpsInits()[0], lhsAttr, rhsAttr, StringAttr{});
   rewriter.replaceOp(op, dot.getResult());
   return success();
 }
@@ -315,16 +316,17 @@ LogicalResult rewriteReduction(RewriterBase &rewriter, linalg::GenericOp op) {
     return failure();
 
   rewriter.setInsertionPoint(op);
-  auto reduce = rewriter.create<htile::ReduceOp>(
-      op.getLoc(), op.getResult(0).getType(), op.getInputs()[0],
-      rewriter.getI64IntegerAttr(static_cast<int64_t>(*reductionAxis)),
-      rewriter.getStringAttr(*kind));
+  auto reduce =
+      htile::ReduceOp::create(rewriter, op.getLoc(), op.getResult(0).getType(), op.getInputs()[0],
+                              rewriter.getI64IntegerAttr(static_cast<int64_t>(*reductionAxis)),
+                              rewriter.getStringAttr(*kind));
   Value combined;
   if (*kind == "sum")
-    combined = rewriter.create<arith::AddFOp>(op.getLoc(), op.getDpsInits()[0], reduce.getResult());
+    combined =
+        arith::AddFOp::create(rewriter, op.getLoc(), op.getDpsInits()[0], reduce.getResult());
   else if (*kind == "max")
     combined =
-        rewriter.create<arith::MaximumFOp>(op.getLoc(), op.getDpsInits()[0], reduce.getResult());
+        arith::MaximumFOp::create(rewriter, op.getLoc(), op.getDpsInits()[0], reduce.getResult());
   else
     return failure();
   rewriter.replaceOp(op, combined);
