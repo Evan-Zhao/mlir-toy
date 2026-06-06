@@ -97,6 +97,40 @@ module attributes {transform.with_named_sequence} {
     return %0 : tensor<4x8xf32>
   }
 
+  // CHECK-LABEL: func.func @index_mask(
+  func.func @index_mask(
+      %true_tile: tensor<4x8xi1>,
+      %out: tensor<4x8xi1>) -> tensor<4x8xi1> {
+    %false = arith.constant false
+    // CHECK-DAG: %[[C4:.+]] = arith.constant 4 : index
+    // CHECK-DAG: %[[C8:.+]] = arith.constant 8 : index
+    // CHECK-DAG: %[[I:.+]] = htile.arange %{{.*}} to %[[C4]] : tensor<4xindex>
+    // CHECK-DAG: %[[J:.+]] = htile.arange %{{.*}} to %[[C8]] : tensor<8xindex>
+    // CHECK-DAG: %[[IB:.+]] = linalg.broadcast ins(%[[I]] : tensor<4xindex>)
+    // CHECK-DAG: %[[JB:.+]] = linalg.broadcast ins(%[[J]] : tensor<8xindex>)
+    // CHECK-DAG: %[[II:.+]] = arith.index_cast %[[IB]] : tensor<4x8xindex> to tensor<4x8xi64>
+    // CHECK-DAG: %[[JI:.+]] = arith.index_cast %[[JB]] : tensor<4x8xindex> to tensor<4x8xi64>
+    // CHECK-DAG: %[[CMP:.+]] = arith.cmpi sle, %[[JI]], %[[II]] : tensor<4x8xi64>
+    // CHECK-DAG: %[[FALSE:.+]] = htile.full %false : i1 -> tensor<4x8xi1>
+    // CHECK: arith.select %[[CMP]], %arg0, %[[FALSE]] : tensor<4x8xi1>
+    // CHECK-NOT: linalg.generic
+    %0 = linalg.generic {
+        indexing_maps = [#id2, #id2],
+        iterator_types = ["parallel", "parallel"]}
+        ins(%true_tile : tensor<4x8xi1>)
+        outs(%out : tensor<4x8xi1>) {
+    ^bb0(%in: i1, %unused: i1):
+      %i = linalg.index 0 : index
+      %ii = arith.index_cast %i : index to i64
+      %j = linalg.index 1 : index
+      %ji = arith.index_cast %j : index to i64
+      %live = arith.cmpi sle, %ji, %ii : i64
+      %selected = arith.select %live, %in, %false : i1
+      linalg.yield %selected : i1
+    } -> tensor<4x8xi1>
+    return %0 : tensor<4x8xi1>
+  }
+
   // CHECK-LABEL: func.func @fill(
   func.func @fill(%value: f32, %out: tensor<4x8xf32>) -> tensor<4x8xf32> {
     // CHECK: htile.full %arg0 : f32 -> tensor<4x8xf32>

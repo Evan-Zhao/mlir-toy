@@ -46,13 +46,20 @@ The transform rewrites these operations:
 
 - `linalg.fill` becomes `htile.full`.
 - Contraction-shaped `linalg.generic` becomes `htile.dot`.
-  - A contraction whose RHS indexing map is transposed emits `transpose_b`.
-  - A contraction with a DPS init operand emits accumulating `htile.dot`.
-- Single-axis add reductions become `htile.reduce ... kind "sum"`.
-- Single-axis max reductions become `htile.reduce ... kind "max"`.
-- All-parallel elementwise `linalg.generic` ops are opened into tensor `arith` / `math` ops.
+  - A contraction whose RHS indexing map is transposed emits `transpose_b`; same for LHS.
+  - The DPS init operand is preserved as the accumulating input to `htile.dot`.
+- Single-axis add reductions become `htile.reduce ... kind "sum"` followed by an add with the
+  original DPS init; same for max.
+- All-parallel elementwise `linalg.generic` ops are opened into tensor elementwise ops.
+- Elementwise scalar ops are rebuilt generically when they are pure, single-result, regionless,
+  successorless `OpTrait::Elementwise` ops.
+- `affine.apply` ops inside elementwise bodies are first expanded with MLIR affine utilities, so
+  the rewritten tensor body uses ordinary tensor `arith` ops.
+- `linalg.index` inside elementwise bodies becomes an `htile.arange` along that dimension,
+  broadcast to the elementwise result shape when needed.
 - Projected row-vector operands in elementwise ops are materialized with `linalg.broadcast`.
-- Captured scalar operands in elementwise ops are materialized as tile-shaped `htile.full` values.
+- Captured scalar operands in elementwise ops are materialized as tile-shaped `htile.full` values;
+  scalar `arith.constant` ops inside the body become tensor `arith.constant` splats.
 
 The reduction translation uses the shared binary-reduction combiner matcher from `LoopTr/Utils`.
 HTile-specific code only maps supported combiner ops to HTile reduce kinds.
@@ -62,8 +69,9 @@ converted. Unsupported payload ops emit an error at the payload op location.
 
 Current limitations:
 
-- It currently supports a narrow set of scalar elementwise operations and reduction combiners;
-  unsupported ones fail loudly.
+- Elementwise conversion is generic over pure single-result elementwise ops, but still rejects ops
+  with regions, successors, multiple results, or unsupported result typing.
+- Reduction conversion only recognizes the currently supported binary reduction combiners.
 - It expects static tile shapes.
 
 ## Placement Transforms

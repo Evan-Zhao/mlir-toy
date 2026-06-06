@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin --load-dialect-plugin=%neptune_ta_plugin %s --transform-interpreter 2>&1 | FileCheck %s --check-prefix=MATCH
+// RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin --load-dialect-plugin=%neptune_ta_plugin --load-dialect-plugin=%neptune_htile_plugin %s --transform-interpreter 2>&1 | FileCheck %s
 //
 // Transform-dialect schedule for a Torch-MLIR causal-attention payload. This
 // extends the basic FlashAttention-style schedule with
@@ -105,6 +105,14 @@ module attributes {transform.with_named_sequence} {
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.scf.localize_scratch_tensors %func : !any
     transform.apply_cse to %func : !any
+    transform.apply_patterns to %func {
+      transform.apply_patterns.linalg.fold_unit_extent_dims_via_reshapes
+    } : !any
+    transform.apply_cse to %func : !any
+
+    // --- HTile lowering begins ---
+    transform.htile.linalg_to_semantic %func : !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     transform.yield
   }
@@ -216,20 +224,29 @@ module attributes {transform.with_named_sequence} {
   }
 }
 
-// MATCH-LABEL: func.func @attention(
-// MATCH-NOT: tensor.empty() : tensor<4x1024x64xf32>
-// MATCH: %[[FORALL:[0-9]+]] = scf.forall (%{{.*}}, %{{.*}}) in (4, 8) shared_outs(%{{.*}} = %{{.*}}) -> (tensor<1x4x1024x64xf16>)
-// MATCH: tensor.empty() : tensor<1x1x128xf32>
-// MATCH: tensor.empty() : tensor<1x1x128x64xf32>
-// MATCH: linalg.fill ins(%cst{{.*}} : f32) outs(%{{.*}} : tensor<1x1x128x64xf32>)
-// MATCH: %[[RAW_BOUND:.+]] = arith.select %{{.*}}, %{{.*}}, %c0 : index
-// MATCH: %[[CAPPED_BOUND:.+]] = arith.select %{{.*}}, %[[RAW_BOUND]], %c16 : index
-// MATCH: %[[LIVE:.+]]:8 = scf.for %{{.*}} = %c0 to %[[CAPPED_BOUND]] step %c1 iter_args(
-// MATCH: %[[MIXED:.+]]:3 = scf.for %{{.*}} = %[[CAPPED_BOUND]] to %c16 step %c1 iter_args(%{{.*}} = %[[LIVE]]#1, %{{.*}} = %[[LIVE]]#4, %{{.*}} = %[[LIVE]]#7) -> (tensor<1x1x128xf32>, tensor<1x1x128x64xf32>, tensor<1x1x128xf32>)
-// MATCH: linalg.generic {indexing_maps = [#map{{[0-9]+}}, #map{{[0-9]+}}, #map{{[0-9]+}}, #map{{[0-9]+}}], iterator_types = ["parallel", "parallel", "parallel"]}
-// MATCH: math.exp2
-// MATCH: linalg.generic {indexing_maps = [#map{{[0-9]+}}, #map{{[0-9]+}}, #map{{[0-9]+}}], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%[[MIXED]]#1, %[[MIXED]]#2 : tensor<1x1x128x64xf32>, tensor<1x1x128xf32>)
-// MATCH: arith.divf %{{.*}}, %{{.*}} : f32
-// MATCH: linalg.generic {indexing_maps = [#map{{[0-9]+}}, #map{{[0-9]+}}], iterator_types = ["parallel", "parallel", "parallel", "parallel"]} ins(%{{.*}} : tensor<1x1x128x64xf32>) outs(%{{.*}} : tensor<1x1x128x64xf16>)
-// MATCH: tensor.parallel_insert_slice %{{.*}} into %{{.*}}[0, %{{.*}}, %{{.*}}, 0] [1, 1, 128, 64] [1, 1, 1, 1] : tensor<1x1x128x64xf16> into tensor<1x4x1024x64xf16>
-// MATCH: return %[[FORALL]] : tensor<1x4x1024x64xf16>
+// CHECK-LABEL: func.func @attention(
+// CHECK-NOT: tensor.empty() : tensor<4x1024x64xf32>
+// CHECK: %[[FORALL:[0-9]+]] = scf.forall (%{{.*}}, %{{.*}}) in (4, 8) shared_outs(%{{.*}} = %{{.*}}) -> (tensor<1x4x1024x64xf16>)
+// CHECK: htile.full %cst{{.*}} : f32 -> tensor<1x1x128xf32>
+// CHECK: htile.full %cst{{.*}} : f32 -> tensor<1x1x128x64xf32>
+// CHECK: %[[RAW_BOUND:.+]] = arith.select %{{.*}}, %{{.*}}, %c0 : index
+// CHECK: %[[CAPPED_BOUND:.+]] = arith.select %{{.*}}, %[[RAW_BOUND]], %c16 : index
+// CHECK: %[[LIVE:.+]]:8 = scf.for %{{.*}} = %c0 to %[[CAPPED_BOUND]] step %c1 iter_args(
+// CHECK: %[[MIXED:.+]]:3 = scf.for %{{.*}} = %[[CAPPED_BOUND]] to %c16 step %c1 iter_args(%{{.*}} = %[[LIVE]]#1, %{{.*}} = %[[LIVE]]#4, %{{.*}} = %[[LIVE]]#7) -> (tensor<1x1x128xf32>, tensor<1x1x128x64xf32>, tensor<1x1x128xf32>)
+// CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} {transpose_b}
+// CHECK: htile.arange %c0 to %c128 : tensor<128xindex>
+// CHECK: linalg.broadcast ins(%{{.*}} : tensor<128xindex>) outs(%{{.*}} : tensor<128x64xindex>) dimensions = [1]
+// CHECK: arith.muli %{{.*}}, %{{.*}} : tensor<128x64xindex>
+// CHECK: arith.addi %{{.*}}, %{{.*}} : tensor<128x64xindex>
+// CHECK: htile.arange %c0 to %c64 : tensor<64xindex>
+// CHECK: linalg.broadcast ins(%{{.*}} : tensor<64xindex>) outs(%{{.*}} : tensor<128x64xindex>) dimensions = [0]
+// CHECK: arith.cmpi sle, %{{.*}}, %{{.*}} : tensor<128x64xi64>
+// CHECK: arith.select %{{.*}}, %{{.*}}, %{{.*}} : tensor<128x64xi1>, tensor<128x64xf32>
+// CHECK: htile.reduce %{{.*}} axis 1 kind "max" : tensor<128x64xf32> -> tensor<128xf32>
+// CHECK: math.exp2
+// CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<128x64xf32>, tensor<64x64xf16>, tensor<128x64xf32> -> tensor<128x64xf32>
+// CHECK: htile.reduce %{{.*}} axis 1 kind "sum" : tensor<128x64xf32> -> tensor<128xf32>
+// CHECK: arith.divf %{{.*}}, %{{.*}} : tensor<128x64xf32>
+// CHECK: arith.truncf %{{.*}} : tensor<128x64xf32> to tensor<128x64xf16>
+// CHECK: tensor.parallel_insert_slice %{{.*}} into %{{.*}}[0, %{{.*}}, %{{.*}}, 0] [1, 1, 128, 64] [1, 1, 1, 1] : tensor<1x1x128x64xf16> into tensor<1x4x1024x64xf16>
+// CHECK: return %[[FORALL]] : tensor<1x4x1024x64xf16>

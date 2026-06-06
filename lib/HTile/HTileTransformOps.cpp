@@ -1,22 +1,24 @@
 #include "HTile/HTileTransformOps.h"
-
 #include "HTile/HTileDialect.h"
+
 #include "LoopTr/Utils.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Transform/IR/TransformDialect.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
-#include "mlir/Dialect/Transform/Utils/DiagnosedSilenceableFailure.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/PatternMatch.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 
-#include <optional>
+#define DEBUG_TYPE "htile-transform-ops"
 
 using namespace mlir;
 
@@ -56,12 +58,6 @@ SmallVector<size_t> getMapDims(AffineMap map) {
     dims.push_back(*maybePos);
   }
   return dims;
-}
-
-void eraseCreatedOps(SmallVectorImpl<Operation *> &createdOps) {
-  for (Operation *op : llvm::reverse(createdOps))
-    op->erase();
-  createdOps.clear();
 }
 
 FailureOr<Value> createBroadcastToResultShape(OpBuilder &builder, Location loc, Value input,
@@ -121,6 +117,34 @@ FailureOr<Value> materializeScalarAsTile(OpBuilder &builder, Location loc, Value
   return full.getResult();
 }
 
+FailureOr<Value> materializeIndexTile(OpBuilder &builder, Location loc, linalg::IndexOp indexOp,
+                                      RankedTensorType resultType,
+                                      SmallVectorImpl<Operation *> &createdOps) {
+  size_t dim = static_cast<size_t>(indexOp.getDim());
+  if (dim >= static_cast<size_t>(resultType.getRank()))
+    return failure();
+
+  int64_t extent = resultType.getDimSize(static_cast<int64_t>(dim));
+  if (extent == ShapedType::kDynamic)
+    return failure();
+
+  auto indexType = builder.getIndexType();
+  auto arangeType = RankedTensorType::get({extent}, indexType, resultType.getEncoding());
+  Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
+  createdOps.push_back(zero.getDefiningOp());
+  Value end = builder.create<arith::ConstantIndexOp>(loc, extent);
+  createdOps.push_back(end.getDefiningOp());
+  auto arange = builder.create<htile::ArangeOp>(loc, arangeType, zero, end);
+  createdOps.push_back(arange);
+
+  SmallVector<AffineExpr> exprs;
+  exprs.push_back(builder.getAffineDimExpr(static_cast<unsigned>(dim)));
+  AffineMap indexingMap =
+      AffineMap::get(resultType.getRank(), /*symbolCount=*/0, exprs, builder.getContext());
+  return createBroadcastToResultShape(builder, loc, arange.getResult(), indexingMap, resultType,
+                                      createdOps);
+}
+
 FailureOr<StringRef> getHTileReductionKind(Operation *combiner) {
   if (isa<arith::AddFOp>(combiner))
     return StringRef("sum");
@@ -132,35 +156,61 @@ FailureOr<StringRef> getHTileReductionKind(Operation *combiner) {
 FailureOr<Value> createTensorScalarLikeOp(OpBuilder &builder, Location loc, Operation *scalarOp,
                                           ValueRange operands, RankedTensorType resultShape,
                                           SmallVectorImpl<Operation *> &createdOps) {
-  Operation *created = nullptr;
-  if (isa<arith::AddFOp>(scalarOp)) {
-    created = builder.create<arith::AddFOp>(loc, operands[0], operands[1]);
-  } else if (isa<arith::MulFOp>(scalarOp)) {
-    created = builder.create<arith::MulFOp>(loc, operands[0], operands[1]);
-  } else if (isa<arith::SubFOp>(scalarOp)) {
-    created = builder.create<arith::SubFOp>(loc, operands[0], operands[1]);
-  } else if (isa<arith::DivFOp>(scalarOp)) {
-    created = builder.create<arith::DivFOp>(loc, operands[0], operands[1]);
-  } else if (isa<arith::MaximumFOp>(scalarOp)) {
-    created = builder.create<arith::MaximumFOp>(loc, operands[0], operands[1]);
-  } else if (isa<arith::NegFOp>(scalarOp)) {
-    created = builder.create<arith::NegFOp>(loc, operands[0]);
-  } else if (isa<math::Exp2Op>(scalarOp)) {
-    created = builder.create<math::Exp2Op>(loc, operands[0]);
-  } else if (auto ext = dyn_cast<arith::ExtFOp>(scalarOp)) {
-    auto dstType =
-        RankedTensorType::get(resultShape.getShape(), ext.getType(), resultShape.getEncoding());
-    created = builder.create<arith::ExtFOp>(loc, dstType, operands[0]);
-  } else if (auto trunc = dyn_cast<arith::TruncFOp>(scalarOp)) {
-    auto dstType =
-        RankedTensorType::get(resultShape.getShape(), trunc.getType(), resultShape.getEncoding());
-    created = builder.create<arith::TruncFOp>(loc, dstType, operands[0]);
+
+  // Convert scalar constant op to a tensor constant op.
+  if (auto constant = dyn_cast<arith::ConstantOp>(scalarOp)) {
+    if (!operands.empty() || isa<ShapedType>(constant.getType()))
+      return failure();
+    auto resultType = RankedTensorType::get(resultShape.getShape(), constant.getType(),
+                                            resultShape.getEncoding());
+    auto splat = DenseElementsAttr::get(resultType, constant.getValue());
+    auto created = builder.create<arith::ConstantOp>(loc, splat);
+    createdOps.push_back(created);
+    return created.getResult();
   }
-  if (created) {
+
+  // This is a default case that covers all "element-wise" operations that returns one result.
+  // The canonical examples are most arith ops and math ops.
+  bool elemwise = scalarOp->hasTrait<OpTrait::Elementwise>(),
+       oneResult = scalarOp->getNumResults() == 1, noRegions = scalarOp->getNumRegions() == 0,
+       noSuccessors = scalarOp->getNumSuccessors() == 0,
+       noMemoryEffects = isMemoryEffectFree(scalarOp);
+  LLVM_DEBUG(llvm::dbgs() << "Creating tensor-scalar-like op for: " << *scalarOp << "\n"
+                          << "  elemwise = " << elemwise << ", oneResult: " << oneResult
+                          << ", noRegions: " << noRegions << ", noSuccessors: " << noSuccessors
+                          << ", noMemoryEffects: " << noMemoryEffects << "\n");
+  if (elemwise && oneResult && noRegions && noSuccessors && noMemoryEffects) {
+    auto resultType = RankedTensorType::get(
+        resultShape.getShape(), scalarOp->getResult(0).getType(), resultShape.getEncoding());
+    OperationState state(loc, scalarOp->getName());
+    state.addOperands(operands);
+    state.addTypes(resultType);
+    state.addAttributes(scalarOp->getAttrs());
+    Operation *created = builder.create(state);
     createdOps.push_back(created);
     return created->getResult(0);
   }
+  scalarOp->emitError() << "this scalar operation is not supported";
   return failure();
+}
+
+LogicalResult expandAffineApplyOpsInLinalgBody(linalg::GenericOp op) {
+  SmallVector<affine::AffineApplyOp> affineApplies;
+  op.getBody()->walk([&](affine::AffineApplyOp affineApply) {
+    if (affineApply->getParentOp() == op)
+      affineApplies.push_back(affineApply);
+  });
+
+  for (affine::AffineApplyOp affineApply : affineApplies) {
+    OpBuilder builder(affineApply);
+    std::optional<SmallVector<Value, 8>> expanded = affine::expandAffineMap(
+        builder, affineApply.getLoc(), affineApply.getAffineMap(), affineApply.getOperands());
+    if (!expanded || expanded->size() != 1)
+      return failure();
+    affineApply.getResult().replaceAllUsesWith((*expanded)[0]);
+    affineApply->erase();
+  }
+  return success();
 }
 
 LogicalResult rewriteFill(RewriterBase &rewriter, linalg::FillOp op) {
@@ -288,71 +338,80 @@ LogicalResult rewriteElementwise(RewriterBase &rewriter, linalg::GenericOp op) {
         return iterator == utils::IteratorType::parallel;
       }))
     return failure();
+  if (failed(expandAffineApplyOpsInLinalgBody(op)))
+    return failure();
 
   RankedTensorType resultType = cast<RankedTensorType>(op.getResult(0).getType());
   SmallVector<AffineMap> maps = op.getIndexingMapsArray();
   rewriter.setInsertionPoint(op);
 
+  // Track the operations created during the rewrite, and remove them if this function fails.
   SmallVector<Operation *> createdOps;
+  bool failedAndRevert = true;
+  auto guard = llvm::scope_exit([&]() {
+    if (!failedAndRevert)
+      return;
+    for (Operation *op : llvm::reverse(createdOps))
+      op->erase();
+    createdOps.clear();
+  });
+
   IRMapping mapping;
   unsigned argIndex = 0;
-  for (Value input : op.getInputs()) {
-    FailureOr<Value> prepared = createBroadcastToResultShape(
-        rewriter, op.getLoc(), input, maps[argIndex], resultType, createdOps);
-    if (failed(prepared)) {
-      eraseCreatedOps(createdOps);
-      return failure();
+  auto rewriteOperands = [&](OperandRange range) {
+    for (Value v : range) {
+      FailureOr<Value> prepared = createBroadcastToResultShape(
+          rewriter, op.getLoc(), v, maps[argIndex], resultType, createdOps);
+      if (failed(prepared))
+        return failure();
+      mapping.map(op.getBlock()->getArgument(argIndex), *prepared);
+      ++argIndex;
     }
-    mapping.map(op.getBlock()->getArgument(argIndex), *prepared);
-    ++argIndex;
-  }
-  for (Value init : op.getDpsInits()) {
-    FailureOr<Value> prepared = createBroadcastToResultShape(
-        rewriter, op.getLoc(), init, maps[argIndex], resultType, createdOps);
-    if (failed(prepared)) {
-      eraseCreatedOps(createdOps);
-      return failure();
-    }
-    mapping.map(op.getBlock()->getArgument(argIndex), *prepared);
-    ++argIndex;
-  }
+    return success();
+  };
+  if (failed(rewriteOperands(op.getInputs())))
+    return failure();
+  if (failed(rewriteOperands(op.getDpsInits())))
+    return failure();
 
   auto yield = dyn_cast<linalg::YieldOp>(op.getBlock()->getTerminator());
-  if (!yield || yield.getValues().size() != 1) {
-    eraseCreatedOps(createdOps);
+  if (!yield || yield.getValues().size() != 1)
     return failure();
-  }
 
   for (Operation &bodyOp : op.getBlock()->without_terminator()) {
+    if (auto index = dyn_cast<linalg::IndexOp>(bodyOp)) {
+      FailureOr<Value> tensorIndex =
+          materializeIndexTile(rewriter, bodyOp.getLoc(), index, resultType, createdOps);
+      if (failed(tensorIndex))
+        return failure();
+      mapping.map(index.getResult(), *tensorIndex);
+      continue;
+    }
+
     SmallVector<Value> mappedOperands;
     for (Value operand : bodyOp.getOperands()) {
       Value mapped = mapping.lookupOrNull(operand);
       if (!mapped) {
         FailureOr<Value> tile =
             materializeScalarAsTile(rewriter, bodyOp.getLoc(), operand, resultType, createdOps);
-        if (failed(tile)) {
-          eraseCreatedOps(createdOps);
+        if (failed(tile))
           return failure();
-        }
         mapped = *tile;
       }
       mappedOperands.push_back(mapped);
     }
     FailureOr<Value> tensorOp = createTensorScalarLikeOp(rewriter, bodyOp.getLoc(), &bodyOp,
                                                          mappedOperands, resultType, createdOps);
-    if (failed(tensorOp) || bodyOp.getNumResults() != 1) {
-      eraseCreatedOps(createdOps);
+    if (failed(tensorOp) || bodyOp.getNumResults() != 1)
       return failure();
-    }
     mapping.map(bodyOp.getResult(0), *tensorOp);
   }
 
   Value replacement = mapping.lookupOrNull(yield.getValues()[0]);
-  if (!replacement) {
-    eraseCreatedOps(createdOps);
+  if (!replacement)
     return failure();
-  }
   rewriter.replaceOp(op, replacement);
+  failedAndRevert = false;
   return success();
 }
 
