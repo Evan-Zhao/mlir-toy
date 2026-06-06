@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin --load-dialect-plugin=%neptune_ta_plugin %s --transform-interpreter 2>&1 | FileCheck %s
+// RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin --load-dialect-plugin=%neptune_ta_plugin --load-dialect-plugin=%neptune_htile_plugin %s --transform-interpreter 2>&1 | FileCheck %s
 //
 // Transform-dialect schedule that transforms the Torch-MLIR GQA payload below
 // into a FlashAttention-like fused program with a `(group, head)` outer loop shape.
@@ -90,6 +90,14 @@ module attributes {transform.with_named_sequence} {
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.scf.localize_scratch_tensors %func : !any
     transform.apply_cse to %func : !any
+    transform.apply_patterns to %func {
+      transform.apply_patterns.linalg.fold_unit_extent_dims_via_reshapes
+    } : !any
+    transform.apply_cse to %func : !any
+
+    // --- HTile lowering begins ---
+    transform.htile.linalg_to_semantic %func : !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     transform.yield
   }
@@ -194,18 +202,21 @@ module attributes {transform.with_named_sequence} {
 // CHECK-LABEL: func.func @attention(
 // CHECK-NOT: linalg.batch_matmul
 // CHECK-NOT: linalg.transpose
-// CHECK-NOT: tensor.collapse_shape
-// CHECK-NOT: tensor.expand_shape %arg0
+// CHECK-NOT: linalg.generic
 // CHECK-NOT: tensor.empty() : tensor<1x2x2x128x64xf32>
 // CHECK: %[[LOOP:[0-9]+]] = scf.forall (%{{.*}}, %{{.*}}) in (2, 2) shared_outs(%{{.*}} = %{{.*}}) -> (tensor<1x2x2x128x64xf16>)
-// CHECK: tensor.empty() : tensor<1x1x1x128x64xf32>
-// CHECK: linalg.fill ins(%{{.*}} : f32) outs(%{{.*}} : tensor<1x1x1x128x64xf32>)
+// CHECK: htile.full %{{.*}} : f32 -> tensor<1x1x1x128xf32>
+// CHECK: htile.full %{{.*}} : f32 -> tensor<1x1x1x128x64xf32>
 // CHECK: %{{.*}}:3 = scf.for %{{.*}} = %c0 to %c2 step %c1 iter_args(
 // CHECK: affine.apply
+// CHECK: affine.apply
 // CHECK: tensor.extract_slice %arg0[0, %{{.*}}, 0, 0] [1, 1, 128, 64] [1, 1, 1, 1]
-// CHECK: linalg.generic {{.*}}iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel", "reduction"]
-// CHECK: math.exp2
-// CHECK: linalg.generic {{.*}}iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]} ins(%{{.*}}#1, %{{.*}}#2 : tensor<1x1x1x128x64xf32>, tensor<1x1x1x128xf32>)
-// CHECK: arith.divf %{{.*}}, %{{.*}} : f32
-// CHECK: linalg.generic {{.*}}iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]} ins(%{{.*}} : tensor<1x1x1x128x64xf32>) outs(%{{.*}} : tensor<1x1x1x128x64xf16>)
+// CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} {transpose_b} : tensor<128x64xf16>, tensor<64x64xf16>, tensor<128x64xf32> -> tensor<128x64xf32>
+// CHECK: htile.reduce %{{.*}} axis 1 kind "max" : tensor<128x64xf32> -> tensor<128xf32>
+// CHECK: linalg.broadcast ins(%{{.*}} : tensor<128xf32>) outs(%{{.*}} : tensor<128x64xf32>) dimensions = [1]
+// CHECK: math.exp2 %{{.*}} : tensor<128x64xf32>
+// CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<128x64xf32>, tensor<64x64xf16>, tensor<128x64xf32> -> tensor<128x64xf32>
+// CHECK: htile.reduce %{{.*}} axis 1 kind "sum" : tensor<128x64xf32> -> tensor<128xf32>
+// CHECK: arith.divf %{{.*}}, %{{.*}} : tensor<128x64xf32>
+// CHECK: arith.truncf %{{.*}} : tensor<128x64xf32> to tensor<128x64xf16>
 // CHECK: tensor.parallel_insert_slice %{{.*}} into %{{.*}}[0, %{{.*}}, %{{.*}}, 0, 0] [1, 1, 1, 128, 64] [1, 1, 1, 1, 1] : tensor<1x1x1x128x64xf16> into tensor<1x2x2x128x64xf16>
