@@ -131,8 +131,8 @@ The detailed rolling update design is documented in a
       loop after the streaming loop.
 - [x] The integrated global-attention test checks the FlashAttention-like
       structural shape in `test/Pipeline/tm_global_attention.mlir`.
-- [ ] Automatic L1-to-HTile lowering is still separate work. L1 deliberately
-      omits memory placement, cache staging, and hardware-specific tile scopes.
+- [ ] Automatic Linalg-to-HTile lowering is still separate work.
+      See [Linalg to HTile Translation](translation-to-htile.md).
 - [ ] HTile/backend integration should consume the scheduled L1 form rather
       than relying on handwritten HTile examples.
 - [ ] The generated L1 is not normalized to the exact handwritten
