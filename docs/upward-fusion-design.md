@@ -105,39 +105,3 @@ The implemented transform avoids that problem by converting the tiled reduction
 dimension into an inner sequential `scf.for`. The row-max tile is then fully
 computed inside that loop and inserted exactly once by each outer `forall`
 instance.
-
-## Attention Example
-
-For the attention softmax prefix:
-
-```text
-qk = Q @ K^T
-score = scale(qk)
-row_max = reduce_max(score, dim = j)
-```
-
-the schedule uses the two ops in order:
-
-1. tile the `qk` producer,
-2. fuse `scale` upward with `fusion.into_producer`,
-3. fuse `row_max` upward with `scf.fuse_reduction_into_forall`.
-
-After the reduction fusion, the relevant loop shape is:
-
-```text
-scf.forall over outer non-reduction tiles
-  scf.for over the tiled reduction dimension
-    compute qk tile
-    scale tile
-    update row-max tile
-  publish full score panel
-  publish completed row-max tile
-```
-
-In the current attention configuration, that means:
-
-- outer `scf.forall` over head and row tiles,
-- inner `scf.for` over column tiles,
-- loop-carried score-panel and row-max tile state inside the inner `scf.for`,
-- one final `tensor.parallel_insert_slice` of the completed row-max tile per
-  outer parallel instance.
