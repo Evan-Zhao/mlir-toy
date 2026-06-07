@@ -316,7 +316,7 @@ using LoopCloneCustomizer =
 
 FailureOr<scf::ForOp> cloneForWithBody(RewriterBase &rewriter, scf::ForOp source, Value lowerBound,
                                        Value upperBound, ValueRange initArgs,
-                                       LoopCloneCustomizer customizer = nullptr) {
+                                       LoopCloneCustomizer customizer) {
   auto clonedLoop = scf::ForOp::create(rewriter, source.getLoc(), lowerBound, upperBound,
                                        source.getStep(), initArgs);
   Block &sourceBlock = source.getRegion().front();
@@ -331,13 +331,11 @@ FailureOr<scf::ForOp> cloneForWithBody(RewriterBase &rewriter, scf::ForOp source
   OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPointToStart(&targetBlock);
   for (Operation &op : sourceBlock.without_terminator()) {
-    if (customizer) {
-      FailureOr<bool> handled = customizer(rewriter, mapping, op);
-      if (failed(handled))
-        return failure();
-      if (*handled)
-        continue;
-    }
+    FailureOr<bool> handled = customizer(rewriter, mapping, op);
+    if (failed(handled))
+      return failure();
+    if (*handled)
+      continue;
     rewriter.clone(op, mapping);
   }
 
@@ -1041,7 +1039,8 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
     BAIL("failed to clone the mixed loop");
   if (!mixedProducer)
     BAIL("failed to clone the producer into the mixed loop");
-  if (producerWasTracked && failed(rewriter.notifyPayloadOperationReplaced(producer, mixedProducer)))
+  if (producerWasTracked &&
+      failed(rewriter.notifyPayloadOperationReplaced(producer, mixedProducer)))
     BAIL("failed to preserve the producer handle");
 
   if (loop.getNumResults() == 0)
