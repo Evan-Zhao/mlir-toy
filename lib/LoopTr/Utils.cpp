@@ -119,8 +119,7 @@ void cloneSingleRegionBody(OpBuilder &builder, Location nestedLoc, Block &oldBlo
   for (auto [oldArg, newArg] : llvm::zip_equal(oldBlock.getArguments(), newArgs))
     mapping.map(oldArg, newArg);
 
-  for (Operation &op : oldBlock.without_terminator())
-    builder.clone(op, mapping);
+  cloneBlockWithoutTerminator(builder, oldBlock, mapping);
 
   auto oldYield = cast<linalg::YieldOp>(oldBlock.getTerminator());
   SmallVector<Value> yielded;
@@ -200,6 +199,16 @@ FailureOr<uint64_t> getReductionIteratorIndex(linalg::GenericOp generic) {
     return failure();
   }
   return reductionDims.front();
+}
+
+SmallVector<std::pair<Operation *, Operation *>>
+cloneBlockWithoutTerminator(OpBuilder &builder, Block &block, IRMapping &mapping) {
+  SmallVector<std::pair<Operation *, Operation *>> clonedOps;
+  for (Operation &op : block.without_terminator()) {
+    Operation *cloned = builder.clone(op, mapping);
+    clonedOps.emplace_back(&op, cloned);
+  }
+  return clonedOps;
 }
 
 FailureOr<tensor::ParallelInsertSliceOp> getParallelInsertSliceForLoopResult(scf::ForallOp loop,

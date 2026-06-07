@@ -6,6 +6,7 @@
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Transform/Utils/DiagnosedSilenceableFailure.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 
 namespace mlir {
@@ -94,6 +95,9 @@ FailureOr<BinaryReductionCombinerMatch> matchBinaryReductionCombiner(linalg::Gen
 SmallVector<OpFoldResult> getUnitStrides(RewriterBase &rewriter, size_t rank);
 
 SmallVector<OpFoldResult> getMixedTensorSizes(RewriterBase &rewriter, Location loc, Value tensor);
+
+SmallVector<std::pair<Operation *, Operation *>>
+cloneBlockWithoutTerminator(OpBuilder &builder, Block &block, IRMapping &mapping);
 
 /// A wrapper around `cloneValueDefChainAtInsertionPoint` that applies to all operands of
 /// `toMoveOperands`.

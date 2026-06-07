@@ -5,12 +5,14 @@
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/Patterns.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Transforms/Transforms.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
+#include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -18,6 +20,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Config/llvm-config.h"
 
+#include <mlir/IR/PatternMatch.h>
 #include <variant>
 
 using namespace mlir;
@@ -361,16 +364,284 @@ FailureOr<OpFoldResult> remapAffineIndex(RewriterBase &rewriter, Location loc, O
   return success(affineOp.getResult());
 }
 
-FailureOr<SmallVector<OpFoldResult>> remapAffineIndices(RewriterBase &rewriter, Location loc,
-                                                        SmallVector<OpFoldResult> values,
-                                                        const DenseMap<Value, Value> &mapping) {
+LogicalResult remapAffineIndices(RewriterBase &rewriter, Location loc,
+                                 SmallVectorImpl<OpFoldResult> &values,
+                                 const DenseMap<Value, Value> &mapping) {
   for (OpFoldResult &value : values) {
     auto result = remapAffineIndex(rewriter, loc, value, mapping);
     if (failed(result))
       return failure();
     value = *result;
   }
-  return values;
+  return success();
+}
+
+struct FoldedTensorInfo {
+  RankedTensorType oldType;
+  RankedTensorType newType;
+  SmallVector<ReassociationIndices> reassociation;
+
+  SmallVector<OpFoldResult> collapseSliceParams(ArrayRef<OpFoldResult> params) const {
+    SmallVector<OpFoldResult> collapsed;
+    collapsed.reserve(reassociation.size());
+    for (const ReassociationIndices &group : reassociation) {
+      int64_t selectedDim = group.back();
+      for (int64_t dim : group) {
+        if (oldType.getDimSize(dim) != 1) {
+          selectedDim = dim;
+          break;
+        }
+      }
+      collapsed.push_back(params[selectedDim]);
+    }
+    return collapsed;
+  }
+};
+
+SmallVector<OpFoldResult> getStaticMixedSizes(OpBuilder &builder, RankedTensorType type) {
+  SmallVector<OpFoldResult> sizes;
+  sizes.reserve(type.getRank());
+  for (int64_t size : type.getShape())
+    sizes.push_back(builder.getIndexAttr(size));
+  return sizes;
+}
+
+FailureOr<SmallVector<std::optional<FoldedTensorInfo>>> getFoldedTensorInfos(OpBuilder &builder,
+                                                                             ValueRange values) {
+  auto getFoldedTensorInfo = [&builder](Type type) -> FailureOr<FoldedTensorInfo> {
+    auto tensorType = dyn_cast<RankedTensorType>(type);
+    if (!tensorType || tensorType.getEncoding())
+      return failure();
+    std::optional<SmallVector<ReassociationIndices>> reassociation =
+        linalg::getReassociationMapForFoldingUnitDims(getStaticMixedSizes(builder, tensorType));
+    if (!reassociation)
+      return failure();
+    auto newType = tensor::CollapseShapeOp::inferCollapsedType(tensorType, *reassociation);
+    if (newType == tensorType)
+      return failure(); // Here means "nothing to do".
+    return FoldedTensorInfo{
+        .oldType = tensorType, .newType = newType, .reassociation = std::move(*reassociation)};
+  };
+
+  using RetT = SmallVector<std::optional<FoldedTensorInfo>>;
+  RetT infos;
+  infos.reserve(values.size());
+  bool changed = false;
+  for (Value v : values) {
+    FailureOr<FoldedTensorInfo> info = getFoldedTensorInfo(v.getType());
+    changed |= succeeded(info);
+    infos.push_back(succeeded(info) ? info : std::optional<FoldedTensorInfo>{});
+  }
+  return changed ? success(infos) : FailureOr<RetT>{};
+}
+
+Value collapseTensor(OpBuilder &builder, Location loc, Value value, const FoldedTensorInfo &info) {
+  return tensor::CollapseShapeOp::create(builder, loc, info.newType, value, info.reassociation);
+}
+
+Value expandTensor(OpBuilder &builder, Location loc, Value value, const FoldedTensorInfo &info) {
+  return tensor::ExpandShapeOp::create(builder, loc, info.oldType, value, info.reassociation);
+}
+
+void notifyReplacedRecursively(Operation *oldOp, TransformRewriter &rewriter, Operation *newOp) {
+  SmallVector<Operation *> oldOps, newOps;
+  oldOp->walk<WalkOrder::PreOrder>([&](Operation *op) { oldOps.push_back(op); });
+  newOp->walk<WalkOrder::PreOrder>([&](Operation *op) { newOps.push_back(op); });
+  if (oldOps.size() != newOps.size())
+    return;
+
+  for (auto [oldNested, newNested] : llvm::zip(oldOps, newOps)) {
+    if (succeeded(rewriter.notifyPayloadOperationReplaced(oldNested, newNested)))
+      continue;
+    rewriter.silenceTrackingFailure();
+  }
+}
+
+template <typename OpRange>
+void notifyClonedOpsRecursively(TransformRewriter &rewriter, OpRange &&clonedOps) {
+  for (auto [oldOp, newOp] : clonedOps)
+    notifyReplacedRecursively(oldOp, rewriter, newOp);
+}
+
+std::optional<unsigned> findForallOutArgIndex(scf::ForallOp loop, Value value) {
+  auto blockArg = dyn_cast<BlockArgument>(value);
+  if (!blockArg || blockArg.getOwner() != loop.getBody())
+    return std::nullopt;
+  unsigned rank = loop.getRank();
+  if (blockArg.getArgNumber() < rank)
+    return std::nullopt;
+  unsigned index = blockArg.getArgNumber() - rank;
+  if (index >= loop.getNumResults())
+    return std::nullopt;
+  return index;
+}
+
+FailureOr<Operation *> cloneOrRewriteForallCombiningOp(
+    scf::ForallOp oldLoop, RewriterBase &rewriter, Operation &oldOp, const IRMapping &mapping,
+    ArrayRef<std::optional<FoldedTensorInfo>> infos, scf::ForallOp newLoop) {
+  auto insert = cast<tensor::ParallelInsertSliceOp>(&oldOp);
+  auto loc = insert.getLoc();
+
+  Value oldDest = insert.getDest();
+  std::optional<unsigned> index = findForallOutArgIndex(oldLoop, oldDest);
+  if (!index)
+    return failure();
+
+  Value source = mapping.lookupOrDefault(insert.getSource());
+  Value dest = newLoop.getRegionOutArgs()[*index];
+  SmallVector<OpFoldResult> offsets = insert.getMixedOffsets(), sizes = insert.getMixedSizes(),
+                            strides = insert.getMixedStrides();
+  auto remapAffineIndicesLocal = [&](SmallVectorImpl<OpFoldResult> &values) {
+    return remapAffineIndices(rewriter, loc, values, mapping.getValueMap());
+  };
+  if (failed(remapAffineIndicesLocal(offsets)) || failed(remapAffineIndicesLocal(sizes)) ||
+      failed(remapAffineIndicesLocal(strides)))
+    return failure();
+
+  const auto &info = infos[*index];
+  if (info) {
+    auto sourceType = dyn_cast<RankedTensorType>(source.getType());
+    if (!sourceType || sourceType.getRank() != info->oldType.getRank())
+      return failure();
+    RankedTensorType collapsedSourceType =
+        tensor::CollapseShapeOp::inferCollapsedType(sourceType, info->reassociation);
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPoint(newLoop.getTerminator());
+      source = tensor::CollapseShapeOp::create(rewriter, insert.getLoc(), collapsedSourceType,
+                                               source, info->reassociation);
+    }
+    offsets = info->collapseSliceParams(offsets);
+    sizes = info->collapseSliceParams(sizes);
+    strides = info->collapseSliceParams(strides);
+  } else {
+    dest = mapping.lookupOrDefault(oldDest);
+  }
+
+  return {tensor::ParallelInsertSliceOp::create(rewriter, insert.getLoc(), source, dest, offsets,
+                                                sizes, strides)};
+}
+
+using OpPairs = SmallVector<std::pair<Operation *, Operation *>>;
+
+template <typename LoopOp> struct LoopSharedTrait {};
+
+template <> struct LoopSharedTrait<scf::ForallOp> {
+  static ValueRange getInitOrOut(scf::ForallOp loop) { return loop.getOutputs(); }
+  static scf::ForallOp createLike(OpBuilder &builder, scf::ForallOp oldLoop, ValueRange outputs) {
+    return scf::ForallOp::create(builder, oldLoop.getLoc(), oldLoop.getMixedLowerBound(),
+                                 oldLoop.getMixedUpperBound(), oldLoop.getMixedStep(), outputs,
+                                 oldLoop.getMapping());
+  }
+
+  static void mapInductionVars(IRMapping &mapping, scf::ForallOp oldLoop, scf::ForallOp newLoop) {
+    for (auto [oldIv, newIv] : llvm::zip(oldLoop.getInductionVars(), newLoop.getInductionVars()))
+      mapping.map(oldIv, newIv);
+  }
+
+  static FailureOr<OpPairs>
+  cloneCombiningOps(scf::ForallOp oldLoop, RewriterBase &rewriter, const IRMapping &mapping,
+                    const SmallVector<std::optional<FoldedTensorInfo>> &infos,
+                    scf::ForallOp newLoop) {
+    OpPairs clonedCombiningOps;
+    rewriter.setInsertionPointToEnd(&newLoop.getTerminator().getRegion().front());
+    for (Operation &oldCombiningOp : oldLoop.getTerminator().getYieldingOps()) {
+      FailureOr<Operation *> newCombiningOp = cloneOrRewriteForallCombiningOp(
+          oldLoop, rewriter, oldCombiningOp, mapping, infos, newLoop);
+      if (failed(newCombiningOp))
+        return failure();
+      clonedCombiningOps.emplace_back(&oldCombiningOp, *newCombiningOp);
+    }
+    return clonedCombiningOps;
+  }
+};
+
+template <> struct LoopSharedTrait<scf::ForOp> {
+  static ValueRange getInitOrOut(scf::ForOp loop) { return loop.getInitArgs(); }
+  static scf::ForOp createLike(OpBuilder &builder, scf::ForOp oldLoop, ValueRange inits) {
+    return scf::ForOp::create(builder, oldLoop.getLoc(), oldLoop.getLowerBound(),
+                              oldLoop.getUpperBound(), oldLoop.getStep(), inits,
+                              /*bodyBuilder=*/nullptr, oldLoop.getUnsignedCmp());
+  }
+  static void mapInductionVars(IRMapping &mapping, scf::ForOp oldLoop, scf::ForOp newLoop) {
+    mapping.map(oldLoop.getInductionVar(), newLoop.getInductionVar());
+  }
+
+  static FailureOr<OpPairs>
+  cloneCombiningOps(scf::ForOp oldLoop, RewriterBase &rewriter, const IRMapping &mapping,
+                    const SmallVector<std::optional<FoldedTensorInfo>> &infos, scf::ForOp newLoop) {
+    auto oldYield = cast<scf::YieldOp>(oldLoop.getBody()->getTerminator());
+    rewriter.setInsertionPointToEnd(newLoop.getBody());
+    SmallVector<Value> newYieldOperands;
+    newYieldOperands.reserve(oldYield.getNumOperands());
+    auto loc = oldYield.getLoc();
+    for (auto [yielded, info] : llvm::zip(oldYield.getOperands(), infos)) {
+      Value mapped = mapping.lookupOrDefault(yielded);
+      newYieldOperands.push_back(info ? collapseTensor(rewriter, loc, mapped, *info) : mapped);
+    }
+    auto newYield = scf::YieldOp::create(rewriter, loc, newYieldOperands);
+    return OpPairs{{oldYield, newYield}};
+  }
+};
+
+template <typename LoopOp>
+FailureOr<LoopOp> foldUnitExtentDimsInLoop(TransformRewriter &rewriter, LoopOp loop) {
+  auto infosR = getFoldedTensorInfos(rewriter, loop.getResults());
+  if (failed(infosR))
+    return failure();
+  SmallVector<std::optional<FoldedTensorInfo>> &infos = *infosR;
+  using LoopTrait = LoopSharedTrait<LoopOp>;
+
+  Location loc = loop.getLoc();
+  rewriter.setInsertionPoint(loop);
+  SmallVector<Value> newOuts = LoopTrait::getInitOrOut(loop);
+  for (size_t i = 0; i < newOuts.size(); ++i)
+    if (infos[i])
+      newOuts[i] = collapseTensor(rewriter, loc, newOuts[i], *infos[i]);
+
+  auto newLoop = LoopTrait::createLike(rewriter, loop, newOuts);
+  newLoop->setAttrs(loop->getAttrs());
+
+  IRMapping mapping;
+  LoopTrait::mapInductionVars(mapping, loop, newLoop);
+  rewriter.setInsertionPointToStart(newLoop.getBody());
+  for (auto [oldArg, newArg, info] :
+       llvm::zip(loop.getRegionIterArgs(), newLoop.getRegionIterArgs(), infos))
+    mapping.map(oldArg, info ? expandTensor(rewriter, loc, newArg, *info) : newArg);
+
+  OpPairs clonedOps;
+  for (Operation &op : loop.getBody()->without_terminator()) {
+    Operation *newOp = rewriter.clone(op, mapping);
+    clonedOps.emplace_back(&op, newOp);
+  }
+
+  auto clonedCombiningOpsR = LoopTrait::cloneCombiningOps(loop, rewriter, mapping, infos, newLoop);
+  if (failed(clonedCombiningOpsR))
+    return failure();
+
+  notifyClonedOpsRecursively(rewriter, clonedOps);
+  notifyClonedOpsRecursively(rewriter, *clonedCombiningOpsR);
+  if (failed(rewriter.notifyPayloadOperationReplaced(loop, newLoop)))
+    rewriter.silenceTrackingFailure();
+
+  rewriter.setInsertionPointAfter(newLoop);
+  SmallVector<Value> replacements = newLoop.getResults();
+  for (size_t i = 0; i < replacements.size(); ++i)
+    if (infos[i])
+      replacements[i] = expandTensor(rewriter, loc, replacements[i], *infos[i]);
+  rewriter.replaceOp(loop, replacements);
+  return newLoop;
+}
+
+void collectScfLoopsPostOrder(Operation *op, SmallVectorImpl<Operation *> &loops) {
+  for (Region &region : op->getRegions()) {
+    for (Block &block : region) {
+      for (Operation &nested : block)
+        collectScfLoopsPostOrder(&nested, loops);
+    }
+  }
+  if (isa<scf::ForOp, scf::ForallOp>(op))
+    loops.push_back(op);
 }
 
 struct SplitForallIntoForResult {
@@ -384,7 +655,7 @@ struct SplitForallIntoForResult {
   scf::ForOp innerFor;
   Value outerTile, innerTile;
   TileSlice reductionSlice;
-  SmallVector<std::pair<Operation *, Operation *>> clonedOps;
+  OpPairs clonedOps;
 };
 
 std::variant<SplitForallIntoForResult, DiagnosedSilenceableFailure>
@@ -423,13 +694,11 @@ splitForallDimensionForReduction(TransformOpInterface transform, RewriterBase &r
   }
   outerIvMapping.map(loop.getRegionOutArgs().front(), outerProducerArg);
 
-  auto outerTileOffsetsF = remapAffineIndices(rewriter, loc, plan.producerInsert.getMixedOffsets(),
-                                              outerIvMapping.getValueMap());
-  if (failed(outerTileOffsetsF)) {
+  auto outerTileOffsets = plan.producerInsert.getMixedOffsets();
+  if (failed(remapAffineIndices(rewriter, loc, outerTileOffsets, outerIvMapping.getValueMap()))) {
     plan.producerInsert->emitRemark() << "failed to remap offsets of this operation";
     return emitSilenceableFailure(transform, "failed to remap offsets of insert operation");
   }
-  const SmallVector<OpFoldResult> &outerTileOffsets = *outerTileOffsetsF;
   SmallVector<OpFoldResult> outerTileSizes = plan.producerInsert.getMixedSizes();
   outerTileSizes[plan.reductionDim] =
       getMixedTensorSizes(rewriter, loc, plan.producerResult)[plan.reductionDim];
@@ -451,7 +720,7 @@ splitForallDimensionForReduction(TransformOpInterface transform, RewriterBase &r
                                     ValueRange{tileInit, redTileInit});
   outerIvMapping.map(loop.getInductionVars()[plan.removedIvIndex], forLoop.getInductionVar());
   rewriter.setInsertionPointToStart(forLoop.getBody());
-  SmallVector<std::pair<Operation *, Operation *>> clonedOps;
+  OpPairs clonedOps;
   for (Operation &op : loop.getBody()->without_terminator()) {
     Operation *newOp = rewriter.clone(op, outerIvMapping);
     clonedOps.emplace_back(&op, newOp);
@@ -486,6 +755,64 @@ void ScfLocalizeScratchTensorsOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   onlyReadsHandle(getTargetMutable(), effects);
   modifiesPayload(effects);
+}
+
+void ScfFoldUnitExtentDimsViaReshapesOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  onlyReadsHandle(getTargetMutable(), effects);
+  modifiesPayload(effects);
+}
+
+DiagnosedSilenceableFailure
+ScfFoldUnitExtentDimsViaReshapesOp::applyToOne(TransformRewriter &rewriter, Operation *target,
+                                               ApplyToEachResultList &results,
+                                               TransformState &state) {
+  (void)results;
+  (void)state;
+  auto transform = cast<TransformOpInterface>(getOperation());
+
+  Operation *isolatedTarget = findEnclosingIsolatedFromAbove(target);
+  if (!isolatedTarget)
+    return emitSilenceableFailure(target, "expected target to be nested in an isolated op");
+
+  SmallVector<Operation *> loops;
+  collectScfLoopsPostOrder(target, loops);
+
+  bool changed = false;
+  for (Operation *op : loops) {
+    if (!op->getBlock())
+      continue;
+
+    if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+      FailureOr<scf::ForOp> newLoop = foldUnitExtentDimsInLoop(rewriter, forOp);
+      if (succeeded(newLoop)) {
+        changed = true;
+        continue;
+      }
+      if (rewriter.hasTrackingFailures())
+        BAIL("failed to preserve handles while rewriting scf.for");
+      continue;
+    }
+
+    FailureOr<scf::ForallOp> newLoop = foldUnitExtentDimsInLoop(rewriter, cast<scf::ForallOp>(op));
+    if (succeeded(newLoop)) {
+      changed = true;
+      continue;
+    }
+    if (rewriter.hasTrackingFailures())
+      BAIL("failed to preserve handles while rewriting scf.forall");
+  }
+
+  if (!changed) {
+    auto diag =
+        emitSilenceableFailure(transform, "no scf.for or scf.forall loop-carried tensors had "
+                                          "foldable unit-extent dims");
+    diag.attachNote(target->getLoc()) << "target op was " << target->getName() << " and "
+                                      << loops.size() << " nested SCF loops were inspected";
+    return diag;
+  }
+
+  return DiagnosedSilenceableFailure::success();
 }
 
 DiagnosedSilenceableFailure ScfLocalizeScratchTensorsOp::applyToOne(TransformRewriter &rewriter,

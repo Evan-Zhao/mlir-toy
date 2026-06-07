@@ -119,6 +119,44 @@ def ScfLocalizeScratchTensorsOp : Op<Transform_Dialect, "scf.localize_scratch_te
   }];
 }
 
+def ScfFoldUnitExtentDimsViaReshapesOp
+    : Op<Transform_Dialect, "scf.fold_unit_extent_dims_via_reshapes",
+         [TransformOpInterface, TransformEachOpTrait,
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+          ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Fold unit-extent dimensions of SCF loop-carried tensors via reshapes";
+
+  let description = [{
+    Rebuilds nested `scf.for` and `scf.forall` ops whose loop-carried tensor
+    values have statically-known unit-extent dimensions. The replacement loop
+    carries collapsed tensors, using the same reassociation helper as
+    `transform.apply_patterns.linalg.fold_unit_extent_dims_via_reshapes`.
+
+    Bridge `tensor.collapse_shape` and `tensor.expand_shape` ops are inserted
+    around the rebuilt loop as needed. For `scf.forall`, `tensor.parallel_insert_slice`
+    combining ops are rewritten against the collapsed shared_out block
+    arguments; non-combining uses of shared_out block arguments are bridged with
+    `tensor.expand_shape`.
+
+    The transform walks the target payload op postorder, so inner loops are
+    rewritten before their enclosing loops. Existing payload handles to replaced
+    loops and cloned nested operations are updated when tracking succeeds.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$target);
+  let results = (outs);
+
+  let assemblyFormat = "$target attr-dict `:` type($target)";
+
+  let extraClassDeclaration = [{
+    ::mlir::DiagnosedSilenceableFailure applyToOne(
+        ::mlir::transform::TransformRewriter &rewriter,
+        ::mlir::Operation *target,
+        ::mlir::transform::ApplyToEachResultList &results,
+        ::mlir::transform::TransformState &state);
+  }];
+}
+
 def ScfFuseReductionIntoForallOp
     : Op<Transform_Dialect, "scf.fuse_reduction_into_forall",
          [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
