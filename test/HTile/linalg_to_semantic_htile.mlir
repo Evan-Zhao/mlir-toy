@@ -78,8 +78,7 @@ module attributes {transform.with_named_sequence} {
       %row_value: tensor<4xf32>,
       %out: tensor<4x8xf32>,
       %scale: f32) -> tensor<4x8xf32> {
-    // CHECK-DAG: %[[BCAST_EMPTY:.+]] = tensor.empty() : tensor<4x8xf32>
-    // CHECK-DAG: %[[BCAST:.+]] = linalg.broadcast ins(%arg1 : tensor<4xf32>) outs(%[[BCAST_EMPTY]] : tensor<4x8xf32>) dimensions = [1]
+    // CHECK-DAG: %[[BCAST:.+]] = htile.broadcast %arg1 dimensions = [1] : tensor<4xf32> -> tensor<4x8xf32>
     // CHECK-DAG: %[[SCALE:.+]] = htile.full %arg3 : f32 -> tensor<4x8xf32>
     // CHECK: %[[MUL:.+]] = arith.mulf %arg0, %[[SCALE]] : tensor<4x8xf32>
     // CHECK: arith.subf %[[MUL]], %[[BCAST]] : tensor<4x8xf32>
@@ -106,8 +105,8 @@ module attributes {transform.with_named_sequence} {
     // CHECK-DAG: %[[C8:.+]] = arith.constant 8 : index
     // CHECK-DAG: %[[I:.+]] = htile.arange %{{.*}} to %[[C4]] : tensor<4xindex>
     // CHECK-DAG: %[[J:.+]] = htile.arange %{{.*}} to %[[C8]] : tensor<8xindex>
-    // CHECK-DAG: %[[IB:.+]] = linalg.broadcast ins(%[[I]] : tensor<4xindex>)
-    // CHECK-DAG: %[[JB:.+]] = linalg.broadcast ins(%[[J]] : tensor<8xindex>)
+    // CHECK-DAG: %[[IB:.+]] = htile.broadcast %[[I]] dimensions = [1] : tensor<4xindex> -> tensor<4x8xindex>
+    // CHECK-DAG: %[[JB:.+]] = htile.broadcast %[[J]] dimensions = [0] : tensor<8xindex> -> tensor<4x8xindex>
     // CHECK-DAG: %[[II:.+]] = arith.index_cast %[[IB]] : tensor<4x8xindex> to tensor<4x8xi64>
     // CHECK-DAG: %[[JI:.+]] = arith.index_cast %[[JB]] : tensor<4x8xindex> to tensor<4x8xi64>
     // CHECK-DAG: %[[CMP:.+]] = arith.cmpi sle, %[[JI]], %[[II]] : tensor<4x8xi64>

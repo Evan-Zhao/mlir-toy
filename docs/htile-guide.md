@@ -57,15 +57,15 @@ The transform rewrites these operations:
   the rewritten tensor body uses ordinary tensor `arith` ops.
 - `linalg.index` inside elementwise bodies becomes an `htile.arange` along that dimension,
   broadcast to the elementwise result shape when needed.
-- Projected row-vector operands in elementwise ops are materialized with `linalg.broadcast`.
+- Projected row-vector operands in elementwise ops are materialized with `htile.broadcast`.
 - Captured scalar operands in elementwise ops are materialized as tile-shaped `htile.full` values;
   scalar `arith.constant` ops inside the body become tensor `arith.constant` splats.
 
 The reduction translation uses the shared binary-reduction combiner matcher from `LoopTr/Utils`.
 HTile-specific code only maps supported combiner ops to HTile reduce kinds.
 
-The transform fails loudly if any original non-broadcast Linalg operation under the target is not
-converted. Unsupported payload ops emit an error at the payload op location.
+The transform fails loudly if any original Linalg operation under the target is not converted.
+Unsupported payload ops emit an error at the payload op location.
 
 Current limitations:
 
@@ -193,8 +193,8 @@ bufferization so that the rest of the scheduled tile body stays in value-based t
 ### Broadcast Semantics
 
 MLIR tensor arithmetic requires equal operand types, so L1 materializes row broadcasts explicitly.
-Triton treats row vectors and panels more flexibly. For now, keeping `linalg.broadcast` is the
-lowest-risk representation; a later HTile-level broadcast convention may clean up backends.
+Semantic HTile represents those broadcasts as non-DPS `htile.broadcast` ops. Backend translators can
+lower them to unsqueeze / expand-dims forms appropriate for their target.
 
 ### Tensor-Return ABI Versus Kernel ABI
 

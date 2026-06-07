@@ -92,6 +92,22 @@ def HTile_ArangeOp : Op<HTile_Dialect, "arange"> {
   let assemblyFormat = "$start `to` $end attr-dict `:` type($result)";
 }
 
+def HTile_BroadcastOp : Op<HTile_Dialect, "broadcast"> {
+  let summary = "broadcast a tile by inserting dimensions";
+  let description = [{
+    Broadcasts the input tile to the result shape by inserting the dimensions
+    listed in the `dimensions` attribute.
+  }];
+
+  let arguments = (ins AnyRankedTensor:$input, DenseI64ArrayAttr:$dimensions);
+  let results = (outs AnyRankedTensor:$result);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat =
+      "$input `dimensions` `=` $dimensions attr-dict `:` type($input) `->` type($result)";
+}
+
 def HTile_UnsqueezeOp : Op<HTile_Dialect, "unsqueeze"> {
   let summary = "insert unit dimensions into a tile";
   let description = [{

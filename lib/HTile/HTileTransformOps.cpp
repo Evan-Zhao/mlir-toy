@@ -97,12 +97,10 @@ FailureOr<Value> createBroadcastToResultShape(OpBuilder &builder, Location loc, 
     return failure();
   }
 
-  Value empty = tensor::EmptyOp::create(builder, loc, targetType.getShape(),
-                                        targetType.getElementType(), targetType.getEncoding());
-  createdOps.push_back(empty.getDefiningOp());
-  auto broadcast = linalg::BroadcastOp::create(builder, loc, input, empty, broadcastDims);
+  auto broadcast = htile::BroadcastOp::create(builder, loc, targetType, input,
+                                              builder.getDenseI64ArrayAttr(broadcastDims));
   createdOps.push_back(broadcast);
-  return broadcast->getResult(0);
+  return broadcast.getResult();
 }
 
 FailureOr<Value> materializeScalarAsTile(OpBuilder &builder, Location loc, Value scalar,
@@ -222,6 +220,21 @@ LogicalResult rewriteFill(RewriterBase &rewriter, linalg::FillOp op) {
   rewriter.setInsertionPoint(op);
   auto full = htile::FullOp::create(rewriter, op.getLoc(), resultType, op.getInputs().front());
   rewriter.replaceOp(op, full.getResult());
+  return success();
+}
+
+LogicalResult rewriteBroadcast(RewriterBase &rewriter, linalg::BroadcastOp op) {
+  if (op->getNumResults() != 1)
+    return failure();
+  auto inputType = dyn_cast<RankedTensorType>(op.getInput().getType());
+  auto resultType = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+  if (!inputType || !resultType)
+    return failure();
+
+  rewriter.setInsertionPoint(op);
+  auto broadcast = htile::BroadcastOp::create(rewriter, op.getLoc(), resultType, op.getInput(),
+                                              op.getDimensionsAttr());
+  rewriter.replaceOp(op, broadcast.getResult());
   return success();
 }
 
@@ -422,6 +435,8 @@ LogicalResult rewriteOriginalLinalgOp(RewriterBase &rewriter, Operation *op) {
     return success();
   if (auto fill = dyn_cast<linalg::FillOp>(op))
     return rewriteFill(rewriter, fill);
+  if (auto broadcast = dyn_cast<linalg::BroadcastOp>(op))
+    return rewriteBroadcast(rewriter, broadcast);
   if (auto generic = dyn_cast<linalg::GenericOp>(op)) {
     if (succeeded(rewriteContraction(rewriter, generic)))
       return success();
@@ -432,8 +447,6 @@ LogicalResult rewriteOriginalLinalgOp(RewriterBase &rewriter, Operation *op) {
     op->emitError() << "unsupported linalg.generic operation";
     return failure();
   }
-  if (isa<linalg::BroadcastOp>(op))
-    return success();
   op->emitError() << "unsupported linalg operation";
   return failure();
 }

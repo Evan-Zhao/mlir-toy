@@ -65,7 +65,7 @@ The current `transform.htile.linalg_to_semantic` transform produces **Semantic H
 - contraction-shaped `linalg.generic` becomes `htile.dot`,
 - single-axis sum and max reductions become `htile.reduce`,
 - all-parallel elementwise `linalg.generic` ops are opened into tensor `arith` / `math`,
-- projected row-vector operands are materialized with `linalg.broadcast`.
+- projected row-vector operands are materialized with `htile.broadcast`.
 
 Semantic HTile deliberately keeps the tensor ABI, `scf.forall` / `scf.for` loop structure,
 `tensor.extract_slice`, and `tensor.parallel_insert_slice`. It is a compute-level translation, not

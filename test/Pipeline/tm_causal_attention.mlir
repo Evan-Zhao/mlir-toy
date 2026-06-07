@@ -237,11 +237,11 @@ module attributes {transform.with_named_sequence} {
 // CHECK: %[[MIXED:.+]]:3 = scf.for %{{.*}} = %[[CAPPED_BOUND]] to %c16 step %c1 iter_args(%{{.*}} = %[[LIVE]]#1, %{{.*}} = %[[LIVE]]#4, %{{.*}} = %[[LIVE]]#7) -> (tensor<128xf32>, tensor<128x64xf32>, tensor<128xf32>)
 // CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} {transpose_b}
 // CHECK: htile.arange %c0 to %c128 : tensor<128xindex>
-// CHECK: linalg.broadcast ins(%{{.*}} : tensor<128xindex>) outs(%{{.*}} : tensor<128x64xindex>) dimensions = [1]
+// CHECK: htile.broadcast %{{.*}} dimensions = [1] : tensor<128xindex> -> tensor<128x64xindex>
 // CHECK: arith.muli %{{.*}}, %{{.*}} : tensor<128x64xindex>
 // CHECK: arith.addi %{{.*}}, %{{.*}} : tensor<128x64xindex>
 // CHECK: htile.arange %c0 to %c64 : tensor<64xindex>
-// CHECK: linalg.broadcast ins(%{{.*}} : tensor<64xindex>) outs(%{{.*}} : tensor<128x64xindex>) dimensions = [0]
+// CHECK: htile.broadcast %{{.*}} dimensions = [0] : tensor<64xindex> -> tensor<128x64xindex>
 // CHECK: arith.cmpi sle, %{{.*}}, %{{.*}} : tensor<128x64xi64>
 // CHECK: arith.select %{{.*}}, %{{.*}}, %{{.*}} : tensor<128x64xi1>, tensor<128x64xf32>
 // CHECK: htile.reduce %{{.*}} axis 1 kind "max" : tensor<128x64xf32> -> tensor<128xf32>

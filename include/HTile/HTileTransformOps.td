@@ -18,8 +18,8 @@ def HTileLinalgToSemanticOp : Op<Transform_Dialect, "htile.linalg_to_semantic",
       `arith`/`math` operations and semantic broadcasts,
     - `linalg.fill` becomes `htile.full`.
 
-    The transform emits a silenceable failure if any non-broadcast Linalg op
-    originally present in the target cannot be converted.
+    The transform emits a silenceable failure if any Linalg op originally
+    present in the target cannot be converted.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$target);

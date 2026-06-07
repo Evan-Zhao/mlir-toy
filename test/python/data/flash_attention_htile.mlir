@@ -63,15 +63,8 @@ module {
         %max_next = arith.maximumf %max_prev_i, %row_max
             : tensor<128xf32, #local>
 
-        // Neptune's tile arithmetic broadcasts the row vector after unsqueeze.
-        // MLIR arith ops require equal operand types, so materialize the
-        // broadcast explicitly.
-        %max_next_64_empty = tensor.empty()
-            : tensor<128x64xf32, #local>
-        %max_next_64 = linalg.broadcast
-            ins(%max_next : tensor<128xf32, #local>)
-            outs(%max_next_64_empty : tensor<128x64xf32, #local>)
-            dimensions = [1]
+        %max_next_64 = htile.broadcast %max_next dimensions = [1]
+            : tensor<128xf32, #local> -> tensor<128x64xf32, #local>
 
         %shifted_score = arith.subf %score, %max_next_64
             : tensor<128x64xf32, #local>
@@ -99,18 +92,10 @@ module {
             : tensor<128x64xf16, #local>, tensor<64x128xf16, #shared>
             -> tensor<128x128xf32, #local>
 
-        %max_prev_128_empty = tensor.empty()
-            : tensor<128x128xf32, #local>
-        %max_prev_128 = linalg.broadcast
-            ins(%max_prev_i : tensor<128xf32, #local>)
-            outs(%max_prev_128_empty : tensor<128x128xf32, #local>)
-            dimensions = [1]
-        %max_next_128_empty = tensor.empty()
-            : tensor<128x128xf32, #local>
-        %max_next_128 = linalg.broadcast
-            ins(%max_next : tensor<128xf32, #local>)
-            outs(%max_next_128_empty : tensor<128x128xf32, #local>)
-            dimensions = [1]
+        %max_prev_128 = htile.broadcast %max_prev_i dimensions = [1]
+            : tensor<128xf32, #local> -> tensor<128x128xf32, #local>
+        %max_next_128 = htile.broadcast %max_next dimensions = [1]
+            : tensor<128xf32, #local> -> tensor<128x128xf32, #local>
 
         %acc_delta = arith.subf %max_prev_128, %max_next_128
             : tensor<128x128xf32, #local>
@@ -127,12 +112,8 @@ module {
               tensor<128xf32, #local>
       } {htile.pipeline_stages = 2 : i32}
 
-      %exp_sum_128_empty = tensor.empty()
-          : tensor<128x128xf32, #local>
-      %exp_sum_128 = linalg.broadcast
-          ins(%exp_sum_final : tensor<128xf32, #local>)
-          outs(%exp_sum_128_empty : tensor<128x128xf32, #local>)
-          dimensions = [1]
+      %exp_sum_128 = htile.broadcast %exp_sum_final dimensions = [1]
+          : tensor<128xf32, #local> -> tensor<128x128xf32, #local>
 
       %norm = arith.divf %acc_final, %exp_sum_128
           : tensor<128x128xf32, #local>

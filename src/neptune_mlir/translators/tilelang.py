@@ -181,7 +181,7 @@ class Translator:
         if op_name == "scf.for":
             allocs.extend(self._collect_allocs(op.regions[0].blocks[0]))
             return allocs
-        if op_name in {"linalg.broadcast", "tensor.empty", "htile.copy"}:
+        if op_name in {"htile.broadcast", "tensor.empty", "htile.copy"}:
             return allocs
 
         for result in op.results:
@@ -209,6 +209,7 @@ class Translator:
             "htile.full": "frag",
             "htile.dot": "dot",
             "htile.reduce": "red",
+            "htile.broadcast": "bcast",
             "arith.truncf": "cast",
             "math.exp2": "exp",
         }.get(op_name, "frag")
@@ -239,7 +240,7 @@ class Translator:
             "htile.dot": self._htile_dot,
             "htile.reduce": self._htile_reduce,
             "htile.copy": self._htile_copy,
-            "linalg.broadcast": self._linalg_broadcast,
+            "htile.broadcast": self._htile_broadcast,
             "scf.for": self._scf_for,
             "scf.yield": self._scf_yield,
             "tensor.empty": lambda o: [],
@@ -442,9 +443,9 @@ class Translator:
         self._names[op.results[0]] = self._get(op.operands[0])
         return []
 
-    # --- linalg.broadcast ---
+    # --- htile.broadcast ---
 
-    def _linalg_broadcast(self, op: ir.OpView) -> list[ast.stmt]:
+    def _htile_broadcast(self, op: ir.OpView) -> list[ast.stmt]:
         dims_attr = op.attributes.get("dimensions")
         dims = _parse_dense_i64_array(dims_attr) if dims_attr else [1]
         self._broadcasts[op.results[0]] = BroadcastInfo(op.operands[0], dims)

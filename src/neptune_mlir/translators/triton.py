@@ -159,7 +159,7 @@ class Translator:
             "htile.reduce": self._htile_reduce,
             "htile.permute": self._htile_permute,
             "htile.copy": self._htile_copy,
-            "linalg.broadcast": self._linalg_broadcast,
+            "htile.broadcast": self._htile_broadcast,
             "scf.for": self._scf_for,
             "scf.yield": self._scf_yield,
             "tensor.empty": lambda o: [],
@@ -400,9 +400,9 @@ class Translator:
         self._names[op.results[0]] = self._get(op.operands[0])
         return []
 
-    # --- linalg.broadcast -> unsqueeze ---
+    # --- htile.broadcast -> unsqueeze ---
 
-    def _linalg_broadcast(self, op: ir.OpView) -> list[ast.stmt]:
+    def _htile_broadcast(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "bcast")
         src = self._expr(op.operands[0])
         dims_attr = op.attributes.get("dimensions")
