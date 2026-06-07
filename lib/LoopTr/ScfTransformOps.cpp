@@ -812,6 +812,10 @@ ScfFoldUnitExtentDimsViaReshapesOp::applyToOne(TransformRewriter &rewriter, Oper
     return diag;
   }
 
+  if (failed(runGreedyCleanup(rewriter, target)))
+    return ::mlir::emitDefiniteFailure(target,
+                                       "greedy cleanup after SCF dim folding did not converge");
+
   return DiagnosedSilenceableFailure::success();
 }
 

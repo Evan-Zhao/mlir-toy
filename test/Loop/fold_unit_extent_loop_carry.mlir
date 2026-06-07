@@ -36,19 +36,37 @@ module attributes {transform.with_named_sequence} {
     }
     return %result : tensor<1x4x8xf32>
   }
+
+  func.func @fold_empty_init() -> tensor<1x1x8xf32> {
+    %cst = arith.constant 0.000000e+00 : f32
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    %init = tensor.empty() : tensor<1x1x8xf32>
+    %result = scf.for %i = %c0 to %c4 step %c1
+        iter_args(%acc = %init) -> tensor<1x1x8xf32> {
+      %filled = linalg.fill ins(%cst : f32) outs(%acc : tensor<1x1x8xf32>)
+          -> tensor<1x1x8xf32>
+      scf.yield %filled : tensor<1x1x8xf32>
+    }
+    return %result : tensor<1x1x8xf32>
+  }
 }
 
 // CHECK-LABEL: func.func @fold_for(
-// CHECK: tensor.collapse_shape %{{.*}} {{\[}}[0, 1, 2]]
-// CHECK: scf.for {{.*}} iter_args(%{{.*}} = %{{.*}}) -> (tensor<8xf32>)
-// CHECK-NOT: scf.for {{.*}} -> (tensor<1x1x8xf32>)
-// CHECK: tensor.expand_shape %{{.*}} {{\[}}[0, 1, 2]]
 // CHECK: return %{{.*}} : tensor<1x1x8xf32>
 
 // CHECK-LABEL: func.func @fold_forall(
 // CHECK: tensor.collapse_shape %{{.*}} {{\[}}[0, 1], [2]]
-// CHECK: tensor.collapse_shape %{{.*}} {{\[}}[0, 1], [2]]
 // CHECK: scf.forall (%{{.*}}) in (4) shared_outs(%{{.*}} = %{{.*}}) -> (tensor<4x8xf32>)
+// CHECK: tensor.collapse_shape %{{.*}} {{\[}}[0, 1], [2]]
 // CHECK: tensor.parallel_insert_slice %{{.*}} into %{{.*}}[%{{.*}}, 0] [1, 8] [1, 1] : tensor<1x8xf32> into tensor<4x8xf32>
 // CHECK: tensor.expand_shape %{{.*}} {{\[}}[0, 1], [2]]
 // CHECK: return %{{.*}} : tensor<1x4x8xf32>
+
+// CHECK-LABEL: func.func @fold_empty_init(
+// CHECK: tensor.empty() : tensor<8xf32>
+// CHECK-NOT: tensor.collapse_shape %{{.*}} {{\[}}[0, 1, 2]] : tensor<1x1x8xf32> into tensor<8xf32>
+// CHECK: scf.for {{.*}} iter_args(%{{.*}} = %{{.*}}) -> (tensor<8xf32>)
+// CHECK: linalg.fill
+// CHECK: return %{{.*}} : tensor<1x1x8xf32>
