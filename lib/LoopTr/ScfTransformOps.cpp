@@ -18,9 +18,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/Config/llvm-config.h"
 
-#include <mlir/IR/PatternMatch.h>
 #include <variant>
 
 using namespace mlir;
@@ -406,29 +404,29 @@ SmallVector<OpFoldResult> getStaticMixedSizes(OpBuilder &builder, RankedTensorTy
   return sizes;
 }
 
+FailureOr<FoldedTensorInfo> getFoldedTensorInfo(OpBuilder &builder, Type type) {
+  auto tensorType = dyn_cast<RankedTensorType>(type);
+  if (!tensorType || tensorType.getEncoding())
+    return failure();
+  std::optional<SmallVector<ReassociationIndices>> reassociation =
+      linalg::getReassociationMapForFoldingUnitDims(getStaticMixedSizes(builder, tensorType));
+  if (!reassociation)
+    return failure();
+  auto newType = tensor::CollapseShapeOp::inferCollapsedType(tensorType, *reassociation);
+  if (newType == tensorType)
+    return failure(); // Here means "nothing to do".
+  return FoldedTensorInfo{
+      .oldType = tensorType, .newType = newType, .reassociation = std::move(*reassociation)};
+}
+
 FailureOr<SmallVector<std::optional<FoldedTensorInfo>>> getFoldedTensorInfos(OpBuilder &builder,
                                                                              ValueRange values) {
-  auto getFoldedTensorInfo = [&builder](Type type) -> FailureOr<FoldedTensorInfo> {
-    auto tensorType = dyn_cast<RankedTensorType>(type);
-    if (!tensorType || tensorType.getEncoding())
-      return failure();
-    std::optional<SmallVector<ReassociationIndices>> reassociation =
-        linalg::getReassociationMapForFoldingUnitDims(getStaticMixedSizes(builder, tensorType));
-    if (!reassociation)
-      return failure();
-    auto newType = tensor::CollapseShapeOp::inferCollapsedType(tensorType, *reassociation);
-    if (newType == tensorType)
-      return failure(); // Here means "nothing to do".
-    return FoldedTensorInfo{
-        .oldType = tensorType, .newType = newType, .reassociation = std::move(*reassociation)};
-  };
-
   using RetT = SmallVector<std::optional<FoldedTensorInfo>>;
   RetT infos;
   infos.reserve(values.size());
   bool changed = false;
   for (Value v : values) {
-    FailureOr<FoldedTensorInfo> info = getFoldedTensorInfo(v.getType());
+    FailureOr<FoldedTensorInfo> info = getFoldedTensorInfo(builder, v.getType());
     changed |= succeeded(info);
     infos.push_back(succeeded(info) ? info : std::optional<FoldedTensorInfo>{});
   }
@@ -501,19 +499,28 @@ FailureOr<Operation *> cloneOrRewriteForallCombiningOp(
   const auto &info = infos[*index];
   if (info) {
     auto sourceType = dyn_cast<RankedTensorType>(source.getType());
-    if (!sourceType || sourceType.getRank() != info->oldType.getRank())
+    if (!sourceType)
       return failure();
-    RankedTensorType collapsedSourceType =
-        tensor::CollapseShapeOp::inferCollapsedType(sourceType, info->reassociation);
-    {
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPoint(newLoop.getTerminator());
-      source = tensor::CollapseShapeOp::create(rewriter, insert.getLoc(), collapsedSourceType,
-                                               source, info->reassociation);
-    }
     offsets = info->collapseSliceParams(offsets);
     sizes = info->collapseSliceParams(sizes);
     strides = info->collapseSliceParams(strides);
+
+    RankedTensorType expectedSourceType =
+        tensor::ExtractSliceOp::inferResultType(info->newType, sizes);
+    auto isRankReduced = [](RankedTensorType lhs, RankedTensorType rhs) {
+      return isRankReducedType(lhs, rhs) == SliceVerificationResult::Success;
+    };
+    if (isRankReduced(expectedSourceType, sourceType)) {
+      // Source is already a legal rank-reduced tile for the rewritten slice.
+    } else if (auto sourceInfo = getFoldedTensorInfo(rewriter, sourceType);
+               succeeded(sourceInfo) && isRankReduced(expectedSourceType, sourceInfo->newType)) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPoint(newLoop.getTerminator());
+      source = tensor::CollapseShapeOp::create(rewriter, insert.getLoc(), sourceInfo->newType,
+                                               source, sourceInfo->reassociation);
+    } else {
+      return failure();
+    }
   } else {
     dest = mapping.lookupOrDefault(oldDest);
   }

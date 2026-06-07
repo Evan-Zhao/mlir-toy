@@ -37,6 +37,18 @@ module attributes {transform.with_named_sequence} {
     return %result : tensor<1x4x8xf32>
   }
 
+  func.func @fold_forall_rank_reduced_source(%out: tensor<1x4x8xf32>, %tile: tensor<1x8xf32>)
+      -> tensor<1x4x8xf32> {
+    %result = scf.forall (%i) in (4) shared_outs(%arg = %out)
+        -> tensor<1x4x8xf32> {
+      scf.forall.in_parallel {
+        tensor.parallel_insert_slice %tile into %arg[0, %i, 0] [1, 1, 8] [1, 1, 1]
+            : tensor<1x8xf32> into tensor<1x4x8xf32>
+      }
+    }
+    return %result : tensor<1x4x8xf32>
+  }
+
   func.func @fold_empty_init() -> tensor<1x1x8xf32> {
     %cst = arith.constant 0.000000e+00 : f32
     %c0 = arith.constant 0 : index
@@ -59,9 +71,15 @@ module attributes {transform.with_named_sequence} {
 // CHECK-LABEL: func.func @fold_forall(
 // CHECK: tensor.collapse_shape %{{.*}} {{\[}}[0, 1], [2]]
 // CHECK: scf.forall (%{{.*}}) in (4) shared_outs(%{{.*}} = %{{.*}}) -> (tensor<4x8xf32>)
-// CHECK: tensor.collapse_shape %{{.*}} {{\[}}[0, 1], [2]]
-// CHECK: tensor.parallel_insert_slice %{{.*}} into %{{.*}}[%{{.*}}, 0] [1, 8] [1, 1] : tensor<1x8xf32> into tensor<4x8xf32>
+// CHECK: tensor.collapse_shape %{{.*}} {{\[}}[0, 1, 2]]
+// CHECK: tensor.parallel_insert_slice %{{.*}} into %{{.*}}[%{{.*}}, 0] [1, 8] [1, 1] : tensor<8xf32> into tensor<4x8xf32>
 // CHECK: tensor.expand_shape %{{.*}} {{\[}}[0, 1], [2]]
+// CHECK: return %{{.*}} : tensor<1x4x8xf32>
+
+// CHECK-LABEL: func.func @fold_forall_rank_reduced_source(
+// CHECK: scf.forall (%{{.*}}) in (4) shared_outs(%{{.*}} = %{{.*}}) -> (tensor<4x8xf32>)
+// CHECK-NOT: tensor.collapse_shape
+// CHECK: tensor.parallel_insert_slice %{{.*}} into %{{.*}}[%{{.*}}, 0] [1, 8] [1, 1] : tensor<1x8xf32> into tensor<4x8xf32>
 // CHECK: return %{{.*}} : tensor<1x4x8xf32>
 
 // CHECK-LABEL: func.func @fold_empty_init(
