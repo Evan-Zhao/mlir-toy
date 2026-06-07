@@ -90,8 +90,10 @@ module attributes {transform.with_named_sequence} {
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.scf.localize_scratch_tensors %func : !any
     transform.apply_cse to %func : !any
+    transform.scf.fold_unit_extent_dims_via_reshapes %func : !any
     transform.apply_patterns to %func {
       transform.apply_patterns.linalg.fold_unit_extent_dims_via_reshapes
+      transform.apply_patterns.canonicalization
     } : !any
     transform.apply_cse to %func : !any
 
@@ -204,9 +206,9 @@ module attributes {transform.with_named_sequence} {
 // CHECK-NOT: linalg.transpose
 // CHECK-NOT: linalg.generic
 // CHECK-NOT: tensor.empty() : tensor<1x2x2x128x64xf32>
-// CHECK: %[[LOOP:[0-9]+]] = scf.forall (%{{.*}}, %{{.*}}) in (2, 2) shared_outs(%{{.*}} = %{{.*}}) -> (tensor<1x2x2x128x64xf16>)
-// CHECK: htile.full %{{.*}} : f32 -> tensor<1x1x1x128xf32>
-// CHECK: htile.full %{{.*}} : f32 -> tensor<1x1x1x128x64xf32>
+// CHECK: %[[LOOP:[0-9]+]] = scf.forall (%{{.*}}, %{{.*}}) in (2, 2) shared_outs(%{{.*}} = %{{.*}}) -> (tensor<2x2x128x64xf16>)
+// CHECK: htile.full %{{.*}} : f32 -> tensor<128xf32>
+// CHECK: htile.full %{{.*}} : f32 -> tensor<128x64xf32>
 // CHECK: %{{.*}}:3 = scf.for %{{.*}} = %c0 to %c2 step %c1 iter_args(
 // CHECK: affine.apply
 // CHECK: affine.apply
@@ -219,4 +221,4 @@ module attributes {transform.with_named_sequence} {
 // CHECK: htile.reduce %{{.*}} axis 1 kind "sum" : tensor<128x64xf32> -> tensor<128xf32>
 // CHECK: arith.divf %{{.*}}, %{{.*}} : tensor<128x64xf32>
 // CHECK: arith.truncf %{{.*}} : tensor<128x64xf32> to tensor<128x64xf16>
-// CHECK: tensor.parallel_insert_slice %{{.*}} into %{{.*}}[0, %{{.*}}, %{{.*}}, 0, 0] [1, 1, 1, 128, 64] [1, 1, 1, 1, 1] : tensor<1x1x1x128x64xf16> into tensor<1x2x2x128x64xf16>
+// CHECK: tensor.parallel_insert_slice %{{.*}} into %{{.*}}[%{{.*}}, %{{.*}}, 0, 0] [1, 1, 128, 64] [1, 1, 1, 1] : tensor<1x1x128x64xf16> into tensor<2x2x128x64xf16>
