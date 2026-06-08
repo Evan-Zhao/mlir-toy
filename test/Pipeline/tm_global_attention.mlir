@@ -135,8 +135,8 @@ module attributes {transform.with_named_sequence} {
     transform.scf.localize_scratch_tensors %func : !any
     // Remove unit-size dims from the loops and the linalg ops in the loop.
     // This is useful when we lower to HTile, because HTile requires (for example) dot to be in 2D.
-    transform.scf.fold_unit_extent_dims_via_reshapes %func : !any
     transform.apply_patterns to %func {
+      transform.apply_patterns.scf.fold_unit_extent_dims_via_reshapes
       transform.apply_patterns.linalg.fold_unit_extent_dims_via_reshapes
       transform.apply_patterns.canonicalization
     } : !any

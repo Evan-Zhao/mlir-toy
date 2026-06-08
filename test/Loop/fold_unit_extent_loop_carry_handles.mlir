@@ -8,7 +8,9 @@ module attributes {transform.with_named_sequence} {
     %func = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
     %loop = transform.structured.match ops{["scf.for"]} in %func : (!any) -> !any
     %generic = transform.structured.match ops{["linalg.generic"]} in %func : (!any) -> !any
-    transform.scf.fold_unit_extent_dims_via_reshapes %func : !any
+    transform.apply_patterns to %func {
+      transform.apply_patterns.scf.fold_unit_extent_dims_via_reshapes
+    } : !any
     transform.print %loop : !any
     transform.print %generic : !any
     transform.yield

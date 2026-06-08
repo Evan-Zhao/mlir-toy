@@ -33,14 +33,16 @@ useful ranks. The current integrated pipeline uses:
 
 ```mlir
 transform.apply_patterns to %func {
+  transform.apply_patterns.scf.fold_unit_extent_dims_via_reshapes
   transform.apply_patterns.linalg.fold_unit_extent_dims_via_reshapes
+  transform.apply_patterns.canonicalization
 } : !any
 transform.apply_cse to %func : !any
 ```
 
 This removes unit dimensions from the Linalg compute ops by inserting `tensor.collapse_shape` /
-`tensor.expand_shape` around them. It does not rewrite `scf.for` iter_arg or result types, so
-loop-carried state may still have the original higher-rank tensor type.
+`tensor.expand_shape` around them, and rewrites SCF loop-carried tensor state to carry the
+collapsed forms where possible.
 
 The transform rewrites these operations:
 

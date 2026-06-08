@@ -5,7 +5,9 @@
 module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%module: !any) {
     %funcs = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
-    transform.scf.fold_unit_extent_dims_via_reshapes %funcs : !any
+    transform.apply_patterns to %funcs {
+      transform.apply_patterns.scf.fold_unit_extent_dims_via_reshapes
+    } : !any
     transform.print %funcs : !any
     transform.yield
   }

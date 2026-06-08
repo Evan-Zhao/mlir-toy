@@ -93,8 +93,8 @@ module attributes {transform.with_named_sequence} {
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.scf.localize_scratch_tensors %func : !any
     transform.apply_cse to %func : !any
-    transform.scf.fold_unit_extent_dims_via_reshapes %func : !any
     transform.apply_patterns to %func {
+      transform.apply_patterns.scf.fold_unit_extent_dims_via_reshapes
       transform.apply_patterns.linalg.fold_unit_extent_dims_via_reshapes
       transform.apply_patterns.canonicalization
     } : !any

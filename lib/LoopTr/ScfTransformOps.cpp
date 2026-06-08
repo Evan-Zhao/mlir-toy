@@ -441,24 +441,30 @@ Value expandTensor(OpBuilder &builder, Location loc, Value value, const FoldedTe
   return tensor::ExpandShapeOp::create(builder, loc, info.oldType, value, info.reassociation);
 }
 
-void notifyReplacedRecursively(Operation *oldOp, TransformRewriter &rewriter, Operation *newOp) {
+void notifyReplacedRecursively(Operation *oldOp, RewriterBase &rewriter, Operation *newOp) {
+  auto *listener = dyn_cast_if_present<RewriterBase::Listener>(rewriter.getListener());
+  if (!listener)
+    return;
+
   SmallVector<Operation *> oldOps, newOps;
   oldOp->walk<WalkOrder::PreOrder>([&](Operation *op) { oldOps.push_back(op); });
   newOp->walk<WalkOrder::PreOrder>([&](Operation *op) { newOps.push_back(op); });
   if (oldOps.size() != newOps.size())
     return;
 
-  for (auto [oldNested, newNested] : llvm::zip(oldOps, newOps)) {
-    if (succeeded(rewriter.notifyPayloadOperationReplaced(oldNested, newNested)))
-      continue;
-    rewriter.silenceTrackingFailure();
-  }
+  for (auto [oldNested, newNested] : llvm::zip(oldOps, newOps))
+    listener->notifyOperationReplaced(oldNested, newNested);
 }
 
 template <typename OpRange>
-void notifyClonedOpsRecursively(TransformRewriter &rewriter, OpRange &&clonedOps) {
+void notifyClonedOpsRecursively(RewriterBase &rewriter, OpRange &&clonedOps) {
   for (auto [oldOp, newOp] : clonedOps)
     notifyReplacedRecursively(oldOp, rewriter, newOp);
+}
+
+void notifyLoopReplaced(RewriterBase &rewriter, Operation *oldLoop, Operation *newLoop) {
+  if (auto *listener = dyn_cast_if_present<RewriterBase::Listener>(rewriter.getListener()))
+    listener->notifyOperationReplaced(oldLoop, newLoop);
 }
 
 std::optional<unsigned> findForallOutArgIndex(scf::ForallOp loop, Value value) {
@@ -592,7 +598,7 @@ template <> struct LoopSharedTrait<scf::ForOp> {
 };
 
 template <typename LoopOp>
-FailureOr<LoopOp> foldUnitExtentDimsInLoop(TransformRewriter &rewriter, LoopOp loop) {
+FailureOr<LoopOp> foldUnitExtentDimsInLoop(PatternRewriter &rewriter, LoopOp loop) {
   auto infosR = getFoldedTensorInfos(rewriter, loop.getResults());
   if (failed(infosR))
     return failure();
@@ -628,8 +634,7 @@ FailureOr<LoopOp> foldUnitExtentDimsInLoop(TransformRewriter &rewriter, LoopOp l
 
   notifyClonedOpsRecursively(rewriter, clonedOps);
   notifyClonedOpsRecursively(rewriter, *clonedCombiningOpsR);
-  if (failed(rewriter.notifyPayloadOperationReplaced(loop, newLoop)))
-    rewriter.silenceTrackingFailure();
+  notifyLoopReplaced(rewriter, loop, newLoop);
 
   rewriter.setInsertionPointAfter(newLoop);
   SmallVector<Value> replacements = newLoop.getResults();
@@ -640,16 +645,13 @@ FailureOr<LoopOp> foldUnitExtentDimsInLoop(TransformRewriter &rewriter, LoopOp l
   return newLoop;
 }
 
-void collectScfLoopsPostOrder(Operation *op, SmallVectorImpl<Operation *> &loops) {
-  for (Region &region : op->getRegions()) {
-    for (Block &block : region) {
-      for (Operation &nested : block)
-        collectScfLoopsPostOrder(&nested, loops);
-    }
+template <typename LoopOp> struct FoldUnitExtentDimsInLoopPattern : OpRewritePattern<LoopOp> {
+  using OpRewritePattern<LoopOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(LoopOp loop, PatternRewriter &rewriter) const override {
+    return success(succeeded(foldUnitExtentDimsInLoop(rewriter, loop)));
   }
-  if (isa<scf::ForOp, scf::ForallOp>(op))
-    loops.push_back(op);
-}
+};
 
 struct SplitForallIntoForResult {
   struct TileSlice {
@@ -764,66 +766,18 @@ void ScfLocalizeScratchTensorsOp::getEffects(
   modifiesPayload(effects);
 }
 
-void ScfFoldUnitExtentDimsViaReshapesOp::getEffects(
-    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  onlyReadsHandle(getTargetMutable(), effects);
-  modifiesPayload(effects);
-}
-
-DiagnosedSilenceableFailure
-ScfFoldUnitExtentDimsViaReshapesOp::applyToOne(TransformRewriter &rewriter, Operation *target,
-                                               ApplyToEachResultList &results,
-                                               TransformState &state) {
-  (void)results;
-  (void)state;
-  auto transform = cast<TransformOpInterface>(getOperation());
-
-  Operation *isolatedTarget = findEnclosingIsolatedFromAbove(target);
-  if (!isolatedTarget)
-    return emitSilenceableFailure(target, "expected target to be nested in an isolated op");
-
-  SmallVector<Operation *> loops;
-  collectScfLoopsPostOrder(target, loops);
-
-  bool changed = false;
-  for (Operation *op : loops) {
-    if (!op->getBlock())
-      continue;
-
-    if (auto forOp = dyn_cast<scf::ForOp>(op)) {
-      FailureOr<scf::ForOp> newLoop = foldUnitExtentDimsInLoop(rewriter, forOp);
-      if (succeeded(newLoop)) {
-        changed = true;
-        continue;
-      }
-      if (rewriter.hasTrackingFailures())
-        BAIL("failed to preserve handles while rewriting scf.for");
-      continue;
-    }
-
-    FailureOr<scf::ForallOp> newLoop = foldUnitExtentDimsInLoop(rewriter, cast<scf::ForallOp>(op));
-    if (succeeded(newLoop)) {
-      changed = true;
-      continue;
-    }
-    if (rewriter.hasTrackingFailures())
-      BAIL("failed to preserve handles while rewriting scf.forall");
-  }
-
-  if (!changed) {
-    auto diag =
-        emitSilenceableFailure(transform, "no scf.for or scf.forall loop-carried tensors had "
-                                          "foldable unit-extent dims");
-    diag.attachNote(target->getLoc()) << "target op was " << target->getName() << " and "
-                                      << loops.size() << " nested SCF loops were inspected";
-    return diag;
-  }
-
-  if (failed(runGreedyCleanup(rewriter, target)))
-    return ::mlir::emitDefiniteFailure(target,
-                                       "greedy cleanup after SCF dim folding did not converge");
-
-  return DiagnosedSilenceableFailure::success();
+void ScfFoldUnitExtentDimsViaReshapesPatternsOp::populatePatterns(RewritePatternSet &patterns) {
+  patterns.add<FoldUnitExtentDimsInLoopPattern<scf::ForOp>,
+               FoldUnitExtentDimsInLoopPattern<scf::ForallOp>>(patterns.getContext());
+  linalg::populateSwapExtractSliceWithFillPatterns(patterns);
+  tensor::populateFoldTensorEmptyPatterns(patterns);
+  tensor::populateReassociativeReshapeFoldingPatterns(patterns);
+  scf::populateSCFForLoopCanonicalizationPatterns(patterns);
+  populateRegionBranchOpInterfaceCanonicalizationPatterns(patterns, scf::ForOp::getOperationName());
+#if LLVM_VERSION_MAJOR >= 23
+  populateRegionBranchOpInterfaceCanonicalizationPatterns(patterns,
+                                                          scf::ForallOp::getOperationName());
+#endif
 }
 
 DiagnosedSilenceableFailure ScfLocalizeScratchTensorsOp::applyToOne(TransformRewriter &rewriter,
