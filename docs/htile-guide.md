@@ -89,98 +89,84 @@ The main ABI distinction is between Semantic HTile and Kernel HTile:
   arguments, uses `htile.load` / `htile.store` at memory boundaries, and has no tensor return.
 
 The current Triton, TileLang, and cuTile translators are backend translators, not general
-tensor-return HTile interpreters. They should consume Kernel HTile. Therefore
-`attention_htile.mlir` should either be treated as a semantic intermediate, or rewritten by a
-small ABI-conversion pass before invoking those translators.
+tensor-return HTile interpreters. They should consume Kernel HTile.
+Therefore a semantic HTile program should run `transform.htile.semantic_to_kernel_abi`
+before invoking those translators.
 
-For the current attention shape, kernel ABI conversion is mechanical:
+The `semantic_to_kernel_abi` transform currently implements:
 
-1. Change the function type from `(q, k, v) -> out_tensor` to
-   `(q_mem, k_mem, v_mem, out_mem) -> ()`.
-1. Ensure `htile.load` sources are memory arguments, not returned tensor values.
-1. Replace the final semantic output boundary with:
+1. ranked tensor function arguments are rewritten to memref arguments,
+1. ranked tensor function results are appended as trailing memref output arguments,
+1. converted input arguments get `bufferization.to_tensor` bridges so the existing tensor body
+   remains verifier-valid,
+1. direct `tensor.extract_slice` reads from converted function input arguments are rewritten to
+   `htile.load`,
+1. returned `scf.forall` tensor results are rewritten into side-effecting `htile.store` operations
+   by converting the corresponding `tensor.parallel_insert_slice` publications,
+1. returned `scf.forall` operations are rebuilt without `shared_outs` and without tensor results,
+1. `func.return` operations are rewritten to return no operands.
 
-   ```mlir
-   htile.store %norm_f16_local, %out[%c0, %h, %c0, %c0]
-       : tensor<128x64xf16, #local>, memref<1x4x128x64xf16>
-   ```
+### Emitting HTile Loads and Stores
 
-1. Lower the outer parallel grid to the backend translator's expected kernel launch form.
-   Handwritten backend examples use `gpu.launch`, while scheduled L1 uses `scf.forall`.
-
-Boundary-only bufferization does not by itself complete this conversion. It may leave a memref
-return bridged from a tensor result, and the final `tensor.parallel_insert_slice` remains in the
-tensor body. The output argument and `htile.store` rewrite are still HTile/backend ABI work.
-
-Implemented so far in `transform.htile.semantic_to_kernel_abi`:
-
-- ranked tensor function arguments are rewritten to memref arguments,
-- ranked tensor function results are appended as trailing memref output arguments,
-- converted input arguments get `bufferization.to_tensor` bridges so the existing tensor body
-  remains verifier-valid,
-- `func.return` operations are rewritten to return no operands.
-
-## View Normalization And Memory Loads
-
-Do not interpret semantic input copies as backend memory loads. If placement has introduced
-`htile.copy`, the HTile dialect still defines it as a placement change for an already materialized
-tile, and the Python backend translators lower it as an SSA alias with no emitted memory
-operation. A backend legalization pass must rewrite:
+After function ABI rewriting inserts `bufferization.to_tensor` bridges,
+`semantic_to_kernel_abi` looks at each `extract_slice` and expects this pattern:
 
 ```mlir
-%tile = tensor.extract_slice %q[...] : tensor<...> to tensor<128x64xf16>
-%shared = htile.copy %tile
-    : tensor<128x64xf16> -> tensor<128x64xf16, #shared>
+%tensor = bufferization.to_tensor %q_memref restrict writable : memref<...> to tensor<...>
+%tile = tensor.extract_slice %tensor[...] [...] [1, 1, ...] : tensor<...> to tensor<128x64xf16>
+%use = htile.dot %tile, ...
 ```
 
-to:
+and rewrites it into:
 
 ```mlir
-%shared = htile.load %q_memref[...]
-    : memref<...> -> tensor<128x64xf16, #shared>
+%tile = htile.load %q_memref[...] : memref<...> -> tensor<128x64xf16>
+%use = htile.dot %tile, ...
 ```
 
-Input argument conversion can reuse partial One-Shot Bufferize. Restricting bufferization to the
-`func` dialect rewrites tensor function arguments to memrefs and inserts `bufferization.to_tensor`
-bridges at the top of the function, while leaving the scheduled tensor body intact:
+Similarly, to produce stores, `semantic_to_kernel_abi` expects each return value
+of the function is produced by an `scf.forall`
+that publishes it with a `parallel_insert_slice`, like this:
 
-```shell
-mlir-opt input.mlir --canonicalize \
-  --one-shot-bufferize='bufferize-function-boundaries allow-unknown-ops dialect-filter=func function-boundary-type-conversion=identity-layout-map'
+```mlir
+%result = scf.forall (...) shared_outs(%out = %init) -> (tensor<...>) {
+  ...
+  scf.forall.in_parallel {
+    tensor.parallel_insert_slice %tile into %out[...] [...] [1, 1, ...]
+      : tensor<...> into tensor<...>
+  }
+}
+return %result : tensor<...>
 ```
 
-This is useful for L1-to-HTile lowering: view normalization can treat
-`bufferization.to_tensor %arg_memref` as a memory-boundary root, emit `htile.load` from
-`%arg_memref`, and keep the remaining tensor body value-based.
+and rewrites it into a side-effecting loop with an explicit store:
 
-The input IR may contain intermediate `tensor.extract_slice` values that are not real memory
-operations. HTile should usually load the final tile directly from the original source or a
-canonical single view of that source.
+```mlir
+scf.forall (...) {
+  ...
+  htile.store %tile, %out_memref[...] : tensor<...>, memref<...>
+}
+return
+```
 
-MLIR bufferization can help expose these relationships because `tensor.extract_slice` bufferizes
-to `memref.subview`, and memref alias folding can compose nested subviews. It does not remove the
-problem by itself: the downstream HTile/Triton path must either see a base memory object plus
-explicit offsets, or explicitly understand subview layout metadata. Feeding arbitrary subview
-results to `htile.load` without honoring their offsets and strides would be incorrect.
+This transform is complete for the current global, causal, and GQA attention pipelines:
+the output function has memref input/output arguments, direct `htile.load` / `htile.store`
+memory boundaries, and no tensor return.
+It intentionally leaves the outer `scf.forall` schedule in place and does not make placement,
+launch, or backend-specific layout decisions.
 
-For the tensor path, implement view normalization as a narrow `tensor.extract_slice` chain resolver:
+Current ABI conversion assumptions:
 
-1. Start from the tile value that will become an `htile.load`.
-1. Walk through defining `tensor.extract_slice` ops until reaching a supported root, usually a
-   function argument or output tensor.
-1. For each slice, use `OffsetSizeAndStrideOpInterface` to read mixed offsets/sizes/strides,
-   and use `ExtractSliceOp::computeRankReductionMask()` to map rank-reduced result dimensions.
-1. Compose each child offset into the corresponding root dimension:
-   `new_offset = parent_offset + child_offset * parent_stride`.
-   For the first implementation, require unit strides; then this reduces to simple affine
-   addition. Keep sizes from the final tile.
-1. Materialize composed dynamic offsets with folded affine/index arithmetic such as
-   `affine::makeComposedFoldedAffineApply`, then create one `htile.load` from the root.
-1. Fail if the chain contains non-unit strides, dynamic rank ambiguity, non-slice producers, or
-   a root that is not a valid memory boundary.
-
-This mirrors the memref subview composition algorithm conceptually, but should operate before full
-bufferization so that the rest of the scheduled tile body stays in value-based tensor form.
+- the target is a non-external `func.func` with exactly one `func.return`,
+- tensor argument/result ABI types are ranked, unencoded tensors,
+- each input memory read is a unit-stride `tensor.extract_slice` directly from a
+  `bufferization.to_tensor` bridge over a function memref argument,
+- each converted `tensor.extract_slice` result feeds only HTile ops,
+- each returned tensor is produced by an `scf.forall`,
+- returned `scf.forall` results are published through unit-stride
+  `tensor.parallel_insert_slice` ops,
+- after those publications are converted, the `scf.forall` shared output block arguments and
+  tensor results have no remaining uses.
 
 ## Placement Transforms
 
