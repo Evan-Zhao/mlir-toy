@@ -4,8 +4,12 @@
 #include "LoopTr/Utils.h"
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Transforms/Transforms.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/IR/OpDefinition.h"
@@ -17,6 +21,7 @@
 #define DEBUG_TYPE "htile-transform-ops"
 
 using namespace mlir;
+using bufferization::ToTensorOp;
 
 namespace mlir::transform {
 namespace {
@@ -550,6 +555,259 @@ LogicalResult applyRewritesGreedily(TransformRewriter &rewriter, Operation *targ
   return applyPatternsGreedily(target, std::move(patterns), config);
 }
 
+struct OutputStore {
+  Value returnedTensor;
+  BlockArgument outputMemrefArg;
+};
+
+struct KernelAbiRewriteInfo {
+  SmallVector<OutputStore> outputStores;
+};
+
+FailureOr<KernelAbiRewriteInfo> rewriteFunctionAbi(RewriterBase &rewriter, func::FuncOp funcOp) {
+  if (funcOp.isDeclaration())
+    return funcOp.emitError() << "cannot rewrite ABI of external function";
+
+  FunctionType oldType = funcOp.getFunctionType();
+  KernelAbiRewriteInfo info;
+  SmallVector<Type> newInputTypes;
+  SmallVector<Type> oldTensorInputTypes;
+  SmallVector<unsigned> tensorInputIndices;
+  SmallVector<DictionaryAttr> newArgAttrs;
+  funcOp.getAllArgAttrs(newArgAttrs);
+  newInputTypes.reserve(oldType.getNumInputs() + oldType.getNumResults());
+
+  auto getMemrefAbiType = [&](Type type, StringRef role, size_t index) -> FailureOr<MemRefType> {
+    auto tensorType = dyn_cast<RankedTensorType>(type);
+    if (!tensorType)
+      return funcOp.emitError() << "unsupported "
+                                << (isa<TensorType>(type) ? "unranked tensor " : "non-tensor ")
+                                << role << " " << index;
+    if (tensorType.getEncoding())
+      return funcOp.emitError() << "unsupported encoded tensor " << role << " " << index;
+    return MemRefType::get(tensorType.getShape(), tensorType.getElementType());
+  };
+
+  for (auto [index, inputType] : llvm::enumerate(oldType.getInputs())) {
+    if (!isa<TensorType>(inputType)) {
+      newInputTypes.push_back(inputType);
+      continue;
+    }
+    FailureOr<MemRefType> memrefType = getMemrefAbiType(inputType, "argument", index);
+    if (failed(memrefType))
+      return failure();
+    newInputTypes.push_back(*memrefType);
+    oldTensorInputTypes.push_back(inputType);
+    tensorInputIndices.push_back(index);
+  }
+  for (auto [index, resultType] : llvm::enumerate(oldType.getResults())) {
+    FailureOr<MemRefType> memrefType = getMemrefAbiType(resultType, "result", index);
+    if (failed(memrefType))
+      return failure();
+    newInputTypes.push_back(*memrefType);
+  }
+
+  funcOp.setType(FunctionType::get(funcOp.getContext(), newInputTypes, {}));
+
+  Block &entry = funcOp.getBody().front();
+  for (size_t index = 0, e = oldType.getNumInputs(); index < e; ++index)
+    entry.getArgument(index).setType(newInputTypes[index]);
+  for (size_t index = oldType.getNumInputs(), e = newInputTypes.size(); index < e; ++index)
+    entry.addArgument(newInputTypes[index], funcOp.getLoc());
+
+  if (!newArgAttrs.empty()) {
+    auto emptyDict = DictionaryAttr::get(funcOp.getContext());
+    newArgAttrs.append(oldType.getNumResults(), emptyDict);
+    funcOp.setAllArgAttrs(newArgAttrs);
+  }
+  funcOp.setAllResultAttrs(ArrayRef<DictionaryAttr>{});
+
+  rewriter.setInsertionPointToStart(&entry);
+  for (auto [oldTensorType, argIndex] : llvm::zip_equal(oldTensorInputTypes, tensorInputIndices)) {
+    BlockArgument arg = entry.getArgument(argIndex);
+    auto tensor = ToTensorOp::create(rewriter, arg.getLoc(), oldTensorType, arg,
+                                     /*restrict=*/true, /*writable=*/true);
+    for (OpOperand &use : llvm::make_early_inc_range(arg.getUses())) {
+      if (use.getOwner() == tensor)
+        continue;
+      use.set(tensor.getResult());
+    }
+  }
+
+  SmallVector<func::ReturnOp> returns;
+  funcOp.walk([&](func::ReturnOp returnOp) { returns.push_back(returnOp); });
+  if (returns.size() != 1)
+    return funcOp.emitError() << "expected exactly one return op";
+  for (func::ReturnOp returnOp : returns) {
+    if (returnOp.getNumOperands() != oldType.getNumResults())
+      return returnOp.emitError() << "return operand count does not match function result count";
+    for (auto [index, returned] : llvm::enumerate(returnOp.getOperands())) {
+      info.outputStores.push_back(
+          {returned, cast<BlockArgument>(entry.getArgument(oldType.getNumInputs() + index))});
+    }
+    rewriter.setInsertionPoint(returnOp);
+    rewriter.replaceOpWithNewOp<func::ReturnOp>(returnOp);
+  }
+
+  return info;
+}
+
+LogicalResult rewriteExtractSliceAsLoad(RewriterBase &rewriter, func::FuncOp funcOp,
+                                        tensor::ExtractSliceOp extract) {
+  auto toTensor = extract.getSource().getDefiningOp<ToTensorOp>();
+  if (!toTensor)
+    return extract.emitError()
+           << "expected tensor.extract_slice source to be a function memref argument";
+
+  auto memrefArg = dyn_cast<BlockArgument>(toTensor.getBuffer());
+  if (!memrefArg || memrefArg.getOwner() != &funcOp.getBody().front() ||
+      !isa<MemRefType>(memrefArg.getType()))
+    return extract.emitError()
+           << "expected tensor.extract_slice source to be a function memref argument";
+
+  if (!extract.hasUnitStride())
+    return extract.emitError() << "unsupported non-unit tensor.extract_slice stride";
+
+  if (extract->use_empty())
+    return extract.emitError() << "expected tensor.extract_slice result to feed an htile op";
+
+  StringRef htileNamespace = htile::HTileDialect::getDialectNamespace();
+  for (OpOperand &use : extract->getUses()) {
+    Operation *owner = use.getOwner();
+    if (!owner->getDialect() || owner->getDialect()->getNamespace() != htileNamespace)
+      return extract.emitError() << "expected tensor.extract_slice result to feed only htile ops";
+  }
+
+  rewriter.setInsertionPoint(extract);
+  SmallVector<Value> offsets =
+      getValueOrCreateConstantIndexOp(rewriter, extract.getLoc(), extract.getMixedOffsets());
+  auto load = htile::LoadOp::create(rewriter, extract.getLoc(), extract.getResultType(),
+                                    toTensor.getBuffer(), offsets);
+  rewriter.replaceOp(extract, load.getResult());
+  return success();
+}
+
+struct ForallStoreGroup {
+  scf::ForallOp forallOp;
+  SmallVector<OutputStore> outputStores;
+};
+
+LogicalResult materializeStoreForForallResult(RewriterBase &rewriter, OutputStore store) {
+  auto result = dyn_cast<OpResult>(store.returnedTensor);
+  if (!result)
+    return emitError(store.returnedTensor.getLoc())
+           << "expected returned tensor to be produced by scf.forall";
+  auto forallOp = dyn_cast<scf::ForallOp>(result.getDefiningOp());
+  if (!forallOp)
+    return result.getDefiningOp()->emitError()
+           << "expected returned tensor to be produced by scf.forall";
+
+  BlockArgument outputArg = forallOp.getTiedBlockArgument(result);
+  SmallVector<Operation *> combiningOps = forallOp.getCombiningOps(outputArg);
+  if (combiningOps.empty())
+    return forallOp.emitError() << "expected returned scf.forall result to be published";
+
+  for (Operation *combiningOp : combiningOps) {
+    auto insert = dyn_cast<tensor::ParallelInsertSliceOp>(combiningOp);
+    if (!insert)
+      return combiningOp->emitError()
+             << "expected returned scf.forall result to use tensor.parallel_insert_slice";
+    if (!insert.hasUnitStride())
+      return insert.emitError() << "unsupported non-unit tensor.parallel_insert_slice stride";
+
+    auto inParallel = insert->getParentOfType<scf::InParallelOp>();
+    if (!inParallel)
+      return insert.emitError() << "expected tensor.parallel_insert_slice under scf.forall";
+
+    rewriter.setInsertionPoint(inParallel);
+    SmallVector<Value> offsets =
+        getValueOrCreateConstantIndexOp(rewriter, insert.getLoc(), insert.getMixedOffsets());
+    htile::StoreOp::create(rewriter, insert.getLoc(), insert.getSource(), store.outputMemrefArg,
+                           offsets);
+    rewriter.eraseOp(insert);
+  }
+
+  return success();
+}
+
+LogicalResult rebuildForallWithoutOutputs(RewriterBase &rewriter, scf::ForallOp forallOp) {
+  for (BlockArgument outputArg : forallOp.getRegionOutArgs()) {
+    if (!outputArg.use_empty())
+      return forallOp.emitError() << "unsupported remaining use of scf.forall shared_out";
+  }
+  for (OpResult result : forallOp->getResults()) {
+    if (!result.use_empty())
+      return forallOp.emitError()
+             << "expected returned scf.forall result to have no remaining uses";
+  }
+
+  SmallVector<Value> oldOutputs = llvm::to_vector(forallOp.getOutputs());
+  rewriter.setInsertionPoint(forallOp);
+  scf::ForallOp::create(
+      rewriter, forallOp.getLoc(), forallOp.getMixedLowerBound(), forallOp.getMixedUpperBound(),
+      forallOp.getMixedStep(), ValueRange{}, forallOp.getMapping(),
+      [&](OpBuilder &nestedBuilder, Location, ValueRange bbArgs) {
+        SmallVector<Value> replacements = llvm::to_vector(bbArgs);
+        replacements.append(oldOutputs.begin(), oldOutputs.end());
+        rewriter.mergeBlocks(forallOp.getBody(), nestedBuilder.getBlock(), replacements);
+      });
+  rewriter.eraseOp(forallOp);
+
+  for (Value oldOutput : oldOutputs) {
+    Operation *def = oldOutput.getDefiningOp();
+    if (def && def->use_empty())
+      rewriter.eraseOp(def);
+  }
+  return success();
+}
+
+LogicalResult rewriteOutputStores(RewriterBase &rewriter, KernelAbiRewriteInfo &info) {
+  SmallVector<ForallStoreGroup> groups;
+  for (OutputStore store : info.outputStores) {
+    auto result = dyn_cast<OpResult>(store.returnedTensor);
+    if (!result)
+      return emitError(store.returnedTensor.getLoc())
+             << "expected returned tensor to be produced by scf.forall";
+    auto forallOp = dyn_cast<scf::ForallOp>(result.getDefiningOp());
+    if (!forallOp)
+      return result.getDefiningOp()->emitError()
+             << "expected returned tensor to be produced by scf.forall";
+
+    auto existing = llvm::find_if(
+        groups, [&](const ForallStoreGroup &group) { return group.forallOp == forallOp; });
+    if (existing == groups.end()) {
+      groups.push_back({forallOp, {}});
+      existing = std::prev(groups.end());
+    }
+    existing->outputStores.push_back(store);
+  }
+
+  for (ForallStoreGroup &group : groups) {
+    if (!group.forallOp->getBlock())
+      continue;
+    for (OutputStore store : group.outputStores) {
+      if (failed(materializeStoreForForallResult(rewriter, store)))
+        return failure();
+    }
+    if (failed(rebuildForallWithoutOutputs(rewriter, group.forallOp)))
+      return failure();
+  }
+  return success();
+}
+
+LogicalResult rewriteExtractSlicesAsLoads(RewriterBase &rewriter, func::FuncOp funcOp) {
+  SmallVector<tensor::ExtractSliceOp> extracts;
+  funcOp.walk([&](tensor::ExtractSliceOp extract) { extracts.push_back(extract); });
+
+  for (tensor::ExtractSliceOp extract : extracts) {
+    if (!extract->getBlock())
+      continue;
+    if (failed(rewriteExtractSliceAsLoad(rewriter, funcOp, extract)))
+      return failure();
+  }
+  return success();
+}
+
 } // namespace
 
 void HTileLinalgToSemanticOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
@@ -590,18 +848,48 @@ DiagnosedSilenceableFailure HTileLinalgToSemanticOp::applyToOne(TransformRewrite
   return DiagnosedSilenceableFailure::success();
 }
 
+void HTileSemanticToKernelAbiOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  onlyReadsHandle(getTargetMutable(), effects);
+  modifiesPayload(effects);
+}
+
+DiagnosedSilenceableFailure HTileSemanticToKernelAbiOp::applyToOne(TransformRewriter &rewriter,
+                                                                   Operation *target,
+                                                                   ApplyToEachResultList &results,
+                                                                   TransformState &state) {
+  (void)results;
+  (void)state;
+
+  auto funcOp = dyn_cast<func::FuncOp>(target);
+  if (!funcOp) {
+    target->emitError() << "expected func.func target";
+    return DiagnosedSilenceableFailure::definiteFailure();
+  }
+
+  FailureOr<KernelAbiRewriteInfo> info = rewriteFunctionAbi(rewriter, funcOp);
+  if (failed(info))
+    return DiagnosedSilenceableFailure::definiteFailure();
+  if (failed(rewriteOutputStores(rewriter, *info)))
+    return DiagnosedSilenceableFailure::definiteFailure();
+  if (failed(rewriteExtractSlicesAsLoads(rewriter, funcOp)))
+    return DiagnosedSilenceableFailure::definiteFailure();
+  return DiagnosedSilenceableFailure::success();
+}
+
 } // namespace mlir::transform
 
 namespace htile {
 
 void registerHTileTransformExtension(mlir::DialectRegistry &registry) {
   registry.addExtension(+[](mlir::MLIRContext *ctx, mlir::transform::TransformDialect *dialect) {
-    ctx->loadDialect<htile::HTileDialect>();
+    ctx->loadDialect<htile::HTileDialect, mlir::bufferization::BufferizationDialect>();
     struct TransformDialectAccess : public mlir::transform::TransformDialect {
       using mlir::Dialect::addOperations;
     };
     static_cast<TransformDialectAccess *>(dialect)
-        ->addOperations<mlir::transform::HTileLinalgToSemanticOp>();
+        ->addOperations<mlir::transform::HTileLinalgToSemanticOp,
+                        mlir::transform::HTileSemanticToKernelAbiOp>();
   });
 }
 

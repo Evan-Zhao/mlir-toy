@@ -76,22 +76,6 @@ Current limitations:
 - Reduction conversion only recognizes the currently supported binary reduction combiners.
 - It expects static tile shapes.
 
-## Placement Transforms
-
-Placement is not part of `transform.htile.linalg_to_semantic`. A later HTile placement transform
-can start with this simple policy:
-
-- input tiles copied from Q/K/V extracts use `#htile.encoding<placement = shared>`,
-- temporary compute tiles and loop-carried online-softmax state use
-  `#htile.encoding<placement = local>`,
-- values crossing back to plain tensor L1 use `htile.copy`.
-
-This is intentionally coarse. More precise placement, cache staging, async copies, warp roles, and
-layout choices belong to later HTile/backend lowering.
-
-`htile.copy` is a placement/value conversion, not a global memory access. If a placement transform
-inserts semantic copies, kernel-ABI legalization still decides which copies become loads/stores.
-
 ## Kernel HTile And Backend ABI
 
 The main ABI distinction is between Semantic HTile and Kernel HTile:
@@ -127,6 +111,14 @@ For the current attention shape, kernel ABI conversion is mechanical:
 Boundary-only bufferization does not by itself complete this conversion. It may leave a memref
 return bridged from a tensor result, and the final `tensor.parallel_insert_slice` remains in the
 tensor body. The output argument and `htile.store` rewrite are still HTile/backend ABI work.
+
+Implemented so far in `transform.htile.semantic_to_kernel_abi`:
+
+- ranked tensor function arguments are rewritten to memref arguments,
+- ranked tensor function results are appended as trailing memref output arguments,
+- converted input arguments get `bufferization.to_tensor` bridges so the existing tensor body
+  remains verifier-valid,
+- `func.return` operations are rewritten to return no operands.
 
 ## View Normalization And Memory Loads
 
@@ -189,6 +181,22 @@ For the tensor path, implement view normalization as a narrow `tensor.extract_sl
 
 This mirrors the memref subview composition algorithm conceptually, but should operate before full
 bufferization so that the rest of the scheduled tile body stays in value-based tensor form.
+
+## Placement Transforms
+
+Placement is not part of `transform.htile.linalg_to_semantic`. A later HTile placement transform
+can start with this simple policy:
+
+- input tiles copied from Q/K/V extracts use `#htile.encoding<placement = shared>`,
+- temporary compute tiles and loop-carried online-softmax state use
+  `#htile.encoding<placement = local>`,
+- values crossing back to plain tensor L1 use `htile.copy`.
+
+This is intentionally coarse. More precise placement, cache staging, async copies, warp roles, and
+layout choices belong to later HTile/backend lowering.
+
+`htile.copy` is a placement/value conversion, not a global memory access. If a placement transform
+inserts semantic copies, kernel-ABI legalization still decides which copies become loads/stores.
 
 ## Backend Lowering Notes
 

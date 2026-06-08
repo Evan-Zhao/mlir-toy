@@ -113,6 +113,7 @@ module attributes {transform.with_named_sequence} {
 
     // --- HTile lowering begins ---
     transform.htile.linalg_to_semantic %func : !any
+    transform.htile.semantic_to_kernel_abi %func : !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     transform.yield
@@ -226,16 +227,18 @@ module attributes {transform.with_named_sequence} {
 }
 
 // CHECK-LABEL: func.func @attention(
+// CHECK-SAME: %arg0: memref<1x4x1024x64xf16>, %arg1: memref<1x4x1024x64xf16>, %arg2: memref<1x4x1024x64xf16>, %arg3: memref<1x4x1024x64xf16>)
 // CHECK-NOT: tensor.empty() : tensor<4x1024x64xf32>
 // CHECK-NOT: tensor.empty() : tensor<4x1024x64xf16>
-// CHECK: %[[INIT:[0-9]+]] = tensor.empty() : tensor<1x4x1024x64xf16>
-// CHECK: %[[FORALL:[0-9]+]] = scf.forall (%{{.*}}, %{{.*}}) in (4, 8) shared_outs(%{{.*}} = %[[INIT]]) -> (tensor<1x4x1024x64xf16>)
+// CHECK: scf.forall (%{{.*}}, %{{.*}}) in (4, 8) {
 // CHECK: htile.full %cst{{.*}} : f32 -> tensor<128xf32>
 // CHECK: htile.full %cst{{.*}} : f32 -> tensor<128x64xf32>
 // CHECK: %[[RAW_BOUND:.+]] = arith.select %{{.*}}, %{{.*}}, %c0 : index
 // CHECK: %[[CAPPED_BOUND:.+]] = arith.select %{{.*}}, %[[RAW_BOUND]], %c16 : index
 // CHECK: %[[LIVE:.+]]:3 = scf.for %{{.*}} = %c0 to %[[CAPPED_BOUND]] step %c1 iter_args(
 // CHECK: %[[MIXED:.+]]:3 = scf.for %{{.*}} = %[[CAPPED_BOUND]] to %c16 step %c1 iter_args(%{{.*}} = %[[LIVE]]#0, %{{.*}} = %[[LIVE]]#1, %{{.*}} = %[[LIVE]]#2) -> (tensor<128xf32>, tensor<128x64xf32>, tensor<128xf32>)
+// CHECK: htile.load %arg0{{\[}}%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}{{\]}} : memref<1x4x1024x64xf16> -> tensor<128x64xf16>
+// CHECK: htile.load %arg1{{\[}}%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}{{\]}} : memref<1x4x1024x64xf16> -> tensor<64x64xf16>
 // CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} {transpose_b}
 // CHECK: htile.arange %c0 to %c128 : tensor<128xindex>
 // CHECK: htile.broadcast %{{.*}} dimensions = [1] : tensor<128xindex> -> tensor<128x64xindex>
@@ -247,9 +250,11 @@ module attributes {transform.with_named_sequence} {
 // CHECK: arith.select %{{.*}}, %{{.*}}, %{{.*}} : tensor<128x64xi1>, tensor<128x64xf32>
 // CHECK: htile.reduce %{{.*}} axis 1 kind "max" : tensor<128x64xf32> -> tensor<128xf32>
 // CHECK: math.exp2
+// CHECK: htile.load %arg2{{\[}}%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}{{\]}} : memref<1x4x1024x64xf16> -> tensor<64x64xf16>
 // CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<128x64xf32>, tensor<64x64xf16>, tensor<128x64xf32> -> tensor<128x64xf32>
 // CHECK: htile.reduce %{{.*}} axis 1 kind "sum" : tensor<128x64xf32> -> tensor<128xf32>
 // CHECK: arith.divf %{{.*}}, %{{.*}} : tensor<128x64xf32>
 // CHECK: arith.truncf %{{.*}} : tensor<128x64xf32> to tensor<128x64xf16>
-// CHECK: tensor.parallel_insert_slice %{{.*}} into %{{.*}}[0, %{{.*}}, %{{.*}}, 0] [1, 1, 128, 64] [1, 1, 1, 1] : tensor<128x64xf16> into tensor<1x4x1024x64xf16>
-// CHECK: return %[[FORALL]] : tensor<1x4x1024x64xf16>
+// CHECK: htile.store %{{.*}}, %arg3{{\[}}%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}{{\]}} : tensor<128x64xf16>, memref<1x4x1024x64xf16>
+// CHECK-NOT: tensor.parallel_insert_slice
+// CHECK: return
