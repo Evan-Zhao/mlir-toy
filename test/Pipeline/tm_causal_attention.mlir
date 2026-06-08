@@ -227,7 +227,9 @@ module attributes {transform.with_named_sequence} {
 
 // CHECK-LABEL: func.func @attention(
 // CHECK-NOT: tensor.empty() : tensor<4x1024x64xf32>
-// CHECK: %[[FORALL:[0-9]+]] = scf.forall (%{{.*}}, %{{.*}}) in (4, 8) shared_outs(%{{.*}} = %{{.*}}) -> (tensor<4x1024x64xf16>)
+// CHECK-NOT: tensor.empty() : tensor<4x1024x64xf16>
+// CHECK: %[[INIT:[0-9]+]] = tensor.empty() : tensor<1x4x1024x64xf16>
+// CHECK: %[[FORALL:[0-9]+]] = scf.forall (%{{.*}}, %{{.*}}) in (4, 8) shared_outs(%{{.*}} = %[[INIT]]) -> (tensor<1x4x1024x64xf16>)
 // CHECK: htile.full %cst{{.*}} : f32 -> tensor<128xf32>
 // CHECK: htile.full %cst{{.*}} : f32 -> tensor<128x64xf32>
 // CHECK: %[[RAW_BOUND:.+]] = arith.select %{{.*}}, %{{.*}}, %c0 : index
@@ -249,5 +251,5 @@ module attributes {transform.with_named_sequence} {
 // CHECK: htile.reduce %{{.*}} axis 1 kind "sum" : tensor<128x64xf32> -> tensor<128xf32>
 // CHECK: arith.divf %{{.*}}, %{{.*}} : tensor<128x64xf32>
 // CHECK: arith.truncf %{{.*}} : tensor<128x64xf32> to tensor<128x64xf16>
-// CHECK: tensor.parallel_insert_slice %{{.*}} into %{{.*}}[%{{.*}}, %{{.*}}, 0] [1, 128, 64] [1, 1, 1] : tensor<128x64xf16> into tensor<4x1024x64xf16>
-// CHECK: return %{{.*}} : tensor<1x4x1024x64xf16>
+// CHECK: tensor.parallel_insert_slice %{{.*}} into %{{.*}}[0, %{{.*}}, %{{.*}}, 0] [1, 1, 128, 64] [1, 1, 1, 1] : tensor<128x64xf16> into tensor<1x4x1024x64xf16>
+// CHECK: return %[[FORALL]] : tensor<1x4x1024x64xf16>

@@ -242,7 +242,9 @@ module attributes {transform.with_named_sequence} {
 // CHECK-NOT: linalg.transpose
 // CHECK-NOT: linalg.generic
 // CHECK-NOT: tensor.empty() : tensor<4x1024x64xf32>
-// CHECK: %[[LOOP:[0-9]+]] = scf.forall (%{{.*}}, %{{.*}}) in (4, 8) shared_outs(%{{.*}} = %{{.*}}) -> (tensor<4x1024x64xf16>)
+// CHECK-NOT: tensor.empty() : tensor<4x1024x64xf16>
+// CHECK: %[[INIT:[0-9]+]] = tensor.empty() : tensor<1x4x1024x64xf16>
+// CHECK: %[[LOOP:[0-9]+]] = scf.forall (%{{.*}}, %{{.*}}) in (4, 8) shared_outs(%{{.*}} = %[[INIT]]) -> (tensor<1x4x1024x64xf16>)
 // CHECK: htile.full %{{.*}} : f32 -> tensor<128xf32>
 // CHECK: htile.full %{{.*}} : f32 -> tensor<128x64xf32>
 // CHECK: %{{.*}}:3 = scf.for %{{.*}} = %c0 to %c16 step %c1 iter_args(%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}) -> (tensor<128xf32>, tensor<128x64xf32>, tensor<128xf32>)
@@ -254,5 +256,5 @@ module attributes {transform.with_named_sequence} {
 // CHECK: htile.reduce %{{.*}} axis 1 kind "sum" : tensor<128x64xf32> -> tensor<128xf32>
 // CHECK: arith.divf %{{.*}}, %{{.*}} : tensor<128x64xf32>
 // CHECK: arith.truncf %{{.*}} : tensor<128x64xf32> to tensor<128x64xf16>
-// CHECK: tensor.parallel_insert_slice %{{.*}} into %{{.*}}[%{{.*}}, %{{.*}}, 0] [1, 128, 64] [1, 1, 1] : tensor<128x64xf16> into tensor<4x1024x64xf16>
-// CHECK: return %{{.*}} : tensor<1x4x1024x64xf16>
+// CHECK: tensor.parallel_insert_slice %{{.*}} into %{{.*}}[0, %{{.*}}, %{{.*}}, 0] [1, 1, 128, 64] [1, 1, 1, 1] : tensor<128x64xf16> into tensor<1x4x1024x64xf16>
+// CHECK: return %[[LOOP]] : tensor<1x4x1024x64xf16>

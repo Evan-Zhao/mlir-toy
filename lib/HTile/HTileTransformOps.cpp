@@ -2,19 +2,15 @@
 #include "HTile/HTileDialect.h"
 
 #include "LoopTr/Utils.h"
-#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/Dialect/Transform/IR/TransformDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/Transforms/Transforms.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
-#include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/DialectRegistry.h"
-#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 
@@ -451,6 +447,109 @@ LogicalResult rewriteOriginalLinalgOp(RewriterBase &rewriter, Operation *op) {
   return failure();
 }
 
+LogicalResult foldExpandShapeOfSingleResultForall(RewriterBase &rewriter,
+                                                  tensor::ExpandShapeOp expandOp) {
+  auto forallOp = expandOp.getSrc().getDefiningOp<scf::ForallOp>();
+  if (!forallOp)
+    return failure();
+  if (forallOp.getNumResults() != 1 || !forallOp.getResult(0).hasOneUse())
+    return failure();
+
+  BlockArgument oldOutArg = forallOp.getRegionOutArgs().front();
+  SmallVector<tensor::ParallelInsertSliceOp> inserts;
+  for (OpOperand &use : oldOutArg.getUses()) {
+    auto insert = dyn_cast<tensor::ParallelInsertSliceOp>(use.getOwner());
+    if (!insert || insert.getDest() != oldOutArg)
+      return failure();
+    inserts.push_back(insert);
+  }
+  if (inserts.empty())
+    return failure();
+
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(forallOp);
+  Value expandedOutput = tensor::ExpandShapeOp::create(
+      rewriter, forallOp.getLoc(), expandOp.getResultType(), forallOp.getOutputs().front(),
+      expandOp.getReassociationIndices(), expandOp.getMixedOutputShape());
+  auto newForallOp = scf::ForallOp::create(
+      rewriter, forallOp.getLoc(), forallOp.getMixedLowerBound(), forallOp.getMixedUpperBound(),
+      forallOp.getMixedStep(), expandedOutput, forallOp.getMapping(),
+      [&](OpBuilder &, Location, ValueRange bbArgs) {
+        SmallVector<Value> replacements = llvm::to_vector(bbArgs);
+        rewriter.mergeBlocks(forallOp.getBody(), bbArgs.front().getParentBlock(), replacements);
+      });
+
+  auto expandRankReducedSliceParams =
+      [&](ArrayRef<OpFoldResult> oldParams,
+          int64_t unitValue) -> FailureOr<SmallVector<OpFoldResult>> {
+    RankedTensorType expandedType = expandOp.getResultType();
+    SmallVector<ReassociationIndices> reassociation = expandOp.getReassociationIndices();
+    if (reassociation.size() != oldParams.size())
+      return failure();
+
+    OpFoldResult unit = rewriter.getIndexAttr(unitValue);
+    SmallVector<OpFoldResult> expandedParams;
+    expandedParams.reserve(expandedType.getRank());
+    for (auto [oldDim, group] : llvm::enumerate(reassociation)) {
+      std::optional<int64_t> carriedDim;
+      for (int64_t expandedDim : group) {
+        int64_t dimSize = expandedType.getDimSize(expandedDim);
+        if (dimSize == 1)
+          continue;
+        if (ShapedType::isDynamic(dimSize) || carriedDim)
+          return failure();
+        carriedDim = expandedDim;
+      }
+
+      if (!carriedDim)
+        carriedDim = group.back();
+      for (int64_t expandedDim : group)
+        expandedParams.push_back(expandedDim == *carriedDim ? oldParams[oldDim] : unit);
+    }
+    return expandedParams;
+  };
+
+  for (tensor::ParallelInsertSliceOp insert : inserts) {
+    auto expandedOffsetsR = expandRankReducedSliceParams(insert.getMixedOffsets(), 0),
+         expandedSizesR = expandRankReducedSliceParams(insert.getMixedSizes(), 1),
+         expandedStridesR = expandRankReducedSliceParams(insert.getMixedStrides(), 1);
+    if (failed(expandedOffsetsR) || failed(expandedSizesR) || failed(expandedStridesR))
+      return failure();
+    rewriter.setInsertionPoint(insert);
+    tensor::ParallelInsertSliceOp::create(rewriter, insert.getLoc(), insert.getSource(),
+                                          newForallOp.getRegionOutArgs().front(), *expandedOffsetsR,
+                                          *expandedSizesR, *expandedStridesR);
+    rewriter.eraseOp(insert);
+  }
+
+  rewriter.replaceOp(expandOp, newForallOp.getResult(0));
+  rewriter.eraseOp(forallOp);
+  return success();
+}
+
+LogicalResult foldForallResultExpands(RewriterBase &rewriter, Operation *target) {
+  SmallVector<tensor::ExpandShapeOp> expandOps;
+  target->walk([&](tensor::ExpandShapeOp expandOp) { expandOps.push_back(expandOp); });
+
+  for (tensor::ExpandShapeOp expandOp : expandOps) {
+    if (!expandOp->getBlock())
+      continue;
+    if (failed(foldExpandShapeOfSingleResultForall(rewriter, expandOp)))
+      return failure();
+  }
+  return success();
+}
+
+LogicalResult applyRewritesGreedily(TransformRewriter &rewriter, Operation *target,
+                                    const std::function<void(RewritePatternSet &)> &patternSet) {
+  RewritePatternSet patterns(target->getContext());
+  patternSet(patterns);
+  GreedyRewriteConfig config;
+  config.setListener(static_cast<RewriterBase::Listener *>(rewriter.getListener()));
+  config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
+  return applyPatternsGreedily(target, std::move(patterns), config);
+}
+
 } // namespace
 
 void HTileLinalgToSemanticOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
@@ -473,6 +572,20 @@ DiagnosedSilenceableFailure HTileLinalgToSemanticOp::applyToOne(TransformRewrite
       continue;
     return DiagnosedSilenceableFailure::definiteFailure();
   }
+
+  if (failed(applyRewritesGreedily(rewriter, target, [&](RewritePatternSet &patterns) {
+        tensor::populateMergeConsecutiveInsertExtractSlicePatterns(patterns);
+        tensor::populateBubbleUpExtractSliceOpPatterns(patterns);
+        tensor::populateReassociativeReshapeFoldingPatterns(patterns);
+        tensor::populateFoldTensorEmptyPatterns(patterns);
+      })))
+    return DiagnosedSilenceableFailure::definiteFailure();
+  if (failed(foldForallResultExpands(rewriter, target)))
+    return DiagnosedSilenceableFailure::definiteFailure();
+  if (failed(applyRewritesGreedily(rewriter, target, [&](RewritePatternSet &patterns) {
+        tensor::populateFoldTensorEmptyPatterns(patterns);
+      })))
+    return DiagnosedSilenceableFailure::definiteFailure();
 
   return DiagnosedSilenceableFailure::success();
 }
