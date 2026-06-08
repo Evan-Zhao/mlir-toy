@@ -88,10 +88,6 @@ module attributes {transform.with_named_sequence} {
     %_4 = transform.fusion.repair_reduction_frontier
         (%fused_bmax, %bsum) and (%elemwise_1, %elemwise_sidecars_1) into %forall_loop, %j0_loop
         : (!any, !any, !any, !any, !any, !any) -> !any
-
-    // 0xFF800000: -inf in f32
-    %live_loop, %mixed_loop = transform.loop.specialize_dead_tile %fused_bmask in %j0_loop
-        {dead_value = 0xFF800000 : f32} : !any, !any -> !any, !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     // CSE removes duplicate affine values and helps fusion
@@ -104,13 +100,16 @@ module attributes {transform.with_named_sequence} {
 
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.scf.localize_scratch_tensors %func : !any
-    transform.apply_cse to %func : !any
     transform.apply_patterns to %func {
       transform.apply_patterns.scf.fold_unit_extent_dims_via_reshapes
       transform.apply_patterns.linalg.fold_unit_extent_dims_via_reshapes
       transform.apply_patterns.canonicalization
     } : !any
     transform.apply_cse to %func : !any
+
+    // 0xFF800000: -inf in f32
+    %live_loop, %mixed_loop = transform.loop.specialize_dead_tile %fused_bmask in %j0_loop
+        {dead_value = 0xFF800000 : f32} : !any, !any -> !any, !any
 
     // --- HTile lowering begins ---
     transform.htile.linalg_to_semantic %func : !any
@@ -229,12 +228,12 @@ module attributes {transform.with_named_sequence} {
 // CHECK-LABEL: func.func @attention(
 // CHECK-NOT: tensor.empty() : tensor<4x1024x64xf32>
 // CHECK: %[[FORALL:[0-9]+]] = scf.forall (%{{.*}}, %{{.*}}) in (4, 8) shared_outs(%{{.*}} = %{{.*}}) -> (tensor<4x1024x64xf16>)
-// CHECK: %[[RAW_BOUND:.+]] = arith.select %{{.*}}, %{{.*}}, %c0 : index
-// CHECK: %[[CAPPED_BOUND:.+]] = arith.select %{{.*}}, %[[RAW_BOUND]], %c16 : index
 // CHECK: htile.full %cst{{.*}} : f32 -> tensor<128xf32>
 // CHECK: htile.full %cst{{.*}} : f32 -> tensor<128x64xf32>
-// CHECK: %[[LIVE:.+]]:8 = scf.for %{{.*}} = %c0 to %[[CAPPED_BOUND]] step %c1 iter_args(
-// CHECK: %[[MIXED:.+]]:3 = scf.for %{{.*}} = %[[CAPPED_BOUND]] to %c16 step %c1 iter_args(%{{.*}} = %[[LIVE]]#1, %{{.*}} = %[[LIVE]]#4, %{{.*}} = %[[LIVE]]#7) -> (tensor<128xf32>, tensor<128x64xf32>, tensor<128xf32>)
+// CHECK: %[[RAW_BOUND:.+]] = arith.select %{{.*}}, %{{.*}}, %c0 : index
+// CHECK: %[[CAPPED_BOUND:.+]] = arith.select %{{.*}}, %[[RAW_BOUND]], %c16 : index
+// CHECK: %[[LIVE:.+]]:3 = scf.for %{{.*}} = %c0 to %[[CAPPED_BOUND]] step %c1 iter_args(
+// CHECK: %[[MIXED:.+]]:3 = scf.for %{{.*}} = %[[CAPPED_BOUND]] to %c16 step %c1 iter_args(%{{.*}} = %[[LIVE]]#0, %{{.*}} = %[[LIVE]]#1, %{{.*}} = %[[LIVE]]#2) -> (tensor<128xf32>, tensor<128x64xf32>, tensor<128xf32>)
 // CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} {transpose_b}
 // CHECK: htile.arange %c0 to %c128 : tensor<128xindex>
 // CHECK: htile.broadcast %{{.*}} dimensions = [1] : tensor<128xindex> -> tensor<128x64xindex>
