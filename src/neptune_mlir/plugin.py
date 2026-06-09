@@ -6,6 +6,7 @@ import sys
 from dataclasses import dataclass
 from importlib.metadata import distribution
 from pathlib import Path
+from warnings import warn
 
 LIB_DIR_ENV_VAR = "NEPTUNE_MLIR_LIB_DIR"
 DIST = distribution("neptune-mlir")
@@ -25,12 +26,26 @@ def _find_file_in_dist(name_stem: str) -> Path | None:
         # (doesn't contain .dylib on macOS, for example)
         if name_stem in file.name:
             candidates.append(Path(DIST.locate_file(file)).resolve())  # type: ignore
+    if len(candidates) > 1:
+        warn(
+            f"Multiple candidates found for file {name_stem} in distribution {DIST.metadata['Name']}: "
+            f"{candidates}. Unable to resolve file."
+        )
     return candidates[0] if len(candidates) == 1 else None
 
 
 def _find_file_in_directory(dir: Path, name_stem: str) -> Path | None:
-    # Allow for a prefix (often "lib")
-    candidates = list(filter(lambda p: p.is_file(), dir.glob(f"*{name_stem}*")))
+    candidates = [
+        path
+        for suffix in [".so", ".dylib", ".dll"]
+        for path in dir.glob(f"*{name_stem}*{suffix}")  # Allow for a prefix (often "lib")
+        if path.is_file()
+    ]
+    if len(candidates) > 1:
+        warn(
+            f"Multiple candidates found for file {name_stem} in directory {dir}: "
+            f"{candidates}. Unable to resolve file."
+        )
     return candidates[0] if len(candidates) == 1 else None
 
 

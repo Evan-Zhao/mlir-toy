@@ -231,12 +231,9 @@ def parse_mlir_module_from_text(text: str) -> ir.Module:
 
 
 def _register_neptune_dialects(ctx: ir.Context) -> None:
-    try:
-        from ..plugin import register_dialects
+    from ..plugin import register_dialects
 
-        register_dialects(ctx)
-    except ImportError:
-        return
+    register_dialects(ctx)
 
 
 def translate_file_with(
