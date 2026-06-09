@@ -17,6 +17,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "htile-transform-ops"
 
