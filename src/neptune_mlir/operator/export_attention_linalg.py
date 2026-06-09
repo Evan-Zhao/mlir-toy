@@ -163,12 +163,12 @@ def _kv_heads(heads: int, kv_heads: int | None) -> int:
 def _build_module_and_args(
     variant: AttentionVariant,
     batch: int,
-    heads: int,
+    q_heads: int,
     kv_heads: int | None,
     seq_len: int,
     dhead: int,
 ) -> tuple[torch.nn.Module, tuple[torch.Tensor, ...]]:
-    dense_shape = (batch, heads, seq_len, dhead)
+    dense_shape = (batch, q_heads, seq_len, dhead)
 
     if variant == AttentionVariant.GLOBAL_ATTN:
         module = AttentionModule().eval()
@@ -182,7 +182,7 @@ def _build_module_and_args(
         return CausalAttentionModule().eval(), (q, k, v)
 
     if variant == AttentionVariant.GLOBAL_GQA:
-        resolved_kv_heads = _kv_heads(heads, kv_heads)
+        resolved_kv_heads = _kv_heads(q_heads, kv_heads)
         q = torch.randn(dense_shape, dtype=torch.float16)
         kv_shape = (batch, resolved_kv_heads, seq_len, dhead)
         k = torch.randn(kv_shape, dtype=torch.float16)
@@ -218,7 +218,7 @@ def export_attention_linalg(
     *,
     variant: AttentionVariant,
     batch: int = 1,
-    heads: int = 4,
+    q_heads: int = 4,
     kv_heads: int | None = None,
     seq_len: int = 128,
     dhead: int = 64,
@@ -227,7 +227,7 @@ def export_attention_linalg(
     model, example_args = _build_module_and_args(
         variant=variant,
         batch=batch,
-        heads=heads,
+        q_heads=q_heads,
         kv_heads=kv_heads,
         seq_len=seq_len,
         dhead=dhead,
@@ -252,7 +252,7 @@ def main():
         export_attention_linalg(
             variant=args.variant,
             batch=args.batch,
-            heads=args.heads,
+            q_heads=args.heads,
             kv_heads=args.kv_heads,
             seq_len=args.seq_len,
             dhead=args.dhead,

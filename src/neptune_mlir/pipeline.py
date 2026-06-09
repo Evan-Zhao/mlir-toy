@@ -107,7 +107,7 @@ def export_attention_to_triton_input_mlir(
     *,
     variant: AttentionVariant | str,
     batch: int = 1,
-    heads: int = 4,
+    q_heads: int = 4,
     kv_heads: int | None = None,
     seq_len: int = 128,
     dhead: int = 64,
@@ -122,7 +122,7 @@ def export_attention_to_triton_input_mlir(
     input_mlir = export_attention_linalg(
         variant=variant,
         batch=batch,
-        heads=heads,
+        q_heads=q_heads,
         kv_heads=kv_heads,
         seq_len=seq_len,
         dhead=dhead,
