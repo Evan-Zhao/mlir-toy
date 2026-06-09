@@ -11,8 +11,6 @@ import ast
 
 from ..mlir_bindings import ir
 from .common import (
-    DEFAULT_PLUGIN,
-    HTILE_DOT_TRANSPOSE_TO_LOAD_ORDER_PIPELINE,
     _assign,
     _call,
     _const,
@@ -28,7 +26,7 @@ from .common import (
     _tensor_shape,
     _tl,
     _tl_call,
-    translate_file_with,
+    parse_mlir_module_from_text,
 )
 
 
@@ -458,33 +456,6 @@ class Translator:
         return stmts
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-
-def translate_file(path: str, plugin: str | None = None) -> ast.Module:
-    """Run mlir-opt on *path*, parse with mlir.ir, and return a Python ast.Module."""
-    return translate_file_with(
-        path,
-        Translator,
-        plugin,
-        pass_pipeline=HTILE_DOT_TRANSPOSE_TO_LOAD_ORDER_PIPELINE,
-        pass_plugin=plugin,
-    )
-
-
-def main():
-    import argparse
-
-    ap = argparse.ArgumentParser()
-    ap.add_argument("mlir_file")
-    ap.add_argument("--plugin", default=DEFAULT_PLUGIN)
-    args = ap.parse_args()
-
-    py_module = translate_file(args.mlir_file, args.plugin)
-    print(ast.unparse(py_module))
-
-
-if __name__ == "__main__":
-    main()
+def translate_mlir_text(text: str) -> ast.Module:
+    """Parse translator-ready MLIR text and return a Python ast.Module."""
+    return Translator().translate(parse_mlir_module_from_text(text))

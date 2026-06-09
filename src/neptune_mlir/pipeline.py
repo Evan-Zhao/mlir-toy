@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import subprocess
 import tempfile
 from pathlib import Path
@@ -115,7 +116,8 @@ def export_attention_to_triton_input_mlir(
     plugins: NeptunePlugins | None = None,
 ) -> str:
     variant = _coerce_attention_variant(variant)
-    if variant not in _VARIANT_TO_SCHEDULE:
+    schedule = _VARIANT_TO_SCHEDULE.get(variant.value)
+    if schedule is None:
         raise ValueError(f"unsupported attention pipeline variant: {variant}")
     input_mlir = export_attention_linalg(
         variant=variant,
@@ -126,15 +128,26 @@ def export_attention_to_triton_input_mlir(
         dhead=dhead,
         func_name=func_name,
     )
-    return lower_attention_linalg_to_triton_input_mlir(
-        input_mlir,
-        _VARIANT_TO_SCHEDULE[variant],
-        tile_config,
-        plugins,
+    return lower_attention_linalg_to_triton_input_mlir(input_mlir, schedule, tile_config, plugins)
+
+
+def lower_attention_linalg_to_triton_ast(
+    input_mlir: str,
+    schedule: AttentionSchedule | str,
+    tile_config: AttentionTileConfig | None = None,
+    plugins: NeptunePlugins | None = None,
+) -> "ast.Module":
+    from .translators.triton import translate_mlir_text
+
+    lowered = lower_attention_linalg_to_triton_input_mlir(
+        input_mlir, schedule, tile_config, plugins
     )
+    return translate_mlir_text(lowered)
 
 
-def _coerce_attention_variant(variant: AttentionVariant | str) -> AttentionVariant:
+def _coerce_attention_variant(variant):
+    from .operator.export_attention_linalg import AttentionVariant
+
     if isinstance(variant, AttentionVariant):
         return variant
     try:

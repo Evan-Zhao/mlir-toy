@@ -20,7 +20,7 @@ from neptune_mlir.translators.tilelang import (
 )
 from neptune_mlir.translators.triton import Translator as TritonTranslator
 from neptune_mlir.translators.triton import (
-    translate_file as translate_triton,
+    translate_mlir_text as translate_triton,
 )
 
 PARENT_DIR = Path(__file__).resolve().parent
@@ -150,7 +150,8 @@ def assert_matches_golden(actual_module: ast.Module, golden_name: str):
 
 def test_triton_translator_matches_golden():
     require_translator_deps()
-    assert_matches_golden(translate_triton(str(MLIR_FILE)), "flash_attention_triton.py")
+    mlir_text = MLIR_FILE.read_text()
+    assert_matches_golden(translate_triton(mlir_text), "flash_attention_triton.py")
 
 
 def test_tilelang_translator_matches_golden():
@@ -172,8 +173,9 @@ def test_cutile_translator_matches_golden():
 def test_triton_translator_functional():
     require_translator_deps()
     torch = require_cuda_torch()
+    mlir_text = MLIR_FILE.read_text()
     triton_module = _exec_translated_module(
-        translate_triton(str(MLIR_FILE)), "translated_flash_attention_triton"
+        translate_triton(mlir_text), "translated_flash_attention_triton"
     )
     q, k, v, out = _make_attention_inputs(torch)
     triton_module.flash_attention_htile[FLASH_GRID](q, k, v, out)
