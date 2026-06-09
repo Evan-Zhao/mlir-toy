@@ -9,8 +9,7 @@ mlir-opt is called as a subprocess to convert HTile dialect ops to generic form.
 
 import ast
 
-import mlir.ir as ir
-
+from ..mlir_bindings import ir
 from .common import (
     DEFAULT_PLUGIN,
     HTILE_DOT_TRANSPOSE_TO_LOAD_ORDER_PIPELINE,

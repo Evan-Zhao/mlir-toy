@@ -10,8 +10,7 @@ the lowering is closer to the Triton translator than to TileLang.
 
 import ast
 
-import mlir.ir as ir
-
+from ..mlir_bindings import ir
 from .common import (
     DEFAULT_PLUGIN,
     HTILE_DOT_TRANSPOSE_TO_LOAD_ORDER_PIPELINE,

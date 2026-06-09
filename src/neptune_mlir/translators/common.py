@@ -7,8 +7,7 @@ import ast
 import subprocess
 from typing import Type
 
-import mlir.ir as ir
-
+from ..mlir_bindings import ir
 from ..plugin import find_plugin_path
 
 DEFAULT_PLUGIN = find_plugin_path()

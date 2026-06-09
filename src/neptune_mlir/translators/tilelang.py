@@ -10,8 +10,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 
-import mlir.ir as ir
-
+from ..mlir_bindings import ir
 from .common import (
     _T,
     DEFAULT_PLUGIN,
