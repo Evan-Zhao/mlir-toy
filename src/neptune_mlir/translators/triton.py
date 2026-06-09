@@ -230,9 +230,7 @@ class Translator:
         logical_shape = [mem_tile_shape[i] for i in dimension_order]
         logical_strides = [tile_strides[i] for i in dimension_order]
         logical_offsets = [tile_indices[i] for i in dimension_order]
-        block_ptr_order = sorted(  # type: ignore
-            range(len(logical_strides)), key=logical_strides.__getitem__
-        )
+        block_ptr_order = sorted(range(len(logical_strides)), key=logical_strides.__getitem__)
 
         bp = self._fresh("bp")
         stmts.append(
@@ -243,9 +241,7 @@ class Translator:
                     base=base_ptr,
                     shape=_list(*[_const(s) for s in logical_shape]),
                     strides=_list(*[_const(s) for s in logical_strides]),
-                    offsets=_list(
-                        *[self._expr(i) for i in logical_offsets[: len(tile_shape)]]
-                    ),
+                    offsets=_list(*[self._expr(i) for i in logical_offsets[: len(tile_shape)]]),
                     block_shape=_list(*[_const(s) for s in tile_shape]),
                     order=_list(*[_const(i) for i in block_ptr_order]),
                 ),
@@ -282,9 +278,7 @@ class Translator:
                     base=base_ptr,
                     shape=_list(*[_const(s) for s in mem_shape[-2:]]),
                     strides=_list(*[_const(s) for s in tile_strides]),
-                    offsets=_list(
-                        *[self._expr(i) for i in tile_indices[: len(tile_shape)]]
-                    ),
+                    offsets=_list(*[self._expr(i) for i in tile_indices[: len(tile_shape)]]),
                     block_shape=_list(*[_const(s) for s in tile_shape]),
                     order=_list(*[_const(i) for i in reversed(range(len(tile_shape)))]),
                 ),
@@ -327,9 +321,7 @@ class Translator:
                 )
                 offset = ast.BinOp(left=offset, op=ast.Add(), right=term)
             ptr = self._fresh("ptr")
-            stmts.append(
-                _assign(ptr, ast.BinOp(left=base_ptr, op=ast.Add(), right=offset))
-            )
+            stmts.append(_assign(ptr, ast.BinOp(left=base_ptr, op=ast.Add(), right=offset)))
             base_ptr = _name(ptr)
             return stmts, base_ptr, indices[batch_dims:], strides[batch_dims:]
         return stmts, base_ptr, indices, [1] * len(tile_shape)
@@ -355,9 +347,7 @@ class Translator:
         lhs = self._expr(op.operands[0])
         rhs = self._expr(op.operands[1])
         acc = self._expr(op.operands[2]) if len(op.operands) > 2 else None
-        call = (
-            _tl_call("dot", lhs, rhs) if acc is None else _tl_call("dot", lhs, rhs, acc)
-        )
+        call = _tl_call("dot", lhs, rhs) if acc is None else _tl_call("dot", lhs, rhs, acc)
         return [_assign(name, call)]
 
     def _htile_reduce(self, op: ir.OpView) -> list[ast.stmt]:
@@ -413,9 +403,7 @@ class Translator:
         for out_dim in range(rank_out):
             indices.append(_const(None) if out_dim in dims else ast.Slice())
 
-        idx = (
-            ast.Tuple(elts=indices, ctx=ast.Load()) if len(indices) > 1 else indices[0]
-        )
+        idx = ast.Tuple(elts=indices, ctx=ast.Load()) if len(indices) > 1 else indices[0]
         return [_assign(name, ast.Subscript(value=src, slice=idx, ctx=ast.Load()))]
 
     # --- scf.for ---

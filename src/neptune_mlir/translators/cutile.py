@@ -230,9 +230,7 @@ class Translator:
         return [
             _assign(
                 name,
-                _ct_call(
-                    "astype", self._expr(op.operands[0]), _mlir_dtype_to_ct(dtype)
-                ),
+                _ct_call("astype", self._expr(op.operands[0]), _mlir_dtype_to_ct(dtype)),
             )
         ]
 
@@ -243,21 +241,15 @@ class Translator:
         tile_shape, _ = _tensor_shape(op.results[0].type)
         offsets = list(op.operands[1:])
         if len(offsets) != len(mem_shape):
-            raise NotImplementedError(
-                "cuTile load expects one offset per memref dimension"
-            )
+            raise NotImplementedError("cuTile load expects one offset per memref dimension")
 
         batch_dims = len(mem_shape) - len(tile_shape)
         if batch_dims < 0:
             raise NotImplementedError("cuTile load rank mismatch")
 
         dimension_order = _dimension_order(op, len(tile_shape))
-        full_order = list(range(batch_dims)) + [
-            batch_dims + dim for dim in dimension_order
-        ]
-        full_tile_shape = [1] * batch_dims + [
-            tile_shape[dim] for dim in range(len(tile_shape))
-        ]
+        full_order = list(range(batch_dims)) + [batch_dims + dim for dim in dimension_order]
+        full_tile_shape = [1] * batch_dims + [tile_shape[dim] for dim in range(len(tile_shape))]
         index = self._tile_space_index(offsets, full_order, full_tile_shape)
 
         loaded = self._fresh("load")
@@ -278,9 +270,7 @@ class Translator:
         stmts.append(
             _assign(
                 result,
-                _ct_call(
-                    "reshape", _name(loaded), _tuple(*[_const(s) for s in tile_shape])
-                ),
+                _ct_call("reshape", _name(loaded), _tuple(*[_const(s) for s in tile_shape])),
             )
         )
         return stmts
@@ -290,9 +280,7 @@ class Translator:
         tile_shape, _ = _tensor_shape(op.operands[0].type)
         offsets = list(op.operands[2:])
         if len(offsets) != len(mem_shape):
-            raise NotImplementedError(
-                "cuTile store expects one offset per memref dimension"
-            )
+            raise NotImplementedError("cuTile store expects one offset per memref dimension")
 
         batch_dims = len(mem_shape) - len(tile_shape)
         full_order = list(range(len(mem_shape)))
@@ -303,11 +291,7 @@ class Translator:
             self._expr(op.operands[0]),
             _tuple(*[_const(s) for s in full_tile_shape]),
         )
-        return [
-            _expr_stmt(
-                _ct_call("store", self._expr(op.operands[1]), _tuple(*index), tile)
-            )
-        ]
+        return [_expr_stmt(_ct_call("store", self._expr(op.operands[1]), _tuple(*index), tile))]
 
     def _tile_space_index(
         self,

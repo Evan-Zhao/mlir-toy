@@ -149,10 +149,7 @@ class Translator:
         grid = [self._expr(v) for v in op.operands[:3]]
         block = [self._expr(v) for v in op.operands[3:6]]
         threads: ast.expr
-        if (
-            self._const_int(op.operands[4]) == 1
-            and self._const_int(op.operands[5]) == 1
-        ):
+        if self._const_int(op.operands[4]) == 1 and self._const_int(op.operands[5]) == 1:
             threads = block[0]
         else:
             threads = _list(*block)
@@ -187,9 +184,7 @@ class Translator:
             if _is_ranked_tensor_type(result.type):
                 name = self._bind(result, self._result_hint(op_name))
                 shape, dtype = _tensor_shape(result.type)
-                alloc_fn = (
-                    "alloc_shared" if self._is_shared(result.type) else "alloc_fragment"
-                )
+                alloc_fn = "alloc_shared" if self._is_shared(result.type) else "alloc_fragment"
                 allocs.append(
                     _assign(
                         name,
@@ -297,9 +292,7 @@ class Translator:
             return [
                 _assign(
                     name,
-                    _T_call(
-                        "max", self._expr(op.operands[0]), self._expr(op.operands[1])
-                    ),
+                    _T_call("max", self._expr(op.operands[0]), self._expr(op.operands[1])),
                 )
             ]
 
@@ -337,9 +330,7 @@ class Translator:
         if len(index_names) == 1:
             target = _name(index_names[0], ast.Store())
         else:
-            target = _tuple(
-                *[_name(n, ast.Store()) for n in index_names], ctx=ast.Store()
-            )
+            target = _tuple(*[_name(n, ast.Store()) for n in index_names], ctx=ast.Store())
         body: list[ast.stmt] = [
             ast.Assign(
                 targets=[_store_subscript(_name(out), indices)],
@@ -361,9 +352,7 @@ class Translator:
     def _value_at(self, value: ir.Value, indices: list[ast.expr]) -> ast.expr:
         if value in self._broadcasts:
             info = self._broadcasts[value]
-            src_indices = [
-                idx for dim, idx in enumerate(indices) if dim not in info.dimensions
-            ]
+            src_indices = [idx for dim, idx in enumerate(indices) if dim not in info.dimensions]
             return self._value_at(info.source, src_indices)
         if _is_ranked_tensor_type(value.type):
             return _subscript(self._expr(value), indices)
@@ -380,11 +369,7 @@ class Translator:
         return [_expr_stmt(_T_call("copy", self._expr(op.operands[0]), dst))]
 
     def _htile_full(self, op: ir.OpView) -> list[ast.stmt]:
-        return [
-            _expr_stmt(
-                _T_call("fill", self._expr(op.results[0]), self._expr(op.operands[0]))
-            )
-        ]
+        return [_expr_stmt(_T_call("fill", self._expr(op.results[0]), self._expr(op.operands[0])))]
 
     def _htile_dot(self, op: ir.OpView) -> list[ast.stmt]:
         dst = self._expr(op.results[0])
@@ -416,16 +401,8 @@ class Translator:
         return stmts
 
     def _htile_reduce(self, op: ir.OpView) -> list[ast.stmt]:
-        kind = (
-            _parse_attr_str(op.attributes.get("kind"))
-            if op.attributes.get("kind")
-            else "sum"
-        )
-        axis = (
-            _parse_attr_int(op.attributes.get("axis"))
-            if op.attributes.get("axis")
-            else 1
-        )
+        kind = _parse_attr_str(op.attributes.get("kind")) if op.attributes.get("kind") else "sum"
+        axis = _parse_attr_int(op.attributes.get("axis")) if op.attributes.get("axis") else 1
         fn = "reduce_max" if kind == "max" else "reduce_sum"
         return [
             _expr_stmt(

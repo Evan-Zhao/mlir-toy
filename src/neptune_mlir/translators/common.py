@@ -59,9 +59,7 @@ def _call(func: ast.expr, *args: ast.expr, **kwargs: ast.expr) -> ast.Call:
 
 
 def _assign(name: str, value: ast.expr) -> ast.Assign:
-    return ast.Assign(
-        targets=[ast.Name(id=name, ctx=ast.Store())], value=value, lineno=0
-    )
+    return ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())], value=value, lineno=0)
 
 
 def _expr_stmt(value: ast.expr) -> ast.Expr:
@@ -169,18 +167,12 @@ def _dimension_order(op: ir.OpView, rank: int) -> list[int]:
         return list(range(rank))
     order = _parse_dense_i64_array(attr)
     if len(order) != rank:
-        raise NotImplementedError(
-            f"dimension_order rank mismatch: got {order}, rank {rank}"
-        )
+        raise NotImplementedError(f"dimension_order rank mismatch: got {order}, rank {rank}")
     return order
 
 
 def _dot_transpose_attrs(op: ir.OpView) -> list[str]:
-    return [
-        name
-        for name in ("transpose_a", "transpose_b")
-        if op.attributes.get(name) is not None
-    ]
+    return [name for name in ("transpose_a", "transpose_b") if op.attributes.get(name) is not None]
 
 
 def _reject_dot_transpose_attrs(op: ir.OpView, backend: str) -> None:
@@ -218,9 +210,7 @@ def parse_mlir_module(
         stderr = result.stderr.strip()
         stdout = result.stdout.strip()
         details = stderr or stdout or "mlir-opt failed without output"
-        raise RuntimeError(
-            f"mlir-opt failed with exit code {result.returncode}: {details}"
-        )
+        raise RuntimeError(f"mlir-opt failed with exit code {result.returncode}: {details}")
 
     ctx = ir.Context()
     ctx.allow_unregistered_dialects = True
