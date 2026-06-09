@@ -207,7 +207,7 @@ function(make_mlir_python_extension)
   if (TORCH_MLIR_LIB_DIR)
     target_link_libraries(${ARG_TARGET} PRIVATE
       "${TORCH_MLIR_LIB_DIR}/libTorchMLIRAggregateCAPI${CMAKE_SHARED_LIBRARY_SUFFIX}"
-      "${TORCH_MLIR_LIB_DIR}/libMLIRPythonSupport-mlir${CMAKE_SHARED_LIBRARY_SUFFIX}"
+      "${TORCH_MLIR_LIB_DIR}/libMLIRPythonSupport-torch_mlir${CMAKE_SHARED_LIBRARY_SUFFIX}"
     )
     set_target_properties(${ARG_TARGET} PROPERTIES
       BUILD_RPATH "${TORCH_MLIR_LIB_DIR}"
