@@ -2,13 +2,14 @@
 """Export attention-like PyTorch modules to linalg-on-tensors MLIR.
 
 Usage:
-  python scripts/export_attention_linalg.py > attention.mlir
-  python scripts/export_attention_linalg.py --variant global-gqa > attention_gqa.mlir
-  python scripts/export_attention_linalg.py --variant sparse-mm > sparse_probe.mlir
+  python export_attention_linalg.py --variant global-attn > attention.mlir
+  python export_attention_linalg.py --variant global-gqa > attention_gqa.mlir
+  python export_attention_linalg.py --variant sparse-mm > sparse_probe.mlir
 """
 
 import argparse
 import math
+from enum import Enum
 
 import torch
 from torch_mlir import fx
@@ -103,20 +104,26 @@ def _module_to_text(module) -> str:
     return str(module)
 
 
-VARIANTS = (
-    "global-attn",
-    "causal-attn",
-    "global-gqa",
-    "float8-inputs",
-    "fake-quant",
-    "sparse-mm",
-)
+class AttentionVariant(str, Enum):
+    GLOBAL_ATTN = "global-attn"
+    CAUSAL_ATTN = "causal-attn"
+    GLOBAL_GQA = "global-gqa"
+    FLOAT8_INPUTS = "float8-inputs"
+    FAKE_QUANT = "fake-quant"
+    SPARSE_MM = "sparse-mm"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+VARIANTS = tuple(AttentionVariant)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--variant",
+        type=AttentionVariant,
         choices=VARIANTS,
         required=True,
         help="attention variant to export",
@@ -139,51 +146,56 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _kv_heads(args: argparse.Namespace) -> int:
-    if args.kv_heads is not None:
-        kv_heads = args.kv_heads
-    elif args.heads % 2 == 0:
-        kv_heads = args.heads // 2
+def _kv_heads(heads: int, kv_heads: int | None) -> int:
+    if kv_heads is not None:
+        resolved_kv_heads = kv_heads
+    elif heads % 2 == 0:
+        resolved_kv_heads = heads // 2
     else:
-        kv_heads = 1
-    if kv_heads <= 0:
+        resolved_kv_heads = 1
+    if resolved_kv_heads <= 0:
         raise ValueError("--kv-heads must be positive")
-    if args.heads % kv_heads != 0:
+    if heads % resolved_kv_heads != 0:
         raise ValueError("--heads must be divisible by --kv-heads for GQA variants")
-    return kv_heads
+    return resolved_kv_heads
 
 
 def _build_module_and_args(
-    args: argparse.Namespace,
+    variant: AttentionVariant,
+    batch: int,
+    heads: int,
+    kv_heads: int | None,
+    seq_len: int,
+    dhead: int,
 ) -> tuple[torch.nn.Module, tuple[torch.Tensor, ...]]:
-    dense_shape = (args.batch, args.heads, args.seq_len, args.dhead)
+    dense_shape = (batch, heads, seq_len, dhead)
 
-    if args.variant == "global-attn":
+    if variant == AttentionVariant.GLOBAL_ATTN:
         module = AttentionModule().eval()
         example_args = tuple(torch.randn(dense_shape, dtype=torch.float16) for _ in range(3))
         return module, example_args
 
-    if args.variant == "causal-attn":
+    if variant == AttentionVariant.CAUSAL_ATTN:
         q = torch.randn(dense_shape, dtype=torch.float16)
         k = torch.randn(dense_shape, dtype=torch.float16)
         v = torch.randn(dense_shape, dtype=torch.float16)
         return CausalAttentionModule().eval(), (q, k, v)
 
-    if args.variant == "global-gqa":
-        kv_heads = _kv_heads(args)
+    if variant == AttentionVariant.GLOBAL_GQA:
+        resolved_kv_heads = _kv_heads(heads, kv_heads)
         q = torch.randn(dense_shape, dtype=torch.float16)
-        kv_shape = (args.batch, kv_heads, args.seq_len, args.dhead)
+        kv_shape = (batch, resolved_kv_heads, seq_len, dhead)
         k = torch.randn(kv_shape, dtype=torch.float16)
         v = torch.randn(kv_shape, dtype=torch.float16)
         return ManualGQAAttentionModule().eval(), (q, k, v)
 
-    if args.variant == "float8-inputs":
+    if variant == AttentionVariant.FLOAT8_INPUTS:
         q = torch.randn(dense_shape, dtype=torch.float32).to(torch.float8_e4m3fn)
         k = torch.randn(dense_shape, dtype=torch.float32).to(torch.float8_e4m3fn)
         v = torch.randn(dense_shape, dtype=torch.float32).to(torch.float8_e4m3fn)
         return Float8InputAttentionModule().eval(), (q, k, v)
 
-    if args.variant == "fake-quant":
+    if variant == AttentionVariant.FAKE_QUANT:
         q = torch.randn(dense_shape, dtype=torch.float32)
         k = torch.randn(dense_shape, dtype=torch.float32)
         v = torch.randn(dense_shape, dtype=torch.float32)
@@ -192,33 +204,61 @@ def _build_module_and_args(
         sv = torch.full((1, 1, 1, 1), 0.1, dtype=torch.float32)
         return FakeQuantAttentionModule().eval(), (q, k, v, sq, sk, sv)
 
-    if args.variant == "sparse-mm":
+    if variant == AttentionVariant.SPARSE_MM:
         indices = torch.tensor([[0, 1, 1], [2, 0, 2]], dtype=torch.int64)
         values = torch.tensor([3.0, 4.0, 5.0], dtype=torch.float32)
         a = torch.sparse_coo_tensor(indices, values, (2, 3))
         b = torch.randn(3, 4, dtype=torch.float32)
         return SparseMMModule().eval(), (a, b)
 
-    raise ValueError(f"unknown variant: {args.variant}")
+    raise ValueError(f"unknown variant: {variant}")
 
 
-def main():
-    args = parse_args()
-    model, example_args = _build_module_and_args(args)
-
+def export_attention_linalg(
+    *,
+    variant: AttentionVariant,
+    batch: int = 1,
+    heads: int = 4,
+    kv_heads: int | None = None,
+    seq_len: int = 128,
+    dhead: int = 64,
+    func_name: str = "attention",
+) -> str:
+    model, example_args = _build_module_and_args(
+        variant=variant,
+        batch=batch,
+        heads=heads,
+        kv_heads=kv_heads,
+        seq_len=seq_len,
+        dhead=dhead,
+    )
     exported_program = torch.export.export(model, example_args)
-    # Possible to control decomposition behavior by passing this `decomp_table` to `run_decompositions`.
-    # Now we don't run this decomposition step because we don't need it.
-    # But it will be needed when we use SDPA.
+    # Possible to control decomposition behavior by passing this `decomp_table` to
+    # `run_decompositions`. This will be needed when we use SDPA.
     # decomp_table = torch.export.default_decompositions().materialize()
     # exported_program = exported_program.run_decompositions(decomp_table)
     module = fx.export_and_import(
         exported_program,
         output_type="linalg-on-tensors",
-        func_name=args.func_name,
+        func_name=func_name,
         import_symbolic_shape_expressions=True,
     )
-    print(_module_to_text(module))
+    return _module_to_text(module)
+
+
+def main():
+    args = parse_args()
+    print(
+        export_attention_linalg(
+            variant=args.variant,
+            batch=args.batch,
+            heads=args.heads,
+            kv_heads=args.kv_heads,
+            seq_len=args.seq_len,
+            dhead=args.dhead,
+            func_name=args.func_name,
+        )
+    )
 
 
 if __name__ == "__main__":
