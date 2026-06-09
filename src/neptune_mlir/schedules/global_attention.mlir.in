@@ -1,0 +1,147 @@
+// Transform-dialect schedule that transforms a Torch-MLIR global-attention
+// payload into a FlashAttention-like fused Kernel HTile program.
+
+!any = !transform.any_op
+
+module attributes {transform.with_named_sequence} {
+  // Checks if an op is a linalg operation with exactly 4D of an iteration space,
+  // where the first 3 dims are parallel and the last dim is reduction.
+  transform.named_sequence @match_3d_1d_reduction(%candidate: !any {transform.readonly}) -> !any {
+    %matched = transform.match.structured %candidate : (!any) -> !any {
+    ^bb0(%op: !any):
+      transform.match.structured.dim %op[0, 1, 2] {parallel} : !any
+      transform.match.structured.dim %op[3] {reduction} : !any
+      transform.match.structured.yield %op : !any
+    }
+    transform.yield %matched : !any
+  }
+
+  transform.named_sequence @match_4d_matmul_transb(%candidate: !any {transform.readonly}) -> !any {
+    %matched = transform.match.ta.einsum %candidate
+        {equation = "b h i d, b h j d -> b h i j"} : (!any) -> !any
+    transform.yield %matched : !any
+  }
+
+  transform.named_sequence @match_4d_matmul(%candidate: !any {transform.readonly}) -> !any {
+    %matched = transform.match.ta.einsum %candidate
+        {equation = "b h i j, b h j d -> b h i d"} : (!any) -> !any
+    transform.yield %matched : !any
+  }
+
+  transform.named_sequence @return_matched(%arg: !any {transform.readonly}) -> !any {
+    transform.yield %arg : !any
+  }
+
+  transform.named_sequence @__transform_main(%module: !any) {
+    // Prepass. Translate the input function from linalg to `ta` dialect, which enables
+    // more flexible expression rewrites. Apply rewrites, then translate back to linalg.
+    %func0 = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
+    %func1 = transform.apply_registered_pass "linalg-generalize-named-ops" to %func0 : (!any) -> !any
+    %func = transform.apply_registered_pass "linalg-to-ta" to %func1 : (!any) -> !any
+    // Replace `exp(x)` with `exp2(x * log2(e))`, then push `log2(e)` constant around
+    // until it folds with other multiplicative constants.
+    transform.ta.rewrite_exp_to_exp2 %func : !any
+    // Replace `matmul(P_ij / s_i, V_jd)` with `matmul(P_ij, V_jd) / s_i`.
+    transform.apply_patterns to %func {
+      transform.apply_patterns.ta.exchange_div_and_matmul
+    } : !any
+    // This is a special idiom: use einsum to match matmuls in `ta` dialect is easy.
+    // Then the `to_linalg` translator keeps these handles alive even after the translation,
+    // so you get %bmm0 to point to the first matmul in linalg.
+    %bmm0 = transform.collect_matching @match_4d_matmul_transb in %func : (!any) -> !any
+    %bmm1 = transform.collect_matching @match_4d_matmul in %func : (!any) -> !any
+    transform.ta.to_linalg %func : !any
+
+    // Start working out a full loop nest over the first batch matmul `bmm0`.
+    // Inline elemwise ops (in this case, should be F16->F32 casts) into bmm0.
+    transform.linalg.greedy_inline_elementwise %bmm0 : !any
+    // Also inline elementwise ops into bmm1.
+    // `operand_number = 1` says only inline producers of the RHS of the matmul.
+    transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any
+    // Tile all parallel dimensions of bmm0 (b, h, i, j) into a scf.forall loop.
+    // We'll fuse everything else into this loop nest.
+    %_1, %forall_loop = transform.structured.tile_using_forall
+        %bmm0 tile_sizes [1, 1, ${block_m}, ${block_n}, 0] : (!any) -> (!any, !any)
+    // Canonicalization removes trivial (size-1) dimensions. This copies the loop and invalidates
+    // all handles pointing to ops inside the loop body.
+    // So we want to do this before we start fusion.
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+
+    // Fusion 1. Match an element-wise op that is a consumer of mm0, and fuse it into mm0.
+    //   TVM: sch.reverse_compute_at(bscale, j0)
+    %bscale = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
+    transform.fusion.into_producer %bscale into %forall_loop : (!any, !any) -> !any
+    // Fusion can create redundant loop-carried values, and canonicalization removes them.
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+
+    // Fusion 2. Fuse row-max into forall, splitting a serial `for` loop from forall in the process.
+    // Because of how MLIR scf.for works, this fusion implicitly also r-factors the reduction.
+    //   TVM: sch.reverse_compute_at(bmax, j0); sch.rfactor(...)
+    %consumers = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
+    %_2, %bmax = transform.foreach_match restrict_root in %consumers
+        @match_3d_1d_reduction -> @return_matched : (!any) -> (!any, !any)
+    // The "row-max" in the input program has two outputs: the max value and the argmax.
+    // The subsequent fusion only supports single-output ops, so we remove the unused argmax
+    // output before fusion.
+    transform.linalg.erase_unused_operands_and_results %bmax : !any
+    %fused_bmax, %j0_loop = transform.scf.fuse_reduction_into_forall
+        %bmax into %forall_loop : (!any, !any) -> (!any, !any)
+
+    // Fusion 3 (rolling update). First find the nearest reduction reachable from the loop's
+    // output value, together with the ordered elementwise chain between them.
+    // This could find either the row-sum of softmax, or the second matmul,
+    // since they both depend on the loop's output. In this schedule
+    %bmm1_2, %elemwise = transform.fusion.find_next_reduction
+        %forall_loop : (!any) -> (!any, !any)
+    // Clone and fuse that elementwise chain under %forall_loop and %j0_loop,
+    // publishing the "sidecar" tensors as extra loop results.
+    %elemwise_sidecars = transform.fusion.clone_fuse_elemwise
+        %elemwise into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
+    // Repair the first reduction frontier by turning it into loop-carried state
+    // driven by the relayed sidecar value.
+    %_3 = transform.fusion.repair_reduction_frontier
+        (%fused_bmax, %bmm1_2) and (%elemwise, %elemwise_sidecars) into %forall_loop, %j0_loop
+        : (!any, !any, !any, !any, !any, !any) -> !any
+
+    // Fusion 4. Apply rolling update again, this time with the second matmul being the reduction.
+    %bsum, %elemwise_1 = transform.fusion.find_next_reduction
+        %forall_loop : (!any) -> (!any, !any)
+    %elemwise_sidecars_1 = transform.fusion.clone_fuse_elemwise
+        %elemwise_1 into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
+    %_4 = transform.fusion.repair_reduction_frontier
+        (%fused_bmax, %bsum) and (%elemwise_1, %elemwise_sidecars_1) into %forall_loop, %j0_loop
+        : (!any, !any, !any, !any, !any, !any) -> !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+
+    // Fusion 5. Fuse the trailing elemwise ops into the forall loop (but outside the for loop):
+    // elemwise division, then FP32->FP16 cast.
+    // CSE removes duplicate affine values and helps fusion
+    // (fusion compares offset equal by comparing pointers to SSA value).
+    transform.apply_cse to %func : !any
+    %div = transform.get_consumers_of_result %forall_loop[1] : (!any) -> !any
+    transform.fusion.into_producer %div into %forall_loop : (!any, !any) -> !any
+    %trunc = transform.get_consumers_of_result %forall_loop[2] : (!any) -> !any
+    transform.fusion.into_producer %trunc into %forall_loop : (!any, !any) -> !any
+
+    // Post-pass: pushes lingering init tensor (see destination-passing style)
+    // before and outside the loops into the loop body.
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+    transform.scf.localize_scratch_tensors %func : !any
+    // Remove unit-size dims from the loops and the linalg ops in the loop.
+    // This is useful when we lower to HTile, because HTile requires (for example) dot to be in 2D.
+    transform.apply_patterns to %func {
+      transform.apply_patterns.scf.fold_unit_extent_dims_via_reshapes
+      transform.apply_patterns.linalg.fold_unit_extent_dims_via_reshapes
+      transform.apply_patterns.canonicalization
+    } : !any
+    transform.apply_cse to %func : !any
+
+    // --- HTile lowering begins ---
+    // Use the translator to lower the tiled linalg program into HTile.
+    transform.htile.linalg_to_semantic %func : !any
+    transform.htile.semantic_to_kernel_abi %func : !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+
+    transform.yield
+  }
+}
