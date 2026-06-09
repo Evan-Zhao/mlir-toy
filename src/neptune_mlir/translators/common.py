@@ -8,10 +8,12 @@ import subprocess
 from typing import Type
 
 from ..mlir_bindings import ir
-from ..plugin import find_plugin_path
+from ..plugin import find_neptune_plugins
 
-DEFAULT_PLUGIN = find_plugin_path()
-DEFAULT_PLUGIN = None if DEFAULT_PLUGIN is None else DEFAULT_PLUGIN.as_posix()
+default_plugin = find_neptune_plugins()
+if default_plugin is None:
+    raise RuntimeError("Neptune MLIR plugin not found")
+DEFAULT_PLUGIN = default_plugin.htile_dialect
 HTILE_DOT_TRANSPOSE_TO_LOAD_ORDER_PIPELINE = (
     "builtin.module(htile-dot-transpose-to-load-order,cse,canonicalize)"
 )
@@ -214,8 +216,27 @@ def parse_mlir_module(
 
     ctx = ir.Context()
     ctx.allow_unregistered_dialects = True
+    _register_neptune_dialects(ctx)
     with ctx:
         return ir.Module.parse(result.stdout)
+
+
+def parse_mlir_module_from_text(text: str) -> ir.Module:
+    """Parse MLIR module text with Neptune dialects loaded when available."""
+    ctx = ir.Context()
+    ctx.allow_unregistered_dialects = True
+    _register_neptune_dialects(ctx)
+    with ctx:
+        return ir.Module.parse(text)
+
+
+def _register_neptune_dialects(ctx: ir.Context) -> None:
+    try:
+        from ..plugin import register_dialects
+
+        register_dialects(ctx)
+    except ImportError:
+        return
 
 
 def translate_file_with(

@@ -1,11 +1,37 @@
 """Helpers for locating Neptune MLIR native plugin shared libraries."""
 
+import importlib.util
 import os
 import sys
 from dataclasses import dataclass
+from importlib.metadata import distribution
 from pathlib import Path
 
-NATIVE_DIR_ENV = "NEPTUNE_MLIR_NATIVE_DIR"
+LIB_DIR_ENV_VAR = "NEPTUNE_MLIR_LIB_DIR"
+DIST = distribution("neptune-mlir")
+_NATIVE_EXTENSION_MODULE = "neptune_mlir._neptuneMlir"
+_NATIVE_EXTENSION_TARGET = "_neptuneMlir"
+
+
+def _get_lib_dir_env() -> Path | None:
+    env_value = os.environ.get(LIB_DIR_ENV_VAR)
+    return Path(env_value).expanduser() if env_value else None
+
+
+def _find_file_in_dist(name_stem: str) -> Path | None:
+    candidates = []
+    for file in DIST.files or []:
+        # No suffix detection. EXTENSION_SUFFIXES has been unreliable
+        # (doesn't contain .dylib on macOS, for example)
+        if name_stem in file.name:
+            candidates.append(Path(DIST.locate_file(file)).resolve())  # type: ignore
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _find_file_in_directory(dir: Path, name_stem: str) -> Path | None:
+    # Allow for a prefix (often "lib")
+    candidates = list(filter(lambda p: p.is_file(), dir.glob(f"*{name_stem}*")))
+    return candidates[0] if len(candidates) == 1 else None
 
 
 @dataclass(frozen=True)
@@ -25,37 +51,10 @@ class NeptunePlugins:
         return [f"--load-pass-plugin={self.htile_dialect}"]
 
 
-def _native_library_names(target: str) -> tuple[str, ...]:
-    suffix = _dynamic_library_suffix()
-    if sys.platform == "win32":
-        return (f"{target}{suffix}", f"lib{target}{suffix}")
-    return (f"lib{target}{suffix}",)
-
-
-def _native_library_name(target: str) -> str:
-    return _native_library_names(target)[0]
-
-
-def _dynamic_library_suffix() -> str:
-    if sys.platform == "darwin":
-        return ".dylib"
-    if sys.platform == "win32":
-        return ".dll"
-    return ".so"
-
-
-def _find_native_library(directory: Path, target: str) -> Path | None:
-    for name in _native_library_names(target):
-        candidate = directory / name
-        if candidate.is_file():
-            return candidate.resolve()
-    return None
-
-
-def _find_plugin_set(directory: Path) -> NeptunePlugins | None:
-    loop_transform = _find_native_library(directory, "LoopTransform")
-    ta_dialect = _find_native_library(directory, "TADialect")
-    htile_dialect = _find_native_library(directory, "HTileDialect")
+def _find_plugin_set(finder) -> NeptunePlugins | None:
+    loop_transform = finder("LoopTransform")
+    ta_dialect = finder("TADialect")
+    htile_dialect = finder("HTileDialect")
     if loop_transform is None or ta_dialect is None or htile_dialect is None:
         return None
     return NeptunePlugins(
@@ -65,57 +64,48 @@ def _find_plugin_set(directory: Path) -> NeptunePlugins | None:
     )
 
 
-def _append_candidate(candidates: list[Path], directory: Path) -> None:
-    directory = directory.expanduser()
-    if directory not in candidates:
-        candidates.append(directory)
-
-
-def _append_build_dir_candidates(candidates: list[Path], build_dir: Path) -> None:
-    _append_candidate(candidates, build_dir)
-    if not build_dir.is_dir():
-        return
-    for child in sorted(build_dir.iterdir()):
-        if child.is_dir():
-            _append_candidate(candidates, child)
-
-
-def _candidate_dirs() -> list[Path]:
-    candidates: list[Path] = []
-
-    env_dir = os.environ.get(NATIVE_DIR_ENV)
-    if env_dir:
-        _append_candidate(candidates, Path(env_dir))
-
-    pkg_dir = Path(__file__).resolve().parent
-    repo_root = pkg_dir.parents[1] if len(pkg_dir.parents) >= 2 else pkg_dir
-    _append_candidate(candidates, pkg_dir / "_native")
-    _append_build_dir_candidates(candidates, repo_root / "build")
-    _append_build_dir_candidates(candidates, Path.cwd() / "build")
-
-    return candidates
-
-
 def find_neptune_plugins() -> NeptunePlugins | None:
-    """Resolve the Neptune MLIR native plugin set.
-
-    Resolution order:
-    1. NEPTUNE_MLIR_NATIVE_DIR, containing all three plugin libraries.
-    2. Installed package directory: neptune_mlir/_native.
-    3. Common editable/development build dirs: <repo>/build and children.
-    4. Current working directory build dirs: <cwd>/build and children.
-    """
-    for directory in _candidate_dirs():
-        if not directory.is_dir():
-            continue
-        if plugins := _find_plugin_set(directory):
-            return plugins
-    return None
+    """Resolve the Neptune MLIR native plugin set from installed distribution metadata."""
+    if env_path := _get_lib_dir_env():
+        return _find_plugin_set(lambda name: _find_file_in_directory(env_path, name))
+    return _find_plugin_set(_find_file_in_dist)
 
 
-def find_plugin_path() -> Path | None:
-    """Resolve the HTile dialect plugin path for existing translator entry points."""
-    plugins = find_neptune_plugins()
-    if plugins is None:
-        return None
-    return plugins.htile_dialect
+def find_neptune_native_extension() -> Path | None:
+    """Resolve the Neptune Python native extension used for MLIR registration."""
+    if env_path := _get_lib_dir_env():
+        extension_dir = env_path / "neptune_mlir" / "_mlir_libs"
+        return _find_file_in_directory(extension_dir, _NATIVE_EXTENSION_TARGET)
+    return _find_file_in_dist(_NATIVE_EXTENSION_TARGET)
+
+
+def _load_neptune_native_extension():
+    if module := sys.modules.get(_NATIVE_EXTENSION_MODULE):
+        return module
+
+    ext_path = find_neptune_native_extension()
+    if ext_path is None:
+        raise ImportError("failed to load Neptune MLIR native extension: no extension found")
+    spec = importlib.util.spec_from_file_location(_NATIVE_EXTENSION_MODULE, ext_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(
+            f"failed to load Neptune MLIR native extension: invalid spec for {ext_path}"
+        )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_NATIVE_EXTENSION_MODULE] = module
+    try:
+        spec.loader.exec_module(module)
+    except ImportError:
+        sys.modules.pop(_NATIVE_EXTENSION_MODULE, None)
+        raise
+    return module
+
+
+def register_htile_dialect(context, *, load: bool = True) -> None:
+    """Register and optionally load the HTile dialect into an MLIR Python context."""
+    _load_neptune_native_extension().register_htile_dialect(context, load)
+
+
+def register_dialects(context, *, load: bool = True) -> None:
+    """Register Neptune dialects available through the native Python extension."""
+    register_htile_dialect(context, load=load)

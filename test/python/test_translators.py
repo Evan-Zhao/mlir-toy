@@ -10,28 +10,27 @@ from pathlib import Path
 
 import pytest
 
-from neptune_mlir.plugin import find_plugin_path  # noqa: E402
-from neptune_mlir.translators.common import translate_file_with  # noqa: E402
+from neptune_mlir.plugin import find_neptune_plugins
+from neptune_mlir.translators.common import translate_file_with
 from neptune_mlir.translators.cutile import (
-    translate_file as translate_cutile,  # noqa: E402
+    translate_file as translate_cutile,
 )
-from neptune_mlir.translators.tilelang import (  # noqa: E402
+from neptune_mlir.translators.tilelang import (
     translate_file as translate_tilelang,
 )
-from neptune_mlir.translators.triton import Translator as TritonTranslator  # noqa: E402
+from neptune_mlir.translators.triton import Translator as TritonTranslator
 from neptune_mlir.translators.triton import (
-    translate_file as translate_triton,  # noqa: E402
+    translate_file as translate_triton,
 )
 
 PARENT_DIR = Path(__file__).resolve().parent
-PLUGIN = find_plugin_path()
-if PLUGIN is None:
+plugin = find_neptune_plugins()
+if plugin is None:
     pytest.exit("MLIR plugin path not found")
+PLUGIN = plugin.htile_dialect
 GOLDEN_DIR = PARENT_DIR / "golden"
 MLIR_FILE = PARENT_DIR / "data" / "flash_attention_htile.mlir"
-DOT_TRANSPOSE_PASS_PIPELINE = (
-    "builtin.module(htile-dot-transpose-to-load-order,cse,canonicalize)"
-)
+DOT_TRANSPOSE_PASS_PIPELINE = "builtin.module(htile-dot-transpose-to-load-order,cse,canonicalize)"
 FLASH_GRID = (32, 32, 1)
 FLASH_SHAPE = (1, 32, 4096, 128)
 FLASH_REF_BLOCK_ROWS = 128
@@ -50,9 +49,7 @@ def require_cuda_torch():
     import torch
 
     if not torch.cuda.is_available():
-        pytest.skip(
-            "A working CUDA runtime is required for functional translator tests"
-        )
+        pytest.skip("A working CUDA runtime is required for functional translator tests")
     try:
         torch.cuda.init()
     except Exception as exc:  # pragma: no cover - hardware/runtime dependent
@@ -106,15 +103,9 @@ def _exec_translated_module(module_ast: ast.Module, module_name: str):
 def _make_attention_inputs(torch):
     generator = torch.Generator(device="cuda")
     generator.manual_seed(0)
-    q = torch.randn(
-        FLASH_SHAPE, dtype=torch.float16, device="cuda", generator=generator
-    )
-    k = torch.randn(
-        FLASH_SHAPE, dtype=torch.float16, device="cuda", generator=generator
-    )
-    v = torch.randn(
-        FLASH_SHAPE, dtype=torch.float16, device="cuda", generator=generator
-    )
+    q = torch.randn(FLASH_SHAPE, dtype=torch.float16, device="cuda", generator=generator)
+    k = torch.randn(FLASH_SHAPE, dtype=torch.float16, device="cuda", generator=generator)
+    v = torch.randn(FLASH_SHAPE, dtype=torch.float16, device="cuda", generator=generator)
     out = torch.empty(FLASH_SHAPE, dtype=torch.float16, device="cuda")
     return q, k, v, out
 
@@ -159,10 +150,7 @@ def assert_matches_golden(actual_module: ast.Module, golden_name: str):
 
 def test_triton_translator_matches_golden():
     require_translator_deps()
-    assert_matches_golden(
-        translate_triton(str(MLIR_FILE), str(PLUGIN)),
-        "flash_attention_triton.py",
-    )
+    assert_matches_golden(translate_triton(str(MLIR_FILE)), "flash_attention_triton.py")
 
 
 def test_tilelang_translator_matches_golden():
@@ -185,8 +173,7 @@ def test_triton_translator_functional():
     require_translator_deps()
     torch = require_cuda_torch()
     triton_module = _exec_translated_module(
-        translate_triton(str(MLIR_FILE), str(PLUGIN)),
-        "translated_flash_attention_triton",
+        translate_triton(str(MLIR_FILE)), "translated_flash_attention_triton"
     )
     q, k, v, out = _make_attention_inputs(torch)
     triton_module.flash_attention_htile[FLASH_GRID](q, k, v, out)
@@ -225,9 +212,7 @@ def test_cutile_translator_functional():
         "translated_flash_attention_cutile",
     )
     q, k, v, out = _make_attention_inputs(torch)
-    _launch_cutile_kernel(
-        ct, torch, cutile_module.flash_attention_htile, (q, k, v, out)
-    )
+    _launch_cutile_kernel(ct, torch, cutile_module.flash_attention_htile, (q, k, v, out))
     torch.cuda.synchronize()
     _assert_attention_output_close(torch, out, q, k, v)
 

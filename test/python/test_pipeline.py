@@ -1,7 +1,7 @@
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -16,8 +16,7 @@ from neptune_mlir.schedules import AttentionTileConfig
 
 def require_plugins():
     plugins = find_neptune_plugins()
-    if plugins is None:
-        pytest.skip("Neptune MLIR native plugins are required")
+    assert plugins is not None, "Neptune failed to find its plugins (dynamic libs)"
     return plugins
 
 

@@ -8,6 +8,18 @@ include(CTest)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 set(CMAKE_CXX_EXTENSIONS NO)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "Export compile_commands.json")
+
+if(SKBUILD)
+  set(BUILD_PYTHON_EXTENSIONS_DEFAULT ON)
+else()
+  set(BUILD_PYTHON_EXTENSIONS_DEFAULT OFF)
+endif()
+option(
+  NEPTUNE_MLIR_BUILD_PYTHON_EXTENSIONS
+  "Build Python native extensions instead of mlir-opt plugins"
+  ${BUILD_PYTHON_EXTENSIONS_DEFAULT}
+)
 
 # Find Python3 if not defined. When building from pip, scikit-build will set this variable.
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
@@ -31,6 +43,19 @@ find_package(pybind11 CONFIG REQUIRED)
 
 find_package(LLVM REQUIRED CONFIG)
 find_package(MLIR REQUIRED CONFIG)
+
+if(NEPTUNE_MLIR_BUILD_PYTHON_EXTENSIONS)
+  execute_process(
+    COMMAND "${Python3_EXECUTABLE}" -c
+            "import pathlib, torch_mlir._mlir_libs as libs; print(pathlib.Path(libs.__file__).resolve().parent)"
+    OUTPUT_VARIABLE TORCH_MLIR_LIB_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _TORCH_MLIR_LIB_QUERY_RESULT
+  )
+  if(NOT _TORCH_MLIR_LIB_QUERY_RESULT EQUAL 0)
+    message(WARNING "Could not determine Torch-MLIR library directory, Python extension may fail to load")
+  endif()
+endif()
 
 message(STATUS "Using Python3: ${Python3_EXECUTABLE}")
 message(STATUS "Using pybind11 CMake package in: ${pybind11_DIR}")
@@ -124,6 +149,42 @@ add_mlir_pdll_library(TAExpToExp2PDLL
   ExpToExp2.cpp.inc
 )
 
+function(setup_mlir_target TARGET)
+  # Resolve MLIR/LLVM symbols from the host process at runtime.
+  if(APPLE)
+    target_link_options(${TARGET} PRIVATE -undefined dynamic_lookup)
+  endif()
+
+  llvm_update_compile_flags(${TARGET})
+  target_include_directories(${TARGET} PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}
+  )
+  target_include_directories(${TARGET} SYSTEM PUBLIC
+    ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS}
+  )
+  target_compile_definitions(${TARGET} PRIVATE ${LLVM_DEFINITIONS})
+
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(${TARGET} PRIVATE
+      -Wall -Wextra -Wpedantic -Wimplicit-fallthrough
+      -Wnon-virtual-dtor -Wunused-function -Wno-unused-parameter
+    )
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+      target_compile_options(${TARGET} PRIVATE
+        -Wunneeded-internal-declaration
+      )
+    endif()
+    if(NEPTUNE_MLIR_WARNINGS_AS_ERRORS)
+      target_compile_options(${TARGET} PRIVATE -Werror)
+    endif()
+  elseif(MSVC)
+    target_compile_options(${TARGET} PRIVATE /W4)
+    if(NEPTUNE_MLIR_WARNINGS_AS_ERRORS)
+      target_compile_options(${TARGET} PRIVATE /WX)
+    endif()
+  endif()
+endfunction()
+
 function(make_mlir_opt_plugin)
   cmake_parse_arguments(ARG "" "TARGET" "SOURCES;DEPS" ${ARGN})
   # Shared plugin for `mlir-opt --load-dialect-plugin=<path>/libHTileDialect.so`
@@ -131,43 +192,51 @@ function(make_mlir_opt_plugin)
   # Must NOT statically embed MLIR libs -- mlir-opt already provides them via
   # libMLIR.so, and duplicate TypeID registries cause a segfault on load.
   add_library(${ARG_TARGET} SHARED ${ARG_SOURCES})
-  # Resolve MLIR/LLVM symbols from the host process at runtime.
-  if(APPLE)
-    target_link_options(${ARG_TARGET} PRIVATE -undefined dynamic_lookup)
-  endif()
-
   add_dependencies(${ARG_TARGET} ${ARG_DEPS})
-  llvm_update_compile_flags(${ARG_TARGET})
-  target_include_directories(${ARG_TARGET} PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_BINARY_DIR}
-  )
-  target_include_directories(${ARG_TARGET} SYSTEM PUBLIC
-    ${LLVM_INCLUDE_DIRS}
-    ${MLIR_INCLUDE_DIRS}
-  )
-  target_compile_definitions(${ARG_TARGET} PRIVATE ${LLVM_DEFINITIONS})
-
-  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(${ARG_TARGET} PRIVATE
-      -Wall -Wextra -Wpedantic -Wimplicit-fallthrough
-      -Wnon-virtual-dtor -Wunused-function -Wno-unused-parameter
-    )
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-      target_compile_options(${ARG_TARGET} PRIVATE
-        -Wunneeded-internal-declaration
-      )
-    endif()
-    if(NEPTUNE_MLIR_WARNINGS_AS_ERRORS)
-      target_compile_options(${ARG_TARGET} PRIVATE -Werror)
-    endif()
-  elseif(MSVC)
-    target_compile_options(${ARG_TARGET} PRIVATE /W4)
-    if(NEPTUNE_MLIR_WARNINGS_AS_ERRORS)
-      target_compile_options(${ARG_TARGET} PRIVATE /WX)
-    endif()
-  endif()
+  setup_mlir_target(${ARG_TARGET})
+  install(TARGETS ${ARG_TARGET} LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}")
 endfunction()
+
+function(make_mlir_python_extension)
+  cmake_parse_arguments(ARG "" "TARGET" "SOURCES;DEPS" ${ARGN})
+  Python3_add_library(${ARG_TARGET} MODULE WITH_SOABI ${ARG_SOURCES})
+
+  # The extension resolves MLIR symbols from the Python MLIR runtime loaded by
+  # torch_mlir/mlir. Link Torch-MLIR's aggregate CAPI when available so dynamic
+  # loaders can find that runtime without relying on global symbol visibility.
+  if (TORCH_MLIR_LIB_DIR)
+    target_link_libraries(${ARG_TARGET} PRIVATE
+      "${TORCH_MLIR_LIB_DIR}/libTorchMLIRAggregateCAPI${CMAKE_SHARED_LIBRARY_SUFFIX}"
+      "${TORCH_MLIR_LIB_DIR}/libMLIRPythonSupport-mlir${CMAKE_SHARED_LIBRARY_SUFFIX}"
+    )
+    set_target_properties(${ARG_TARGET} PROPERTIES
+      BUILD_RPATH "${TORCH_MLIR_LIB_DIR}"
+      INSTALL_RPATH "${TORCH_MLIR_LIB_DIR}"
+    )
+  endif()
+  add_dependencies(${ARG_TARGET} ${ARG_DEPS})
+  setup_mlir_target(${ARG_TARGET})
+  set_target_properties(${ARG_TARGET} PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/neptune_mlir/_mlir_libs"
+  )
+  install(TARGETS _neptuneMlir LIBRARY DESTINATION "neptune_mlir/_mlir_libs")
+endfunction()
+
+if(NEPTUNE_MLIR_BUILD_PYTHON_EXTENSIONS)
+  make_mlir_python_extension(
+    TARGET _neptuneMlir
+    SOURCES
+      lib/Python/NeptuneMLIRModule.cpp
+      lib/HTile/HTileDialect.cpp
+      lib/HTile/HTilePasses.cpp
+      lib/HTile/HTileTransformOps.cpp
+      lib/LoopTr/Utils.cpp
+    DEPS
+      HTileOpsIncGen
+      HTileAttrsIncGen
+      HTileTransformOpsIncGen
+  )
+endif()
 
 make_mlir_opt_plugin(
   TARGET HTileDialect
@@ -210,23 +279,12 @@ make_mlir_opt_plugin(
     lib/LoopTr/Utils.cpp
     DEPS LoopTransformOpsIncGen
 )
+
+# This is how we call the Python solver from C++.
 target_link_libraries(LoopTransform PRIVATE pybind11::embed)
 set_source_files_properties(
   lib/LoopTr/PythonSolver.cpp
   PROPERTIES COMPILE_OPTIONS "-frtti;-fexceptions"
-)
-
-if(SKBUILD)
-  set(NEPTUNE_MLIR_PLUGIN_INSTALL_DIR "neptune_mlir/_native")
-else()
-  set(NEPTUNE_MLIR_PLUGIN_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}")
-endif()
-
-install(
-  TARGETS HTileDialect TADialect LoopTransform
-  LIBRARY DESTINATION "${NEPTUNE_MLIR_PLUGIN_INSTALL_DIR}"
-  RUNTIME DESTINATION "${NEPTUNE_MLIR_PLUGIN_INSTALL_DIR}"
-  ARCHIVE DESTINATION "${NEPTUNE_MLIR_PLUGIN_INSTALL_DIR}"
 )
 
 if(BUILD_TESTING)
