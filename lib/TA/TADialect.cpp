@@ -5,10 +5,12 @@
 #include "TA/TATransformOps.h"
 #include "TA/TATypes.h"
 #include "TA/TAUtils.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Tools/Plugins/DialectPlugin.h"
 #include "mlir/Tools/Plugins/PassPlugin.h"
+#include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/StringSet.h"
 
 #define GET_DIALECT_DEFS
@@ -614,6 +616,49 @@ LogicalResult ExtFOp::verify() {
 
 LogicalResult TruncFOp::verify() {
   return verifyFloatCastElementwiseOp(getOperation(), /*widening=*/false);
+}
+
+namespace {
+
+struct FoldTruncFOfConstant : OpRewritePattern<TruncFOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(TruncFOp op, PatternRewriter &rewriter) const override {
+    auto constant = op.getOperand().getDefiningOp<ConstantOp>();
+    if (!constant)
+      return failure();
+
+    auto value = dyn_cast<FloatAttr>(constant.getValue());
+    if (!value)
+      return failure();
+
+    auto result = cast<ExprType>(op.getResult().getType());
+    auto resultElement = dyn_cast<FloatType>(result.getElementType());
+    if (!resultElement)
+      return failure();
+
+    APFloat rounded = value.getValue();
+    bool losesInfo = false;
+    APFloat::opStatus status =
+        rounded.convert(resultElement.getFloatSemantics(), APFloat::rmNearestTiesToEven,
+                        &losesInfo);
+    if (status == APFloat::opInvalidOp)
+      return failure();
+
+    auto replacement =
+        ConstantOp::create(rewriter, op.getLoc(), op.getResult().getType(),
+                           FloatAttr::get(resultElement, rounded));
+    for (NamedAttribute attr : op->getDiscardableAttrs())
+      replacement->setAttr(attr.getName(), attr.getValue());
+    rewriter.replaceOp(op, replacement);
+    return success();
+  }
+};
+
+} // namespace
+
+void TruncFOp::getCanonicalizationPatterns(RewritePatternSet &patterns, MLIRContext *context) {
+  patterns.add<FoldTruncFOfConstant>(context);
 }
 
 LogicalResult CmpFOp::verify() {

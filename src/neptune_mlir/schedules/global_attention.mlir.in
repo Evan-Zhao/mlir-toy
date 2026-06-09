@@ -38,6 +38,8 @@ module attributes {transform.with_named_sequence} {
     %func0 = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
     %func1 = transform.apply_registered_pass "linalg-generalize-named-ops" to %func0 : (!any) -> !any
     %func = transform.apply_registered_pass "linalg-to-ta" to %func1 : (!any) -> !any
+    // This canonicalization step folds trunc(const(f64), f32) into a constant in f32.
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     // Replace `exp(x)` with `exp2(x * log2(e))`, then push `log2(e)` constant around
     // until it folds with other multiplicative constants.
     transform.ta.rewrite_exp_to_exp2 %func : !any

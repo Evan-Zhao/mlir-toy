@@ -36,6 +36,7 @@ module attributes {transform.with_named_sequence} {
     %func0 = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
     %func1 = transform.apply_registered_pass "linalg-generalize-named-ops" to %func0 : (!any) -> !any
     %func = transform.apply_registered_pass "linalg-to-ta" to %func1 : (!any) -> !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.ta.rewrite_exp_to_exp2 %func : !any
     transform.apply_patterns to %func {
       transform.apply_patterns.ta.exchange_div_and_matmul
