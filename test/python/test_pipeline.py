@@ -25,7 +25,7 @@ def make_attn_pytest_param(
 
 BATCHES = (1, 2)
 SEQ_LENS = (128, 1024, 16384)
-DHEADS = (64,)
+DHEADS = (64, 128)
 ATTN_HEADS = (2, 4)
 ATTN_VARIANTS = (AttentionVariant.GLOBAL_ATTN, AttentionVariant.CAUSAL_ATTN)
 GQA_HEADS = ((4, 2),)
