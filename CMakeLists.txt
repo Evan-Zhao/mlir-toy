@@ -282,6 +282,10 @@ make_mlir_opt_plugin(
 
 # This is how we call the Python solver from C++.
 target_link_libraries(LoopTransform PRIVATE pybind11::embed)
+set_target_properties(LoopTransform PROPERTIES
+  BUILD_RPATH "${Python3_LIBRARY_DIRS}"
+  INSTALL_RPATH "${Python3_LIBRARY_DIRS}"
+)
 set_source_files_properties(
   lib/LoopTr/PythonSolver.cpp
   PROPERTIES COMPILE_OPTIONS "-frtti;-fexceptions"
