@@ -10,16 +10,22 @@ set(CMAKE_CXX_STANDARD_REQUIRED YES)
 set(CMAKE_CXX_EXTENSIONS NO)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "Export compile_commands.json")
 
+set(_NEPTUNE_MLIR_UNDER_SKBUILD OFF)
 if(SKBUILD)
-  set(BUILD_PYTHON_EXTENSIONS_DEFAULT ON)
-else()
-  set(BUILD_PYTHON_EXTENSIONS_DEFAULT OFF)
+  if(DEFINED SKBUILD_PLATLIB_DIR AND NOT EXISTS "${SKBUILD_PLATLIB_DIR}")
+    message(STATUS "Ignoring stale scikit-build cache from ${SKBUILD_PLATLIB_DIR}")
+  else()
+    set(_NEPTUNE_MLIR_UNDER_SKBUILD ON)
+  endif()
 endif()
-option(
-  NEPTUNE_MLIR_BUILD_PYTHON_EXTENSIONS
-  "Build Python native extensions instead of mlir-opt plugins"
-  ${BUILD_PYTHON_EXTENSIONS_DEFAULT}
-)
+
+if(_NEPTUNE_MLIR_UNDER_SKBUILD)
+  set(NEPTUNE_MLIR_BUILD_PYTHON_EXTENSIONS ON)
+else()
+  set(NEPTUNE_MLIR_BUILD_PYTHON_EXTENSIONS OFF)
+endif()
+unset(NEPTUNE_MLIR_BUILD_PYTHON_EXTENSIONS CACHE)
+unset(SKBUILD CACHE)
 
 # Find Python3 if not defined. When building from pip, scikit-build will set this variable.
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
