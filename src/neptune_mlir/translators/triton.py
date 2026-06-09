@@ -147,11 +147,15 @@ class Translator:
             "arith.subf": lambda o: self._binop(o, ast.Sub()),
             "arith.divf": lambda o: self._binop(o, ast.Div()),
             "arith.maximumf": lambda o: self._tl_binop(o, "maximum"),
+            "arith.index_cast": self._arith_index_cast,
+            "arith.cmpi": self._arith_cmpi,
+            "arith.select": self._arith_select,
             "arith.truncf": self._arith_truncf,
             "math.exp2": lambda o: self._tl_unary(o, "exp2"),
             "htile.load": self._htile_load,
             "htile.store": self._htile_store,
             "htile.full": self._htile_full,
+            "htile.arange": self._htile_arange,
             "htile.dot": self._htile_dot,
             "htile.reduce": self._htile_reduce,
             "htile.permute": self._htile_permute,
@@ -166,7 +170,7 @@ class Translator:
         }
         handler = dispatch.get(_op_type_name(op))
         if handler is None:
-            return [ast.Expr(value=_const(f"# TODO: {_op_type_name(op)}"))]
+            raise NotImplementedError(f"unsupported op: {_op_type_name(op)}")
         return handler(op)
 
     # --- arith ops ---
@@ -200,6 +204,45 @@ class Translator:
     def _tl_unary(self, op: ir.OpView, fn: str) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
         return [_assign(name, _tl_call(fn, self._expr(op.operands[0])))]
+
+    def _arith_index_cast(self, op: ir.OpView) -> list[ast.stmt]:
+        self._names[op.results[0]] = self._get(op.operands[0])
+        return []
+
+    def _arith_cmpi(self, op: ir.OpView) -> list[ast.stmt]:
+        name = self._bind(op.results[0], "cmp")
+        predicate_attr = op.attributes.get("predicate")
+        predicate = ir.IntegerAttr(predicate_attr).value
+        predicate_to_op = {
+            0: ast.Eq,
+            1: ast.NotEq,
+            2: ast.Lt,
+            3: ast.LtE,
+            4: ast.Gt,
+            5: ast.GtE,
+            6: ast.Lt,
+            7: ast.LtE,
+            8: ast.Gt,
+            9: ast.GtE,
+        }
+        cmp_op = predicate_to_op.get(predicate)
+        if cmp_op is None:
+            raise NotImplementedError(f"unsupported arith.cmpi predicate: {predicate}")
+        return [
+            _assign(
+                name,
+                ast.Compare(
+                    left=self._expr(op.operands[0]),
+                    ops=[cmp_op()],
+                    comparators=[self._expr(op.operands[1])],
+                ),
+            )
+        ]
+
+    def _arith_select(self, op: ir.OpView) -> list[ast.stmt]:
+        name = self._bind(op.results[0], "sel")
+        cond, true_val, false_val = map(self._expr, op.operands)
+        return [_assign(name, _tl_call("where", cond, true_val, false_val))]
 
     def _arith_truncf(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
@@ -325,17 +368,14 @@ class Translator:
         return stmts, base_ptr, indices, [1] * len(tile_shape)
 
     def _htile_full(self, op: ir.OpView) -> list[ast.stmt]:
-        shape, dtype = _tensor_shape(op.results[0].type)
-        name = self._bind(op.results[0], "tile")
+        self._names[op.results[0]] = self._get(op.operands[0])
+        return []
+
+    def _htile_arange(self, op: ir.OpView) -> list[ast.stmt]:
+        name = self._bind(op.results[0], "range")
         return [
             _assign(
-                name,
-                _tl_call(
-                    "full",
-                    _list(*[_const(s) for s in shape]),
-                    self._expr(op.operands[0]),
-                    _mlir_dtype_to_tl(dtype),
-                ),
+                name, _tl_call("arange", self._expr(op.operands[0]), self._expr(op.operands[1]))
             )
         ]
 

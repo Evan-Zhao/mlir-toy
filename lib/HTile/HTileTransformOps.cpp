@@ -156,16 +156,14 @@ FailureOr<Value> createTensorScalarLikeOp(OpBuilder &builder, Location loc, Oper
                                           ValueRange operands, RankedTensorType resultShape,
                                           SmallVectorImpl<Operation *> &createdOps) {
 
-  // Convert scalar constant op to a tensor constant op.
+  // Keep scalar constants scalar. Consumers that need tensor operands materialize
+  // them with htile.full, which avoids large dense tensor constants in semantic IR.
   if (auto constant = dyn_cast<arith::ConstantOp>(scalarOp)) {
     if (!operands.empty() || isa<ShapedType>(constant.getType()))
       return failure();
-    auto resultType = RankedTensorType::get(resultShape.getShape(), constant.getType(),
-                                            resultShape.getEncoding());
-    auto splat = DenseElementsAttr::get(resultType, constant.getValue());
-    auto created = arith::ConstantOp::create(builder, loc, splat);
+    Operation *created = builder.clone(*constant.getOperation());
     createdOps.push_back(created);
-    return created.getResult();
+    return created->getResult(0);
   }
 
   // This is a default case that covers all "element-wise" operations that returns one result.
@@ -407,14 +405,16 @@ LogicalResult rewriteElementwise(RewriterBase &rewriter, linalg::GenericOp op) {
     SmallVector<Value> mappedOperands;
     for (Value operand : bodyOp.getOperands()) {
       Value mapped = mapping.lookupOrNull(operand);
-      if (!mapped) {
-        FailureOr<Value> tile =
-            materializeScalarAsTile(rewriter, bodyOp.getLoc(), operand, resultType, createdOps);
-        if (failed(tile))
-          return failure();
-        mapped = *tile;
+      if (mapped && isa<RankedTensorType>(mapped.getType())) {
+        mappedOperands.push_back(mapped);
+        continue;
       }
-      mappedOperands.push_back(mapped);
+      auto scalarVal = mapped ? mapped : operand;
+      FailureOr<Value> tile =
+          materializeScalarAsTile(rewriter, bodyOp.getLoc(), scalarVal, resultType, createdOps);
+      if (failed(tile))
+        return failure();
+      mappedOperands.push_back(*tile);
     }
     FailureOr<Value> tensorOp = createTensorScalarLikeOp(rewriter, bodyOp.getLoc(), &bodyOp,
                                                          mappedOperands, resultType, createdOps);
