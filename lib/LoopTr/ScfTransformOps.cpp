@@ -58,6 +58,21 @@ Value makeEmptyLikeExtractSlice(RewriterBase &rewriter, tensor::ExtractSliceOp e
                                  resultType.getElementType());
 }
 
+struct SliceFillOfEmpty final : OpRewritePattern<tensor::ExtractSliceOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tensor::ExtractSliceOp extract,
+                                PatternRewriter &rewriter) const override {
+    auto fill = extract.getSource().getDefiningOp<linalg::FillOp>();
+    if (!fill || !fill.getOutputs()[0].getDefiningOp<tensor::EmptyOp>())
+      return failure();
+
+    Value empty = makeEmptyLikeExtractSlice(rewriter, extract);
+    rewriter.replaceOpWithNewOp<linalg::FillOp>(extract, fill.getInputs(), ValueRange{empty});
+    return success();
+  }
+};
+
 bool localizeScratchSlicesInFor(TransformRewriter &rewriter, scf::ForOp loop) {
   auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
   SmallVector<tensor::ExtractSliceOp> toReplace;
@@ -226,6 +241,7 @@ bool eraseTriviallyDeadOps(TransformRewriter &rewriter, Operation *target) {
 
 LogicalResult runGreedyCleanup(TransformRewriter &rewriter, Operation *target) {
   RewritePatternSet patterns(target->getContext());
+  patterns.add<SliceFillOfEmpty>(target->getContext());
   linalg::populateSwapExtractSliceWithFillPatterns(patterns);
   tensor::populateFoldTensorEmptyPatterns(patterns);
   tensor::populateReassociativeReshapeFoldingPatterns(patterns);

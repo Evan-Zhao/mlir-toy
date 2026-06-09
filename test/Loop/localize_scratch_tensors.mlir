@@ -74,4 +74,21 @@ module attributes {transform.with_named_sequence} {
     }
     return %result : tensor<8xf32>
   }
+
+  // CHECK-LABEL: func.func @localize_multi_use_fill_slices
+  // CHECK-NOT: tensor.empty() : tensor<8x8xf32>
+  // CHECK-COUNT-2: linalg.fill
+  // CHECK-NOT: tensor.extract_slice
+  func.func @localize_multi_use_fill_slices() -> (tensor<8x4xf32>, tensor<8x4xf32>) {
+    %zero = arith.constant 0.0 : f32
+    %full_empty = tensor.empty() : tensor<8x8xf32>
+    %full = linalg.fill ins(%zero : f32) outs(%full_empty : tensor<8x8xf32>) -> tensor<8x8xf32>
+
+    %left = tensor.extract_slice %full[0, 0] [8, 4] [1, 1]
+        : tensor<8x8xf32> to tensor<8x4xf32>
+    %right = tensor.extract_slice %full[0, 4] [8, 4] [1, 1]
+        : tensor<8x8xf32> to tensor<8x4xf32>
+
+    return %left, %right : tensor<8x4xf32>, tensor<8x4xf32>
+  }
 }
