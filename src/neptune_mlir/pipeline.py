@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -64,6 +65,34 @@ def _run_mlir_opt_file(
     return result.stdout
 
 
+def _export_attention_linalg_subprocess(
+    *,
+    variant: AttentionVariant,
+    batch: int,
+    q_heads: int,
+    kv_heads: int | None,
+    seq_len: int,
+    dhead: int,
+    func_name: str,
+) -> str:
+    # Torch-MLIR and the standalone MLIR Python bindings ship separate native
+    # runtimes that cannot be loaded into one Python process in arbitrary order.
+    cmd = [sys.executable, "-m", "neptune_mlir.operator.export_attention_linalg"]
+    cmd += ["--variant", variant.value, "--batch", str(batch), "--heads", str(q_heads)]
+    cmd += ["--seq-len", str(seq_len), "--dhead", str(dhead), "--func-name", func_name]
+    if kv_heads is not None:
+        cmd.extend(["--kv-heads", str(kv_heads)])
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        stdout = result.stdout.strip()
+        details = stderr or stdout or "Torch-MLIR export failed without output"
+        raise RuntimeError(
+            f"Torch-MLIR export failed with exit code {result.returncode}: {details}"
+        )
+    return result.stdout
+
+
 def run_neptune_mlir_opt(
     input_mlir: str,
     pass_pipeline: str,
@@ -115,13 +144,11 @@ def export_attention_to_triton_input_mlir(
     tile_config: AttentionTileConfig | None = None,
     plugins: NeptunePlugins | None = None,
 ) -> str:
-    from .operator.export_attention_linalg import export_attention_linalg
-
     variant = _coerce_attention_variant(variant)
     schedule = _VARIANT_TO_SCHEDULE.get(variant.value)
     if schedule is None:
         raise ValueError(f"unsupported attention pipeline variant: {variant}")
-    input_mlir = export_attention_linalg(
+    input_mlir = _export_attention_linalg_subprocess(
         variant=variant,
         batch=batch,
         q_heads=q_heads,
