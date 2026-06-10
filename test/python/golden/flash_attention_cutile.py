@@ -14,7 +14,7 @@ def flash_attention_htile(arr_0, arr_1, arr_2, arr_3):
     bid_h = ct.bid(1)
     bid_b = ct.bid(2)
     v_12 = bid_m * c_8
-    load_13 = ct.load(arr_0, (c_4, bid_h, v_12 // 128, c_4 // 128), (1, 1, 128, 128), order=(0, 1, 2, 3))
+    load_13 = ct.load(arr_0, (bid_b, bid_h, v_12 // 128, c_4 // 128), (1, 1, 128, 128), order=(0, 1, 2, 3))
     tile_14 = ct.reshape(load_13, (128, 128))
     tile_15 = ct.full((128,), c_10, dtype=ct.float32)
     tile_16 = ct.full((128, 128), c_9, dtype=ct.float32)
@@ -24,8 +24,8 @@ def flash_attention_htile(arr_0, arr_1, arr_2, arr_3):
     acc_20 = tile_15
     for j_21 in range(c_4, c_7, c_5):
         v_22 = j_21 * c_7
-        load_23 = ct.load(arr_1, (c_4, bid_h, c_4 // 128, v_22 // 64), (1, 1, 128, 64), order=(0, 1, 3, 2))
-        tile_24 = ct.reshape(load_23, (128, 64))
+        load_23 = ct.load(arr_1, (bid_b, bid_h, c_4 // 64, v_22 // 128), (1, 1, 64, 128), order=(0, 1, 3, 2))
+        tile_24 = ct.reshape(load_23, (64, 128))
         tile_25 = ct.mma(tile_14, tile_24, ct.full((128, 64), 0, dtype=ct.float32))
         tile_26 = ct.full((128, 64), c_11, dtype=ct.float32)
         v_27 = tile_25 * tile_26
@@ -40,7 +40,7 @@ def flash_attention_htile(arr_0, arr_1, arr_2, arr_3):
         v_36 = acc_18 * v_35
         v_37 = v_36 + red_33
         v_38 = ct.astype(v_32, ct.float16)
-        load_39 = ct.load(arr_2, (c_4, bid_h, v_22 // 64, c_4 // 128), (1, 1, 64, 128), order=(0, 1, 2, 3))
+        load_39 = ct.load(arr_2, (bid_b, bid_h, v_22 // 64, c_4 // 128), (1, 1, 64, 128), order=(0, 1, 2, 3))
         tile_40 = ct.reshape(load_39, (64, 128))
         tile_41 = ct.mma(v_38, tile_40, ct.full((128, 128), 0, dtype=ct.float32))
         bcast_42 = ct.broadcast_to(ct.expand_dims(acc_20, axis=1), (128, 128))
@@ -55,4 +55,4 @@ def flash_attention_htile(arr_0, arr_1, arr_2, arr_3):
     bcast_48 = ct.broadcast_to(ct.expand_dims(acc_18, axis=1), (128, 128))
     v_49 = acc_19 / bcast_48
     v_50 = ct.astype(v_49, ct.float16)
-    ct.store(arr_3, (c_4, bid_h, v_12 // 128, c_4 // 128), ct.reshape(v_50, (1, 1, 128, 128)))
+    ct.store(arr_3, (bid_b, bid_h, v_12 // 128, c_4 // 128), ct.reshape(v_50, (1, 1, 128, 128)))

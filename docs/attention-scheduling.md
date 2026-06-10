@@ -6,8 +6,7 @@ the scheduled L1 form used by the downstream pipeline.
 ## Goal
 
 Implement an MLIR Transform dialect schedule that lowers an algorithm-only attention program into
-a scheduled, tile-level FlashAttention-like form. The canonical handwritten reference is
-`test/python/data/flash_attention_l1.mlir`.
+a scheduled, tile-level FlashAttention-like form.
 
 The integrated schedule lives in the pipeline test
 [`test/Pipeline/tm_global_attention.mlir`](../test/Pipeline/tm_global_attention.mlir).

@@ -38,13 +38,13 @@ def flash_attention_htile(buf_0: T.Buffer((1, 32, 4096, 128), 'float16'), buf_1:
         frag_36 = T.alloc_fragment([128, 128], 'float32')
         cast_37 = T.alloc_fragment([128, 128], 'float16')
         v_38 = bx * c_8
-        T.copy(buf_0[c_4, by, v_38:v_38 + 128, c_4:c_4 + 128], shared_12)
+        T.copy(buf_0[bz, by, v_38:v_38 + 128, c_4:c_4 + 128], shared_12)
         T.fill(frag_13, c_10)
         T.fill(frag_14, c_9)
         T.fill(frag_15, c_9)
         for j_39 in T.Pipelined(c_4, c_7, num_stages=2):
             v_40 = j_39 * c_7
-            T.copy(buf_1[c_4, by, v_40:v_40 + 64, c_4:c_4 + 128], shared_16)
+            T.copy(buf_1[bz, by, v_40:v_40 + 64, c_4:c_4 + 128], shared_16)
             T.gemm(shared_12, shared_16, dot_17, clear_accum=True, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
             T.fill(frag_18, c_11)
             for i0_41, i1_42 in T.Parallel(128, 64):
@@ -67,7 +67,7 @@ def flash_attention_htile(buf_0: T.Buffer((1, 32, 4096, 128), 'float16'), buf_1:
                 frag_28[i0_51] = frag_27[i0_51] + red_24[i0_51]
             for i0_52, i1_53 in T.Parallel(128, 64):
                 cast_29[i0_52, i1_53] = T.cast(exp_23[i0_52, i1_53], 'float16')
-            T.copy(buf_2[c_4, by, v_40:v_40 + 64, c_4:c_4 + 128], shared_30)
+            T.copy(buf_2[bz, by, v_40:v_40 + 64, c_4:c_4 + 128], shared_30)
             T.gemm(cast_29, shared_30, dot_31, clear_accum=True, policy=T.GemmWarpPolicy.FullRow)
             for i0_54, i1_55 in T.Parallel(128, 128):
                 frag_32[i0_54, i1_55] = frag_13[i0_54] - frag_21[i0_54]
@@ -84,4 +84,4 @@ def flash_attention_htile(buf_0: T.Buffer((1, 32, 4096, 128), 'float16'), buf_1:
             frag_36[i0_62, i1_63] = frag_14[i0_62, i1_63] / frag_15[i0_62]
         for i0_64, i1_65 in T.Parallel(128, 128):
             cast_37[i0_64, i1_65] = T.cast(frag_36[i0_64, i1_65], 'float16')
-        T.copy(cast_37, buf_3[c_4, by, v_38:v_38 + 128, c_4:c_4 + 128])
+        T.copy(cast_37, buf_3[bz, by, v_38:v_38 + 128, c_4:c_4 + 128])

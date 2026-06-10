@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """HTile MLIR -> NVIDIA cuTile Python translator using MLIR Python bindings.
 
-Usage:
-    python -m neptune_mlir.translators.cutile <input.mlir> [--plugin <plugin.dylib>]
-
 This backend is intentionally value-based: cuTile tiles are immutable values, so
 the lowering is closer to the Triton translator than to TileLang.
 """
@@ -12,8 +9,6 @@ import ast
 
 from ..mlir_bindings import ir
 from .common import (
-    DEFAULT_PLUGIN,
-    HTILE_DOT_TRANSPOSE_TO_LOAD_ORDER_PIPELINE,
     _assign,
     _attr,
     _call,
@@ -29,7 +24,7 @@ from .common import (
     _reject_dot_transpose_attrs,
     _tensor_shape,
     _tuple,
-    translate_file_with,
+    parse_mlir_module_from_text,
 )
 
 
@@ -466,27 +461,6 @@ class Translator:
         return stmts
 
 
-def translate_file(path: str, plugin: str | None = None) -> ast.Module:
-    return translate_file_with(
-        path,
-        Translator,
-        plugin,
-        pass_pipeline=(HTILE_DOT_TRANSPOSE_TO_LOAD_ORDER_PIPELINE if plugin else None),
-        pass_plugin=plugin,
-    )
-
-
-def main():
-    import argparse
-
-    ap = argparse.ArgumentParser()
-    ap.add_argument("mlir_file")
-    ap.add_argument("--plugin", default=DEFAULT_PLUGIN)
-    args = ap.parse_args()
-
-    py_module = translate_file(args.mlir_file, args.plugin)
-    print(ast.unparse(py_module))
-
-
-if __name__ == "__main__":
-    main()
+def translate_mlir_text(text: str) -> ast.Module:
+    """Parse translator-ready MLIR text and return a Python ast.Module."""
+    return Translator().translate(parse_mlir_module_from_text(text))

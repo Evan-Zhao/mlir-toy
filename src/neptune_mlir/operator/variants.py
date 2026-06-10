@@ -14,5 +14,12 @@ class AttentionVariant(str, Enum):
     def __str__(self) -> str:
         return self.value
 
+    @classmethod
+    def from_string(cls, value: str) -> "AttentionVariant":
+        try:
+            return cls(value)
+        except ValueError:
+            raise ValueError(f"unknown attention variant: {value}") from None
+
 
 VARIANTS = tuple(AttentionVariant)

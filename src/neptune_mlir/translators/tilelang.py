@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""HTile MLIR -> TileLang Python translator using MLIR Python bindings.
-
-Usage:
-    python -m neptune_mlir.translators.tilelang <input.mlir> [--plugin <plugin.dylib>]
-"""
+"""HTile MLIR -> TileLang Python translator using MLIR Python bindings."""
 
 from __future__ import annotations
 
@@ -13,7 +9,6 @@ from dataclasses import dataclass
 from ..mlir_bindings import ir
 from .common import (
     _T,
-    DEFAULT_PLUGIN,
     _assign,
     _attr,
     _const,
@@ -34,7 +29,7 @@ from .common import (
     _T_call,
     _tensor_shape,
     _tuple,
-    translate_file_with,
+    parse_mlir_module_from_text,
 )
 
 
@@ -534,21 +529,6 @@ class Translator:
         return None
 
 
-def translate_file(path: str, plugin: str | None = None) -> ast.Module:
-    return translate_file_with(path, Translator, plugin)
-
-
-def main():
-    import argparse
-
-    ap = argparse.ArgumentParser()
-    ap.add_argument("mlir_file")
-    ap.add_argument("--plugin", default=DEFAULT_PLUGIN)
-    args = ap.parse_args()
-
-    py_module = translate_file(args.mlir_file, args.plugin)
-    print(ast.unparse(py_module))
-
-
-if __name__ == "__main__":
-    main()
+def translate_mlir_text(text: str) -> ast.Module:
+    """Parse translator-ready MLIR text and return a Python ast.Module."""
+    return Translator().translate(parse_mlir_module_from_text(text))

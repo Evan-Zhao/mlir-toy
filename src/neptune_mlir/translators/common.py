@@ -8,16 +8,6 @@ import subprocess
 from typing import Type
 
 from ..mlir_bindings import ir
-from ..plugin import find_neptune_plugins
-
-default_plugin = find_neptune_plugins()
-if default_plugin is None:
-    raise RuntimeError("Neptune MLIR plugin not found")
-DEFAULT_PLUGIN = default_plugin.htile_dialect
-HTILE_DOT_TRANSPOSE_TO_LOAD_ORDER_PIPELINE = (
-    "builtin.module(htile-dot-transpose-to-load-order,cse,canonicalize)"
-)
-
 
 # ---------------------------------------------------------------------------
 # AST helpers

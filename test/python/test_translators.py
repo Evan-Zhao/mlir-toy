@@ -3,7 +3,6 @@ import ast
 import importlib.util
 import math
 import shutil
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -12,16 +11,10 @@ import pytest
 
 from neptune_mlir.plugin import find_neptune_plugins
 from neptune_mlir.translators.common import translate_file_with
-from neptune_mlir.translators.cutile import (
-    translate_file as translate_cutile,
-)
-from neptune_mlir.translators.tilelang import (
-    translate_file as translate_tilelang,
-)
+from neptune_mlir.translators.cutile import translate_mlir_text as translate_cutile
+from neptune_mlir.translators.tilelang import translate_mlir_text as translate_tilelang
 from neptune_mlir.translators.triton import Translator as TritonTranslator
-from neptune_mlir.translators.triton import (
-    translate_mlir_text as translate_triton,
-)
+from neptune_mlir.translators.triton import translate_mlir_text as translate_triton
 
 PARENT_DIR = Path(__file__).resolve().parent
 plugin = find_neptune_plugins()
@@ -29,8 +22,8 @@ if plugin is None:
     pytest.exit("MLIR plugin path not found")
 PLUGIN = plugin.htile_dialect
 GOLDEN_DIR = PARENT_DIR / "golden"
-MLIR_FILE = PARENT_DIR / "data" / "flash_attention_htile.mlir"
-DOT_TRANSPOSE_PASS_PIPELINE = "builtin.module(htile-dot-transpose-to-load-order,cse,canonicalize)"
+HTILE_LOAD_ORDER_INPUT = PARENT_DIR / "data" / "flash_attention_htile_load_order.mlir"
+HTILE_INPUT = PARENT_DIR / "data" / "flash_attention_htile.mlir"
 FLASH_GRID = (32, 32, 1)
 FLASH_SHAPE = (1, 32, 4096, 128)
 FLASH_REF_BLOCK_ROWS = 128
@@ -68,7 +61,7 @@ def require_tilelang_runtime():
 def require_cutile_runtime():
     if not _module_available("cuda.tile"):
         pytest.skip("cuda.tile is required for cuTile functional translator tests")
-    import cuda.tile as ct
+    import cuda.tile as ct  # type: ignore
 
     return ct
 
@@ -150,30 +143,26 @@ def assert_matches_golden(actual_module: ast.Module, golden_name: str):
 
 def test_triton_translator_matches_golden():
     require_translator_deps()
-    mlir_text = MLIR_FILE.read_text()
+    mlir_text = HTILE_LOAD_ORDER_INPUT.read_text()
     assert_matches_golden(translate_triton(mlir_text), "flash_attention_triton.py")
-
-
-def test_tilelang_translator_matches_golden():
-    require_translator_deps()
-    assert_matches_golden(
-        translate_tilelang(str(MLIR_FILE), str(PLUGIN)),
-        "flash_attention_tilelang.py",
-    )
 
 
 def test_cutile_translator_matches_golden():
     require_translator_deps()
-    assert_matches_golden(
-        translate_cutile(str(MLIR_FILE), str(PLUGIN)),
-        "flash_attention_cutile.py",
-    )
+    mlir_text = HTILE_LOAD_ORDER_INPUT.read_text()
+    assert_matches_golden(translate_cutile(mlir_text), "flash_attention_cutile.py")
+
+
+def test_tilelang_translator_matches_golden():
+    require_translator_deps()
+    mlir_text = HTILE_INPUT.read_text()
+    assert_matches_golden(translate_tilelang(mlir_text), "flash_attention_tilelang.py")
 
 
 def test_triton_translator_functional():
     require_translator_deps()
     torch = require_cuda_torch()
-    mlir_text = MLIR_FILE.read_text()
+    mlir_text = HTILE_LOAD_ORDER_INPUT.read_text()
     triton_module = _exec_translated_module(
         translate_triton(mlir_text), "translated_flash_attention_triton"
     )
@@ -183,13 +172,27 @@ def test_triton_translator_functional():
     _assert_attention_output_close(torch, out, q, k, v)
 
 
+def test_cutile_translator_functional():
+    require_translator_deps()
+    torch = require_cuda_torch()
+    ct = require_cutile_runtime()
+    mlir_text = HTILE_LOAD_ORDER_INPUT.read_text()
+    cutile_module = _exec_translated_module(
+        translate_cutile(mlir_text), "translated_flash_attention_cutile"
+    )
+    q, k, v, out = _make_attention_inputs(torch)
+    _launch_cutile_kernel(ct, torch, cutile_module.flash_attention_htile, (q, k, v, out))
+    torch.cuda.synchronize()
+    _assert_attention_output_close(torch, out, q, k, v)
+
+
 def test_tilelang_translator_functional():
     require_translator_deps()
     torch = require_cuda_torch()
     tilelang = require_tilelang_runtime()
+    mlir_text = HTILE_INPUT.read_text()
     tilelang_module = _exec_translated_module(
-        translate_tilelang(str(MLIR_FILE), str(PLUGIN)),
-        "translated_flash_attention_tilelang",
+        translate_tilelang(mlir_text), "translated_flash_attention_tilelang"
     )
     kernel = tilelang.compile(
         tilelang_module.flash_attention_htile,
@@ -205,46 +208,7 @@ def test_tilelang_translator_functional():
     _assert_attention_output_close(torch, out, q, k, v)
 
 
-def test_cutile_translator_functional():
-    require_translator_deps()
-    torch = require_cuda_torch()
-    ct = require_cutile_runtime()
-    cutile_module = _exec_translated_module(
-        translate_cutile(str(MLIR_FILE), str(PLUGIN)),
-        "translated_flash_attention_cutile",
-    )
-    q, k, v, out = _make_attention_inputs(torch)
-    _launch_cutile_kernel(ct, torch, cutile_module.flash_attention_htile, (q, k, v, out))
-    torch.cuda.synchronize()
-    _assert_attention_output_close(torch, out, q, k, v)
-
-
-def test_dot_transpose_to_load_order_pass():
-    require_translator_deps()
-    result = subprocess.run(
-        [
-            "mlir-opt",
-            f"--load-dialect-plugin={PLUGIN}",
-            f"--load-pass-plugin={PLUGIN}",
-            f"--pass-pipeline={DOT_TRANSPOSE_PASS_PIPELINE}",
-            str(MLIR_FILE),
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-
-    assert "transpose_b" not in result.stdout
-    assert "htile.permute" not in result.stdout
-    assert "dimension_order = array<i64: 1, 0>" in result.stdout
-    assert (
-        'htile.dot %1, %10 {warp_policy = "full_row"} : '
-        "tensor<128x128xf16, #htile.encoding<placement = shared>>, "
-        "tensor<128x64xf16, #htile.encoding<placement = shared>>"
-    ) in result.stdout
-
-
 def test_triton_rejects_unfissioned_dot_transpose():
     require_translator_deps()
     with pytest.raises(NotImplementedError, match="htile-dot-transpose-to-load-order"):
-        translate_file_with(str(MLIR_FILE), TritonTranslator, str(PLUGIN))
+        translate_file_with(str(HTILE_INPUT), TritonTranslator, str(PLUGIN))

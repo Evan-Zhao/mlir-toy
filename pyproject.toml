@@ -14,11 +14,6 @@ dependencies = ["sympy>=1.14"]
 dev = ["pytest>=8.0"]
 export = ["torch", "torch-mlir"]
 
-[project.scripts]
-neptune-triton = "neptune_mlir.translators.triton:main"
-neptune-tilelang = "neptune_mlir.translators.tilelang:main"
-neptune-cutile = "neptune_mlir.translators.cutile:main"
-
 [tool.scikit-build]
 cmake.version = ">=3.20"
 wheel.packages = ["src/neptune_mlir"]
