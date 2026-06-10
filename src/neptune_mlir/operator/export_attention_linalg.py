@@ -16,7 +16,7 @@ from torch_mlir import fx
 from neptune_mlir.operator.variants import VARIANTS, AttentionVariant
 
 
-class AttentionModule(torch.nn.Module):
+class GlobalAttentionModule(torch.nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         scale = 1.0 / math.sqrt(q.shape[-1])
         scores = torch.matmul(q.to(torch.float32), k.to(torch.float32).transpose(-1, -2))
@@ -24,24 +24,6 @@ class AttentionModule(torch.nn.Module):
         probs = torch.softmax(scores, dim=-1)
         out_f32 = torch.matmul(probs, v.to(torch.float32))
         return out_f32.to(torch.float16)
-
-
-class ManualGQAAttentionModule(torch.nn.Module):
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        q_heads = q.shape[1]
-        kv_heads = k.shape[1]
-        if q_heads % kv_heads != 0:
-            raise ValueError(f"q heads ({q_heads}) must be divisible by kv heads ({kv_heads})")
-        groups = q_heads // kv_heads
-        q = q.reshape(q.shape[0], groups, kv_heads, q.shape[2], q.shape[3])
-        k = k[:, :, None, :, :].expand(k.shape[0], kv_heads, groups, k.shape[2], k.shape[3])
-        v = v[:, :, None, :, :].expand(v.shape[0], kv_heads, groups, v.shape[2], v.shape[3])
-        scale = 1.0 / math.sqrt(q.shape[-1])
-        scores = torch.matmul(q.to(torch.float32), k.to(torch.float32).transpose(-1, -2))
-        scores = scores * scale
-        probs = torch.softmax(scores, dim=-1)
-        out_f32 = torch.matmul(probs, v.to(torch.float32))
-        return out_f32.to(torch.float16).reshape(q.shape)
 
 
 class CausalAttentionModule(torch.nn.Module):
@@ -58,6 +40,24 @@ class CausalAttentionModule(torch.nn.Module):
         probs = torch.softmax(scores, dim=-1)
         out_f32 = torch.matmul(probs, v.to(torch.float32))
         return out_f32.to(torch.float16)
+
+
+class GlobalGQAModule(torch.nn.Module):
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        q_heads = q.shape[1]
+        kv_heads = k.shape[1]
+        if q_heads % kv_heads != 0:
+            raise ValueError(f"q heads ({q_heads}) must be divisible by kv heads ({kv_heads})")
+        groups = q_heads // kv_heads
+        q = q.reshape(q.shape[0], groups, kv_heads, q.shape[2], q.shape[3])
+        k = k[:, :, None, :, :].expand(k.shape[0], kv_heads, groups, k.shape[2], k.shape[3])
+        v = v[:, :, None, :, :].expand(v.shape[0], kv_heads, groups, v.shape[2], v.shape[3])
+        scale = 1.0 / math.sqrt(q.shape[-1])
+        scores = torch.matmul(q.to(torch.float32), k.to(torch.float32).transpose(-1, -2))
+        scores = scores * scale
+        probs = torch.softmax(scores, dim=-1)
+        out_f32 = torch.matmul(probs, v.to(torch.float32))
+        return out_f32.to(torch.float16).reshape(q.shape)
 
 
 class Float8InputAttentionModule(torch.nn.Module):
@@ -115,15 +115,15 @@ def parse_args() -> argparse.Namespace:
         help="attention variant to export",
     )
     parser.add_argument("-b", "--batch", type=int, default=1, help="batch size")
-    parser.add_argument("--heads", type=int, default=4, help="number of heads")
+    parser.add_argument("--q-heads", type=int, default=4, help="number of heads")
     parser.add_argument(
         "--kv-heads",
         type=int,
         default=None,
-        help="number of KV heads for GQA variants (defaults to half of --heads when possible)",
+        help="number of KV heads for GQA variants (defaults to --q-heads)",
     )
     parser.add_argument("-s", "--seq-len", type=int, default=128, help="sequence length")
-    parser.add_argument("-d", "--dhead", type=int, default=64, help="head dimension")
+    parser.add_argument("-d", "--head-dim", type=int, default=64, help="head dimension")
     parser.add_argument(
         "--func-name",
         default="attention",
@@ -147,44 +147,35 @@ def _kv_heads(heads: int, kv_heads: int | None) -> int:
 
 
 def _build_module_and_args(
-    variant: AttentionVariant,
-    batch: int,
-    q_heads: int,
-    kv_heads: int | None,
-    seq_len: int,
-    dhead: int,
+    variant: AttentionVariant, batch: int, q_heads: int, kv_heads: int, seq_len: int, head_dim: int
 ) -> tuple[torch.nn.Module, tuple[torch.Tensor, ...]]:
-    dense_shape = (batch, q_heads, seq_len, dhead)
-
-    if variant == AttentionVariant.GLOBAL_ATTN:
-        module = AttentionModule().eval()
-        example_args = tuple(torch.randn(dense_shape, dtype=torch.float16) for _ in range(3))
-        return module, example_args
-
-    if variant == AttentionVariant.CAUSAL_ATTN:
-        q = torch.randn(dense_shape, dtype=torch.float16)
-        k = torch.randn(dense_shape, dtype=torch.float16)
-        v = torch.randn(dense_shape, dtype=torch.float16)
-        return CausalAttentionModule().eval(), (q, k, v)
+    q_shape = (batch, q_heads, seq_len, head_dim)
 
     if variant == AttentionVariant.GLOBAL_GQA:
-        resolved_kv_heads = _kv_heads(q_heads, kv_heads)
-        q = torch.randn(dense_shape, dtype=torch.float16)
-        kv_shape = (batch, resolved_kv_heads, seq_len, dhead)
+        q = torch.randn(q_shape, dtype=torch.float16)
+        kv_shape = (batch, kv_heads, seq_len, head_dim)
         k = torch.randn(kv_shape, dtype=torch.float16)
         v = torch.randn(kv_shape, dtype=torch.float16)
-        return ManualGQAAttentionModule().eval(), (q, k, v)
+        return GlobalGQAModule().eval(), (q, k, v)
+
+    if variant == AttentionVariant.GLOBAL_ATTN:
+        example_args = tuple(torch.randn(q_shape, dtype=torch.float16) for _ in range(3))
+        return GlobalAttentionModule(), example_args
+
+    if variant == AttentionVariant.CAUSAL_ATTN:
+        example_args = tuple(torch.randn(q_shape, dtype=torch.float16) for _ in range(3))
+        return CausalAttentionModule(), example_args
 
     if variant == AttentionVariant.FLOAT8_INPUTS:
-        q = torch.randn(dense_shape, dtype=torch.float32).to(torch.float8_e4m3fn)
-        k = torch.randn(dense_shape, dtype=torch.float32).to(torch.float8_e4m3fn)
-        v = torch.randn(dense_shape, dtype=torch.float32).to(torch.float8_e4m3fn)
+        q = torch.randn(q_shape, dtype=torch.float32).to(torch.float8_e4m3fn)
+        k = torch.randn(q_shape, dtype=torch.float32).to(torch.float8_e4m3fn)
+        v = torch.randn(q_shape, dtype=torch.float32).to(torch.float8_e4m3fn)
         return Float8InputAttentionModule().eval(), (q, k, v)
 
     if variant == AttentionVariant.FAKE_QUANT:
-        q = torch.randn(dense_shape, dtype=torch.float32)
-        k = torch.randn(dense_shape, dtype=torch.float32)
-        v = torch.randn(dense_shape, dtype=torch.float32)
+        q = torch.randn(q_shape, dtype=torch.float32)
+        k = torch.randn(q_shape, dtype=torch.float32)
+        v = torch.randn(q_shape, dtype=torch.float32)
         sq = torch.full((1, 1, 1, 1), 0.1, dtype=torch.float32)
         sk = torch.full((1, 1, 1, 1), 0.1, dtype=torch.float32)
         sv = torch.full((1, 1, 1, 1), 0.1, dtype=torch.float32)
@@ -207,16 +198,11 @@ def export_attention_linalg(
     q_heads: int = 4,
     kv_heads: int | None = None,
     seq_len: int = 128,
-    dhead: int = 64,
+    head_dim: int = 64,
     func_name: str = "attention",
 ) -> str:
     model, example_args = _build_module_and_args(
-        variant=variant,
-        batch=batch,
-        q_heads=q_heads,
-        kv_heads=kv_heads,
-        seq_len=seq_len,
-        dhead=dhead,
+        variant, batch, q_heads, kv_heads or q_heads, seq_len, head_dim
     )
     exported_program = torch.export.export(model, example_args)
     # Possible to control decomposition behavior by passing this `decomp_table` to
@@ -238,10 +224,10 @@ def main():
         export_attention_linalg(
             variant=args.variant,
             batch=args.batch,
-            q_heads=args.heads,
+            q_heads=args.q_heads,
             kv_heads=args.kv_heads,
             seq_len=args.seq_len,
-            dhead=args.dhead,
+            head_dim=args.head_dim,
             func_name=args.func_name,
         )
     )

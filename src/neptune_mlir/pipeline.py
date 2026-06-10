@@ -72,14 +72,14 @@ def _export_attention_linalg_subprocess(
     q_heads: int,
     kv_heads: int | None,
     seq_len: int,
-    dhead: int,
+    head_dim: int,
     func_name: str,
 ) -> str:
     # Torch-MLIR and the standalone MLIR Python bindings ship separate native
     # runtimes that cannot be loaded into one Python process in arbitrary order.
     cmd = [sys.executable, "-m", "neptune_mlir.operator.export_attention_linalg"]
-    cmd += ["--variant", variant.value, "--batch", str(batch), "--heads", str(q_heads)]
-    cmd += ["--seq-len", str(seq_len), "--dhead", str(dhead), "--func-name", func_name]
+    cmd += ["--variant", variant.value, "--batch", str(batch), "--q-heads", str(q_heads)]
+    cmd += ["--seq-len", str(seq_len), "--head-dim", str(head_dim), "--func-name", func_name]
     if kv_heads is not None:
         cmd.extend(["--kv-heads", str(kv_heads)])
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -139,7 +139,7 @@ def export_attention_to_triton_input_mlir(
     q_heads: int = 4,
     kv_heads: int | None = None,
     seq_len: int = 128,
-    dhead: int = 64,
+    head_dim: int = 64,
     func_name: str = "attention",
     tile_config: AttentionTileConfig | None = None,
     plugins: NeptunePlugins | None = None,
@@ -154,7 +154,7 @@ def export_attention_to_triton_input_mlir(
         q_heads=q_heads,
         kv_heads=kv_heads,
         seq_len=seq_len,
-        dhead=dhead,
+        head_dim=head_dim,
         func_name=func_name,
     )
     return lower_attention_linalg_to_triton_input_mlir(input_mlir, schedule, tile_config, plugins)

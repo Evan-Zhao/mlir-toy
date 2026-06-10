@@ -18,25 +18,25 @@ def make_attn_pytest_param(
 ):
     return pytest.param(
         variant,
-        {"batch": batch, "q_heads": qh, "kv_heads": kvh, "seq_len": seq_len, "dhead": dhead},
+        {"batch": batch, "q_heads": qh, "kv_heads": kvh, "seq_len": seq_len, "head_dim": dhead},
         id=f"{variant.value}-b{batch}-qh{qh}-kvh{kvh}-s{seq_len}-d{dhead}",
     )
 
 
 BATCHES = (1, 2)
 SEQ_LENS = (128, 1024, 16384)
-DHEADS = (64, 128)
+HEAD_DIMS = (64, 128)
 ATTN_HEADS = (2, 4)
 ATTN_VARIANTS = (AttentionVariant.GLOBAL_ATTN, AttentionVariant.CAUSAL_ATTN)
 GQA_HEADS = ((4, 2),)
 TRANSLATOR_INPUT_CASES = [
     make_attn_pytest_param(variant, batch, heads, heads, seq_len, hdim)
     for variant, batch, heads, seq_len, hdim in product(
-        ATTN_VARIANTS, BATCHES, ATTN_HEADS, SEQ_LENS, DHEADS
+        ATTN_VARIANTS, BATCHES, ATTN_HEADS, SEQ_LENS, HEAD_DIMS
     )
 ] + [
-    make_attn_pytest_param(AttentionVariant.GLOBAL_GQA, batch, q_heads, kv_heads, seq_len, dhead)
-    for batch, (q_heads, kv_heads), seq_len, dhead in product(BATCHES, GQA_HEADS, SEQ_LENS, DHEADS)
+    make_attn_pytest_param(AttentionVariant.GLOBAL_GQA, batch, q_heads, kv_heads, seq_len, hd)
+    for batch, (q_heads, kv_heads), seq_len, hd in product(BATCHES, GQA_HEADS, SEQ_LENS, HEAD_DIMS)
 ]
 
 
@@ -68,11 +68,7 @@ def test_export_attention_to_triton_input_mlir(variant, kwargs) -> None:
     plugins = require_plugins()
 
     lowered = export_attention_to_triton_input_mlir(
-        variant=variant,
-        seq_len=128,
-        dhead=64,
-        plugins=plugins,
-        **kwargs,
+        variant=variant, seq_len=128, head_dim=64, plugins=plugins, **kwargs
     )
 
     assert "func.func @attention" in lowered
@@ -91,7 +87,7 @@ def test_custom_tile_config_reaches_lowered_loop_bounds() -> None:
         variant=AttentionVariant.GLOBAL_ATTN,
         q_heads=2,
         seq_len=128,
-        dhead=64,
+        head_dim=64,
         tile_config=AttentionTileConfig(block_m=64, block_n=32),
         plugins=plugins,
     )
