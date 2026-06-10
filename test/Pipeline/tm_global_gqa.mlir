@@ -4,7 +4,7 @@
 // into a FlashAttention-like fused program with a `(group, head)` outer loop shape.
 
 !any = !transform.any_op
-#map = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d3, d4)>
+#map = affine_map<(d0, d1, d2, d3, d4) -> (d0, d2, d3, d4)>
 #map1 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>
 #map2 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3)>
 #map3 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, 0)>
@@ -22,13 +22,13 @@ module attributes {transform.with_named_sequence} {
 
   transform.named_sequence @match_4d_matmul_transb(%candidate: !any {transform.readonly}) -> !any {
     %matched = transform.match.ta.einsum %candidate
-        {equation = "b g h i d, b g j d -> b g h i j"} : (!any) -> !any
+        {equation = "b g h i d, b h j d -> b g h i j"} : (!any) -> !any
     transform.yield %matched : !any
   }
 
   transform.named_sequence @match_4d_matmul(%candidate: !any {transform.readonly}) -> !any {
     %matched = transform.match.ta.einsum %candidate
-        {equation = "b g h i j, b g j d -> b g h i d"} : (!any) -> !any
+        {equation = "b g h i j, b h j d -> b g h i d"} : (!any) -> !any
     transform.yield %matched : !any
   }
 

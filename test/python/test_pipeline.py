@@ -28,7 +28,7 @@ SEQ_LENS = (128, 1024, 16384)
 HEAD_DIMS = (64, 128)
 ATTN_HEADS = (2, 4)
 ATTN_VARIANTS = (AttentionVariant.GLOBAL_ATTN, AttentionVariant.CAUSAL_ATTN)
-GQA_HEADS = ((4, 2),)
+GQA_HEADS = ((4, 2), (4, 1))  # (4, 1) would be MQA
 TRANSLATOR_INPUT_CASES = [
     make_attn_pytest_param(variant, batch, heads, heads, seq_len, hdim)
     for variant, batch, heads, seq_len, hdim in product(

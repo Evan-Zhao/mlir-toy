@@ -50,8 +50,8 @@ class GlobalGQAModule(torch.nn.Module):
             raise ValueError(f"q heads ({q_heads}) must be divisible by kv heads ({kv_heads})")
         groups = q_heads // kv_heads
         q = q.reshape(q.shape[0], groups, kv_heads, q.shape[2], q.shape[3])
-        k = k[:, :, None, :, :].expand(k.shape[0], kv_heads, groups, k.shape[2], k.shape[3])
-        v = v[:, :, None, :, :].expand(v.shape[0], kv_heads, groups, v.shape[2], v.shape[3])
+        k = k[:, None, :, :, :].expand(k.shape[0], groups, kv_heads, k.shape[2], k.shape[3])
+        v = v[:, None, :, :, :].expand(v.shape[0], groups, kv_heads, v.shape[2], v.shape[3])
         scale = 1.0 / math.sqrt(q.shape[-1])
         scores = torch.matmul(q.to(torch.float32), k.to(torch.float32).transpose(-1, -2))
         scores = scores * scale
