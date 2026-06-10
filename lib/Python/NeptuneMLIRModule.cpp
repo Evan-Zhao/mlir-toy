@@ -16,14 +16,10 @@ MlirContext contextFromPython(PyObject *context) {
   PyObject *capsule = PyObject_GetAttrString(context, "_CAPIPtr");
   if (!capsule)
     return MlirContext{nullptr};
-  void *ptr = PyCapsule_GetPointer(capsule, "torch_mlir.ir.Context._CAPIPtr");
-  if (!ptr) {
-    PyErr_Clear();
-    ptr = PyCapsule_GetPointer(capsule, "mlir.ir.Context._CAPIPtr");
-  }
+  void *ptr = PyCapsule_GetPointer(capsule, "mlir.ir.Context._CAPIPtr");
   Py_DECREF(capsule);
   if (!ptr) {
-    PyErr_SetString(PyExc_TypeError, "expected an mlir.ir.Context or torch_mlir.ir.Context");
+    PyErr_SetString(PyExc_TypeError, "expected an mlir.ir.Context object");
     return MlirContext{nullptr};
   }
   return MlirContext{ptr};

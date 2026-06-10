@@ -53,13 +53,16 @@ find_package(MLIR REQUIRED CONFIG)
 if(NEPTUNE_MLIR_BUILD_PYTHON_EXTENSIONS)
   execute_process(
     COMMAND "${Python3_EXECUTABLE}" -c
-            "import pathlib, torch_mlir._mlir_libs as libs; print(pathlib.Path(libs.__file__).resolve().parent)"
-    OUTPUT_VARIABLE TORCH_MLIR_LIB_DIR
+            "import pathlib, mlir._mlir_libs as libs; print(pathlib.Path(libs.__file__).resolve().parent)"
+    OUTPUT_VARIABLE MLIR_PYTHON_LIB_DIR
     OUTPUT_STRIP_TRAILING_WHITESPACE
-    RESULT_VARIABLE _TORCH_MLIR_LIB_QUERY_RESULT
+    RESULT_VARIABLE _NEPTUNE_MLIR_PYTHON_LIB_QUERY_RESULT
+    ERROR_VARIABLE _NEPTUNE_MLIR_PYTHON_LIB_QUERY_ERROR
   )
-  if(NOT _TORCH_MLIR_LIB_QUERY_RESULT EQUAL 0)
-    message(WARNING "Could not determine Torch-MLIR library directory, Python extension may fail to load")
+  if(NOT _NEPTUNE_MLIR_PYTHON_LIB_QUERY_RESULT EQUAL 0)
+    message(FATAL_ERROR
+      "Failed to locate MLIR Python runtime using Python interpreter "
+      "'${Python3_EXECUTABLE}': ${_NEPTUNE_MLIR_PYTHON_LIB_QUERY_ERROR}")
   endif()
 endif()
 
@@ -67,6 +70,9 @@ message(STATUS "Using Python3: ${Python3_EXECUTABLE}")
 message(STATUS "Using pybind11 CMake package in: ${pybind11_DIR}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
+if(NEPTUNE_MLIR_BUILD_PYTHON_EXTENSIONS)
+  message(STATUS "Using MLIR Python runtime in: ${MLIR_PYTHON_LIB_DIR}")
+endif()
 
 list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
@@ -207,19 +213,14 @@ function(make_mlir_python_extension)
   cmake_parse_arguments(ARG "" "TARGET" "SOURCES;DEPS" ${ARGN})
   Python3_add_library(${ARG_TARGET} MODULE WITH_SOABI ${ARG_SOURCES})
 
-  # The extension resolves MLIR symbols from the Python MLIR runtime loaded by
-  # torch_mlir/mlir. Link Torch-MLIR's aggregate CAPI when available so dynamic
-  # loaders can find that runtime without relying on global symbol visibility.
-  if (TORCH_MLIR_LIB_DIR)
-    target_link_libraries(${ARG_TARGET} PRIVATE
-      "${TORCH_MLIR_LIB_DIR}/libTorchMLIRAggregateCAPI${CMAKE_SHARED_LIBRARY_SUFFIX}"
-      "${TORCH_MLIR_LIB_DIR}/libMLIRPythonSupport-torch_mlir${CMAKE_SHARED_LIBRARY_SUFFIX}"
-    )
-    set_target_properties(${ARG_TARGET} PROPERTIES
-      BUILD_RPATH "${TORCH_MLIR_LIB_DIR}"
-      INSTALL_RPATH "${TORCH_MLIR_LIB_DIR}"
-    )
-  endif()
+  target_link_libraries(${ARG_TARGET} PRIVATE
+    "${MLIR_PYTHON_LIB_DIR}/libMLIRPythonCAPI${CMAKE_SHARED_LIBRARY_SUFFIX}"
+    "${MLIR_PYTHON_LIB_DIR}/libMLIRPythonSupport-mlir${CMAKE_SHARED_LIBRARY_SUFFIX}"
+  )
+  set_target_properties(${ARG_TARGET} PROPERTIES
+    BUILD_RPATH "${MLIR_PYTHON_LIB_DIR}"
+    INSTALL_RPATH "${MLIR_PYTHON_LIB_DIR}"
+  )
   add_dependencies(${ARG_TARGET} ${ARG_DEPS})
   setup_mlir_target(${ARG_TARGET})
   set_target_properties(${ARG_TARGET} PROPERTIES
