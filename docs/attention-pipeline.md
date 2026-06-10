@@ -4,6 +4,8 @@ This document describes how an attention program is lowered from algorithmic att
 languages like Triton. Each stage in the pipeline has its own design documents, which this
 document links to and summarizes. The integrated example for attention lowering is at
 [`test/Pipeline/tm_global_attention.mlir`](../test/Pipeline/tm_global_attention.mlir).
+Potential next attention variants are tracked in the
+[attention variant roadmap](attention-variants.md).
 
 ## Pipeline Overview
 
