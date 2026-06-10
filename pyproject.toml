@@ -12,6 +12,7 @@ dependencies = ["sympy>=1.14"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+export = ["torch", "torch-mlir"]
 
 [project.scripts]
 neptune-triton = "neptune_mlir.translators.triton:main"

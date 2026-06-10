@@ -9,10 +9,11 @@ Usage:
 
 import argparse
 import math
-from enum import Enum
 
 import torch
 from torch_mlir import fx
+
+from neptune_mlir.operator.variants import VARIANTS, AttentionVariant
 
 
 class AttentionModule(torch.nn.Module):
@@ -102,21 +103,6 @@ def _module_to_text(module) -> str:
     if op is not None and hasattr(op, "get_asm"):
         return op.get_asm()
     return str(module)
-
-
-class AttentionVariant(str, Enum):
-    GLOBAL_ATTN = "global-attn"
-    CAUSAL_ATTN = "causal-attn"
-    GLOBAL_GQA = "global-gqa"
-    FLOAT8_INPUTS = "float8-inputs"
-    FAKE_QUANT = "fake-quant"
-    SPARSE_MM = "sparse-mm"
-
-    def __str__(self) -> str:
-        return self.value
-
-
-VARIANTS = tuple(AttentionVariant)
 
 
 def parse_args() -> argparse.Namespace:

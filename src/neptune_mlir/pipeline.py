@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from .operator.export_attention_linalg import AttentionVariant, export_attention_linalg
+from .operator.variants import AttentionVariant
 from .plugin import NeptunePlugins, find_neptune_plugins
 from .schedules import (
     AttentionSchedule,
@@ -115,6 +115,8 @@ def export_attention_to_triton_input_mlir(
     tile_config: AttentionTileConfig | None = None,
     plugins: NeptunePlugins | None = None,
 ) -> str:
+    from .operator.export_attention_linalg import export_attention_linalg
+
     variant = _coerce_attention_variant(variant)
     schedule = _VARIANT_TO_SCHEDULE.get(variant.value)
     if schedule is None:
@@ -146,8 +148,6 @@ def lower_attention_linalg_to_triton_ast(
 
 
 def _coerce_attention_variant(variant):
-    from .operator.export_attention_linalg import AttentionVariant
-
     if isinstance(variant, AttentionVariant):
         return variant
     try:

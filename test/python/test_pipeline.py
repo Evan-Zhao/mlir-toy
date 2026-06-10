@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from neptune_mlir.operator.export_attention_linalg import AttentionVariant
+from neptune_mlir.operator.variants import AttentionVariant
 from neptune_mlir.pipeline import (
     attention_to_triton_input_pass_pipeline,
     export_attention_to_triton_input_mlir,
@@ -46,6 +46,15 @@ def require_plugins():
     return plugins
 
 
+def require_export_deps():
+    import importlib.util
+
+    if importlib.util.find_spec("torch") is None:
+        pytest.skip("PyTorch is required for attention export tests")
+    if importlib.util.find_spec("torch_mlir") is None:
+        pytest.skip("Torch-MLIR is required for attention export tests")
+
+
 @pytest.mark.parametrize(
     ("variant", "kwargs"),
     [
@@ -55,6 +64,7 @@ def require_plugins():
     ],
 )
 def test_export_attention_to_triton_input_mlir(variant, kwargs) -> None:
+    require_export_deps()
     plugins = require_plugins()
 
     lowered = export_attention_to_triton_input_mlir(
@@ -74,6 +84,7 @@ def test_export_attention_to_triton_input_mlir(variant, kwargs) -> None:
 
 
 def test_custom_tile_config_reaches_lowered_loop_bounds() -> None:
+    require_export_deps()
     plugins = require_plugins()
 
     lowered = export_attention_to_triton_input_mlir(
@@ -92,6 +103,7 @@ def test_custom_tile_config_reaches_lowered_loop_bounds() -> None:
 
 @pytest.mark.parametrize(("variant", "kwargs"), TRANSLATOR_INPUT_CASES)
 def test_lowered_attention_full_pipeline(variant, kwargs) -> None:
+    require_export_deps()
     from neptune_mlir.translators.triton import translate_mlir_text
 
     lowered = export_attention_to_triton_input_mlir(variant=variant, **kwargs)
