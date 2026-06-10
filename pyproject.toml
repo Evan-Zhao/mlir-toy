@@ -14,6 +14,9 @@ dependencies = ["sympy>=1.14"]
 dev = ["pytest>=8.0"]
 export = ["torch", "torch-mlir"]
 
+[project.scripts]
+neptune-export-attn = "neptune_mlir.operator.export_attention_linalg:main"
+
 [tool.scikit-build]
 cmake.version = ">=3.20"
 wheel.packages = ["src/neptune_mlir"]
