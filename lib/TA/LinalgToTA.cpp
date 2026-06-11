@@ -15,13 +15,9 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
-#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
-
-#include <memory>
-#include <optional>
-#include <string>
 
 namespace ta {
 
@@ -29,307 +25,31 @@ using namespace mlir;
 
 namespace {
 
-using AxisPack = SmallVector<std::string, 2>;
-using TensorAxes = SmallVector<AxisPack, 4>;
-using AxisId = unsigned;
-using AxisIdPack = SmallVector<AxisId, 2>;
-using TensorAxisIds = SmallVector<AxisIdPack, 4>;
-
-static RankedTensorType rankedTensor(Type type) { return dyn_cast<RankedTensorType>(type); }
-
-static TypedAttr splatScalarConstant(arith::ConstantOp constant) {
-  auto elements = dyn_cast<DenseElementsAttr>(constant.getValue());
-  if (!elements || !elements.isSplat())
-    return {};
-  return dyn_cast<TypedAttr>(elements.getSplatValue<Attribute>());
-}
-
-static SmallVector<std::string> flattenAxes(const TensorAxes &axes) {
-  SmallVector<std::string> flat;
-  for (const AxisPack &pack : axes)
-    flat.append(pack.begin(), pack.end());
-  return flat;
-}
-
-class ScopedTABuilder {
-public:
-  ScopedTABuilder(OpBuilder &builder, Location loc, RankedTensorType resultType)
-      : context(builder.getContext()), loc(loc), indexType(builder.getIndexType()) {
-    scope = ScopeOp::create(builder, loc, resultType, ValueRange{}, getAxes({}),
-                            DenseI64ArrayAttr::get(context, {}));
-    Block *body = new Block();
-    scope.getBody().push_back(body);
-    bodyBuilder = std::make_unique<OpBuilder>(context);
-    bodyBuilder->setInsertionPointToStart(body);
-  }
-
-  ScopeOp getScope() const { return scope; }
-
-  OpBuilder &builder() { return *bodyBuilder; }
-
-  ArrayRef<std::string> getScopeAxisNames() const { return axisNames; }
-
-  void setImportGroup(std::optional<int64_t> group) { importGroup = group; }
-
-  std::optional<int64_t> getImportGroup() const { return importGroup; }
-
-  std::string createAxis(StringRef prefix, int64_t extent = ShapedType::kDynamic) {
-    std::string name;
-    do {
-      name = (prefix + std::to_string(nextAxis++)).str();
-    } while (axisValues.contains(name));
-    addAxis(name, extent);
-    return name;
-  }
-
-  Value axis(StringRef name, int64_t extent = ShapedType::kDynamic) {
-    auto it = axisValues.find(name);
-    if (it != axisValues.end())
-      return it->second;
-    addAxis(name.str(), extent);
-    return axisValues.lookup(name);
-  }
-
-  AxesAttr getAxes(ArrayRef<std::string> names) const {
-    SmallVector<Attribute> axes;
-    DenseSet<StringRef> seen;
-    for (StringRef name : names) {
-      if (!seen.insert(name).second)
-        continue;
-      axes.push_back(AxisAttr::get(context, name));
-    }
-    return AxesAttr::get(context, ArrayAttr::get(context, axes));
-  }
-
-  ExprType expr(Type elementType, ArrayRef<std::string> axes) const {
-    return ExprType::get(context, elementType, getAxes(axes));
-  }
-
-  SmallVector<std::string> unionAxes(ValueRange operands) const {
-    DenseSet<StringRef> seen;
-    SmallVector<std::string> result;
-    for (Value operand : operands) {
-      auto exprType = cast<ExprType>(operand.getType());
-      for (Attribute attr : exprType.getAxes().getAxes()) {
-        auto axis = cast<AxisAttr>(attr);
-        StringRef name = axis.getName().getValue();
-        if (!seen.insert(name).second)
-          continue;
-        result.push_back(name.str());
-      }
-    }
-    return result;
-  }
-
-  FailureOr<Value> at(Value source, const TensorAxes &dimAxes, Type elementType) {
-    SmallVector<Value> indices;
-    for (const AxisPack &pack : dimAxes) {
-      if (pack.empty()) {
-        indices.push_back(indexZero());
-        continue;
-      }
-      if (pack.size() == 1) {
-        indices.push_back(axis(pack.front()));
-        continue;
-      }
-
-      SmallVector<Value> multiIndex;
-      SmallVector<int64_t> basis;
-      for (StringRef axisName : pack) {
-        int64_t extent = axisExtent(axisName);
-        if (extent == ShapedType::kDynamic)
-          return emitError(loc) << "cannot linearize multiple dynamic logical axes into "
-                                << "one tensor dimension";
-        multiIndex.push_back(axis(axisName));
-        basis.push_back(extent);
-      }
-      indices.push_back(
-          affine::AffineLinearizeIndexOp::create(builder(), loc, multiIndex, basis,
-                                                 /*disjoint=*/true));
-    }
-
-    SmallVector<std::string> resultAxes = flattenAxes(dimAxes);
-    auto op = AtOp::create(builder(), loc, expr(elementType, resultAxes), source, indices);
-    annotate(op);
-    return op.getResult();
-  }
-
-  Value constant(TypedAttr value) {
-    auto op = ConstantOp::create(builder(), loc, expr(value.getType(), {}), value);
-    annotate(op);
-    return op.getResult();
-  }
-
-  Value index(StringRef axisName, Type elementType = Type()) {
-    if (!elementType)
-      elementType = indexType;
-    auto op = IndexOp::create(builder(), loc, expr(elementType, {axisName.str()}), axis(axisName));
-    annotate(op);
-    return op.getResult();
-  }
-
-  Value cmpi(arith::CmpIPredicate predicate, Value lhs, Value rhs) {
-    SmallVector<std::string> axes = unionAxes({lhs, rhs});
-    auto op =
-        CmpIOp::create(builder(), loc, expr(IntegerType::get(context, 1), axes), predicate, lhs,
-                       rhs);
-    annotate(op);
-    return op.getResult();
-  }
-
-  Value select(Value condition, Value trueValue, Value falseValue) {
-    SmallVector<std::string> axes = unionAxes({trueValue, falseValue, condition});
-    auto trueType = cast<ExprType>(trueValue.getType());
-    auto op = SelectOp::create(builder(), loc, expr(trueType.getElementType(), axes), condition,
-                               trueValue, falseValue);
-    annotate(op);
-    return op.getResult();
-  }
-
-  template <typename OpTy> Value unary(Type elementType, Value input) {
-    SmallVector<std::string> axes = unionAxes({input});
-    auto op = OpTy::create(builder(), loc, expr(elementType, axes), input);
-    annotate(op);
-    return op.getResult();
-  }
-
-  template <typename OpTy> Value binary(Type elementType, Value lhs, Value rhs) {
-    SmallVector<std::string> axes = unionAxes({lhs, rhs});
-    auto op = OpTy::create(builder(), loc, expr(elementType, axes), lhs, rhs);
-    annotate(op);
-    return op.getResult();
-  }
-
-  Value reduce(ReduceKind kind, Value input, ArrayRef<std::string> reductionAxes, Type elementType,
-               ArrayRef<std::string> resultAxes) {
-    auto op = ReduceOp::create(builder(), loc, expr(elementType, resultAxes), kind, input, Value(),
-                               getAxes(reductionAxes));
-    annotate(op);
-    return op.getResult();
-  }
-
-  void yield(Value value) { YieldOp::create(builder(), loc, value); }
-
-private:
-  void annotate(Operation *op) const {
-    if (!importGroup)
-      return;
-    op->setAttr("ta.import_group", IntegerAttr::get(IntegerType::get(context, 64), *importGroup));
-  }
-
-  void addAxis(const std::string &name, int64_t extent) {
-    if (axisValues.contains(name))
-      return;
-
-    Block &body = scope.getBody().front();
-    BlockArgument arg = body.addArgument(indexType, loc);
-    axisNames.push_back(name);
-    staticExtents.push_back(extent);
-    axisValues.try_emplace(axisNames.back(), arg);
-    scope.setAxesAttr(getAxes(axisNames));
-    scope.setStaticExtentsAttr(DenseI64ArrayAttr::get(context, staticExtents));
-  }
-
-  int64_t axisExtent(StringRef name) const {
-    for (auto [axisName, extent] : llvm::zip_equal(axisNames, staticExtents)) {
-      if (axisName == name)
-        return extent;
-    }
-    return ShapedType::kDynamic;
-  }
-
-  Value indexZero() {
-    if (zero)
-      return zero;
-    OpBuilder::InsertionGuard guard(builder());
-    builder().setInsertionPointToStart(&scope.getBody().front());
-    zero = arith::ConstantIndexOp::create(builder(), loc, 0);
-    return zero;
-  }
-
-  MLIRContext *context;
-  Location loc;
-  Type indexType;
-  ScopeOp scope;
-  SmallVector<std::string> axisNames;
-  SmallVector<int64_t> staticExtents;
-  llvm::StringMap<Value> axisValues;
-  std::unique_ptr<OpBuilder> bodyBuilder;
-  Value zero;
-  std::optional<int64_t> importGroup;
-  unsigned nextAxis = 0;
+struct Axis {
+  std::string name;
+  int64_t extent = ShapedType::kDynamic;
 };
 
-class FunctionImporter {
+using AxisPack = SmallVector<Axis, 2>;
+using TensorAxes = SmallVector<AxisPack, 4>;
+
+template <typename IdT> class AxisUnionFind {
 public:
-  FunctionImporter(func::FuncOp func, func::ReturnOp returnOp)
-      : func(func), returnOp(returnOp), insertionBuilder(returnOp) {
-    ta = std::make_unique<ScopedTABuilder>(insertionBuilder, func.getLoc(),
-                                           rankedTensor(func.getResultTypes().front()));
-  }
-
-  LogicalResult run() {
-    if (func.getNumResults() != 1 || returnOp.getNumOperands() != 1)
-      return func.emitOpError("ta importer currently expects one function result");
-
-    auto resultType = rankedTensor(func.getResultTypes().front());
-    if (!resultType)
-      return func.emitOpError("ta importer expects a ranked tensor result");
-
-    if (failed(discoverAxes(resultType)))
-      return failure();
-
-    if (failed(discoverAxisExtents()))
-      return failure();
-
-    canonicalizeFinalAxisNames();
-    materializeScopeAxes();
-
-    if (failed(emitForward()))
-      return failure();
-
-    Value expr = lookupTensorExpr(returnOp.getOperand(0));
-    if (!expr)
-      return emitError(returnOp.getLoc()) << "failed to translate returned tensor";
-
-    ta->yield(expr);
-    returnOp.getOperation()->setOperands(ta->getScope().getResult());
-    eraseUnusedScopeOps();
-    return success();
-  }
-
-  ScopeOp getScope() const { return ta->getScope(); }
-
-private:
-  class ImportGroupGuard {
-  public:
-    ImportGroupGuard(ScopedTABuilder &ta, std::optional<int64_t> group)
-        : ta(ta), oldGroup(ta.getImportGroup()) {
-      ta.setImportGroup(group);
-    }
-    ~ImportGroupGuard() { ta.setImportGroup(oldGroup); }
-
-  private:
-    ScopedTABuilder &ta;
-    std::optional<int64_t> oldGroup;
-  };
-
-  AxisId newAxis(char prefix) {
-    AxisId id = parents.size();
+  IdT add() {
+    IdT id = parents.size();
     parents.push_back(id);
-    axisNames.push_back(prefix + std::to_string(id));
     return id;
   }
 
-  AxisId find(AxisId id) {
-    AxisId parent = parents[id];
+  IdT find(IdT id) {
+    IdT parent = parents[id];
     if (parent == id)
       return id;
     parents[id] = find(parent);
     return parents[id];
   }
 
-  void unite(AxisId lhs, AxisId rhs) {
+  void unite(IdT lhs, IdT rhs) {
     lhs = find(lhs);
     rhs = find(rhs);
     if (lhs == rhs)
@@ -337,6 +57,53 @@ private:
     if (lhs > rhs)
       std::swap(lhs, rhs);
     parents[rhs] = lhs;
+  }
+
+  SmallVector<IdT> getUniqueRoots() {
+    DenseSet<IdT> seen;
+    SmallVector<IdT> roots;
+    for (IdT id = 0, e = parents.size(); id < e; ++id) {
+      IdT root = find(id);
+      if (seen.insert(root).second)
+        roots.push_back(root);
+    }
+    return roots;
+  }
+
+  size_t size() const { return parents.size(); }
+
+private:
+  SmallVector<IdT> parents;
+};
+
+struct FunctionAxisInfo {
+  DenseMap<Value, TensorAxes> valueAxes;
+  DenseMap<linalg::GenericOp, TensorAxes> loopAxisMap;
+  SmallVector<Axis> scopeAxes;
+};
+
+class FunctionAxisDiscovery {
+  using AxisId = unsigned;
+  using AxisIdPack = SmallVector<AxisId, 2>;
+  using TensorAxisIds = SmallVector<AxisIdPack, 4>;
+
+public:
+  FunctionAxisDiscovery(func::FuncOp func, func::ReturnOp returnOp)
+      : func(func), returnOp(returnOp) {}
+
+  FailureOr<FunctionAxisInfo> run(RankedTensorType resultType) {
+    if (failed(discoverAxes(resultType)))
+      return failure();
+    if (failed(discoverAxisExtents()))
+      return failure();
+    return canonicalizeAndBuildInfo();
+  }
+
+private:
+  AxisId newAxis(char prefix) {
+    AxisId id = axisUnions.add();
+    axes.push_back(Axis{.name = prefix + std::to_string(id)});
+    return id;
   }
 
   TensorAxisIds makeResultAxes(RankedTensorType type) {
@@ -356,12 +123,12 @@ private:
     if (existing.size() != desired.size())
       return false;
     for (auto [lhs, rhs] : zip_equal(existing, desired))
-      unite(lhs, rhs);
+      axisUnions.unite(lhs, rhs);
     return false;
   }
 
   FailureOr<bool> mergeValueAxes(Value value, const TensorAxisIds &desired) {
-    auto type = rankedTensor(value.getType());
+    auto type = dyn_cast<RankedTensorType>(value.getType());
     if (!type)
       return emitError(value.getLoc()) << "expected ranked tensor value";
     if (static_cast<int64_t>(desired.size()) != type.getRank())
@@ -373,13 +140,6 @@ private:
     for (auto [axis, desiredAxis] : zip_equal(existing, desired))
       changed |= mergeAxisPack(axis, desiredAxis);
     return changed;
-  }
-
-  FailureOr<TensorAxisIds> getKnownAxes(Value value) {
-    auto it = valueAxes.find(value);
-    if (it == valueAxes.end())
-      return emitError(value.getLoc()) << "missing discovered axes for tensor value";
-    return it->second;
   }
 
   FailureOr<TensorAxisIds> sourceAxesForCollapse(tensor::CollapseShapeOp op,
@@ -412,18 +172,17 @@ private:
   }
 
   FailureOr<bool> discoverGenericAxes(linalg::GenericOp op) {
-    linalg::LinalgOp linalgOp = cast<linalg::LinalgOp>(op.getOperation());
-    SmallVector<AffineMap> maps = linalgOp.getIndexingMapsArray();
-    SmallVector<utils::IteratorType> iterators = linalgOp.getIteratorTypesArray();
+    SmallVector<AffineMap> maps = op.getIndexingMapsArray();
+    SmallVector<utils::IteratorType> iterators = op.getIteratorTypesArray();
     unsigned numInputs = op.getInputs().size();
 
-    auto &loopAxes = loopAxisMap[op.getOperation()];
+    auto &loopAxes = loopAxisMap[op];
     if (loopAxes.empty())
       loopAxes.resize(iterators.size());
 
     bool changed = false;
     for (auto [resultNumber, result] : llvm::enumerate(op->getResults())) {
-      auto resultType = rankedTensor(result.getType());
+      auto resultType = dyn_cast<RankedTensorType>(result.getType());
       if (!resultType)
         continue;
 
@@ -446,7 +205,7 @@ private:
     }
 
     for (auto [index, input] : llvm::enumerate(op.getInputs())) {
-      if (rankedTensor(input.getType())) {
+      if (dyn_cast<RankedTensorType>(input.getType())) {
         FailureOr<TensorAxisIds> axes = projectMap(op, maps[index], loopAxes);
         if (failed(axes))
           return failure();
@@ -466,37 +225,27 @@ private:
     if (failed(changed))
       return failure();
 
+#define HANDLE_SHAPE_OP(Type, op, handler)                                                         \
+  if (auto shapeOp = dyn_cast<Type>(&(op))) {                                                      \
+    auto it = valueAxes.find(shapeOp.getResult());                                                 \
+    if (it == valueAxes.end())                                                                     \
+      continue;                                                                                    \
+    FailureOr<TensorAxisIds> sourceAxes = handler(shapeOp, it->second);                            \
+    if (failed(sourceAxes))                                                                        \
+      return failure();                                                                            \
+    FailureOr<bool> sourceChanged = mergeValueAxes(shapeOp.getSrc(), *sourceAxes);                 \
+    if (failed(sourceChanged))                                                                     \
+      return failure();                                                                            \
+    keepGoing |= *sourceChanged;                                                                   \
+    continue;                                                                                      \
+  }
+
     bool keepGoing = true;
     while (keepGoing) {
       keepGoing = false;
       for (Operation &op : llvm::reverse(func.front().without_terminator())) {
-        if (auto collapse = dyn_cast<tensor::CollapseShapeOp>(&op)) {
-          auto it = valueAxes.find(collapse.getResult());
-          if (it == valueAxes.end())
-            continue;
-          FailureOr<TensorAxisIds> sourceAxes = sourceAxesForCollapse(collapse, it->second);
-          if (failed(sourceAxes))
-            return failure();
-          FailureOr<bool> sourceChanged = mergeValueAxes(collapse.getSrc(), *sourceAxes);
-          if (failed(sourceChanged))
-            return failure();
-          keepGoing |= *sourceChanged;
-          continue;
-        }
-
-        if (auto expand = dyn_cast<tensor::ExpandShapeOp>(&op)) {
-          auto it = valueAxes.find(expand.getResult());
-          if (it == valueAxes.end())
-            continue;
-          FailureOr<TensorAxisIds> sourceAxes = sourceAxesForExpand(expand, it->second);
-          if (failed(sourceAxes))
-            return failure();
-          FailureOr<bool> sourceChanged = mergeValueAxes(expand.getSrc(), *sourceAxes);
-          if (failed(sourceChanged))
-            return failure();
-          keepGoing |= *sourceChanged;
-          continue;
-        }
+        HANDLE_SHAPE_OP(tensor::CollapseShapeOp, op, sourceAxesForCollapse);
+        HANDLE_SHAPE_OP(tensor::ExpandShapeOp, op, sourceAxesForExpand);
 
         if (auto generic = dyn_cast<linalg::GenericOp>(&op)) {
           FailureOr<bool> genericChanged = discoverGenericAxes(generic);
@@ -508,115 +257,6 @@ private:
     }
 
     return success();
-  }
-
-  FailureOr<Value> emitGeneric(linalg::GenericOp op, unsigned resultNumber) {
-    ImportGroupGuard guard(*ta, getImportGroup(op));
-
-    linalg::LinalgOp linalgOp = cast<linalg::LinalgOp>(op.getOperation());
-    SmallVector<utils::IteratorType> iterators = linalgOp.getIteratorTypesArray();
-    unsigned numInputs = op.getInputs().size();
-    TensorAxes resultAxes = canonicalize(valueAxes.lookup(op->getResult(resultNumber)));
-    TensorAxes loopAxes = canonicalize(loopAxisMap.lookup(op.getOperation()));
-
-    SmallVector<Value> inputExprs;
-    inputExprs.reserve(numInputs);
-    for (Value input : op.getInputs()) {
-      if (rankedTensor(input.getType())) {
-        FailureOr<Value> expr = getTensorExpr(input);
-        if (failed(expr))
-          return failure();
-        inputExprs.push_back(*expr);
-      } else {
-        DenseMap<Value, Value> emptyEnv;
-        FailureOr<Value> expr = translateScalar(input, emptyEnv, loopAxes);
-        if (failed(expr))
-          return failure();
-        inputExprs.push_back(*expr);
-      }
-    }
-
-    Block &block = op.getRegion().front();
-    auto yield = dyn_cast<linalg::YieldOp>(block.getTerminator());
-    if (!yield || yield.getNumOperands() <= resultNumber)
-      return op.emitOpError("expected linalg.yield for result");
-
-    DenseMap<Value, Value> env;
-    for (auto [arg, expr] : zip_equal(block.getArguments().take_front(numInputs), inputExprs)) {
-      env[arg] = expr;
-    }
-
-    SmallVector<std::string> reductionAxes;
-    for (auto [index, iterator] : enumerate(iterators)) {
-      if (iterator == utils::IteratorType::reduction)
-        reductionAxes.append(loopAxes[index].begin(), loopAxes[index].end());
-    }
-
-    SmallVector<std::string> flatResultAxes = flattenAxes(resultAxes);
-    Value yielded = yield.getOperand(resultNumber);
-    if (reductionAxes.empty())
-      return translateScalar(yielded, env, loopAxes);
-
-    FailureOr<std::pair<ReduceKind, Value>> combiner =
-        peelReductionCombiner(op, yielded, block.getArguments().drop_front(numInputs));
-    if (failed(combiner))
-      return failure();
-
-    FailureOr<Value> payload = translateScalar(combiner->second, env, loopAxes);
-    if (failed(payload))
-      return failure();
-
-    Type elementType = rankedTensor(op->getResult(resultNumber).getType()).getElementType();
-    return ta->reduce(combiner->first, *payload, reductionAxes, elementType, flatResultAxes);
-  }
-
-  LogicalResult emitForward() {
-    for (Operation &op : func.front().without_terminator()) {
-      if (isa<arith::ConstantOp, tensor::EmptyOp, ScopeOp>(&op))
-        continue;
-
-      if (auto collapse = dyn_cast<tensor::CollapseShapeOp>(&op)) {
-        FailureOr<Value> expr = getTensorExpr(collapse.getSrc());
-        if (failed(expr))
-          return failure();
-        valueMap[collapse.getResult()] = *expr;
-        continue;
-      }
-
-      if (auto expand = dyn_cast<tensor::ExpandShapeOp>(&op)) {
-        FailureOr<Value> expr = getTensorExpr(expand.getSrc());
-        if (failed(expr))
-          return failure();
-        valueMap[expand.getResult()] = *expr;
-        continue;
-      }
-
-      if (auto generic = dyn_cast<linalg::GenericOp>(&op)) {
-        for (auto [resultNumber, result] : llvm::enumerate(generic->getResults())) {
-          if (!rankedTensor(result.getType()))
-            continue;
-          if (!valueAxes.contains(result))
-            continue;
-          FailureOr<Value> expr = emitGeneric(generic, resultNumber);
-          if (failed(expr))
-            return failure();
-          valueMap[result] = *expr;
-        }
-        continue;
-      }
-
-      if (llvm::any_of(op.getResults(), [](Value value) { return rankedTensor(value.getType()); }))
-        return op.emitOpError("unsupported tensor producer for ta import");
-    }
-
-    return success();
-  }
-
-  int64_t getImportGroup(linalg::GenericOp op) {
-    auto [it, inserted] = importGroups.try_emplace(op.getOperation(), nextImportGroup);
-    if (inserted)
-      ++nextImportGroup;
-    return it->second;
   }
 
   LogicalResult assignLoopAxesFromOutputMap(Operation *op, AffineMap map,
@@ -654,96 +294,396 @@ private:
     return axes;
   }
 
-  TensorAxes canonicalize(const TensorAxisIds &ids) {
-    TensorAxes axes;
-    for (const AxisIdPack &pack : ids) {
-      AxisPack canonicalPack;
-      for (AxisId id : pack)
-        canonicalPack.push_back(axisNames[find(id)]);
-      axes.push_back(canonicalPack);
-    }
-    return axes;
-  }
-
-  void canonicalizeFinalAxisNames() {
-    DenseSet<AxisId> seen;
+  FunctionAxisInfo canonicalizeAndBuildInfo() {
     unsigned nextElementwise = 0;
     unsigned nextReduction = 0;
     unsigned nextOther = 0;
-
-    for (AxisId id = 0, e = parents.size(); id < e; ++id) {
-      AxisId root = find(id);
-      if (!seen.insert(root).second)
-        continue;
-
-      switch (axisNames[root].front()) {
+    SmallVector<Axis> scopeAxes;
+    for (AxisId root : axisUnions.getUniqueRoots()) {
+      auto &axisName = axes[root].name;
+      switch (axisName.front()) {
       case 'i':
-        axisNames[root] = "i" + std::to_string(nextElementwise++);
+        axisName = "i" + std::to_string(nextElementwise++);
         break;
       case 'r':
-        axisNames[root] = "r" + std::to_string(nextReduction++);
+        axisName = "r" + std::to_string(nextReduction++);
         break;
       default:
-        axisNames[root] = "x" + std::to_string(nextOther++);
+        axisName = "x" + std::to_string(nextOther++);
         break;
       }
+      scopeAxes.push_back(axes[root]);
     }
-  }
 
-  void materializeScopeAxes() {
-    DenseSet<AxisId> seen;
-    for (AxisId id = 0, e = parents.size(); id < e; ++id) {
-      AxisId root = find(id);
-      if (!seen.insert(root).second)
-        continue;
-      auto extent = axisExtents.find(root);
-      ta->axis(axisNames[root],
-               extent == axisExtents.end() ? ShapedType::kDynamic : extent->second);
-    }
-  }
-
-  LogicalResult recordAxisExtent(AxisId id, int64_t size) {
-    if (size == ShapedType::kDynamic)
-      return success();
-
-    AxisId root = find(id);
-    auto it = axisExtents.find(root);
-    if (it == axisExtents.end()) {
-      axisExtents[root] = size;
-      return success();
-    }
-    if (it->second != size)
-      return emitError(func.getLoc())
-             << "conflicting imported extents for axis '" << axisNames[root] << "'";
-    return success();
+    auto mapIdsToAxes = [&](const auto &inMap, auto &outMap) {
+      for (auto &[value, tensorAxisIds] : inMap) {
+        outMap[value] = llvm::map_to_vector<4>(tensorAxisIds, [&](const AxisIdPack &pack) {
+          return llvm::map_to_vector<2>(pack, [&](AxisId id) { return axes[axisUnions.find(id)]; });
+        });
+      }
+    };
+    DenseMap<Value, TensorAxes> valueAxes;
+    mapIdsToAxes(this->valueAxes, valueAxes);
+    DenseMap<linalg::GenericOp, TensorAxes> loopAxisMap;
+    mapIdsToAxes(this->loopAxisMap, loopAxisMap);
+    return FunctionAxisInfo{.valueAxes = std::move(valueAxes),
+                            .loopAxisMap = std::move(loopAxisMap),
+                            .scopeAxes = scopeAxes};
   }
 
   LogicalResult discoverAxisExtents() {
-    for (auto &[value, axes] : valueAxes) {
-      auto type = rankedTensor(value.getType());
+    for (auto &[value, axes_] : valueAxes) {
+      auto type = dyn_cast<RankedTensorType>(value.getType());
       if (!type)
         continue;
-      for (auto [pack, dim] : llvm::zip_equal(axes, type.getShape())) {
-        if (pack.size() != 1)
+      for (auto [pack, extent] : llvm::zip_equal(axes_, type.getShape())) {
+        if (pack.size() != 1 || extent == ShapedType::kDynamic)
           continue;
-        if (failed(recordAxisExtent(pack.front(), dim)))
-          return failure();
+        auto &axis = axes[axisUnions.find(pack.front())];
+        if (axis.extent == ShapedType::kDynamic)
+          axis.extent = extent;
+        else if (axis.extent != extent)
+          return emitError(func.getLoc())
+                 << "conflicting imported extents for axis '" << axis.name << "'";
       }
     }
     return success();
   }
 
-  int64_t getAxisExtent(StringRef axisName) {
-    for (AxisId id = 0, e = parents.size(); id < e; ++id) {
-      AxisId root = find(id);
-      if (axisNames[root] != axisName)
+  func::FuncOp func;
+  func::ReturnOp returnOp;
+  AxisUnionFind<AxisId> axisUnions;
+  DenseMap<Value, TensorAxisIds> valueAxes;
+  DenseMap<linalg::GenericOp, TensorAxisIds> loopAxisMap;
+  SmallVector<Axis> axes;
+};
+
+static TypedAttr splatScalarConstant(arith::ConstantOp constant) {
+  auto elements = dyn_cast<DenseElementsAttr>(constant.getValue());
+  if (!elements || !elements.isSplat())
+    return {};
+  return dyn_cast<TypedAttr>(elements.getSplatValue<Attribute>());
+}
+
+static SmallVector<std::string> flattenAxes(const TensorAxes &axes) {
+  SmallVector<std::string> flat;
+  for (const AxisPack &pack : axes)
+    for (const auto &[name, _] : pack)
+      flat.push_back(name);
+  return flat;
+}
+
+class ScopedTABuilder {
+public:
+  ScopedTABuilder(Operation *insertBefore, Location loc, RankedTensorType resultType,
+                  ArrayRef<Axis> scopeAxes)
+      : context(insertBefore->getContext()), loc(loc), builder(insertBefore) {
+    Block *body = new Block();
+    SmallVector<std::string> axisNames;
+    SmallVector<int64_t> staticExtents;
+    for (const auto &[axisName, extent] : scopeAxes) {
+      if (axes.contains(axisName))
         continue;
-      auto extent = axisExtents.find(root);
-      if (extent == axisExtents.end())
-        return ShapedType::kDynamic;
-      return extent->second;
+      auto arg = body->addArgument(builder.getIndexType(), loc);
+      axisNames.push_back(axisName);
+      staticExtents.push_back(extent);
+      axes.try_emplace(axisName, arg);
     }
-    return ShapedType::kDynamic;
+    scope = ScopeOp::create(builder, loc, resultType, ValueRange{}, getAxesAttr(axisNames),
+                            DenseI64ArrayAttr::get(context, staticExtents));
+    scope.getBody().push_back(body);
+    builder.setInsertionPointToStart(body);
+  }
+
+  class ImportGroupGuard {
+  public:
+    ImportGroupGuard(ScopedTABuilder &ta, int64_t group) : ta(ta), oldGroup(ta.importGroup) {
+      ta.importGroup = group;
+    }
+
+    ~ImportGroupGuard() { ta.importGroup = oldGroup; }
+
+  private:
+    ScopedTABuilder &ta;
+    std::optional<int64_t> oldGroup;
+  };
+
+  ScopeOp getScope() const { return scope; }
+
+  AxesAttr getAxesAttr(ArrayRef<std::string> names) const {
+    SmallVector<Attribute> axes;
+    DenseSet<StringRef> seen;
+    for (StringRef name : names) {
+      if (!seen.insert(name).second)
+        continue;
+      axes.push_back(AxisAttr::get(context, name));
+    }
+    return AxesAttr::get(context, ArrayAttr::get(context, axes));
+  }
+
+  ExprType expr(Type elementType, ArrayRef<std::string> axes) const {
+    return ExprType::get(context, elementType, getAxesAttr(axes));
+  }
+
+  SmallVector<std::string> unionAxes(ValueRange operands) const {
+    DenseSet<StringRef> seen;
+    SmallVector<std::string> result;
+    for (Value operand : operands) {
+      auto exprType = cast<ExprType>(operand.getType());
+      for (Attribute attr : exprType.getAxes().getAxes()) {
+        auto axis = cast<AxisAttr>(attr);
+        StringRef name = axis.getName().getValue();
+        if (!seen.insert(name).second)
+          continue;
+        result.push_back(name.str());
+      }
+    }
+    return result;
+  }
+
+  FailureOr<Value> at(Value source, const TensorAxes &dimAxes, Type elementType) {
+    SmallVector<Value> indices;
+    for (const AxisPack &pack : dimAxes) {
+      if (pack.empty()) {
+        indices.push_back(indexZero());
+        continue;
+      }
+      if (pack.size() == 1) {
+        auto &axisName = pack.front().name;
+        auto it = axes.find(axisName);
+        if (it == axes.end())
+          return emitError(loc) << "missing materialized ta axis '" << axisName << "'";
+        indices.push_back(it->second);
+        continue;
+      }
+
+      SmallVector<Value> multiIndex;
+      SmallVector<int64_t> basis;
+      for (auto &[name, extent] : pack) {
+        auto it = axes.find(name);
+        if (it == axes.end())
+          return emitError(loc) << "missing materialized ta axis '" << name << "'";
+        if (extent == ShapedType::kDynamic)
+          return emitError(loc) << "cannot linearize multiple dynamic logical axes into "
+                                << "one tensor dimension";
+        multiIndex.push_back(it->second);
+        basis.push_back(extent);
+      }
+      indices.push_back(affine::AffineLinearizeIndexOp::create(builder, loc, multiIndex, basis,
+                                                               /*disjoint=*/true));
+    }
+
+    SmallVector<std::string> resultAxes = flattenAxes(dimAxes);
+    auto op = AtOp::create(builder, loc, expr(elementType, resultAxes), source, indices);
+    return annotate(op);
+  }
+
+  Value constant(TypedAttr value) {
+    auto op = ConstantOp::create(builder, loc, expr(value.getType(), {}), value);
+    return annotate(op);
+  }
+
+  FailureOr<Value> index(const std::string &axisName, Type elementType) {
+    if (!elementType)
+      elementType = builder.getIndexType();
+    auto it = axes.find(axisName);
+    if (it == axes.end())
+      return emitError(loc) << "missing materialized ta axis '" << axisName << "'";
+    auto op = IndexOp::create(builder, loc, expr(elementType, {axisName}), it->second);
+    return annotate(op);
+  }
+
+  Value cmpi(arith::CmpIPredicate predicate, Value lhs, Value rhs) {
+    SmallVector<std::string> axes = unionAxes({lhs, rhs});
+    auto op =
+        CmpIOp::create(builder, loc, expr(IntegerType::get(context, 1), axes), predicate, lhs, rhs);
+    return annotate(op);
+  }
+
+  Value select(Value condition, Value trueValue, Value falseValue) {
+    SmallVector<std::string> axes = unionAxes({trueValue, falseValue, condition});
+    auto trueType = cast<ExprType>(trueValue.getType());
+    auto op = SelectOp::create(builder, loc, expr(trueType.getElementType(), axes), condition,
+                               trueValue, falseValue);
+    return annotate(op);
+  }
+
+  template <typename OpTy> Value unary(Type elementType, Value input) {
+    SmallVector<std::string> axes = unionAxes({input});
+    auto op = OpTy::create(builder, loc, expr(elementType, axes), input);
+    return annotate(op);
+  }
+
+  template <typename OpTy> Value binary(Type elementType, Value lhs, Value rhs) {
+    SmallVector<std::string> axes = unionAxes({lhs, rhs});
+    auto op = OpTy::create(builder, loc, expr(elementType, axes), lhs, rhs);
+    return annotate(op);
+  }
+
+  Value reduce(ReduceKind kind, Value input, ArrayRef<std::string> reductionAxes, Type elementType,
+               ArrayRef<std::string> resultAxes) {
+    auto op = ReduceOp::create(builder, loc, expr(elementType, resultAxes), kind, input, Value(),
+                               getAxesAttr(reductionAxes));
+    return annotate(op);
+  }
+
+  void yield(Value value) { YieldOp::create(builder, loc, value); }
+
+private:
+  template <typename OpTy> Value annotate(OpTy op) const {
+    if (!importGroup)
+      return op.getResult();
+    op->setAttr("ta.import_group", IntegerAttr::get(IntegerType::get(context, 64), *importGroup));
+    return op.getResult();
+  }
+
+  Value indexZero() {
+    if (zero)
+      return zero;
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(&scope.getBody().front());
+    zero = arith::ConstantIndexOp::create(builder, loc, 0);
+    return zero;
+  }
+
+  MLIRContext *context;
+  const Location loc;
+  OpBuilder builder;
+
+  Value zero;
+  ScopeOp scope;
+  std::optional<int64_t> importGroup;
+  llvm::MapVector<std::string, Value, llvm::StringMap<unsigned>> axes;
+};
+
+class FunctionEmitter {
+public:
+  FunctionEmitter(func::FuncOp func, func::ReturnOp returnOp, FunctionAxisInfo axisInfo_)
+      : func(func), returnOp(returnOp), axisInfo(std::move(axisInfo_)),
+        ta(returnOp, func.getLoc(), cast<RankedTensorType>(func.getResultTypes().front()),
+           axisInfo.scopeAxes) {}
+
+  LogicalResult run() {
+    if (failed(emitForward()))
+      return failure();
+
+    auto result = valueMap.lookupOrNull(returnOp.getOperand(0));
+    if (!result)
+      return emitError(returnOp.getLoc()) << "failed to translate returned tensor";
+    ta.yield(result);
+
+    returnOp.getOperation()->setOperands(ta.getScope().getResult());
+    eraseUnusedScopeOps();
+    return success();
+  }
+
+private:
+  FailureOr<Value> emitGeneric(linalg::GenericOp op, unsigned resultNumber) {
+    ScopedTABuilder::ImportGroupGuard guard(ta, nextImportGroup++);
+
+    linalg::LinalgOp linalgOp = cast<linalg::LinalgOp>(op.getOperation());
+    SmallVector<utils::IteratorType> iterators = linalgOp.getIteratorTypesArray();
+    unsigned numInputs = op.getInputs().size();
+
+    auto it = axisInfo.valueAxes.find(op->getResult(resultNumber));
+    if (it == axisInfo.valueAxes.end())
+      return op.emitOpError("missing axis info for the result of this op");
+    SmallVector<std::string> flatResultAxes = flattenAxes(it->second);
+    TensorAxes loopAxes = axisInfo.loopAxisMap.lookup(op);
+
+    SmallVector<Value> inputExprs;
+    inputExprs.reserve(numInputs);
+    for (Value input : op.getInputs()) {
+      if (dyn_cast<RankedTensorType>(input.getType())) {
+        FailureOr<Value> expr = getTensorExpr(input);
+        if (failed(expr))
+          return failure();
+        inputExprs.push_back(*expr);
+      } else {
+        DenseMap<Value, Value> emptyEnv;
+        FailureOr<Value> expr = translateScalar(input, emptyEnv, loopAxes);
+        if (failed(expr))
+          return failure();
+        inputExprs.push_back(*expr);
+      }
+    }
+
+    Block &block = op.getRegion().front();
+    auto yield = dyn_cast<linalg::YieldOp>(block.getTerminator());
+    if (!yield || yield.getNumOperands() <= resultNumber)
+      return op.emitOpError("expected linalg.yield for result");
+
+    DenseMap<Value, Value> env;
+    for (auto [arg, expr] : zip_equal(block.getArguments().take_front(numInputs), inputExprs)) {
+      env[arg] = expr;
+    }
+
+    AxisPack reductionAxes;
+    for (auto [index, iterator] : enumerate(iterators)) {
+      if (iterator == utils::IteratorType::reduction)
+        reductionAxes.append(loopAxes[index].begin(), loopAxes[index].end());
+    }
+    auto redAxisNames =
+        llvm::map_to_vector(reductionAxes, [&](const Axis &axis) { return axis.name; });
+
+    Value yielded = yield.getOperand(resultNumber);
+    if (reductionAxes.empty())
+      return translateScalar(yielded, env, loopAxes);
+
+    FailureOr<std::pair<ReduceKind, Value>> combiner =
+        peelReductionCombiner(op, yielded, block.getArguments().drop_front(numInputs));
+    if (failed(combiner))
+      return failure();
+
+    FailureOr<Value> payload = translateScalar(combiner->second, env, loopAxes);
+    if (failed(payload))
+      return failure();
+    Type elementType =
+        dyn_cast<RankedTensorType>(op->getResult(resultNumber).getType()).getElementType();
+    return ta.reduce(combiner->first, *payload, redAxisNames, elementType, flatResultAxes);
+  }
+
+  LogicalResult emitForward() {
+    for (Operation &op : func.front().without_terminator()) {
+      if (isa<arith::ConstantOp, tensor::EmptyOp, ScopeOp>(&op))
+        continue;
+
+      if (auto collapse = dyn_cast<tensor::CollapseShapeOp>(&op)) {
+        FailureOr<Value> expr = getTensorExpr(collapse.getSrc());
+        if (failed(expr))
+          return failure();
+        valueMap.map(collapse.getResult(), *expr);
+        continue;
+      }
+
+      if (auto expand = dyn_cast<tensor::ExpandShapeOp>(&op)) {
+        FailureOr<Value> expr = getTensorExpr(expand.getSrc());
+        if (failed(expr))
+          return failure();
+        valueMap.map(expand.getResult(), *expr);
+        continue;
+      }
+
+      if (auto generic = dyn_cast<linalg::GenericOp>(&op)) {
+        for (auto [resultNumber, result] : llvm::enumerate(generic->getResults())) {
+          if (!dyn_cast<RankedTensorType>(result.getType()))
+            continue;
+          if (!axisInfo.valueAxes.contains(result))
+            continue;
+          FailureOr<Value> expr = emitGeneric(generic, resultNumber);
+          if (failed(expr))
+            return failure();
+          valueMap.map(result, *expr);
+        }
+        continue;
+      }
+
+      if (llvm::any_of(op.getResults(),
+                       [](Value value) { return dyn_cast<RankedTensorType>(value.getType()); }))
+        return op.emitOpError("unsupported tensor producer for ta import");
+    }
+
+    return success();
   }
 
   FailureOr<Value> translateLinalgIndex(linalg::IndexOp index, ArrayRef<AxisPack> loopAxes,
@@ -760,46 +700,35 @@ private:
       return index.emitOpError("cannot import linalg.index for a constant-indexed dimension");
 
     if (packedAxes.size() == 1)
-      return ta->index(packedAxes.front(), elementType);
+      return ta.index(packedAxes.front().name, elementType);
 
     SmallVector<StringRef> nonUnitAxes;
-    for (StringRef axis : packedAxes) {
-      if (getAxisExtent(axis) != 1)
-        nonUnitAxes.push_back(axis);
-    }
-
+    for (auto &axis : packedAxes)
+      if (axis.extent != 1)
+        nonUnitAxes.push_back(axis.name);
     if (nonUnitAxes.empty()) {
-      if (elementType.isIndex())
-        return ta->constant(ta->builder().getIndexAttr(0));
-      return ta->constant(ta->builder().getIntegerAttr(elementType, 0));
+      return ta.constant(IntegerAttr::get(elementType, 0));
     }
-
     if (nonUnitAxes.size() == 1)
-      return ta->index(nonUnitAxes.front(), elementType);
+      return ta.index(nonUnitAxes.front().str(), elementType);
 
     return index.emitOpError("cannot import linalg.index for a packed tensor dimension with "
                              "multiple non-unit axes");
   }
 
-  Value lookupTensorExpr(Value value) const {
-    auto it = valueMap.find(value);
-    if (it == valueMap.end())
-      return Value();
-    return it->second;
-  }
-
   FailureOr<Value> getTensorExpr(Value value) {
-    if (Value expr = lookupTensorExpr(value))
-      return expr;
+    auto existing = valueMap.lookupOrNull(value);
+    if (existing)
+      return existing;
 
-    auto type = rankedTensor(value.getType());
+    auto type = dyn_cast<RankedTensorType>(value.getType());
     if (!type)
       return emitError(value.getLoc()) << "expected ranked tensor value";
 
     if (auto constant = dyn_cast_or_null<arith::ConstantOp>(value.getDefiningOp())) {
       if (TypedAttr scalar = splatScalarConstant(constant)) {
-        Value expr = ta->constant(scalar);
-        valueMap[value] = expr;
+        Value expr = ta.constant(scalar);
+        valueMap.map(value, expr);
         return expr;
       }
       return constant.emitOpError("only splat tensor constants are supported by ta import");
@@ -808,13 +737,13 @@ private:
     if (auto arg = dyn_cast<BlockArgument>(value)) {
       if (arg.getOwner()->getParentOp() != func)
         return emitError(value.getLoc()) << "unsupported tensor block argument";
-      FailureOr<TensorAxisIds> axes = getKnownAxes(value);
-      if (failed(axes))
-        return failure();
-      FailureOr<Value> expr = ta->at(value, canonicalize(*axes), type.getElementType());
+      auto it = axisInfo.valueAxes.find(value);
+      if (it == axisInfo.valueAxes.end())
+        return emitError(value.getLoc()) << "missing axis info for this tensor value";
+      FailureOr<Value> expr = ta.at(value, it->second, type.getElementType());
       if (failed(expr))
         return failure();
-      valueMap[value] = *expr;
+      valueMap.map(value, *expr);
       return *expr;
     }
 
@@ -863,7 +792,7 @@ private:
     FailureOr<Value> input = translateScalar(def->getOperand(0), env, loopAxes);
     if (failed(input))
       return failure();
-    return ta->unary<OpTy>(def->getResult(0).getType(), *input);
+    return ta.unary<OpTy>(def->getResult(0).getType(), *input);
   }
 
   template <typename OpTy>
@@ -873,7 +802,7 @@ private:
     FailureOr<Value> rhs = translateScalar(def->getOperand(1), env, loopAxes);
     if (failed(lhs) || failed(rhs))
       return failure();
-    return ta->binary<OpTy>(def->getResult(0).getType(), *lhs, *rhs);
+    return ta.binary<OpTy>(def->getResult(0).getType(), *lhs, *rhs);
   }
 
   FailureOr<Value> translateScalar(Value value, const DenseMap<Value, Value> &env,
@@ -890,7 +819,7 @@ private:
       auto typed = dyn_cast<TypedAttr>(constant.getValue());
       if (!typed)
         return def->emitOpError("expected typed constant attribute");
-      return ta->constant(typed);
+      return ta.constant(typed);
     }
 
     if (auto index = dyn_cast<linalg::IndexOp>(def)) {
@@ -928,7 +857,7 @@ private:
       FailureOr<Value> rhs = translateScalar(def->getOperand(1), env, loopAxes);
       if (failed(lhs) || failed(rhs))
         return failure();
-      return ta->cmpi(cmpi.getPredicate(), *lhs, *rhs);
+      return ta.cmpi(cmpi.getPredicate(), *lhs, *rhs);
     }
     if (isa<arith::SelectOp>(def)) {
       FailureOr<Value> condition = translateScalar(def->getOperand(0), env, loopAxes);
@@ -936,14 +865,14 @@ private:
       FailureOr<Value> falseValue = translateScalar(def->getOperand(2), env, loopAxes);
       if (failed(condition) || failed(trueValue) || failed(falseValue))
         return failure();
-      return ta->select(*condition, *trueValue, *falseValue);
+      return ta.select(*condition, *trueValue, *falseValue);
     }
 
     return def->emitOpError("unsupported scalar op for ta import: ") << def->getName();
   }
 
   void eraseUnusedScopeOps() {
-    Block &body = ta->getScope().getBody().front();
+    Block &body = ta.getScope().getBody().front();
     for (Operation &op : llvm::make_early_inc_range(llvm::reverse(body.without_terminator()))) {
       if (!op.use_empty())
         continue;
@@ -955,15 +884,9 @@ private:
 
   func::FuncOp func;
   func::ReturnOp returnOp;
-  OpBuilder insertionBuilder;
-  std::unique_ptr<ScopedTABuilder> ta;
-  SmallVector<AxisId> parents;
-  SmallVector<std::string> axisNames;
-  DenseMap<Value, TensorAxisIds> valueAxes;
-  DenseMap<Operation *, SmallVector<AxisIdPack>> loopAxisMap;
-  DenseMap<AxisId, int64_t> axisExtents;
-  DenseMap<Value, Value> valueMap;
-  DenseMap<Operation *, int64_t> importGroups;
+  FunctionAxisInfo axisInfo;
+  ScopedTABuilder ta;
+  IRMapping valueMap;
   int64_t nextImportGroup = 0;
 };
 
@@ -973,11 +896,6 @@ static SmallVector<Operation *> collectOldBodyOps(func::FuncOp func) {
   for (Operation &op : entry.without_terminator())
     toErase.push_back(&op);
   return toErase;
-}
-
-static void eraseOps(ArrayRef<Operation *> toErase) {
-  for (Operation *op : reverse(toErase))
-    op->erase();
 }
 
 struct ImportLinalgToTAPass
@@ -1007,16 +925,33 @@ struct ImportLinalgToTAPass
     auto returnOp = dyn_cast<func::ReturnOp>(func.front().getTerminator());
     if (!returnOp || returnOp.getNumOperands() == 0)
       return;
-    if (func.getNumResults() != 1 || !rankedTensor(func.getResultTypes().front()))
+    if (func.getNumResults() != 1)
       return;
-
-    SmallVector<Operation *> oldOps = collectOldBodyOps(func);
-    FunctionImporter importer(func, returnOp);
-    if (failed(importer.run())) {
+    if (returnOp.getNumOperands() != 1) {
+      func.emitOpError("ta importer currently expects one function result");
       signalPassFailure();
       return;
     }
-    eraseOps(oldOps);
+
+    auto resultType = dyn_cast<RankedTensorType>(func.getResultTypes().front());
+    if (!resultType)
+      return;
+
+    SmallVector<Operation *> oldOps = collectOldBodyOps(func);
+    FunctionAxisDiscovery discovery(func, returnOp);
+    FailureOr<FunctionAxisInfo> axisInfo = discovery.run(resultType);
+    if (failed(axisInfo)) {
+      signalPassFailure();
+      return;
+    }
+
+    FunctionEmitter emitter(func, returnOp, std::move(*axisInfo));
+    if (failed(emitter.run())) {
+      signalPassFailure();
+      return;
+    }
+    for (Operation *op : llvm::reverse(oldOps))
+      op->erase();
   }
 };
 
