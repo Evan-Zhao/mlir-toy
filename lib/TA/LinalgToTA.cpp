@@ -113,15 +113,18 @@ private:
     return axes;
   }
 
-  bool mergeAxisPack(AxisIdPack &existing, const AxisIdPack &desired) {
+  FailureOr<bool> mergeAxisPack(Location loc, AxisIdPack &existing, const AxisIdPack &desired) {
     if (desired.empty())
       return false;
     if (existing.empty()) {
       existing = desired;
       return true;
     }
-    if (existing.size() != desired.size())
-      return false;
+    if (existing.size() != desired.size()) {
+      emitError(loc) << "incompatible logical axis packs: existing pack has " << existing.size()
+                     << " axes, but newly required pack has " << desired.size() << " axes";
+      return failure();
+    }
     for (auto [lhs, rhs] : zip_equal(existing, desired))
       axisUnions.unite(lhs, rhs);
     return false;
@@ -137,8 +140,12 @@ private:
     auto [it, inserted] = valueAxes.try_emplace(value, TensorAxisIds(type.getRank()));
     TensorAxisIds &existing = it->second;
     bool changed = inserted;
-    for (auto [axis, desiredAxis] : zip_equal(existing, desired))
-      changed |= mergeAxisPack(axis, desiredAxis);
+    for (auto [axis, desiredAxis] : zip_equal(existing, desired)) {
+      FailureOr<bool> axisChanged = mergeAxisPack(value.getLoc(), axis, desiredAxis);
+      if (failed(axisChanged))
+        return failure();
+      changed |= *axisChanged;
+    }
     return changed;
   }
 
@@ -268,7 +275,8 @@ private:
     for (auto [resultIndex, expr] : enumerate(map.getResults())) {
       if (auto dim = dyn_cast<AffineDimExpr>(expr)) {
         AxisIdPack &assigned = loopAxes[dim.getPosition()];
-        mergeAxisPack(assigned, resultAxes[resultIndex]);
+        if (failed(mergeAxisPack(op->getLoc(), assigned, resultAxes[resultIndex])))
+          return failure();
         continue;
       }
       if (isa<AffineConstantExpr>(expr))
