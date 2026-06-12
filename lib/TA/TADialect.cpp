@@ -270,6 +270,54 @@ static AxesAttr subtractAxes(MLIRContext *context, AxesAttr source, AxesAttr rem
   return AxesAttr::get(context, ArrayAttr::get(context, kept));
 }
 
+struct ScopeAxisExtent {
+  int64_t staticExtent = ShapedType::kDynamic;
+  Value dynamicExtent;
+};
+
+static std::optional<ScopeAxisExtent> getScopeAxisExtent(ScopeOp scope, AxisAttr axis) {
+  unsigned dynamicIndex = 0;
+  for (auto [scopeAxisAttr, staticExtent] :
+       llvm::zip_equal(scope.getAxes().getAxes(), scope.getStaticExtents())) {
+    Value dynamicExtent;
+    if (staticExtent == ShapedType::kDynamic)
+      dynamicExtent = scope.getDynamicExtents()[dynamicIndex++];
+
+    AxisAttr scopeAxis = cast<AxisAttr>(scopeAxisAttr);
+    if (scopeAxis.getName() == axis.getName())
+      return ScopeAxisExtent{.staticExtent = staticExtent, .dynamicExtent = dynamicExtent};
+  }
+  return std::nullopt;
+}
+
+static FailureOr<AxesAttr> substAxes(MLIRContext *context, AxesAttr source, AxesAttr from,
+                                     AxesAttr to, function_ref<InFlightDiagnostic()> emitError) {
+  ArrayAttr fromArray = from.getAxes();
+  ArrayAttr toArray = to.getAxes();
+  if (fromArray.size() != toArray.size())
+    return emitError() << "expected the same number of source and target axes";
+
+  DenseMap<StringAttr, Attribute> substitutions;
+  for (auto [fromAttr, toAttr] : llvm::zip_equal(fromArray, toArray)) {
+    AxisAttr fromAxis = cast<AxisAttr>(fromAttr);
+    substitutions[fromAxis.getName()] = toAttr;
+  }
+
+  StringSet<> seen;
+  SmallVector<Attribute> substituted;
+  for (Attribute attr : source.getAxes()) {
+    AxisAttr axis = cast<AxisAttr>(attr);
+    Attribute replacement = substitutions.lookup(axis.getName());
+    Attribute resultAttr = replacement ? replacement : attr;
+    StringRef resultName = cast<AxisAttr>(resultAttr).getName().getValue();
+    if (!seen.insert(resultName).second)
+      return emitError() << "substitution produces duplicate axis '" << resultName << "'";
+    substituted.push_back(resultAttr);
+  }
+
+  return AxesAttr::get(context, ArrayAttr::get(context, substituted));
+}
+
 static LogicalResult verifyElementwiseAxes(Operation *op, ScopeOp scope) {
   for (Value operand : op->getOperands()) {
     if (failed(verifyExprAxes(op, scope, operand.getType(), "operand")))
@@ -471,6 +519,29 @@ LogicalResult ReduceOp::inferReturnTypes(MLIRContext *context, std::optional<Loc
   inferredReturnTypes.push_back(
       ExprType::get(context, payload.getElementType(),
                     subtractAxes(context, payload.getAxes(), adaptor.getAxes())));
+  return success();
+}
+
+LogicalResult SubstOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
+                                        Adaptor adaptor,
+                                        SmallVectorImpl<Type> &inferredReturnTypes) {
+  auto input = dyn_cast<ExprType>(adaptor.getInput().getType());
+  if (!input)
+    return emitInferError(location, "expected ta.subst input to be a ta.expr value");
+  if (!adaptor.getFromAxes() || !adaptor.getToAxes())
+    return emitInferError(location, "expected ta.subst source and target axes");
+
+  auto emitError = [&]() -> InFlightDiagnostic {
+    if (location)
+      return mlir::emitError(*location);
+    return mlir::emitError(UnknownLoc::get(context));
+  };
+  FailureOr<AxesAttr> axes =
+      substAxes(context, input.getAxes(), adaptor.getFromAxes(), adaptor.getToAxes(), emitError);
+  if (failed(axes))
+    return failure();
+
+  inferredReturnTypes.push_back(ExprType::get(context, input.getElementType(), *axes));
   return success();
 }
 
@@ -788,6 +859,65 @@ LogicalResult ReduceOp::verify() {
   auto payload = cast<ExprType>(getInput().getType());
   auto result = cast<ExprType>(getResult().getType());
   return verifyReducePayload(getOperation(), *scopeOr, getAxes(), payload, result, getIdentity());
+}
+
+LogicalResult SubstOp::verify() {
+  auto scopeOr = verifyInsideScope(getOperation());
+  if (failed(scopeOr))
+    return failure();
+
+  ScopeOp scope = *scopeOr;
+  auto input = cast<ExprType>(getInput().getType());
+  auto result = cast<ExprType>(getResult().getType());
+
+  if (failed(verifyAxesSubset(getOperation(), scope.getAxes(), input.getAxes(), "input")))
+    return failure();
+  if (failed(verifyAxesSubset(getOperation(), scope.getAxes(), getFromAxes(), "source")))
+    return failure();
+  if (failed(verifyAxesSubset(getOperation(), scope.getAxes(), getToAxes(), "target")))
+    return failure();
+  if (failed(verifyAxesSubset(getOperation(), scope.getAxes(), result.getAxes(), "result")))
+    return failure();
+
+  if (input.getElementType() != result.getElementType())
+    return emitOpError("result element type must match input element type");
+
+  ArrayAttr inputAxes = input.getAxes().getAxes();
+  for (Attribute attr : getFromAxes().getAxes()) {
+    AxisAttr axis = cast<AxisAttr>(attr);
+    if (!axisContains(inputAxes, axis))
+      return emitOpError() << "source axis '" << axis.getName().getValue()
+                           << "' is not present in the input axes";
+  }
+
+  FailureOr<AxesAttr> expected = substAxes(getContext(), input.getAxes(), getFromAxes(),
+                                           getToAxes(), [&]() { return emitOpError(); });
+  if (failed(expected))
+    return failure();
+  if (!sameAxes(result.getAxes(), *expected))
+    return emitOpError() << "result axes must be input axes after substitution; expected "
+                         << *expected;
+
+  for (auto [fromAttr, toAttr] : llvm::zip_equal(getFromAxes().getAxes(), getToAxes().getAxes())) {
+    AxisAttr fromAxis = cast<AxisAttr>(fromAttr);
+    AxisAttr toAxis = cast<AxisAttr>(toAttr);
+    std::optional<ScopeAxisExtent> fromExtent = getScopeAxisExtent(scope, fromAxis);
+    std::optional<ScopeAxisExtent> toExtent = getScopeAxisExtent(scope, toAxis);
+    if (!fromExtent || !toExtent)
+      return emitOpError("substituted axes must be present in the enclosing scope");
+
+    if (fromExtent->staticExtent != toExtent->staticExtent)
+      return emitOpError() << "substituted axes must have equal extents, but axis '"
+                           << fromAxis.getName().getValue() << "' has extent "
+                           << fromExtent->staticExtent << " and axis '"
+                           << toAxis.getName().getValue() << "' has extent "
+                           << toExtent->staticExtent;
+    if (fromExtent->staticExtent == ShapedType::kDynamic &&
+        fromExtent->dynamicExtent != toExtent->dynamicExtent)
+      return emitOpError("dynamic substituted axes must use the same extent operand");
+  }
+
+  return success();
 }
 
 ParseResult ScopeOp::parse(OpAsmParser &parser, OperationState &result) {

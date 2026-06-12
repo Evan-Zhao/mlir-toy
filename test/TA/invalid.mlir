@@ -99,3 +99,55 @@ func.func @bad_extf_width(%tensor: tensor<16xf32>) -> tensor<16xf16> {
   } : () -> tensor<16xf16>
   return %0 : tensor<16xf16>
 }
+
+func.func @bad_subst_missing_source_axis(%tensor: tensor<16xf32>)
+    -> tensor<16xf32> {
+  %0 = ta.scope axes(%i "i" extent 16, %j "j" extent 32) {
+    %x = ta.at %tensor[%i]
+        : tensor<16xf32> -> !ta.expr<f32, [i]>
+    // expected-error @+1 {{'ta.subst' op source axis 'j' is not present in the input axes}}
+    %bad = ta.subst %x {from_axes = #ta.axes<j>, to_axes = #ta.axes<i>}
+        : !ta.expr<f32, [i]> -> !ta.expr<f32, [i]>
+    ta.yield %bad : !ta.expr<f32, [i]>
+  } : () -> tensor<16xf32>
+  return %0 : tensor<16xf32>
+}
+
+func.func @bad_subst_result_axes(%tensor: tensor<16xf32>)
+    -> tensor<16xf32> {
+  %0 = ta.scope axes(%i "i" extent 16, %j "j" extent 32) {
+    %x = ta.at %tensor[%i]
+        : tensor<16xf32> -> !ta.expr<f32, [i]>
+    // expected-error @+1 {{'ta.subst' op result axes must be input axes after substitution; expected #ta.axes<j>}}
+    %bad = ta.subst %x {from_axes = #ta.axes<i>, to_axes = #ta.axes<j>}
+        : !ta.expr<f32, [i]> -> !ta.expr<f32, [i]>
+    ta.yield %bad : !ta.expr<f32, [i]>
+  } : () -> tensor<16xf32>
+  return %0 : tensor<16xf32>
+}
+
+func.func @bad_subst_duplicate_result_axis(%tensor: tensor<16x32xf32>)
+    -> tensor<32x16xf32> {
+  %0 = ta.scope axes(%i "i" extent 16, %j "j" extent 32) {
+    %x = ta.at %tensor[%i, %j]
+        : tensor<16x32xf32> -> !ta.expr<f32, [i, j]>
+    // expected-error @+1 {{'ta.subst' op substitution produces duplicate axis 'j'}}
+    %bad = ta.subst %x {from_axes = #ta.axes<i>, to_axes = #ta.axes<j>}
+        : !ta.expr<f32, [i, j]> -> !ta.expr<f32, [j, i]>
+    ta.yield %bad : !ta.expr<f32, [j, i]>
+  } : () -> tensor<32x16xf32>
+  return %0 : tensor<32x16xf32>
+}
+
+func.func @bad_subst_extent_mismatch(%tensor: tensor<16xf32>)
+    -> tensor<32xf32> {
+  %0 = ta.scope axes(%i "i" extent 16, %j "j" extent 32) {
+    %x = ta.at %tensor[%i]
+        : tensor<16xf32> -> !ta.expr<f32, [i]>
+    // expected-error @+1 {{'ta.subst' op substituted axes must have equal extents}}
+    %bad = ta.subst %x {from_axes = #ta.axes<i>, to_axes = #ta.axes<j>}
+        : !ta.expr<f32, [i]> -> !ta.expr<f32, [j]>
+    ta.yield %bad : !ta.expr<f32, [j]>
+  } : () -> tensor<32xf32>
+  return %0 : tensor<32xf32>
+}

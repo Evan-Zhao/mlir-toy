@@ -85,6 +85,19 @@ func.func @float_cast_ta(%tensor: tensor<16xf16>) -> tensor<16xf16> {
   return %0 : tensor<16xf16>
 }
 
+// CHECK-LABEL: func.func @subst_ta
+func.func @subst_ta(%tensor: tensor<16xf32>) -> tensor<16xf32> {
+  %0 = ta.scope axes(%i "i" extent 16, %j "j" extent 16) {
+    %x = ta.at %tensor[%i]
+        : tensor<16xf32> -> !ta.expr<f32, [i]>
+    // CHECK: ta.subst %{{.+}} {from_axes = #ta.axes<i>, to_axes = #ta.axes<j>} : !ta.expr<f32, [i]> -> !ta.expr<f32, [j]>
+    %y = ta.subst %x {from_axes = #ta.axes<i>, to_axes = #ta.axes<j>}
+        : !ta.expr<f32, [i]> -> !ta.expr<f32, [j]>
+    ta.yield %y : !ta.expr<f32, [j]>
+  } : () -> tensor<16xf32>
+  return %0 : tensor<16xf32>
+}
+
 // CHECK-LABEL: func.func @dynamic_extent_ta
 func.func @dynamic_extent_ta(%tensor: tensor<?xf32>, %n: index) -> tensor<?xf32> {
   // CHECK: ta.scope axes(%i "i" extent %{{.+}})

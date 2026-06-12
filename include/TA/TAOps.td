@@ -140,6 +140,22 @@ def TA_SelectOp : TA_ElementwiseOp<"select", [InferTypeOpAdaptor]> {
   let assemblyFormat = "operands attr-dict `:` functional-type(operands, results)";
 }
 
+def TA_SubstOp : TA_Op<"subst", [Pure, InferTypeOpAdaptor]> {
+  let summary = "substitute expression axes";
+  let description = [{
+    Re-labels selected axes of a tensor algebra expression while preserving
+    element values. The source and target axis lists must have the same length,
+    and the result axes are the input axes with each source axis replaced by
+    the corresponding target axis.
+  }];
+
+  let arguments = (ins TA_ExprType:$input, TA_AxesAttr:$from_axes, TA_AxesAttr:$to_axes);
+  let results = (outs TA_ExprType:$result);
+
+  let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
+  let hasVerifier = 1;
+}
+
 def TA_ReduceOp : TA_Op<"reduce", [Pure, InferTypeOpAdaptor]> {
   let summary = "mathematical reduction over expression axes";
   let arguments = (ins TA_ReduceKindEnumAttr:$kind, TA_ExprType:$input, Optional<AnyType>:$identity,
