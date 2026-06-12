@@ -915,6 +915,10 @@ private:
       return translateBinaryScalarOp<AddFOp>(def, env, loopAxes);
     if (isa<arith::SubFOp>(def))
       return translateBinaryScalarOp<SubFOp>(def, env, loopAxes);
+    if (isa<arith::SubIOp>(def))
+      return translateBinaryScalarOp<SubIOp>(def, env, loopAxes);
+    if (isa<arith::AndIOp>(def))
+      return translateBinaryScalarOp<AndIOp>(def, env, loopAxes);
     if (isa<arith::MulFOp>(def))
       return translateBinaryScalarOp<MulFOp>(def, env, loopAxes);
     if (isa<arith::DivFOp>(def))
@@ -948,7 +952,7 @@ private:
       if (!op.use_empty())
         continue;
       if (isa<AtOp, ConstantOp, IndexOp, CmpIOp, SelectOp, ExtFOp, TruncFOp, ExpOp, Exp2Op, AddFOp,
-              SubFOp, MulFOp, DivFOp, MaximumFOp, MinimumFOp, ReduceOp>(&op))
+              SubFOp, SubIOp, AndIOp, MulFOp, DivFOp, MaximumFOp, MinimumFOp, ReduceOp>(&op))
         op.erase();
     }
   }

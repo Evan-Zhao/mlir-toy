@@ -5,8 +5,8 @@
 #include "TA/TATransformOps.h"
 #include "TA/TATypes.h"
 #include "TA/TAUtils.h"
-#include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/OpImplementation.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Tools/Plugins/DialectPlugin.h"
 #include "mlir/Tools/Plugins/PassPlugin.h"
@@ -282,13 +282,13 @@ static LogicalResult verifyElementwiseAxes(Operation *op, ScopeOp scope) {
   auto result = cast<ExprType>(op->getResult(0).getType());
   AxesAttr expected = inferOrderedUnionAxes(op->getContext(), op->getOperands());
   if (!sameAxes(result.getAxes(), expected))
-    return op->emitOpError()
-           << "result axes must be the ordered union of operand axes; expected " << expected;
+    return op->emitOpError() << "result axes must be the ordered union of operand axes; expected "
+                             << expected;
 
   return success();
 }
 
-static LogicalResult verifyFloatElementwiseOp(Operation *op) {
+static FailureOr<Type> verifyElementwiseOp(Operation *op) {
   auto scopeOr = verifyInsideScope(op);
   if (failed(scopeOr))
     return failure();
@@ -298,34 +298,35 @@ static LogicalResult verifyFloatElementwiseOp(Operation *op) {
 
   auto result = cast<ExprType>(op->getResult(0).getType());
   Type elementType = result.getElementType();
-  if (!isa<FloatType>(elementType))
-    return op->emitOpError("requires a floating-point expression result");
-
   for (Value operand : op->getOperands()) {
     auto expr = cast<ExprType>(operand.getType());
     if (expr.getElementType() != elementType)
       return op->emitOpError("requires all operand and result element types to match");
   }
 
+  return success(elementType);
+}
+
+template <size_t NArgs> static LogicalResult verifyNAryFloatElementwiseOp(Operation *op) {
+  if (op->getNumOperands() != NArgs)
+    return op->emitOpError() << "expected " << NArgs << " operands";
+  auto resultTy = verifyElementwiseOp(op);
+  if (failed(resultTy))
+    return failure();
+  if (!isa<FloatType>(*resultTy))
+    return op->emitOpError("requires floating-point operand and result element types");
   return success();
 }
 
-static LogicalResult verifyUnaryFloatElementwiseOp(Operation *op) {
-  if (op->getNumOperands() != 1)
-    return op->emitOpError("expected one operand");
-  return verifyFloatElementwiseOp(op);
-}
-
-static LogicalResult verifyBinaryFloatElementwiseOp(Operation *op) {
+static LogicalResult verifyBinaryIntegerElementwiseOp(Operation *op) {
   if (op->getNumOperands() != 2)
     return op->emitOpError("expected two operands");
-  return verifyFloatElementwiseOp(op);
-}
-
-static LogicalResult verifyTernaryFloatElementwiseOp(Operation *op) {
-  if (op->getNumOperands() != 3)
-    return op->emitOpError("expected three operands");
-  return verifyFloatElementwiseOp(op);
+  auto elementType = verifyElementwiseOp(op);
+  if (failed(elementType))
+    return failure();
+  if (!(elementType->isIndex() || elementType->isSignlessInteger()))
+    return op->emitOpError("requires an index or signless integer expression result");
+  return success();
 }
 
 static LogicalResult verifyFloatCastElementwiseOp(Operation *op, bool widening) {
@@ -401,6 +402,8 @@ LogicalResult ConstantOp::inferReturnTypes(MLIRContext *context, std::optional<L
 DEFINE_TA_SAME_ELEMENTWISE_INFER(NegFOp)
 DEFINE_TA_SAME_ELEMENTWISE_INFER(AddFOp)
 DEFINE_TA_SAME_ELEMENTWISE_INFER(SubFOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(SubIOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(AndIOp)
 DEFINE_TA_SAME_ELEMENTWISE_INFER(MulFOp)
 DEFINE_TA_SAME_ELEMENTWISE_INFER(DivFOp)
 DEFINE_TA_SAME_ELEMENTWISE_INFER(MaximumFOp)
@@ -452,9 +455,8 @@ LogicalResult SelectOp::inferReturnTypes(MLIRContext *context, std::optional<Loc
   if (trueValue.getElementType() != falseValue.getElementType())
     return emitInferError(location, "expected matching select value element types");
 
-  FailureOr<AxesAttr> axes =
-      inferSelectAxes(context, location, adaptor.getCondition(), adaptor.getTrueValue(),
-                      adaptor.getFalseValue());
+  FailureOr<AxesAttr> axes = inferSelectAxes(context, location, adaptor.getCondition(),
+                                             adaptor.getTrueValue(), adaptor.getFalseValue());
   if (failed(axes))
     return failure();
   inferredReturnTypes.push_back(ExprType::get(context, trueValue.getElementType(), *axes));
@@ -576,17 +578,20 @@ LogicalResult ConstantOp::verify() {
 }
 
 #define DEFINE_TA_UNARY_FLOAT_VERIFY(OP)                                                           \
-  LogicalResult OP::verify() { return verifyUnaryFloatElementwiseOp(getOperation()); }
-
+  LogicalResult OP::verify() { return verifyNAryFloatElementwiseOp<1>(getOperation()); }
 #define DEFINE_TA_BINARY_FLOAT_VERIFY(OP)                                                          \
-  LogicalResult OP::verify() { return verifyBinaryFloatElementwiseOp(getOperation()); }
-
+  LogicalResult OP::verify() { return verifyNAryFloatElementwiseOp<2>(getOperation()); }
 #define DEFINE_TA_TERNARY_FLOAT_VERIFY(OP)                                                         \
-  LogicalResult OP::verify() { return verifyTernaryFloatElementwiseOp(getOperation()); }
+  LogicalResult OP::verify() { return verifyNAryFloatElementwiseOp<3>(getOperation()); }
+
+#define DEFINE_TA_BINARY_INTEGER_VERIFY(OP)                                                        \
+  LogicalResult OP::verify() { return verifyBinaryIntegerElementwiseOp(getOperation()); }
 
 DEFINE_TA_UNARY_FLOAT_VERIFY(NegFOp)
 DEFINE_TA_BINARY_FLOAT_VERIFY(AddFOp)
 DEFINE_TA_BINARY_FLOAT_VERIFY(SubFOp)
+DEFINE_TA_BINARY_INTEGER_VERIFY(SubIOp)
+DEFINE_TA_BINARY_INTEGER_VERIFY(AndIOp)
 DEFINE_TA_BINARY_FLOAT_VERIFY(MulFOp)
 DEFINE_TA_BINARY_FLOAT_VERIFY(DivFOp)
 DEFINE_TA_BINARY_FLOAT_VERIFY(MaximumFOp)
@@ -639,15 +644,13 @@ struct FoldTruncFOfConstant : OpRewritePattern<TruncFOp> {
 
     APFloat rounded = value.getValue();
     bool losesInfo = false;
-    APFloat::opStatus status =
-        rounded.convert(resultElement.getFloatSemantics(), APFloat::rmNearestTiesToEven,
-                        &losesInfo);
+    APFloat::opStatus status = rounded.convert(resultElement.getFloatSemantics(),
+                                               APFloat::rmNearestTiesToEven, &losesInfo);
     if (status == APFloat::opInvalidOp)
       return failure();
 
-    auto replacement =
-        ConstantOp::create(rewriter, op.getLoc(), op.getResult().getType(),
-                           FloatAttr::get(resultElement, rounded));
+    auto replacement = ConstantOp::create(rewriter, op.getLoc(), op.getResult().getType(),
+                                          FloatAttr::get(resultElement, rounded));
     for (NamedAttribute attr : op->getDiscardableAttrs())
       replacement->setAttr(attr.getName(), attr.getValue());
     rewriter.replaceOp(op, replacement);
@@ -740,13 +743,13 @@ LogicalResult SelectOp::verify() {
   if (failed(verifyExprAxes(getOperation(), *scopeOr, getResult().getType(), "result")))
     return failure();
 
-  FailureOr<AxesAttr> expected = inferSelectAxes(
-      getContext(), getOperation()->getLoc(), getCondition(), getTrueValue(), getFalseValue());
+  FailureOr<AxesAttr> expected = inferSelectAxes(getContext(), getOperation()->getLoc(),
+                                                 getCondition(), getTrueValue(), getFalseValue());
   if (failed(expected))
     return failure();
   if (!sameAxes(result.getAxes(), *expected))
-    return emitOpError()
-           << "result axes must be the selected-value ordered union; expected " << *expected;
+    return emitOpError() << "result axes must be the selected-value ordered union; expected "
+                         << *expected;
 
   if (!condition.getElementType().isInteger(1))
     return emitOpError("condition element type must be i1");
