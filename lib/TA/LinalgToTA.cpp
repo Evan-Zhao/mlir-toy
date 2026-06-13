@@ -49,14 +49,16 @@ public:
     return parents[id];
   }
 
-  void unite(IdT lhs, IdT rhs) {
+  // Returns true if a union was performed, or false if the two sets were already unified.
+  bool unite(IdT lhs, IdT rhs) {
     lhs = find(lhs);
     rhs = find(rhs);
     if (lhs == rhs)
-      return;
+      return false;
     if (lhs > rhs)
       std::swap(lhs, rhs);
     parents[rhs] = lhs;
+    return true;
   }
 
   SmallVector<IdT> getUniqueRoots() {
@@ -114,21 +116,18 @@ private:
     return axes;
   }
 
-  FailureOr<bool> mergeAxisPack(Location loc, AxisIdPack &existing, const AxisIdPack &desired) {
-    if (desired.empty())
-      return false;
-    if (existing.empty()) {
-      existing = desired;
-      return true;
-    }
+  LogicalResult unifyAxisPacks(Location loc, const AxisIdPack &existing, const AxisIdPack &desired,
+                               bool &changed) {
+    if (existing.empty() || desired.empty())
+      return success();
     if (existing.size() != desired.size()) {
       emitError(loc) << "incompatible logical axis packs: existing pack has " << existing.size()
                      << " axes, but newly required pack has " << desired.size() << " axes";
       return failure();
     }
     for (auto [lhs, rhs] : zip_equal(existing, desired))
-      axisUnions.unite(lhs, rhs);
-    return false;
+      changed |= axisUnions.unite(lhs, rhs);
+    return success();
   }
 
   LogicalResult mergeValueAxes(Value value, const TensorAxisIds &desired, bool &changed) {
@@ -138,29 +137,18 @@ private:
     if (static_cast<int64_t>(desired.size()) != type.getRank())
       return emitError(value.getLoc()) << "axis rank does not match tensor rank";
 
-    auto [it, inserted] = valueAxes.try_emplace(value, TensorAxisIds(type.getRank()));
-    TensorAxisIds &existing = it->second;
-    changed |= inserted;
-    for (auto [axis, desiredAxis] : zip_equal(existing, desired)) {
-      FailureOr<bool> axisChanged = mergeAxisPack(value.getLoc(), axis, desiredAxis);
-      if (failed(axisChanged))
+    // If the value is not yet in the map, just map it to `desired`.
+    auto [it, inserted] = valueAxes.try_emplace(value, desired);
+    if (inserted) {
+      changed = true;
+      return success();
+    }
+    // Otherwise, run a unification process to merge the existing axes with `desired`.
+    for (auto [axis, desiredAxis] : zip_equal(it->second, desired)) {
+      if (failed(unifyAxisPacks(value.getLoc(), axis, desiredAxis, changed)))
         return failure();
-      changed |= *axisChanged;
     }
     return success();
-  }
-
-  // Like mergeValueAxes, but with additional checks. The caller is free to move on from a failure.
-  LogicalResult tryMergeValueAxes(Value value, const TensorAxisIds &desired, bool &changed) {
-    auto it = valueAxes.find(value);
-    if (it != valueAxes.end()) {
-      for (auto [existingAxis, desiredAxis] : zip_equal(it->second, desired)) {
-        if (!existingAxis.empty() && !desiredAxis.empty() &&
-            existingAxis.size() != desiredAxis.size())
-          return failure();
-      }
-    }
-    return mergeValueAxes(value, desired, changed);
   }
 
   FailureOr<TensorAxisIds> sourceAxesForCollapse(tensor::CollapseShapeOp op,
@@ -231,8 +219,8 @@ private:
         if (failed(axes))
           return failure();
         operandAxes[&op->getOpOperand(index)] = *axes;
-        // Intentionally ignoring the result of tryMergeValueAxes because we continue anyways.
-        auto _ = tryMergeValueAxes(input, *axes, changed);
+        // Intentionally ignoring the result of mergeValueAxes because we continue anyways.
+        auto _ = mergeValueAxes(input, *axes, changed);
       }
     }
 
@@ -269,8 +257,10 @@ private:
           FailureOr<TensorAxisIds> sourceAxes = sourceAxesForExpand(expand, it->second);
           if (failed(sourceAxes))
             return failure();
-          // Intentionally ignoring the result of tryMergeValueAxes because we continue anyways.
-          auto _ = tryMergeValueAxes(expand.getSrc(), *sourceAxes, keepGoing);
+          // ExpandShapeOp directly admits the axes of its source as the axes of its result. It
+          // doesn't do mergeValueAxes.
+          auto [_, inserted] = valueAxes.try_emplace(expand.getSrc(), *sourceAxes);
+          changed |= inserted;
           continue;
         }
 
@@ -294,14 +284,14 @@ private:
 
     for (auto [resultIndex, expr] : enumerate(map.getResults())) {
       if (auto dim = dyn_cast<AffineDimExpr>(expr)) {
+        bool changed = false;
         AxisIdPack &assigned = loopAxes[dim.getPosition()];
-        if (failed(mergeAxisPack(op->getLoc(), assigned, resultAxes[resultIndex])))
+        if (assigned.empty())
+          assigned = resultAxes[resultIndex];
+        else if (failed(unifyAxisPacks(op->getLoc(), assigned, resultAxes[resultIndex], changed)))
           return failure();
-        continue;
-      }
-      if (isa<AffineConstantExpr>(expr))
-        continue;
-      return op->emitOpError("non-projected output indexing maps are not supported");
+      } else if (!isa<AffineConstantExpr>(expr))
+        return op->emitOpError("non-projected output indexing maps are not supported");
     }
     return success();
   }

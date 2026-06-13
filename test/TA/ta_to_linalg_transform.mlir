@@ -22,6 +22,9 @@ module attributes {transform.with_named_sequence} {
 // CHECK: IR printer
 // CHECK-NEXT: %{{.*}} = linalg.generic {{.*}}iterator_types = ["parallel", "parallel", "reduction"]
 // CHECK: arith.addf
+// CHECK-DAG: #[[IDENTITY_2D:map[0-9]*]] = affine_map<(d0, d1) -> (d0, d1)>
+// CHECK-DAG: #[[FIRST_DIM:map[0-9]*]] = affine_map<(d0, d1) -> (d0)>
+// CHECK-DAG: #[[SECOND_DIM:map[0-9]*]] = affine_map<(d0, d1) -> (d1)>
 // CHECK-LABEL: func.func @ta_matmul_to_linalg_transform(
 // CHECK: arith.mulf
 // CHECK: linalg.generic {{.*}}iterator_types = ["parallel", "parallel", "reduction"]
@@ -45,8 +48,13 @@ module attributes {transform.with_named_sequence} {
 
 // CHECK-LABEL: func.func @subst_to_linalg(
 // CHECK-NOT: ta.subst
-// CHECK: linalg.generic
-// CHECK: arith.subi
+// CHECK: linalg.generic {indexing_maps = [#[[IDENTITY_2D]]], iterator_types = ["parallel", "parallel"]}
+// CHECK-NEXT: ^bb0(%{{.*}}: i64):
+// CHECK-NEXT: %[[J_INDEX:.*]] = linalg.index 0 : index
+// CHECK-NEXT: %[[J:.*]] = arith.index_cast %[[J_INDEX]] : index to i64
+// CHECK-NEXT: %[[I_INDEX:.*]] = linalg.index 1 : index
+// CHECK-NEXT: %[[I:.*]] = arith.index_cast %[[I_INDEX]] : index to i64
+// CHECK-NEXT: arith.subi %[[J]], %[[I]] : i64
   func.func @subst_to_linalg() -> tensor<4x4xi64> {
     %out = ta.scope axes(%i "i" extent 4, %j "j" extent 4) {
       %idx = ta.index %i : !ta.expr<i64, [i]>
@@ -61,7 +69,7 @@ module attributes {transform.with_named_sequence} {
 
 // CHECK-LABEL: func.func @subst_at_to_linalg(
 // CHECK-NOT: ta.subst
-// CHECK: linalg.generic
+// CHECK: linalg.generic {indexing_maps = [#[[FIRST_DIM]], #[[SECOND_DIM]], #[[IDENTITY_2D]]], iterator_types = ["parallel", "parallel"]} ins(%arg0, %arg0
 // CHECK: arith.addf
   func.func @subst_at_to_linalg(%tensor: tensor<4xf32>) -> tensor<4x4xf32> {
     %out = ta.scope axes(%i "i" extent 4, %j "j" extent 4) {
