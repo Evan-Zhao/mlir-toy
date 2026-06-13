@@ -67,6 +67,20 @@ module attributes {transform.with_named_sequence} {
     return %out : tensor<4x4xi64>
   }
 
+// CHECK-LABEL: func.func @cast_to_linalg(
+// CHECK: linalg.generic
+// CHECK: %[[INDEX:.*]] = linalg.index 0 : index
+// CHECK: %[[INDEX_CAST:.*]] = arith.index_cast %[[INDEX]] : index to i64
+// CHECK: arith.sitofp %[[INDEX_CAST]] : i64 to f32
+  func.func @cast_to_linalg() -> tensor<4xf32> {
+    %out = ta.scope axes(%i "i" extent 4) {
+      %idx = ta.index %i : !ta.expr<i64, [i]>
+      %cast = ta.cast %idx : (!ta.expr<i64, [i]>) -> !ta.expr<f32, [i]>
+      ta.yield %cast : !ta.expr<f32, [i]>
+    } : () -> tensor<4xf32>
+    return %out : tensor<4xf32>
+  }
+
 // CHECK-LABEL: func.func @subst_at_to_linalg(
 // CHECK-NOT: ta.subst
 // CHECK: linalg.generic {indexing_maps = [#[[FIRST_DIM]], #[[SECOND_DIM]], #[[IDENTITY_2D]]], iterator_types = ["parallel", "parallel"]} ins(%arg0, %arg0

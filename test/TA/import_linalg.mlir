@@ -47,12 +47,33 @@ func.func @matmul(%arg0: tensor<4x8xf32>, %arg1: tensor<8x16xf32>) -> tensor<4x1
   return %0 : tensor<4x16xf32>
 }
 
+// CHECK-LABEL: func.func @index_sitofp
+// CHECK: ta.scope axes(%i0 "i0" extent 4)
+// CHECK: %[[IDX:.+]] = ta.index %i0{{.*}}!ta.expr<i64, [i0]>
+// CHECK: %[[CAST:.+]] = ta.cast %[[IDX]] {{.*}} : (!ta.expr<i64, [i0]>) -> !ta.expr<f32, [i0]>
+// CHECK: ta.yield %[[CAST]] : !ta.expr<f32, [i0]>
+// CHECK: return {{.*}} : tensor<4xf32>
+func.func @index_sitofp() -> tensor<4xf32> {
+  %empty = tensor.empty() : tensor<4xf32>
+  %0 = linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0)>],
+      iterator_types = ["parallel"]}
+      outs(%empty : tensor<4xf32>) {
+  ^bb0(%out: f32):
+    %i = linalg.index 0 : index
+    %ii = arith.index_cast %i : index to i64
+    %f = arith.sitofp %ii : i64 to f32
+    linalg.yield %f : f32
+  } -> tensor<4xf32>
+  return %0 : tensor<4xf32>
+}
+
 // CHECK-LABEL: func.func @attention
 // CHECK-NEXT: %[[SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 1, %i1 "i1" extent 2, %i2 "i2" extent 4, %i3 "i3" extent 3, %r0 "r0" extent 4, %r1 "r1" extent 3) {
 // CHECK-NEXT:   %[[Q16:.+]] = ta.at %{{.+}}[%i0, %i1, %i2, %r1] {ta.import_group = 0 : i64} : tensor<1x2x4x3xf16> -> !ta.expr<f16, [i0, i1, i2, r1]>
-// CHECK-NEXT:   %[[Q:.+]] = ta.extf %[[Q16]] {ta.import_group = 0 : i64} : (!ta.expr<f16, [i0, i1, i2, r1]>) -> !ta.expr<f32, [i0, i1, i2, r1]>
+// CHECK-NEXT:   %[[Q:.+]] = ta.cast %[[Q16]] {ta.import_group = 0 : i64} : (!ta.expr<f16, [i0, i1, i2, r1]>) -> !ta.expr<f32, [i0, i1, i2, r1]>
 // CHECK-NEXT:   %[[K16:.+]] = ta.at %{{.+}}[%i0, %i1, %r0, %r1] {ta.import_group = 1 : i64} : tensor<1x2x4x3xf16> -> !ta.expr<f16, [i0, i1, r0, r1]>
-// CHECK-NEXT:   %[[K:.+]] = ta.extf %[[K16]] {ta.import_group = 1 : i64} : (!ta.expr<f16, [i0, i1, r0, r1]>) -> !ta.expr<f32, [i0, i1, r0, r1]>
+// CHECK-NEXT:   %[[K:.+]] = ta.cast %[[K16]] {ta.import_group = 1 : i64} : (!ta.expr<f16, [i0, i1, r0, r1]>) -> !ta.expr<f32, [i0, i1, r0, r1]>
 // CHECK-NEXT:   %[[QK:.+]] = ta.mulf %[[Q]], %[[K]] {ta.import_group = 3 : i64} : (!ta.expr<f32, [i0, i1, i2, r1]>, !ta.expr<f32, [i0, i1, r0, r1]>) -> !ta.expr<f32, [i0, i1, i2, r1, r0]>
 // CHECK-NEXT:   %[[DOT:.+]] = ta.reduce <add> %[[QK]] {axes = #ta.axes<r1>, ta.import_group = 3 : i64} : !ta.expr<f32, [i0, i1, i2, r1, r0]> -> !ta.expr<f32, [i0, i1, i2, r0]>
 // CHECK-NEXT:   %[[SCALE:.+]] = ta.constant 0.577350259 : f32 {ta.import_group = 4 : i64} : !ta.expr<f32, []>
@@ -63,10 +84,10 @@ func.func @matmul(%arg0: tensor<4x8xf32>, %arg1: tensor<8x16xf32>) -> tensor<4x1
 // CHECK-NEXT:   %[[DEN:.+]] = ta.reduce <add> %[[EXP]] {axes = #ta.axes<r0>, ta.import_group = 8 : i64} : !ta.expr<f32, [i0, i1, i2, r0]> -> !ta.expr<f32, [i0, i1, i2]>
 // CHECK-NEXT:   %[[PROB:.+]] = ta.divf %[[EXP]], %[[DEN]] {ta.import_group = 9 : i64} : (!ta.expr<f32, [i0, i1, i2, r0]>, !ta.expr<f32, [i0, i1, i2]>) -> !ta.expr<f32, [i0, i1, i2, r0]>
 // CHECK-NEXT:   %[[V16:.+]] = ta.at %{{.+}}[%i0, %i1, %r0, %i3] {ta.import_group = 10 : i64} : tensor<1x2x4x3xf16> -> !ta.expr<f16, [i0, i1, r0, i3]>
-// CHECK-NEXT:   %[[V:.+]] = ta.extf %[[V16]] {ta.import_group = 10 : i64} : (!ta.expr<f16, [i0, i1, r0, i3]>) -> !ta.expr<f32, [i0, i1, r0, i3]>
+// CHECK-NEXT:   %[[V:.+]] = ta.cast %[[V16]] {ta.import_group = 10 : i64} : (!ta.expr<f16, [i0, i1, r0, i3]>) -> !ta.expr<f32, [i0, i1, r0, i3]>
 // CHECK-NEXT:   %[[PV:.+]] = ta.mulf %[[PROB]], %[[V]] {ta.import_group = 11 : i64} : (!ta.expr<f32, [i0, i1, i2, r0]>, !ta.expr<f32, [i0, i1, r0, i3]>) -> !ta.expr<f32, [i0, i1, i2, r0, i3]>
 // CHECK-NEXT:   %[[NUM:.+]] = ta.reduce <add> %[[PV]] {axes = #ta.axes<r0>, ta.import_group = 11 : i64} : !ta.expr<f32, [i0, i1, i2, r0, i3]> -> !ta.expr<f32, [i0, i1, i2, i3]>
-// CHECK-NEXT:   %[[OUT:.+]] = ta.truncf %[[NUM]] {ta.import_group = 12 : i64} : (!ta.expr<f32, [i0, i1, i2, i3]>) -> !ta.expr<f16, [i0, i1, i2, i3]>
+// CHECK-NEXT:   %[[OUT:.+]] = ta.cast %[[NUM]] {ta.import_group = 12 : i64} : (!ta.expr<f32, [i0, i1, i2, i3]>) -> !ta.expr<f16, [i0, i1, i2, i3]>
 // CHECK-NEXT:   ta.yield %[[OUT]] : !ta.expr<f16, [i0, i1, i2, i3]>
 // CHECK-NEXT: } : () -> tensor<1x2x4x3xf16>
 // CHECK-NEXT: return %[[SCOPE]] : tensor<1x2x4x3xf16>

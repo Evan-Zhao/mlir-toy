@@ -36,13 +36,6 @@ class TA_TernaryElementwiseOp<string mnemonic, list<Trait> traits = []>
   let assemblyFormat = "operands attr-dict `:` functional-type(operands, results)";
 }
 
-class TA_FloatCastElementwiseOp<string mnemonic, list<Trait> traits = []>
-    : TA_ElementwiseOp<mnemonic, traits> {
-  let arguments = (ins TA_ExprType:$operand);
-  let results = (outs TA_ExprType:$result);
-  let assemblyFormat = "operands attr-dict `:` functional-type(operands, results)";
-}
-
 def TA_YieldOp : TA_Op<"yield", [Pure, ReturnLike, Terminator]> {
   let summary = "yield from a tensor algebra region";
   let arguments = (ins Variadic<AnyType>:$values);
@@ -105,9 +98,12 @@ def TA_Log2Op : TA_UnaryElementwiseOp<"log2">;
 def TA_RsqrtOp : TA_UnaryElementwiseOp<"rsqrt">;
 def TA_SqrtOp : TA_UnaryElementwiseOp<"sqrt">;
 def TA_TanhOp : TA_UnaryElementwiseOp<"tanh">;
-def TA_ExtFOp : TA_FloatCastElementwiseOp<"extf">;
-def TA_TruncFOp : TA_FloatCastElementwiseOp<"truncf"> {
+def TA_CastOp : TA_ElementwiseOp<"cast"> {
+  let summary = "cast expression element values";
+  let arguments = (ins TA_ExprType:$operand);
+  let results = (outs TA_ExprType:$result);
   let hasCanonicalizer = 1;
+  let assemblyFormat = "operands attr-dict `:` functional-type(operands, results)";
 }
 
 def TA_PowFOp : TA_BinaryElementwiseOp<"powf">;

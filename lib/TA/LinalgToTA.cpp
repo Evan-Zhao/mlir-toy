@@ -880,10 +880,8 @@ private:
     if (def->getNumResults() != 1)
       return def->emitOpError("unsupported scalar op with multiple results");
 
-    if (isa<arith::ExtFOp>(def))
-      return translateUnaryScalarOp<ExtFOp>(def, env, loopAxes);
-    if (isa<arith::TruncFOp>(def))
-      return translateUnaryScalarOp<TruncFOp>(def, env, loopAxes);
+    if (isa<arith::ExtFOp, arith::TruncFOp, arith::SIToFPOp>(def))
+      return translateUnaryScalarOp<CastOp>(def, env, loopAxes);
     if (auto indexCast = dyn_cast<arith::IndexCastOp>(def)) {
       if (auto index = indexCast.getIn().getDefiningOp<linalg::IndexOp>())
         return translateLinalgIndex(index, loopAxes, indexCast.getResult().getType());
@@ -931,8 +929,8 @@ private:
     for (Operation &op : llvm::make_early_inc_range(llvm::reverse(body.without_terminator()))) {
       if (!op.use_empty())
         continue;
-      if (isa<AtOp, ConstantOp, IndexOp, CmpIOp, SelectOp, ExtFOp, TruncFOp, ExpOp, Exp2Op, AddFOp,
-              SubFOp, SubIOp, AndIOp, MulFOp, DivFOp, MaximumFOp, MinimumFOp, ReduceOp>(&op))
+      if (isa<AtOp, ConstantOp, IndexOp, CmpIOp, SelectOp, CastOp, ExpOp, Exp2Op, AddFOp, SubFOp,
+              SubIOp, AndIOp, MulFOp, DivFOp, MaximumFOp, MinimumFOp, ReduceOp>(&op))
         op.erase();
     }
   }

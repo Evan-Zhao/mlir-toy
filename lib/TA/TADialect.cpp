@@ -10,7 +10,6 @@
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Tools/Plugins/DialectPlugin.h"
 #include "mlir/Tools/Plugins/PassPlugin.h"
-#include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/StringSet.h"
 
 #define GET_DIALECT_DEFS
@@ -377,7 +376,7 @@ static LogicalResult verifyBinaryIntegerElementwiseOp(Operation *op) {
   return success();
 }
 
-static LogicalResult verifyFloatCastElementwiseOp(Operation *op, bool widening) {
+static LogicalResult verifyCastElementwiseOp(Operation *op) {
   if (op->getNumOperands() != 1)
     return op->emitOpError("expected one operand");
 
@@ -389,19 +388,25 @@ static LogicalResult verifyFloatCastElementwiseOp(Operation *op, bool widening) 
 
   auto operand = cast<ExprType>(op->getOperand(0).getType());
   auto result = cast<ExprType>(op->getResult(0).getType());
-  auto operandElement = dyn_cast<FloatType>(operand.getElementType());
-  auto resultElement = dyn_cast<FloatType>(result.getElementType());
-  if (!operandElement || !resultElement)
-    return op->emitOpError("requires floating-point operand and result element types");
+  Type operandElement = operand.getElementType();
+  Type resultElement = result.getElementType();
 
-  unsigned operandWidth = operandElement.getWidth();
-  unsigned resultWidth = resultElement.getWidth();
-  if (widening && resultWidth <= operandWidth)
-    return op->emitOpError("result element type must be wider than operand element type");
-  if (!widening && resultWidth >= operandWidth)
-    return op->emitOpError("result element type must be narrower than operand element type");
+  if (auto operandFloat = dyn_cast<FloatType>(operandElement)) {
+    auto resultFloat = dyn_cast<FloatType>(resultElement);
+    if (!resultFloat)
+      return op->emitOpError("requires a floating-point result element type for float casts");
+    if (operandFloat.getWidth() == resultFloat.getWidth())
+      return op->emitOpError("requires a non-identity element type conversion");
+    return success();
+  }
 
-  return success();
+  if (operandElement.isIndex() || operandElement.isSignlessInteger()) {
+    if (!isa<FloatType>(resultElement))
+      return op->emitOpError("requires a floating-point result element type for integer casts");
+    return success();
+  }
+
+  return op->emitOpError("unsupported cast element type conversion");
 }
 
 LogicalResult MapOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
@@ -686,26 +691,16 @@ DEFINE_TA_TERNARY_FLOAT_VERIFY(FmaOp)
 #undef DEFINE_TA_BINARY_FLOAT_VERIFY
 #undef DEFINE_TA_TERNARY_FLOAT_VERIFY
 
-LogicalResult ExtFOp::verify() {
-  return verifyFloatCastElementwiseOp(getOperation(), /*widening=*/true);
-}
-
-LogicalResult TruncFOp::verify() {
-  return verifyFloatCastElementwiseOp(getOperation(), /*widening=*/false);
-}
+LogicalResult CastOp::verify() { return verifyCastElementwiseOp(getOperation()); }
 
 namespace {
 
-struct FoldTruncFOfConstant : OpRewritePattern<TruncFOp> {
+struct FoldCastOfConstant : OpRewritePattern<CastOp> {
   using OpRewritePattern::OpRewritePattern;
 
-  LogicalResult matchAndRewrite(TruncFOp op, PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(CastOp op, PatternRewriter &rewriter) const override {
     auto constant = op.getOperand().getDefiningOp<ConstantOp>();
     if (!constant)
-      return failure();
-
-    auto value = dyn_cast<FloatAttr>(constant.getValue());
-    if (!value)
       return failure();
 
     auto result = cast<ExprType>(op.getResult().getType());
@@ -713,15 +708,26 @@ struct FoldTruncFOfConstant : OpRewritePattern<TruncFOp> {
     if (!resultElement)
       return failure();
 
-    APFloat rounded = value.getValue();
-    bool losesInfo = false;
-    APFloat::opStatus status = rounded.convert(resultElement.getFloatSemantics(),
-                                               APFloat::rmNearestTiesToEven, &losesInfo);
-    if (status == APFloat::opInvalidOp)
+    APFloat folded(resultElement.getFloatSemantics(), APInt::getZero(resultElement.getWidth()));
+    if (auto floatValue = dyn_cast<FloatAttr>(constant.getValue())) {
+      folded = floatValue.getValue();
+      bool losesInfo = false;
+      APFloat::opStatus status = folded.convert(resultElement.getFloatSemantics(),
+                                                APFloat::rmNearestTiesToEven, &losesInfo);
+      if (status == APFloat::opInvalidOp)
+        return failure();
+    } else if (auto intValue = dyn_cast<IntegerAttr>(constant.getValue())) {
+      APFloat::opStatus status =
+          folded.convertFromAPInt(intValue.getValue(), /*IsSigned=*/true,
+                                  APFloat::rmNearestTiesToEven);
+      if (status == APFloat::opInvalidOp)
+        return failure();
+    } else {
       return failure();
+    }
 
     auto replacement = ConstantOp::create(rewriter, op.getLoc(), op.getResult().getType(),
-                                          FloatAttr::get(resultElement, rounded));
+                                          FloatAttr::get(resultElement, folded));
     for (NamedAttribute attr : op->getDiscardableAttrs())
       replacement->setAttr(attr.getName(), attr.getValue());
     rewriter.replaceOp(op, replacement);
@@ -731,8 +737,8 @@ struct FoldTruncFOfConstant : OpRewritePattern<TruncFOp> {
 
 } // namespace
 
-void TruncFOp::getCanonicalizationPatterns(RewritePatternSet &patterns, MLIRContext *context) {
-  patterns.add<FoldTruncFOfConstant>(context);
+void CastOp::getCanonicalizationPatterns(RewritePatternSet &patterns, MLIRContext *context) {
+  patterns.add<FoldCastOfConstant>(context);
 }
 
 LogicalResult CmpFOp::verify() {

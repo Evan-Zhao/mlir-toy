@@ -76,9 +76,9 @@ func.func @float_cast_ta(%tensor: tensor<16xf16>) -> tensor<16xf16> {
   %0 = ta.scope axes(%coord "i" extent 16) {
     %x = ta.at %tensor[%coord]
         : tensor<16xf16> -> !ta.expr<f16, [i]>
-    %wide = ta.extf %x
+    %wide = ta.cast %x
         : (!ta.expr<f16, [i]>) -> !ta.expr<f32, [i]>
-    %narrow = ta.truncf %wide
+    %narrow = ta.cast %wide
         : (!ta.expr<f32, [i]>) -> !ta.expr<f16, [i]>
     ta.yield %narrow : !ta.expr<f16, [i]>
   } : () -> tensor<16xf16>

@@ -521,12 +521,25 @@ private:
     }
 
     Value scalar;
-    if (isa<ExtFOp>(def)) {
+    if (isa<CastOp>(def)) {
+      Type operandType = cast<ExprType>(def->getOperand(0).getType()).getElementType();
       auto resultType = cast<ExprType>(def->getResult(0).getType()).getElementType();
-      scalar = arith::ExtFOp::create(nestedBuilder, nestedLoc, resultType, operands[0]);
-    } else if (isa<TruncFOp>(def)) {
-      auto resultType = cast<ExprType>(def->getResult(0).getType()).getElementType();
-      scalar = arith::TruncFOp::create(nestedBuilder, nestedLoc, resultType, operands[0]);
+
+      if (auto operandFloat = dyn_cast<FloatType>(operandType)) {
+        auto resultFloat = cast<FloatType>(resultType);
+        if (resultFloat.getWidth() > operandFloat.getWidth())
+          scalar = arith::ExtFOp::create(nestedBuilder, nestedLoc, resultType, operands[0]);
+        else
+          scalar = arith::TruncFOp::create(nestedBuilder, nestedLoc, resultType, operands[0]);
+      } else if (operandType.isIndex() || operandType.isSignlessInteger()) {
+        Value operand = operands[0];
+        if (operandType.isIndex())
+          operand = arith::IndexCastOp::create(nestedBuilder, nestedLoc,
+                                               nestedBuilder.getI64Type(), operand);
+        scalar = arith::SIToFPOp::create(nestedBuilder, nestedLoc, resultType, operand);
+      } else {
+        llvm_unreachable("verified ta.cast has unsupported element types");
+      }
     } else if (auto cmpi = dyn_cast<CmpIOp>(def)) {
       scalar = arith::CmpIOp::create(nestedBuilder, nestedLoc, cmpi.getPredicate(), operands[0],
                                      operands[1]);
