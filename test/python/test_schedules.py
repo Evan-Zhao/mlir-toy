@@ -17,10 +17,11 @@ def test_default_attention_schedule_tile_sizes() -> None:
 
 def test_custom_attention_schedule_tile_sizes() -> None:
     text = materialize_attention_schedule(
-        AttentionSchedule.CAUSAL_ATTN,
+        AttentionSchedule.MASKED_ATTN,
         AttentionTileConfig(block_m=64, block_n=32),
     )
     assert "tile_sizes [1, 1, 64, 32, 0]" in text
+    assert "transform.loop.specialize_dead_tile" in text
 
 
 def test_gqa_keeps_batch_group_head_tiles_fixed() -> None:

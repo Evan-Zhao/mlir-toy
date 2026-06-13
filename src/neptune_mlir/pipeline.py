@@ -27,7 +27,8 @@ ATTENTION_TO_TRITON_INPUT_PIPELINE_BODY = (
 
 _VARIANT_TO_SCHEDULE = {
     AttentionVariant.GLOBAL_ATTN: AttentionSchedule.GLOBAL_ATTN,
-    AttentionVariant.CAUSAL_ATTN: AttentionSchedule.CAUSAL_ATTN,
+    AttentionVariant.CAUSAL_ATTN: AttentionSchedule.MASKED_ATTN,
+    AttentionVariant.WINDOWED_CAUSAL_ATTN: AttentionSchedule.MASKED_ATTN,
     AttentionVariant.GLOBAL_GQA: AttentionSchedule.GLOBAL_GQA,
 }
 
@@ -73,6 +74,7 @@ def _export_attention_linalg_subprocess(
     kv_heads: int | None,
     seq_len: int,
     head_dim: int,
+    window_size: int | None,
     func_name: str,
 ) -> str:
     # Torch-MLIR and the standalone MLIR Python bindings ship separate native
@@ -81,7 +83,9 @@ def _export_attention_linalg_subprocess(
     cmd += ["--variant", variant.value, "--batch", str(batch), "--q-heads", str(q_heads)]
     cmd += ["--seq-len", str(seq_len), "--head-dim", str(head_dim), "--func-name", func_name]
     if kv_heads is not None:
-        cmd.extend(["--kv-heads", str(kv_heads)])
+        cmd += ["--kv-heads", str(kv_heads)]
+    if window_size is not None:
+        cmd += ["--window-size", str(window_size)]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         stderr = result.stderr.strip()
@@ -140,6 +144,7 @@ def export_attention_to_triton_input_mlir(
     kv_heads: int | None = None,
     seq_len: int = 128,
     head_dim: int = 64,
+    window_size: int = 128,
     func_name: str = "attention",
     tile_config: AttentionTileConfig | None = None,
     plugins: NeptunePlugins | None = None,
@@ -155,6 +160,7 @@ def export_attention_to_triton_input_mlir(
         kv_heads=kv_heads,
         seq_len=seq_len,
         head_dim=head_dim,
+        window_size=window_size,
         func_name=func_name,
     )
     return lower_attention_linalg_to_triton_input_mlir(input_mlir, schedule, tile_config, plugins)

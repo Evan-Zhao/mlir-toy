@@ -1,6 +1,4 @@
 import ast
-import subprocess
-import sys
 from itertools import product
 from pathlib import Path
 
@@ -16,20 +14,34 @@ from neptune_mlir.schedules import AttentionTileConfig
 
 
 def make_attn_pytest_param(
-    variant: AttentionVariant, batch: int, qh: int, kvh: int, seq_len: int, dhead: int
+    variant: AttentionVariant,
+    batch: int,
+    qh: int,
+    kvh: int,
+    seq_len: int,
+    dhead: int,
+    window_size: int | None = None,
 ):
-    return pytest.param(
-        variant,
-        {"batch": batch, "q_heads": qh, "kv_heads": kvh, "seq_len": seq_len, "head_dim": dhead},
-        id=f"{variant.value}-b{batch}-qh{qh}-kvh{kvh}-s{seq_len}-d{dhead}",
-    )
+    kwargs = {"batch": batch, "q_heads": qh, "kv_heads": kvh, "seq_len": seq_len, "head_dim": dhead}
+    if window_size is not None:
+        assert variant == AttentionVariant.WINDOWED_CAUSAL_ATTN
+        kwargs["window_size"] = window_size
+        variant_name = f"{variant.value}-w{window_size}"
+    else:
+        variant_name = variant.value
+    case_id = f"{variant_name}-b{batch}-qh{qh}-kvh{kvh}-s{seq_len}-d{dhead}"
+    return pytest.param(variant, kwargs, id=case_id)
 
 
 BATCHES = (1, 2)
 SEQ_LENS = (128, 1024, 16384)
 HEAD_DIMS = (64, 128)
 ATTN_HEADS = (2, 4)
-ATTN_VARIANTS = (AttentionVariant.GLOBAL_ATTN, AttentionVariant.CAUSAL_ATTN)
+ATTN_VARIANTS = (
+    AttentionVariant.GLOBAL_ATTN,
+    AttentionVariant.CAUSAL_ATTN,
+    AttentionVariant.WINDOWED_CAUSAL_ATTN,  # Using default window size (128)
+)
 GQA_HEADS = ((4, 2), (4, 1))  # (4, 1) would be MQA
 TRANSLATOR_INPUT_CASES = [
     make_attn_pytest_param(variant, batch, heads, heads, seq_len, hdim)
@@ -62,6 +74,7 @@ def require_export_deps():
     [
         (AttentionVariant.GLOBAL_ATTN, {"q_heads": 2}),
         (AttentionVariant.CAUSAL_ATTN, {"q_heads": 2}),
+        (AttentionVariant.WINDOWED_CAUSAL_ATTN, {"q_heads": 2, "window_size": 128}),
         (AttentionVariant.GLOBAL_GQA, {"q_heads": 4, "kv_heads": 2}),
     ],
 )
@@ -97,39 +110,6 @@ def test_custom_tile_config_reaches_lowered_loop_bounds() -> None:
     assert "arith.constant 64 : index" in lowered
     assert "arith.constant 32 : index" in lowered
     assert "htile.store" in lowered
-
-
-def test_export_sliding_window_causal_attention_linalg() -> None:
-    require_export_deps()
-
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "neptune_mlir.operator.export_attention_linalg",
-            "--variant",
-            "sliding-window-causal-attn",
-            "--seq-len",
-            "16",
-            "--head-dim",
-            "16",
-            "--q-heads",
-            "2",
-            "--window-size",
-            "4",
-        ],
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert "func.func @attention" in result.stdout
-    assert "linalg.batch_matmul" in result.stdout
-    assert "arith.cmpi sle" in result.stdout
-    assert "arith.cmpi sge" in result.stdout
-    assert "arith.andi" in result.stdout
-    assert "torch." not in result.stdout
-    assert "aten." not in result.stdout
 
 
 @pytest.mark.parametrize(("variant", "kwargs"), TRANSLATOR_INPUT_CASES)

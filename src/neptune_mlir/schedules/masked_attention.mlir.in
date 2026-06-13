@@ -1,5 +1,5 @@
-// Transform-dialect schedule for a Torch-MLIR causal-attention payload. This
-// extends the basic FlashAttention-style schedule with
+// Transform-dialect schedule for a Torch-MLIR causal or windowed attention payload.
+// It extends the basic FlashAttention-style schedule with
 // `transform.loop.specialize_dead_tile`, which splits the streaming K/V loop
 // into a fully-live prefix and a mixed suffix.
 
@@ -44,6 +44,7 @@ module attributes {transform.with_named_sequence} {
     %bmm0 = transform.collect_matching @match_4d_matmul_transb in %func : (!any) -> !any
     %bmm1 = transform.collect_matching @match_4d_matmul in %func : (!any) -> !any
     transform.ta.to_linalg %func : !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     transform.linalg.greedy_inline_elementwise %bmm0 : !any
     transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any

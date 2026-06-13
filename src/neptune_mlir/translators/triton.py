@@ -143,6 +143,8 @@ class Translator:
             "arith.constant": self._arith_constant,
             "arith.muli": lambda o: self._binop(o, ast.Mult()),
             "arith.addi": lambda o: self._binop(o, ast.Add()),
+            "arith.subi": lambda o: self._binop(o, ast.Sub()),
+            "arith.andi": lambda o: self._binop(o, ast.BitAnd()),
             "arith.addf": lambda o: self._binop(o, ast.Add()),
             "arith.mulf": lambda o: self._binop(o, ast.Mult()),
             "arith.subf": lambda o: self._binop(o, ast.Sub()),

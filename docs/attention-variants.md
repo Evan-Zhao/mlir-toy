@@ -11,6 +11,8 @@ The pipeline currently covers these variants:
 
 - **Global multi-head attention**: dense unmasked scaled dot-product attention.
 - **Causal multi-head attention**: triangular score masking with dead-tile specialization.
+- **Sliding-window causal attention**: causal score masking with a fixed-width local history
+  window, lowered through the masked-attention schedule.
 - **Global grouped-query attention (GQA)**: Q heads grouped over fewer K/V heads.
 - **Global multi-query attention (MQA)**: the GQA case where all Q heads share one K/V head.
 
@@ -19,21 +21,6 @@ pipeline tests also exercise multiple shapes, including GQA with one K/V head, w
 case.
 
 ## Prioritized Variants
-
-### Sliding-Window Causal Attention
-
-Sliding-window causal attention should be the next target. It keeps the causal ordering but limits
-each query row to a fixed-width local history window. This is common in long-context decoder
-models and is a direct extension of the current causal-mask support.
-
-Compiler pressure points:
-
-- The K/V streaming loop has both a causal upper bound and a local-window lower bound.
-- Many score tiles are completely dead, while boundary tiles are partially live.
-- The mask predicate is still affine/index-based, so it should reuse much of the causal
-  dead-tile specialization machinery.
-- The resulting kernel should avoid both future tokens and tokens older than the window instead
-  of relying on `-inf` masking after loading all K/V tiles.
 
 ### Variable-Length Packed Attention
 
@@ -129,7 +116,6 @@ Compiler pressure points:
 
 ## Suggested Order
 
-1. Sliding-window causal attention.
 1. Variable-length packed attention.
 1. Decode attention with contiguous GQA/MQA KV cache.
 1. PagedAttention-style KV cache.
