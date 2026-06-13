@@ -1,6 +1,7 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_ta_plugin --load-pass-plugin=%neptune_ta_plugin %s --transform-interpreter 2>&1 | FileCheck %s
+// RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin --load-dialect-plugin=%neptune_ta_plugin --load-dialect-plugin=%neptune_htile_plugin --load-pass-plugin=%neptune_ta_plugin %s --transform-interpreter 2>&1 | FileCheck %s
 //
-// Minimal TA transform schedule for the windowed-attention payload, including lowering back to linalg.
+// Transform-dialect schedule for the windowed-attention payload through the
+// tensor/linalg tiled form.
 
 !any = !transform.any_op
 
@@ -15,6 +16,16 @@
 #map8 = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, 0)>
 
 module attributes {transform.with_named_sequence} {
+  transform.named_sequence @match_3d_1d_reduction(%candidate: !any {transform.readonly}) -> !any {
+    %matched = transform.match.structured %candidate : (!any) -> !any {
+    ^bb0(%op: !any):
+      transform.match.structured.dim %op[0, 1, 2] {parallel} : !any
+      transform.match.structured.dim %op[3] {reduction} : !any
+      transform.match.structured.yield %op : !any
+    }
+    transform.yield %matched : !any
+  }
+
   transform.named_sequence @match_4d_matmul_transb(%candidate: !any {transform.readonly}) -> !any {
     %matched = transform.match.ta.einsum %candidate
         {equation = "b h i d, b h j d -> b h i j"} : (!any) -> !any
@@ -25,6 +36,10 @@ module attributes {transform.with_named_sequence} {
     %matched = transform.match.ta.einsum %candidate
         {equation = "b h i j, b h j d -> b h i d"} : (!any) -> !any
     transform.yield %matched : !any
+  }
+
+  transform.named_sequence @return_matched(%arg: !any {transform.readonly}) -> !any {
+    transform.yield %arg : !any
   }
 
   transform.named_sequence @__transform_main(%module: !any) {
@@ -39,6 +54,63 @@ module attributes {transform.with_named_sequence} {
     %bmm1 = transform.collect_matching @match_4d_matmul in %func : (!any) -> !any
     transform.ta.to_linalg %func : !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+
+    transform.linalg.greedy_inline_elementwise %bmm0 : !any
+    transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any
+    %_1, %forall_loop = transform.structured.tile_using_forall
+        %bmm0 tile_sizes [1, 1, 64, 64, 0] : (!any) -> (!any, !any)
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+
+    %bscale = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
+    transform.fusion.into_producer %bscale into %forall_loop : (!any, !any) -> !any
+    %bmask = transform.get_consumers_of_result %forall_loop[1] : (!any) -> !any
+    transform.linalg.greedy_inline_elementwise %bmask : !any
+    %fused_bmask = transform.fusion.into_producer %bmask into %forall_loop : (!any, !any) -> !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+
+    %consumers = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
+    %_2, %bmax = transform.foreach_match restrict_root in %consumers
+        @match_3d_1d_reduction -> @return_matched : (!any) -> (!any, !any)
+    transform.linalg.erase_unused_operands_and_results %bmax : !any
+    %fused_bmax, %j0_loop = transform.scf.fuse_reduction_into_forall
+        %bmax into %forall_loop : (!any, !any) -> (!any, !any)
+
+    %bmm1_2, %elemwise = transform.fusion.find_next_reduction
+        %forall_loop : (!any) -> (!any, !any)
+    %elemwise_sidecars = transform.fusion.clone_fuse_elemwise
+        %elemwise into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
+    %_3 = transform.fusion.repair_reduction_frontier
+        (%fused_bmax, %bmm1_2) and (%elemwise, %elemwise_sidecars) into %forall_loop, %j0_loop
+        : (!any, !any, !any, !any, !any, !any) -> !any
+
+    %bsum, %elemwise_1 = transform.fusion.find_next_reduction
+        %forall_loop : (!any) -> (!any, !any)
+    %elemwise_sidecars_1 = transform.fusion.clone_fuse_elemwise
+        %elemwise_1 into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
+    %_4 = transform.fusion.repair_reduction_frontier
+        (%fused_bmax, %bsum) and (%elemwise_1, %elemwise_sidecars_1) into %forall_loop, %j0_loop
+        : (!any, !any, !any, !any, !any, !any) -> !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+
+    transform.apply_cse to %func : !any
+    %div = transform.get_consumers_of_result %forall_loop[1] : (!any) -> !any
+    transform.fusion.into_producer %div into %forall_loop : (!any, !any) -> !any
+    %trunc = transform.get_consumers_of_result %forall_loop[2] : (!any) -> !any
+    transform.fusion.into_producer %trunc into %forall_loop : (!any, !any) -> !any
+
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+    transform.scf.localize_scratch_tensors %func : !any
+    transform.apply_patterns to %func {
+      transform.apply_patterns.scf.fold_unit_extent_dims_via_reshapes
+      transform.apply_patterns.linalg.fold_unit_extent_dims_via_reshapes
+      transform.apply_patterns.canonicalization
+    } : !any
+    transform.apply_cse to %func : !any
+
+    // 0xFF800000: -inf in f32
+    %live_loop, %mixed_loop = transform.loop.specialize_dead_tile %fused_bmask in %j0_loop
+        {dead_value = 0xFF800000 : f32} : !any, !any -> !any, !any
+
     transform.yield
   }
 
@@ -175,9 +247,37 @@ module attributes {transform.with_named_sequence} {
   }
 }
 
-// CHECK-LABEL: func.func @attention
+// CHECK-LABEL: func.func @attention(
+// CHECK-SAME: %arg0: tensor<1x4x1024x64xf16>, %arg1: tensor<1x4x1024x64xf16>, %arg2: tensor<1x4x1024x64xf16>) -> tensor<1x4x1024x64xf16>
+// CHECK-NOT: tensor.empty() : tensor<4x1024x64xf32>
+// CHECK: %[[RESULT_INIT:.*]] = tensor.empty() : tensor<4x1024x64xf16>
+// CHECK: %[[FORALL:.*]] = scf.forall (%[[B:.*]], %[[I_TILE:.*]]) in (4, 16) shared_outs(%[[OUT:.*]] = %[[RESULT_INIT]]) -> (tensor<4x1024x64xf16>) {
+// CHECK: tensor.extract_slice %arg2
+// CHECK: linalg.fill ins(%{{.*}} : f32) outs(%{{.*}} : tensor<64xf32>) -> tensor<64xf32>
+// CHECK: linalg.fill ins(%{{.*}} : f32) outs(%{{.*}} : tensor<64x64xf32>) -> tensor<64x64xf32>
+// CHECK: %[[LIVE_LOWER_RAW:.*]] = affine.apply
+// CHECK: %[[LIVE_UPPER_RAW:.*]] = affine.apply
+// CHECK: %[[LIVE_LOWER_CLAMP_LO:.*]] = arith.maxsi %[[LIVE_LOWER_RAW]], %c0 : index
+// CHECK: %[[LIVE_LOWER:.*]] = arith.minsi %[[LIVE_LOWER_CLAMP_LO]], %c16 : index
+// CHECK: %[[LIVE_UPPER_CLAMP_LO:.*]] = arith.maxsi %[[LIVE_UPPER_RAW]], %c0 : index
+// CHECK: %[[LIVE_UPPER:.*]] = arith.minsi %[[LIVE_UPPER_CLAMP_LO]], %c16 : index
+// CHECK: %[[LIVE_LOOP:.*]]:3 = scf.for %{{.*}} = %[[LIVE_LOWER]] to %[[LIVE_UPPER]] step %c1 iter_args(
+// CHECK: tensor.extract_slice %arg0
+// CHECK: tensor.extract_slice %arg1
 // CHECK: linalg.generic
+// CHECK: arith.mulf
+// CHECK: math.exp2
+// CHECK: tensor.extract_slice %{{.*}}{{\[}}0, 0, %{{.*}}, 0]
+// CHECK: scf.yield
+// CHECK: %[[MIXED_LOOP:.*]]:3 = scf.for %{{.*}} = %[[LIVE_UPPER]] to %c16 step %c1 iter_args(%{{.*}} = %[[LIVE_LOOP]]#0, %{{.*}} = %[[LIVE_LOOP]]#1, %{{.*}} = %[[LIVE_LOOP]]#2)
+// CHECK: tensor.extract_slice %arg0
+// CHECK: tensor.extract_slice %arg1
 // CHECK: arith.subi
 // CHECK: math.exp2
+// CHECK: arith.divf %{{.*}}, %{{.*}} : f32
+// CHECK: arith.truncf %{{.*}} : f32 to f16
+// CHECK: tensor.parallel_insert_slice %{{.*}} into %[[OUT]]
+// CHECK-NOT: htile.
 // CHECK-NOT: ta.
+// CHECK: tensor.expand_shape %[[FORALL]]
 // CHECK: return
