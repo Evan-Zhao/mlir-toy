@@ -23,6 +23,9 @@ module attributes {transform.with_named_sequence} {
 // CHECK-NEXT: %{{.*}} = linalg.generic {{.*}}iterator_types = ["parallel", "parallel", "reduction"]
 // CHECK: arith.addf
 // CHECK-LABEL: func.func @ta_matmul_to_linalg_transform(
+// CHECK: arith.mulf
+// CHECK: linalg.generic {{.*}}iterator_types = ["parallel", "parallel", "reduction"]
+// CHECK: arith.addf
   func.func @ta_matmul_to_linalg_transform(%lhs: tensor<4x8xf32>,
                                            %rhs: tensor<8x16xf32>)
       -> tensor<4x16xf32> {
@@ -39,8 +42,37 @@ module attributes {transform.with_named_sequence} {
     } : () -> tensor<4x16xf32>
     return %out : tensor<4x16xf32>
   }
-}
 
-// CHECK: arith.mulf
-// CHECK: linalg.generic {{.*}}iterator_types = ["parallel", "parallel", "reduction"]
+// CHECK-LABEL: func.func @subst_to_linalg(
+// CHECK-NOT: ta.subst
+// CHECK: linalg.generic
+// CHECK: arith.subi
+  func.func @subst_to_linalg() -> tensor<4x4xi64> {
+    %out = ta.scope axes(%i "i" extent 4, %j "j" extent 4) {
+      %idx = ta.index %i : !ta.expr<i64, [i]>
+      %idx_j = ta.subst %idx {from_axes = #ta.axes<i>, to_axes = #ta.axes<j>}
+          : !ta.expr<i64, [i]> -> !ta.expr<i64, [j]>
+      %diff = ta.subi %idx_j, %idx
+          : (!ta.expr<i64, [j]>, !ta.expr<i64, [i]>) -> !ta.expr<i64, [j, i]>
+      ta.yield %diff : !ta.expr<i64, [j, i]>
+    } : () -> tensor<4x4xi64>
+    return %out : tensor<4x4xi64>
+  }
+
+// CHECK-LABEL: func.func @subst_at_to_linalg(
+// CHECK-NOT: ta.subst
+// CHECK: linalg.generic
 // CHECK: arith.addf
+  func.func @subst_at_to_linalg(%tensor: tensor<4xf32>) -> tensor<4x4xf32> {
+    %out = ta.scope axes(%i "i" extent 4, %j "j" extent 4) {
+      %x = ta.at %tensor[%i]
+          : tensor<4xf32> -> !ta.expr<f32, [i]>
+      %y = ta.subst %x {from_axes = #ta.axes<i>, to_axes = #ta.axes<j>}
+          : !ta.expr<f32, [i]> -> !ta.expr<f32, [j]>
+      %sum = ta.addf %y, %x
+          : (!ta.expr<f32, [j]>, !ta.expr<f32, [i]>) -> !ta.expr<f32, [j, i]>
+      ta.yield %sum : !ta.expr<f32, [j, i]>
+    } : () -> tensor<4x4xf32>
+    return %out : tensor<4x4xf32>
+  }
+}

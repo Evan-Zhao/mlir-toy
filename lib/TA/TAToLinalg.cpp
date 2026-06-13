@@ -16,6 +16,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringMap.h"
 
 #include <optional>
@@ -157,6 +158,40 @@ private:
     return success();
   }
 
+  SmallVector<StringRef> remapLoopAxes(ArrayRef<StringRef> loopAxes) {
+    SmallVector<StringRef> remapped;
+    remapped.reserve(loopAxes.size());
+    for (StringRef axis : loopAxes) {
+      auto it = axisSubstitutions.find(axis);
+      remapped.push_back(it == axisSubstitutions.end() ? axis : it->second);
+    }
+    return remapped;
+  }
+
+  auto pushSubstitution(SubstOp subst) {
+    SmallVector<std::pair<StringRef, std::optional<StringRef>>> oldMappings;
+    for (auto [fromAttr, toAttr] :
+         llvm::zip_equal(subst.getFromAxes().getAxes(), subst.getToAxes().getAxes())) {
+      StringRef fromAxis = cast<AxisAttr>(fromAttr).getName().getValue();
+      StringRef toAxis = cast<AxisAttr>(toAttr).getName().getValue();
+      auto it = axisSubstitutions.find(toAxis);
+      if (it == axisSubstitutions.end())
+        oldMappings.push_back({toAxis, std::nullopt});
+      else
+        oldMappings.push_back({toAxis, it->second});
+      axisSubstitutions[toAxis] = fromAxis;
+    }
+
+    return llvm::scope_exit([this, oldMappings = std::move(oldMappings)]() {
+      for (auto [axis, oldAxis] : oldMappings) {
+        if (oldAxis)
+          axisSubstitutions[axis] = *oldAxis;
+        else
+          axisSubstitutions.erase(axis);
+      }
+    });
+  }
+
   FailureOr<int64_t> getAxisSize(Operation *op, StringRef axis) {
     auto it = axisSizes.find(axis);
     if (it == axisSizes.end())
@@ -271,6 +306,27 @@ private:
     return inputs.size() - 1;
   }
 
+  FailureOr<std::optional<Value>> findInputScalar(Value value, ArrayRef<StringRef> loopAxes) {
+    Operation *def = value.getDefiningOp();
+    FailureOr<AffineMap> map;
+    if (auto at = dyn_cast<AtOp>(def))
+      map = mapForAt(at, loopAxes);
+    else
+      map = mapForExprAxes(def, cast<ExprType>(value.getType()), loopAxes);
+    if (failed(map))
+      return failure();
+
+    for (auto [index, descriptor] : llvm::enumerate(inputs)) {
+      if (descriptor.map != *map)
+        continue;
+      if (descriptor.at && descriptor.at.getResult() == value)
+        return std::optional<Value>(currentArgs[index]);
+      if (descriptor.exprValue == value)
+        return std::optional<Value>(currentArgs[index]);
+    }
+    return std::optional<Value>();
+  }
+
   LogicalResult collectInputs(Value value, Operation *root, ArrayRef<StringRef> loopAxes) {
     Operation *def = value.getDefiningOp();
     if (!def)
@@ -278,8 +334,15 @@ private:
 
     if (auto constant = dyn_cast<ConstantOp>(def))
       return success();
+    if (isa<IndexOp>(def))
+      return success();
     if (auto at = dyn_cast<AtOp>(def))
       return success(addAtInput(at, loopAxes));
+    if (auto subst = dyn_cast<SubstOp>(def)) {
+      auto guard = pushSubstitution(subst);
+      SmallVector<StringRef> remappedLoopAxes = remapLoopAxes(loopAxes);
+      return collectInputs(subst.getInput(), root, remappedLoopAxes);
+    }
 
     if (canInline(def, root)) {
       for (Value operand : def->getOperands()) {
@@ -323,9 +386,14 @@ private:
     } else {
       loopAxes = axisNames(resultExpr);
       iterators.assign(loopAxes.size(), utils::IteratorType::parallel);
-      for (Value operand : root->getOperands()) {
-        if (isa<ExprType>(operand.getType()) && failed(collectInputs(operand, root, loopAxes)))
+      if (isa<SubstOp>(root)) {
+        if (failed(collectInputs(root->getResult(0), root, loopAxes)))
           return failure();
+      } else {
+        for (Value operand : root->getOperands()) {
+          if (isa<ExprType>(operand.getType()) && failed(collectInputs(operand, root, loopAxes)))
+            return failure();
+        }
       }
     }
 
@@ -392,12 +460,9 @@ private:
   void buildLinalgBody(OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args,
                        Operation *root, ReduceOp reduce, ArrayRef<StringRef> loopAxes) {
     scalarValues.clear();
-    for (auto [index, descriptor] : llvm::enumerate(inputs)) {
-      if (descriptor.at)
-        scalarValues[descriptor.at.getResult()] = args[index];
-      if (descriptor.exprValue)
-        scalarValues[descriptor.exprValue] = args[index];
-    }
+    ValueRange oldArgs = currentArgs;
+    currentArgs = args;
+    auto guard = llvm::scope_exit([this, oldArgs]() { currentArgs = oldArgs; });
 
     Value yielded;
     if (reduce) {
@@ -412,12 +477,11 @@ private:
 
   Value buildScalar(OpBuilder &nestedBuilder, Location nestedLoc, Value value, Operation *root,
                     ArrayRef<StringRef> loopAxes) {
-    auto it = scalarValues.find(value);
-    if (it != scalarValues.end())
-      return it->second;
-
     Operation *def = value.getDefiningOp();
     if (auto constant = dyn_cast<ConstantOp>(def)) {
+      auto it = scalarValues.find(value);
+      if (it != scalarValues.end())
+        return it->second;
       Value scalar = arith::ConstantOp::create(nestedBuilder, nestedLoc, constant.getValue());
       scalarValues[value] = scalar;
       return scalar;
@@ -432,9 +496,22 @@ private:
       Type elementType = cast<ExprType>(index.getResult().getType()).getElementType();
       if (!elementType.isIndex())
         scalar = arith::IndexCastOp::create(nestedBuilder, nestedLoc, elementType, scalar);
-      scalarValues[value] = scalar;
       return scalar;
     }
+
+    if (auto subst = dyn_cast<SubstOp>(def)) {
+      auto guard = pushSubstitution(subst);
+      SmallVector<StringRef> remappedLoopAxes = remapLoopAxes(loopAxes);
+      Value scalar =
+          buildScalar(nestedBuilder, nestedLoc, subst.getInput(), root, remappedLoopAxes);
+      return scalar;
+    }
+
+    FailureOr<std::optional<Value>> inputScalar = findInputScalar(value, loopAxes);
+    if (failed(inputScalar))
+      llvm_unreachable("collected input could not be mapped in the linalg body");
+    if (*inputScalar)
+      return **inputScalar;
 
     SmallVector<Value> operands;
     operands.reserve(def->getNumOperands());
@@ -480,7 +557,6 @@ private:
       llvm_unreachable("unsupported scalar op reached after legality checks");
     }
 
-    scalarValues[value] = scalar;
     return scalar;
   }
 
@@ -504,8 +580,10 @@ private:
   MLIRContext *context;
   Location loc;
   llvm::StringMap<int64_t> axisSizes;
+  llvm::StringMap<StringRef> axisSubstitutions;
   DenseMap<Value, Value> valueToTensor;
   SmallVector<InputDescriptor> inputs;
+  ValueRange currentArgs;
   DenseMap<Value, Value> scalarValues;
   DenseMap<Operation *, Operation *> *loweredOps;
   llvm::function_ref<void(Operation *, const DenseMap<Operation *, Operation *> &)> beforeErase;

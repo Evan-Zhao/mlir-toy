@@ -1,6 +1,6 @@
 // RUN: mlir-opt --load-dialect-plugin=%neptune_ta_plugin --load-pass-plugin=%neptune_ta_plugin %s --transform-interpreter 2>&1 | FileCheck %s
 //
-// Minimal TA-only transform schedule for the windowed-attention payload.
+// Minimal TA transform schedule for the windowed-attention payload, including lowering back to linalg.
 
 !any = !transform.any_op
 
@@ -37,8 +37,8 @@ module attributes {transform.with_named_sequence} {
     } : !any
     %bmm0 = transform.collect_matching @match_4d_matmul_transb in %func : (!any) -> !any
     %bmm1 = transform.collect_matching @match_4d_matmul in %func : (!any) -> !any
-    transform.print %bmm0 : !any
-    transform.print %bmm1 : !any
+    transform.ta.to_linalg %func : !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.yield
   }
 
@@ -175,13 +175,9 @@ module attributes {transform.with_named_sequence} {
   }
 }
 
-// CHECK: IR printer:
-// CHECK-NEXT: %{{.*}} = ta.reduce <add> {{.*}} -> !ta.expr<f32, [i0, i1, i2, r0]>
-// CHECK: IR printer:
-// CHECK-NEXT: %{{.*}} = ta.reduce <add> {{.*}} -> !ta.expr<f32, [i0, i1, i2, i3]>
 // CHECK-LABEL: func.func @attention
-// CHECK: ta.scope
-// CHECK: ta.subst {{.*}}from_axes = #ta.axes<i2>{{.*}}to_axes = #ta.axes<r0>
-// CHECK: ta.exp2
-// CHECK-NOT: ta.exp {{.*}} :
-// CHECK: ta.reduce <add> {{.*}} -> !ta.expr<f32, [i0, i1, i2, i3]>
+// CHECK: linalg.generic
+// CHECK: arith.subi
+// CHECK: math.exp2
+// CHECK-NOT: ta.
+// CHECK: return
