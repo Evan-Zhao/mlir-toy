@@ -79,6 +79,7 @@ private:
 struct FunctionAxisInfo {
   DenseMap<Value, TensorAxes> valueAxes;
   DenseMap<linalg::GenericOp, TensorAxes> loopAxisMap;
+  DenseMap<OpOperand *, TensorAxes> operandAxes;
   SmallVector<Axis> scopeAxes;
 };
 
@@ -130,7 +131,7 @@ private:
     return false;
   }
 
-  FailureOr<bool> mergeValueAxes(Value value, const TensorAxisIds &desired) {
+  LogicalResult mergeValueAxes(Value value, const TensorAxisIds &desired, bool &changed) {
     auto type = dyn_cast<RankedTensorType>(value.getType());
     if (!type)
       return emitError(value.getLoc()) << "expected ranked tensor value";
@@ -139,14 +140,27 @@ private:
 
     auto [it, inserted] = valueAxes.try_emplace(value, TensorAxisIds(type.getRank()));
     TensorAxisIds &existing = it->second;
-    bool changed = inserted;
+    changed |= inserted;
     for (auto [axis, desiredAxis] : zip_equal(existing, desired)) {
       FailureOr<bool> axisChanged = mergeAxisPack(value.getLoc(), axis, desiredAxis);
       if (failed(axisChanged))
         return failure();
       changed |= *axisChanged;
     }
-    return changed;
+    return success();
+  }
+
+  // Like mergeValueAxes, but with additional checks. The caller is free to move on from a failure.
+  LogicalResult tryMergeValueAxes(Value value, const TensorAxisIds &desired, bool &changed) {
+    auto it = valueAxes.find(value);
+    if (it != valueAxes.end()) {
+      for (auto [existingAxis, desiredAxis] : zip_equal(it->second, desired)) {
+        if (!existingAxis.empty() && !desiredAxis.empty() &&
+            existingAxis.size() != desiredAxis.size())
+          return failure();
+      }
+    }
+    return mergeValueAxes(value, desired, changed);
   }
 
   FailureOr<TensorAxisIds> sourceAxesForCollapse(tensor::CollapseShapeOp op,
@@ -216,10 +230,9 @@ private:
         FailureOr<TensorAxisIds> axes = projectMap(op, maps[index], loopAxes);
         if (failed(axes))
           return failure();
-        FailureOr<bool> inputChanged = mergeValueAxes(input, *axes);
-        if (failed(inputChanged))
-          return failure();
-        changed |= *inputChanged;
+        operandAxes[&op->getOpOperand(index)] = *axes;
+        // Intentionally ignoring the result of tryMergeValueAxes because we continue anyways.
+        auto _ = tryMergeValueAxes(input, *axes, changed);
       }
     }
 
@@ -228,31 +241,38 @@ private:
 
   LogicalResult discoverAxes(RankedTensorType resultType) {
     TensorAxisIds resultAxes = makeResultAxes(resultType);
-    FailureOr<bool> changed = mergeValueAxes(returnOp.getOperand(0), resultAxes);
-    if (failed(changed))
+    bool changed = false;
+    if (failed(mergeValueAxes(returnOp.getOperand(0), resultAxes, changed)))
       return failure();
-
-#define HANDLE_SHAPE_OP(Type, op, handler)                                                         \
-  if (auto shapeOp = dyn_cast<Type>(&(op))) {                                                      \
-    auto it = valueAxes.find(shapeOp.getResult());                                                 \
-    if (it == valueAxes.end())                                                                     \
-      continue;                                                                                    \
-    FailureOr<TensorAxisIds> sourceAxes = handler(shapeOp, it->second);                            \
-    if (failed(sourceAxes))                                                                        \
-      return failure();                                                                            \
-    FailureOr<bool> sourceChanged = mergeValueAxes(shapeOp.getSrc(), *sourceAxes);                 \
-    if (failed(sourceChanged))                                                                     \
-      return failure();                                                                            \
-    keepGoing |= *sourceChanged;                                                                   \
-    continue;                                                                                      \
-  }
 
     bool keepGoing = true;
     while (keepGoing) {
       keepGoing = false;
       for (Operation &op : llvm::reverse(func.front().without_terminator())) {
-        HANDLE_SHAPE_OP(tensor::CollapseShapeOp, op, sourceAxesForCollapse);
-        HANDLE_SHAPE_OP(tensor::ExpandShapeOp, op, sourceAxesForExpand);
+        if (auto collapse = dyn_cast<tensor::CollapseShapeOp>(op)) {
+          auto it = valueAxes.find(collapse.getResult());
+          if (it == valueAxes.end())
+            continue;
+          FailureOr<TensorAxisIds> sourceAxes = sourceAxesForCollapse(collapse, it->second);
+          if (failed(sourceAxes) ||
+              failed(mergeValueAxes(collapse.getSrc(), *sourceAxes, keepGoing)))
+            return failure();
+          continue;
+        }
+        // Note the difference from the collapse case: we don't enforce that the axes be merged. If
+        // there is a layout conflict, it will go downstream and the FunctionEmitter will produce a
+        // `ta.subst` operation.
+        if (auto expand = dyn_cast<tensor::ExpandShapeOp>(op)) {
+          auto it = valueAxes.find(expand.getResult());
+          if (it == valueAxes.end())
+            continue;
+          FailureOr<TensorAxisIds> sourceAxes = sourceAxesForExpand(expand, it->second);
+          if (failed(sourceAxes))
+            return failure();
+          // Intentionally ignoring the result of tryMergeValueAxes because we continue anyways.
+          auto _ = tryMergeValueAxes(expand.getSrc(), *sourceAxes, keepGoing);
+          continue;
+        }
 
         if (auto generic = dyn_cast<linalg::GenericOp>(&op)) {
           FailureOr<bool> genericChanged = discoverGenericAxes(generic);
@@ -334,8 +354,11 @@ private:
     mapIdsToAxes(this->valueAxes, valueAxes);
     DenseMap<linalg::GenericOp, TensorAxes> loopAxisMap;
     mapIdsToAxes(this->loopAxisMap, loopAxisMap);
+    DenseMap<OpOperand *, TensorAxes> operandAxes;
+    mapIdsToAxes(this->operandAxes, operandAxes);
     return FunctionAxisInfo{.valueAxes = std::move(valueAxes),
                             .loopAxisMap = std::move(loopAxisMap),
+                            .operandAxes = std::move(operandAxes),
                             .scopeAxes = scopeAxes};
   }
 
@@ -363,6 +386,7 @@ private:
   AxisUnionFind<AxisId> axisUnions;
   DenseMap<Value, TensorAxisIds> valueAxes;
   DenseMap<linalg::GenericOp, TensorAxisIds> loopAxisMap;
+  DenseMap<OpOperand *, TensorAxisIds> operandAxes;
   SmallVector<Axis> axes;
 };
 
@@ -535,6 +559,13 @@ public:
     return annotate(op);
   }
 
+  Value subst(Value input, ArrayRef<std::string> fromAxes, ArrayRef<std::string> toAxes,
+              Type elementType) {
+    auto op = SubstOp::create(builder, loc, expr(elementType, toAxes), input, getAxesAttr(fromAxes),
+                              getAxesAttr(toAxes));
+    return annotate(op);
+  }
+
   void yield(Value value) { YieldOp::create(builder, loc, value); }
 
 private:
@@ -601,11 +632,33 @@ private:
 
     SmallVector<Value> inputExprs;
     inputExprs.reserve(numInputs);
-    for (Value input : op.getInputs()) {
+    for (auto [index, input] : llvm::enumerate(op.getInputs())) {
       if (dyn_cast<RankedTensorType>(input.getType())) {
         FailureOr<Value> expr = getTensorExpr(input);
         if (failed(expr))
           return failure();
+
+        auto axesIt = axisInfo.operandAxes.find(&op->getOpOperand(index));
+        if (axesIt == axisInfo.operandAxes.end())
+          return op.emitOpError("missing use-site axis info for tensor input");
+
+        auto exprType = cast<ExprType>((*expr).getType());
+        SmallVector<std::string> currentAxes;
+        for (Attribute attr : exprType.getAxes().getAxes())
+          currentAxes.push_back(cast<AxisAttr>(attr).getName().getValue().str());
+        SmallVector<std::string> useAxes = flattenAxes(axesIt->second);
+        bool sameAxes = currentAxes.size() == useAxes.size();
+        if (sameAxes) {
+          for (auto [currentAxis, useAxis] : llvm::zip_equal(currentAxes, useAxes)) {
+            if (currentAxis != useAxis) {
+              sameAxes = false;
+              break;
+            }
+          }
+        }
+        if (!sameAxes && currentAxes.size() == 1 && useAxes.size() == 1)
+          expr = ta.subst(*expr, currentAxes, useAxes, exprType.getElementType());
+
         inputExprs.push_back(*expr);
       } else {
         DenseMap<Value, Value> emptyEnv;
@@ -852,6 +905,10 @@ private:
       return translateBinaryScalarOp<AddFOp>(def, env, loopAxes);
     if (isa<arith::SubFOp>(def))
       return translateBinaryScalarOp<SubFOp>(def, env, loopAxes);
+    if (isa<arith::SubIOp>(def))
+      return translateBinaryScalarOp<SubIOp>(def, env, loopAxes);
+    if (isa<arith::AndIOp>(def))
+      return translateBinaryScalarOp<AndIOp>(def, env, loopAxes);
     if (isa<arith::MulFOp>(def))
       return translateBinaryScalarOp<MulFOp>(def, env, loopAxes);
     if (isa<arith::DivFOp>(def))
@@ -885,7 +942,7 @@ private:
       if (!op.use_empty())
         continue;
       if (isa<AtOp, ConstantOp, IndexOp, CmpIOp, SelectOp, ExtFOp, TruncFOp, ExpOp, Exp2Op, AddFOp,
-              SubFOp, MulFOp, DivFOp, MaximumFOp, MinimumFOp, ReduceOp>(&op))
+              SubFOp, SubIOp, AndIOp, MulFOp, DivFOp, MaximumFOp, MinimumFOp, ReduceOp>(&op))
         op.erase();
     }
   }

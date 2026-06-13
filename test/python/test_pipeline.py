@@ -1,4 +1,6 @@
 import ast
+import subprocess
+import sys
 from itertools import product
 from pathlib import Path
 
@@ -95,6 +97,39 @@ def test_custom_tile_config_reaches_lowered_loop_bounds() -> None:
     assert "arith.constant 64 : index" in lowered
     assert "arith.constant 32 : index" in lowered
     assert "htile.store" in lowered
+
+
+def test_export_sliding_window_causal_attention_linalg() -> None:
+    require_export_deps()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "neptune_mlir.operator.export_attention_linalg",
+            "--variant",
+            "sliding-window-causal-attn",
+            "--seq-len",
+            "16",
+            "--head-dim",
+            "16",
+            "--q-heads",
+            "2",
+            "--window-size",
+            "4",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "func.func @attention" in result.stdout
+    assert "linalg.batch_matmul" in result.stdout
+    assert "arith.cmpi sle" in result.stdout
+    assert "arith.cmpi sge" in result.stdout
+    assert "arith.andi" in result.stdout
+    assert "torch." not in result.stdout
+    assert "aten." not in result.stdout
 
 
 @pytest.mark.parametrize(("variant", "kwargs"), TRANSLATOR_INPUT_CASES)

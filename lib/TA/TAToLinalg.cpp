@@ -460,6 +460,10 @@ private:
       scalar = arith::AddFOp::create(nestedBuilder, nestedLoc, operands[0], operands[1]);
     } else if (isa<SubFOp>(def)) {
       scalar = arith::SubFOp::create(nestedBuilder, nestedLoc, operands[0], operands[1]);
+    } else if (isa<SubIOp>(def)) {
+      scalar = arith::SubIOp::create(nestedBuilder, nestedLoc, operands[0], operands[1]);
+    } else if (isa<AndIOp>(def)) {
+      scalar = arith::AndIOp::create(nestedBuilder, nestedLoc, operands[0], operands[1]);
     } else if (isa<MulFOp>(def)) {
       scalar = arith::MulFOp::create(nestedBuilder, nestedLoc, operands[0], operands[1]);
     } else if (isa<DivFOp>(def)) {
