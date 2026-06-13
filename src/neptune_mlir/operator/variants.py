@@ -6,7 +6,7 @@ from enum import Enum
 class AttentionVariant(str, Enum):
     GLOBAL_ATTN = "global-attn"
     CAUSAL_ATTN = "causal-attn"
-    SLIDING_WINDOW_CAUSAL_ATTN = "sliding-window-causal-attn"
+    WINDOWED_CAUSAL_ATTN = "windowed-causal-attn"
     GLOBAL_GQA = "global-gqa"
     FLOAT8_INPUTS = "float8-inputs"
     FAKE_QUANT = "fake-quant"

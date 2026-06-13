@@ -4,7 +4,7 @@
 Usage:
   python export_attention_linalg.py --variant global-attn > attention.mlir
   python export_attention_linalg.py --variant global-gqa > attention_gqa.mlir
-  python export_attention_linalg.py --variant sliding-window-causal-attn > attention_sw.mlir
+  python export_attention_linalg.py --variant windowed-causal-attn > attention_sw.mlir
   python export_attention_linalg.py --variant sparse-mm > sparse_probe.mlir
 """
 
@@ -152,7 +152,7 @@ def parse_args() -> argparse.Namespace:
         "--window-size",
         type=int,
         default=128,
-        help="local history window for sliding-window causal attention",
+        help="local history window for windowed causal attention",
     )
     parser.add_argument(
         "--func-name",
@@ -202,7 +202,7 @@ def _build_module_and_args(
         example_args = tuple(torch.randn(q_shape, dtype=torch.float16) for _ in range(3))
         return CausalAttentionModule(), example_args
 
-    if variant == AttentionVariant.SLIDING_WINDOW_CAUSAL_ATTN:
+    if variant == AttentionVariant.WINDOWED_CAUSAL_ATTN:
         example_args = tuple(torch.randn(q_shape, dtype=torch.float16) for _ in range(3))
         return SlidingWindowCausalAttentionModule(window_size).eval(), example_args
 
