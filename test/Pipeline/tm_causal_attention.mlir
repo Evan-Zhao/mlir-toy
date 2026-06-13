@@ -233,8 +233,8 @@ module attributes {transform.with_named_sequence} {
 // CHECK: scf.forall (%{{.*}}, %{{.*}}) in (4, 8) {
 // CHECK: htile.full %cst{{.*}} : f32 -> tensor<128xf32>
 // CHECK: htile.full %cst{{.*}} : f32 -> tensor<128x64xf32>
-// CHECK: %[[RAW_BOUND:.+]] = arith.select %{{.*}}, %{{.*}}, %c0 : index
-// CHECK: %[[CAPPED_BOUND:.+]] = arith.select %{{.*}}, %[[RAW_BOUND]], %c16 : index
+// CHECK: %[[RAW_BOUND:.+]] = arith.maxsi %{{.*}}, %c0 : index
+// CHECK: %[[CAPPED_BOUND:.+]] = arith.minsi %[[RAW_BOUND]], %c16 : index
 // CHECK: %[[LIVE:.+]]:3 = scf.for %{{.*}} = %c0 to %[[CAPPED_BOUND]] step %c1 iter_args(
 // CHECK: %[[MIXED:.+]]:3 = scf.for %{{.*}} = %[[CAPPED_BOUND]] to %c16 step %c1 iter_args(%{{.*}} = %[[LIVE]]#0, %{{.*}} = %[[LIVE]]#1, %{{.*}} = %[[LIVE]]#2) -> (tensor<128xf32>, tensor<128x64xf32>, tensor<128xf32>)
 // CHECK: htile.load %arg0{{\[}}%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}{{\]}} : memref<1x4x1024x64xf16> -> tensor<128x64xf16>

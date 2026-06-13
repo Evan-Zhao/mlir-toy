@@ -15,7 +15,8 @@ module attributes {transform.with_named_sequence} {
   }
 
   // CHECK-LABEL: func.func @dead_tile(
-  // CHECK: arith.cmpi
+  // CHECK: arith.maxsi
+  // CHECK: arith.minsi
   // CHECK: %[[LIVE_LOOP:.*]] = scf.for %{{.*}} = %[[LIVE_LOWER:.*]] to %[[LIVE_UPPER:.*]] step %c1 iter_args(%{{.*}} = %0) -> (tensor<1x128x64xf32>) {
   // CHECK-NEXT: scf.yield %arg1 : tensor<1x128x64xf32>
   // CHECK: %[[MIXED_LOOP:.*]] = scf.for %{{.*}} = %[[LIVE_UPPER]] to %c16 step %c1 iter_args(%{{.*}} = %[[LIVE_LOOP]]) -> (tensor<1x128x64xf32>) {

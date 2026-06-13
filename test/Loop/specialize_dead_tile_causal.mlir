@@ -23,7 +23,8 @@ module attributes {transform.with_named_sequence} {
   }
 
   // CHECK-LABEL: func.func @propagate_dead_tile(
-  // CHECK: arith.cmpi
+  // CHECK: arith.maxsi
+  // CHECK: arith.minsi
   // CHECK: %[[LIVE_LOOP:.*]]:3 = scf.for %{{.*}} = %[[LIVE_LOWER:.*]] to %[[LIVE_UPPER:.*]] step %c1 iter_args(%{{.*}} = %arg3, %{{.*}} = %arg4, %{{.*}} = %arg5) -> (tensor<1x128xf32>, tensor<1x128xf32>, tensor<1x128x32xf32>) {
   // CHECK-NOT: tag = "producer"
   // CHECK: ins(%arg1 : tensor<1x128x64xf32>) outs(%{{.*}} : tensor<1x128xf32>)

@@ -16,6 +16,7 @@ from .common import (
     _const,
     _dimension_order,
     _func_sym_name,
+    _is_ranked_tensor_type,
     _list,
     _memref_shape,
     _mlir_dtype_to_tl,
@@ -146,6 +147,8 @@ class Translator:
             "arith.mulf": lambda o: self._binop(o, ast.Mult()),
             "arith.subf": lambda o: self._binop(o, ast.Sub()),
             "arith.divf": lambda o: self._binop(o, ast.Div()),
+            "arith.maxsi": lambda o: self._scalar_call_binop(o, "max"),
+            "arith.minsi": lambda o: self._scalar_call_binop(o, "min"),
             "arith.maximumf": lambda o: self._tl_binop(o, "maximum"),
             "arith.index_cast": self._arith_index_cast,
             "arith.cmpi": self._arith_cmpi,
@@ -194,11 +197,16 @@ class Translator:
 
     def _tl_binop(self, op: ir.OpView, fn: str) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
+        return [_assign(name, _tl_call(fn, self._expr(op.operands[0]), self._expr(op.operands[1])))]
+
+    def _scalar_call_binop(self, op: ir.OpView, fn: str) -> list[ast.stmt]:
+        if _is_ranked_tensor_type(op.results[0].type) or any(
+            _is_ranked_tensor_type(operand.type) for operand in op.operands
+        ):
+            raise NotImplementedError(f"unsupported tensor {_op_type_name(op)}")
+        name = self._bind(op.results[0], "v")
         return [
-            _assign(
-                name,
-                _tl_call(fn, self._expr(op.operands[0]), self._expr(op.operands[1])),
-            )
+            _assign(name, _call(_name(fn), self._expr(op.operands[0]), self._expr(op.operands[1])))
         ]
 
     def _tl_unary(self, op: ir.OpView, fn: str) -> list[ast.stmt]:

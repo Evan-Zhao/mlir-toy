@@ -295,11 +295,10 @@ FailureOr<Value> materializeAffineBound(RewriterBase &rewriter, Location loc,
   return affine::AffineApplyOp::create(rewriter, loc, bound.map, bound.operands).getResult();
 }
 
-Value selectMinOrMaxIndexValue(RewriterBase &rewriter, Location loc, Value lhs, Value rhs,
-                               bool isMax) {
-  arith::CmpIPredicate predicate = isMax ? arith::CmpIPredicate::sgt : arith::CmpIPredicate::slt;
-  Value lhsWins = arith::CmpIOp::create(rewriter, loc, predicate, lhs, rhs).getResult();
-  return arith::SelectOp::create(rewriter, loc, lhsWins, lhs, rhs).getResult();
+Value minOrMaxIndexValue(RewriterBase &rewriter, Location loc, Value lhs, Value rhs, bool isMax) {
+  if (isMax)
+    return arith::MaxSIOp::create(rewriter, loc, lhs, rhs).getResult();
+  return arith::MinSIOp::create(rewriter, loc, lhs, rhs).getResult();
 }
 
 FailureOr<std::pair<Value, Value>>
@@ -320,10 +319,10 @@ materializeIntervalBounds(RewriterBase &rewriter, scf::ForOp loop, const AffineI
     upper = *bound;
   }
 
-  lower = selectMinOrMaxIndexValue(rewriter, loc, lower, loop.getLowerBound(), /*isMax=*/true);
-  lower = selectMinOrMaxIndexValue(rewriter, loc, lower, loop.getUpperBound(), /*isMax=*/false);
-  upper = selectMinOrMaxIndexValue(rewriter, loc, upper, loop.getLowerBound(), /*isMax=*/true);
-  upper = selectMinOrMaxIndexValue(rewriter, loc, upper, loop.getUpperBound(), /*isMax=*/false);
+  lower = minOrMaxIndexValue(rewriter, loc, lower, loop.getLowerBound(), /*isMax=*/true);
+  lower = minOrMaxIndexValue(rewriter, loc, lower, loop.getUpperBound(), /*isMax=*/false);
+  upper = minOrMaxIndexValue(rewriter, loc, upper, loop.getLowerBound(), /*isMax=*/true);
+  upper = minOrMaxIndexValue(rewriter, loc, upper, loop.getUpperBound(), /*isMax=*/false);
   return {{lower, upper}};
 }
 

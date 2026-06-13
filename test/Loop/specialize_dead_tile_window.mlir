@@ -19,14 +19,10 @@ module attributes {transform.with_named_sequence} {
   // CHECK-LABEL: func.func @windowed_dead_tile_prefix(
   // CHECK: %[[LOWER_RAW:.*]] = affine.apply #[[$LOWER_MAP]]()
   // CHECK: %[[UPPER_RAW:.*]] = affine.apply #[[$UPPER_MAP]]()
-  // CHECK: %[[LOWER_IS_POSITIVE:.*]] = arith.cmpi sgt, %[[LOWER_RAW]], %c0 : index
-  // CHECK: %[[LOWER_NONNEGATIVE:.*]] = arith.select %[[LOWER_IS_POSITIVE]], %[[LOWER_RAW]], %c0 : index
-  // CHECK: %[[LOWER_LT_UB:.*]] = arith.cmpi slt, %[[LOWER_NONNEGATIVE]], %c16 : index
-  // CHECK: %[[LIVE_LOWER:.*]] = arith.select %[[LOWER_LT_UB]], %[[LOWER_NONNEGATIVE]], %c16 : index
-  // CHECK: %[[UPPER_IS_POSITIVE:.*]] = arith.cmpi sgt, %[[UPPER_RAW]], %c0 : index
-  // CHECK: %[[UPPER_NONNEGATIVE:.*]] = arith.select %[[UPPER_IS_POSITIVE]], %[[UPPER_RAW]], %c0 : index
-  // CHECK: %[[UPPER_LT_UB:.*]] = arith.cmpi slt, %[[UPPER_NONNEGATIVE]], %c16 : index
-  // CHECK: %[[LIVE_UPPER:.*]] = arith.select %[[UPPER_LT_UB]], %[[UPPER_NONNEGATIVE]], %c16 : index
+  // CHECK: %[[LOWER_NONNEGATIVE:.*]] = arith.maxsi %[[LOWER_RAW]], %c0 : index
+  // CHECK: %[[LIVE_LOWER:.*]] = arith.minsi %[[LOWER_NONNEGATIVE]], %c16 : index
+  // CHECK: %[[UPPER_NONNEGATIVE:.*]] = arith.maxsi %[[UPPER_RAW]], %c0 : index
+  // CHECK: %[[LIVE_UPPER:.*]] = arith.minsi %[[UPPER_NONNEGATIVE]], %c16 : index
   // CHECK: scf.for %{{.*}} = %[[LIVE_LOWER]] to %[[LIVE_UPPER]] step %c1
   // CHECK-NEXT: scf.yield %arg0 : tensor<64x64xf32>
   // CHECK: scf.for %{{.*}} = %[[LIVE_UPPER]] to %c16 step %c1
