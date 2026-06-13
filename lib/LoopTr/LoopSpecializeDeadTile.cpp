@@ -188,13 +188,17 @@ struct AffineBound {
     auto [lbMap, ubMap] =
         constraints.getLowerAndUpperBound(/*pos=*/0, /*offset=*/0, /*num=*/1,
                                           /*symStartPos=*/1, /*localExprs=*/{}, context,
-                                          /*closedUB=*/true);
+                                          /*closedUB=*/false);
     if (!lbMap || !ubMap)
       return failure();
 
     SmallVector<Value> operands;
     constraints.getValues(/*start=*/1, constraints.getNumDimAndSymbolVars(), &operands);
-    return AffineBound{lowerBound ? lbMap : ubMap, operands};
+    if (lowerBound)
+      return AffineBound{lbMap, operands};
+    // The affine API represents upper bounds as open bounds. Convert to the
+    // closed maximum value used when reasoning about "all elements in a tile".
+    return AffineBound{ubMap, operands}.offset(-1);
   }
 
 private:
@@ -298,17 +302,29 @@ Value selectMinOrMaxIndexValue(RewriterBase &rewriter, Location loc, Value lhs, 
   return arith::SelectOp::create(rewriter, loc, lhsWins, lhs, rhs).getResult();
 }
 
-FailureOr<Value> materializeIntervalUpperBound(RewriterBase &rewriter, scf::ForOp loop,
-                                               const AffineInterval &interval) {
+FailureOr<std::pair<Value, Value>>
+materializeIntervalBounds(RewriterBase &rewriter, scf::ForOp loop, const AffineInterval &interval) {
   Location loc = loop.getLoc();
-  Value value = loop.getUpperBound();
-  if (interval.empty)
-    value = loop.getLowerBound();
-  else if (interval.upper)
-    value = *materializeAffineBound(rewriter, loc, *interval.upper);
-  value = selectMinOrMaxIndexValue(rewriter, loc, value, loop.getLowerBound(), /*isMax=*/true);
-  value = selectMinOrMaxIndexValue(rewriter, loc, value, loop.getUpperBound(), /*isMax=*/false);
-  return value;
+  Value lower = loop.getLowerBound();
+  Value upper = interval.empty ? loop.getLowerBound() : loop.getUpperBound();
+  if (!interval.empty && interval.lower) {
+    FailureOr<Value> bound = materializeAffineBound(rewriter, loc, *interval.lower);
+    if (failed(bound))
+      return failure();
+    lower = *bound;
+  }
+  if (!interval.empty && interval.upper) {
+    FailureOr<Value> bound = materializeAffineBound(rewriter, loc, *interval.upper);
+    if (failed(bound))
+      return failure();
+    upper = *bound;
+  }
+
+  lower = selectMinOrMaxIndexValue(rewriter, loc, lower, loop.getLowerBound(), /*isMax=*/true);
+  lower = selectMinOrMaxIndexValue(rewriter, loc, lower, loop.getUpperBound(), /*isMax=*/false);
+  upper = selectMinOrMaxIndexValue(rewriter, loc, upper, loop.getLowerBound(), /*isMax=*/true);
+  upper = selectMinOrMaxIndexValue(rewriter, loc, upper, loop.getUpperBound(), /*isMax=*/false);
+  return {{lower, upper}};
 }
 
 using LoopCloneCustomizer =
@@ -379,7 +395,14 @@ AbstractValue getKnownState(Value value, const DenseMap<Value, AbstractValue> &s
 }
 
 enum class RelationKind : uint8_t { LE, LT, GE, GT };
-enum class LiveRelationStrength : uint8_t { Necessary, Sufficient };
+enum class LiveRelationStrength : uint8_t {
+  // An iteration outside this interval is definitely dead. This is used to
+  // truncate a suffix whose loop-carried state would not change.
+  PossibleLive,
+  // Every element in the producer tile is live. This is the mask-free interval
+  // where the dead-select producer can be bypassed entirely.
+  FullyLive
+};
 
 struct NecessaryLiveRelation {
   AffineBound lhs;
@@ -410,11 +433,11 @@ FailureOr<NecessaryLiveRelation> getLiveRelation(PredicateAtom atom, linalg::Gen
 
   auto chooseBound = [&](AffineBound &lower, AffineBound &upper,
                          bool chooseLower) -> AffineBound & { return chooseLower ? lower : upper; };
-  bool necessary = strength == LiveRelationStrength::Necessary;
-  AffineBound &lhsLeLt = chooseBound(*lhsLower, *lhsUpper, necessary);
-  AffineBound &rhsLeLt = chooseBound(*rhsLower, *rhsUpper, !necessary);
-  AffineBound &lhsGeGt = chooseBound(*lhsLower, *lhsUpper, !necessary);
-  AffineBound &rhsGeGt = chooseBound(*rhsLower, *rhsUpper, necessary);
+  bool possibleLive = strength == LiveRelationStrength::PossibleLive;
+  AffineBound &lhsLeLt = chooseBound(*lhsLower, *lhsUpper, possibleLive);
+  AffineBound &rhsLeLt = chooseBound(*rhsLower, *rhsUpper, !possibleLive);
+  AffineBound &lhsGeGt = chooseBound(*lhsLower, *lhsUpper, !possibleLive);
+  AffineBound &rhsGeGt = chooseBound(*rhsLower, *rhsUpper, possibleLive);
 
   switch (predicate) {
   case arith::CmpIPredicate::sle:
@@ -524,10 +547,18 @@ FailureOr<AffineInterval> getIvIntervalFromRelations(ArrayRef<NecessaryLiveRelat
 
   std::optional<AffineBound> lower;
   std::optional<AffineBound> upper;
-  if (lbMap)
-    lower = AffineBound{lbMap, boundOperands};
-  if (ubMap)
-    upper = AffineBound{ubMap, boundOperands}.offset(1);
+  if (lbMap) {
+    if (lbMap.getNumResults() > 1)
+      return failure();
+    if (lbMap.getNumResults() == 1)
+      lower = AffineBound{lbMap, boundOperands};
+  }
+  if (ubMap) {
+    if (ubMap.getNumResults() > 1)
+      return failure();
+    if (ubMap.getNumResults() == 1)
+      upper = AffineBound{ubMap, boundOperands}.offset(1);
+  }
   return AffineInterval{lower, upper};
 }
 
@@ -986,11 +1017,11 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
     BAIL("expected producer to yield select(live_predicate, live_value, dead_value)");
 
   FailureOr<AffineInterval> possibleLiveInterval =
-      deriveLiveInterval(producer, loop, *match, LiveRelationStrength::Necessary);
+      deriveLiveInterval(producer, loop, *match, LiveRelationStrength::PossibleLive);
   if (failed(possibleLiveInterval))
     BAIL("failed to derive an affine possible-live interval for the loop IV");
   FailureOr<AffineInterval> fullyLiveInterval =
-      deriveLiveInterval(producer, loop, *match, LiveRelationStrength::Sufficient);
+      deriveLiveInterval(producer, loop, *match, LiveRelationStrength::FullyLive);
   if (failed(fullyLiveInterval))
     BAIL("failed to derive an affine fully-live interval for the loop IV");
 
@@ -1001,20 +1032,12 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
     BAIL("expected producer live value to come from an input with the same indexing as the output");
 
   rewriter.setInsertionPoint(loop);
-  FailureOr<Value> liveUpperBound =
-      materializeIntervalUpperBound(rewriter, loop, *fullyLiveInterval);
-  if (failed(liveUpperBound))
+  auto fullyLiveBounds = materializeIntervalBounds(rewriter, loop, *fullyLiveInterval);
+  if (failed(fullyLiveBounds))
     BAIL("failed to materialize the fully-live prefix upper bound");
-  Value mixedUpperBound = loop.getUpperBound();
-  if (canTruncateDeadSuffix) {
-    FailureOr<Value> deadUpperBound =
-        materializeIntervalUpperBound(rewriter, loop, *possibleLiveInterval);
-    if (failed(deadUpperBound))
-      BAIL("failed to materialize the fully-dead suffix lower bound");
-    mixedUpperBound = *deadUpperBound;
-  }
+  auto [fullyLiveLower, fullyLiveUpper] = *fullyLiveBounds;
   FailureOr<scf::ForOp> liveLoop =
-      cloneForWithBody(rewriter, loop, loop.getLowerBound(), *liveUpperBound, loop.getInitArgs(),
+      cloneForWithBody(rewriter, loop, fullyLiveLower, fullyLiveUpper, loop.getInitArgs(),
                        [&](RewriterBase &, IRMapping &mapping, Operation &op) -> FailureOr<bool> {
                          if (&op != producer.getOperation())
                            return false;
@@ -1026,9 +1049,16 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
   if (failed(liveLoop))
     BAIL("failed to clone the fully-live prefix loop");
 
+  Value possiblyLiveUpper = loop.getUpperBound();
+  if (canTruncateDeadSuffix) {
+    auto possiblyLiveBounds = materializeIntervalBounds(rewriter, loop, *possibleLiveInterval);
+    if (failed(possiblyLiveBounds))
+      BAIL("failed to materialize the fully-dead suffix lower bound");
+    possiblyLiveUpper = possiblyLiveBounds->second;
+  }
   Operation *mixedProducer = nullptr;
   FailureOr<scf::ForOp> mixedLoop = cloneForWithBody(
-      rewriter, loop, *liveUpperBound, mixedUpperBound, liveLoop->getResults(),
+      rewriter, loop, fullyLiveUpper, possiblyLiveUpper, liveLoop->getResults(),
       [&](RewriterBase &rewriter, IRMapping &mapping, Operation &op) -> FailureOr<bool> {
         if (&op != producer.getOperation())
           return false;

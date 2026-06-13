@@ -15,10 +15,10 @@ module attributes {transform.with_named_sequence} {
   }
 
   // CHECK-LABEL: func.func @dead_tile(
-  // CHECK: %[[LIVE_BOUND:.*]] = arith.select %{{.*}}, %{{.*}}, %c16 : index
-  // CHECK: %[[LIVE_LOOP:.*]] = scf.for %{{.*}} = %c0 to %[[LIVE_BOUND]] step %c1 iter_args(%{{.*}} = %0) -> (tensor<1x128x64xf32>) {
+  // CHECK: arith.cmpi
+  // CHECK: %[[LIVE_LOOP:.*]] = scf.for %{{.*}} = %[[LIVE_LOWER:.*]] to %[[LIVE_UPPER:.*]] step %c1 iter_args(%{{.*}} = %0) -> (tensor<1x128x64xf32>) {
   // CHECK-NEXT: scf.yield %arg1 : tensor<1x128x64xf32>
-  // CHECK: %[[MIXED_LOOP:.*]] = scf.for %{{.*}} = %[[LIVE_BOUND]] to %c16 step %c1 iter_args(%{{.*}} = %[[LIVE_LOOP]]) -> (tensor<1x128x64xf32>) {
+  // CHECK: %[[MIXED_LOOP:.*]] = scf.for %{{.*}} = %[[LIVE_UPPER]] to %c16 step %c1 iter_args(%{{.*}} = %[[LIVE_LOOP]]) -> (tensor<1x128x64xf32>) {
   // CHECK: linalg.generic
   func.func @dead_tile(%q_block: index, %live: tensor<1x128x64xf32>)
       -> tensor<1x128x64xf32> {
