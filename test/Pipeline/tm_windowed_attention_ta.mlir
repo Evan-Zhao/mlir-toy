@@ -1,7 +1,6 @@
 // RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin --load-dialect-plugin=%neptune_ta_plugin --load-dialect-plugin=%neptune_htile_plugin --load-pass-plugin=%neptune_ta_plugin %s --transform-interpreter 2>&1 | FileCheck %s
 //
-// Transform-dialect schedule for the windowed-attention payload through the
-// tensor/linalg tiled form.
+// Transform-dialect schedule for the windowed-attention payload through HTile.
 
 !any = !transform.any_op
 
@@ -110,6 +109,11 @@ module attributes {transform.with_named_sequence} {
     // 0xFF800000: -inf in f32
     %live_loop, %mixed_loop = transform.loop.specialize_dead_tile %fused_bmask in %j0_loop
         {dead_value = 0xFF800000 : f32} : !any, !any -> !any, !any
+
+    // --- HTile lowering begins ---
+    transform.htile.linalg_to_semantic %func : !any
+    transform.htile.semantic_to_kernel_abi %func : !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     transform.yield
   }
@@ -248,35 +252,43 @@ module attributes {transform.with_named_sequence} {
 }
 
 // CHECK-LABEL: func.func @attention(
-// CHECK-SAME: %arg0: tensor<2x4x1024x64xf16>, %arg1: tensor<2x4x1024x64xf16>, %arg2: tensor<2x4x1024x64xf16>) -> tensor<2x4x1024x64xf16>
+// CHECK-SAME: %arg0: memref<2x4x1024x64xf16>, %arg1: memref<2x4x1024x64xf16>, %arg2: memref<2x4x1024x64xf16>, %arg3: memref<2x4x1024x64xf16>)
 // CHECK-NOT: tensor.empty() : tensor<4x1024x64xf32>
-// CHECK: %[[RESULT_INIT:.*]] = tensor.empty() : tensor<2x4x1024x64xf16>
-// CHECK: %[[FORALL:.*]] = scf.forall (%[[B:.*]], %[[H:.*]], %[[I_TILE:.*]]) in (2, 4, 16) shared_outs(%[[OUT:.*]] = %[[RESULT_INIT]]) -> (tensor<2x4x1024x64xf16>) {
-// CHECK: tensor.extract_slice %arg2
-// CHECK: linalg.fill ins(%{{.*}} : f32) outs(%{{.*}} : tensor<64xf32>) -> tensor<64xf32>
-// CHECK: linalg.fill ins(%{{.*}} : f32) outs(%{{.*}} : tensor<64x64xf32>) -> tensor<64x64xf32>
+// CHECK-NOT: tensor.empty() : tensor<4x1024x64xf16>
+// CHECK: scf.forall (%[[B:.*]], %[[H:.*]], %[[I_TILE:.*]]) in (2, 4, 16) {
+// CHECK: htile.full %{{.*}} : f32 -> tensor<64xf32>
+// CHECK: htile.full %{{.*}} : f32 -> tensor<64x64xf32>
 // CHECK: %[[LIVE_LOWER_RAW:.*]] = affine.apply
-// CHECK: %[[LIVE_UPPER_RAW:.*]] = affine.apply
 // CHECK: %[[LIVE_LOWER_CLAMP_LO:.*]] = arith.maxsi %[[LIVE_LOWER_RAW]], %c0 : index
 // CHECK: %[[LIVE_LOWER:.*]] = arith.minsi %[[LIVE_LOWER_CLAMP_LO]], %c16 : index
-// CHECK: %[[LIVE_UPPER_CLAMP_LO:.*]] = arith.maxsi %[[LIVE_UPPER_RAW]], %c0 : index
+// CHECK: %[[LIVE_UPPER_CLAMP_LO:.*]] = arith.maxsi %[[I_TILE]], %c0 : index
 // CHECK: %[[LIVE_UPPER:.*]] = arith.minsi %[[LIVE_UPPER_CLAMP_LO]], %c16 : index
-// CHECK: %[[LIVE_LOOP:.*]]:3 = scf.for %{{.*}} = %[[LIVE_LOWER]] to %[[LIVE_UPPER]] step %c1 iter_args(
-// CHECK: tensor.extract_slice %arg0
-// CHECK: tensor.extract_slice %arg1
-// CHECK: linalg.generic
-// CHECK: arith.mulf
+// CHECK: %[[LIVE_LOOP:.*]]:3 = scf.for %{{.*}} = %[[LIVE_LOWER]] to %[[LIVE_UPPER]] step %c1 iter_args(%{{.*}}, %{{.*}}, %{{.*}})
+// CHECK: htile.load %arg0{{\[}}%[[B]], %{{.*}}, %{{.*}}{{\]}} : memref<2x4x1024x64xf16> -> tensor<64x64xf16>
+// CHECK: htile.load %arg1{{\[}}%[[B]], %{{.*}}, %{{.*}}{{\]}} : memref<2x4x1024x64xf16> -> tensor<64x64xf16>
+// CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} {transpose_b} : tensor<64x64xf16>, tensor<64x64xf16>, tensor<64x64xf32> -> tensor<64x64xf32>
+// CHECK: htile.reduce %{{.*}} axis 1 kind "max" : tensor<64x64xf32> -> tensor<64xf32>
 // CHECK: math.exp2
-// CHECK: tensor.extract_slice %{{.*}}{{\[}}0, 0, %{{.*}}, 0]
+// CHECK: htile.load %arg2{{\[}}%[[B]], %{{.*}}, %{{.*}}{{\]}} : memref<2x4x1024x64xf16> -> tensor<64x64xf16>
+// CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<64x64xf32>, tensor<64x64xf16>, tensor<64x64xf32> -> tensor<64x64xf32>
+// CHECK: htile.reduce %{{.*}} axis 1 kind "sum" : tensor<64x64xf32> -> tensor<64xf32>
 // CHECK: scf.yield
 // CHECK: %[[MIXED_LOOP:.*]]:3 = scf.for %{{.*}} = %[[LIVE_UPPER]] to %c16 step %c1 iter_args(%{{.*}} = %[[LIVE_LOOP]]#0, %{{.*}} = %[[LIVE_LOOP]]#1, %{{.*}} = %[[LIVE_LOOP]]#2)
-// CHECK: tensor.extract_slice %arg0
-// CHECK: tensor.extract_slice %arg1
+// CHECK: htile.load %arg0{{\[}}%[[B]], %{{.*}}, %{{.*}}{{\]}} : memref<2x4x1024x64xf16> -> tensor<64x64xf16>
+// CHECK: htile.load %arg1{{\[}}%[[B]], %{{.*}}, %{{.*}}{{\]}} : memref<2x4x1024x64xf16> -> tensor<64x64xf16>
+// CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} {transpose_b} : tensor<64x64xf16>, tensor<64x64xf16>, tensor<64x64xf32> -> tensor<64x64xf32>
+// CHECK: htile.arange %c0 to %c64 : tensor<64xindex>
+// CHECK: htile.broadcast %{{.*}} dimensions = [1] : tensor<64xindex> -> tensor<64x64xindex>
 // CHECK: arith.subi
+// CHECK: arith.select %{{.*}}, %{{.*}}, %{{.*}} : tensor<64x64xi1>, tensor<64x64xf32>
+// CHECK: htile.reduce %{{.*}} axis 1 kind "max" : tensor<64x64xf32> -> tensor<64xf32>
 // CHECK: math.exp2
-// CHECK: arith.divf %{{.*}}, %{{.*}} : f32
-// CHECK: arith.truncf %{{.*}} : f32 to f16
-// CHECK: tensor.parallel_insert_slice %{{.*}} into %[[OUT]]
-// CHECK-NOT: htile.
+// CHECK: htile.load %arg2{{\[}}%[[B]], %{{.*}}, %{{.*}}{{\]}} : memref<2x4x1024x64xf16> -> tensor<64x64xf16>
+// CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<64x64xf32>, tensor<64x64xf16>, tensor<64x64xf32> -> tensor<64x64xf32>
+// CHECK: htile.reduce %{{.*}} axis 1 kind "sum" : tensor<64x64xf32> -> tensor<64xf32>
+// CHECK: arith.divf %{{.*}}, %{{.*}} : tensor<64x64xf32>
+// CHECK: arith.truncf %{{.*}} : tensor<64x64xf32> to tensor<64x64xf16>
+// CHECK: htile.store %{{.*}}, %arg3{{\[}}%[[B]], %{{.*}}, %{{.*}}{{\]}} : tensor<64x64xf16>, memref<2x4x1024x64xf16>
+// CHECK-NOT: tensor.parallel_insert_slice
 // CHECK-NOT: ta.
-// CHECK: return %[[FORALL]] : tensor<2x4x1024x64xf16>
+// CHECK: return
