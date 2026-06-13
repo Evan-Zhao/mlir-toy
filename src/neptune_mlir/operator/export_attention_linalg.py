@@ -4,6 +4,7 @@
 Usage:
   python export_attention_linalg.py --variant global-attn > attention.mlir
   python export_attention_linalg.py --variant global-gqa > attention_gqa.mlir
+  python export_attention_linalg.py --variant alibi-causal-attn > attention_alibi.mlir
   python export_attention_linalg.py --variant windowed-causal-attn > attention_sw.mlir
   python export_attention_linalg.py --variant sparse-mm > sparse_probe.mlir
 """
@@ -34,6 +35,29 @@ class CausalAttentionModule(torch.nn.Module):
         scores = scores * scale
         q_len = scores.shape[-2]
         kv_len = scores.shape[-1]
+        mask = torch.ones((q_len, kv_len), dtype=torch.bool, device=scores.device).tril()
+        mask = mask.view(1, 1, q_len, kv_len)
+        neg_inf = torch.tensor(float("-inf"), dtype=scores.dtype, device=scores.device)
+        scores = torch.where(mask, scores, neg_inf)
+        probs = torch.softmax(scores, dim=-1)
+        out_f32 = torch.matmul(probs, v.to(torch.float32))
+        return out_f32.to(torch.float16)
+
+
+class AlibiCausalAttentionModule(torch.nn.Module):
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, slopes: torch.Tensor
+    ) -> torch.Tensor:
+        scale = 1.0 / math.sqrt(q.shape[-1])
+        scores = torch.matmul(q.to(torch.float32), k.to(torch.float32).transpose(-1, -2))
+        scores = scores * scale
+        q_len = scores.shape[-2]
+        kv_len = scores.shape[-1]
+        q_heads = scores.shape[1]
+        query_pos = torch.arange(q_len, dtype=torch.float32, device=scores.device)
+        key_pos = torch.arange(kv_len, dtype=torch.float32, device=scores.device)
+        distance = key_pos.view(1, 1, 1, kv_len) - query_pos.view(1, 1, q_len, 1)
+        scores = scores + distance * slopes.view(1, q_heads, 1, 1)
         mask = torch.ones((q_len, kv_len), dtype=torch.bool, device=scores.device).tril()
         mask = mask.view(1, 1, q_len, kv_len)
         neg_inf = torch.tensor(float("-inf"), dtype=scores.dtype, device=scores.device)
@@ -201,6 +225,11 @@ def _build_module_and_args(
     if variant == AttentionVariant.CAUSAL_ATTN:
         example_args = tuple(torch.randn(q_shape, dtype=torch.float16) for _ in range(3))
         return CausalAttentionModule(), example_args
+
+    if variant == AttentionVariant.ALIBI_CAUSAL_ATTN:
+        q, k, v = (torch.randn(q_shape, dtype=torch.float16) for _ in range(3))
+        slopes = (torch.arange(q_heads, dtype=torch.float32) + 1.0) / q_heads
+        return AlibiCausalAttentionModule().eval(), (q, k, v, slopes)
 
     if variant == AttentionVariant.WINDOWED_CAUSAL_ATTN:
         example_args = tuple(torch.randn(q_shape, dtype=torch.float16) for _ in range(3))
