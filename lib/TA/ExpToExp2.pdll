@@ -77,6 +77,19 @@ Pattern ExpToExp2IntroduceLog2E {
   };
 }
 
+// c * (x + y) => (c * x) + (c * y)
+Pattern DistributeConstantMulOverAddF {
+  let add = op<ta.addf>(lhs: Value, rhs: Value);
+  let mul = op<ta.mulf>(constant: Value, add);
+  AxislessConstant(constant);
+
+  rewrite mul with {
+    let scaledLhs = op<ta.mulf>(constant, lhs);
+    let scaledRhs = op<ta.mulf>(constant, rhs);
+    replace mul with op<ta.addf>(scaledLhs, scaledRhs);
+  };
+}
+
 // c * (x - y) => (c * x) - (c * y)
 Pattern DistributeConstantMulOverSubF {
   let sub = op<ta.subf>(lhs: Value, rhs: Value);
