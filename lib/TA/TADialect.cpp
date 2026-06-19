@@ -735,10 +735,39 @@ struct FoldCastOfConstant : OpRewritePattern<CastOp> {
   }
 };
 
+struct FoldMulfOfConstants : OpRewritePattern<MulFOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(MulFOp op, PatternRewriter &rewriter) const override {
+    auto lhs = op.getLhs().getDefiningOp<ConstantOp>();
+    auto rhs = op.getRhs().getDefiningOp<ConstantOp>();
+    if (!lhs || !rhs)
+      return failure();
+
+    auto lhsValue = dyn_cast<FloatAttr>(lhs.getValue());
+    auto rhsValue = dyn_cast<FloatAttr>(rhs.getValue());
+    if (!lhsValue || !rhsValue || lhsValue.getType() != rhsValue.getType())
+      return failure();
+
+    APFloat value = lhsValue.getValue();
+    value.multiply(rhsValue.getValue(), APFloat::rmNearestTiesToEven);
+    auto replacement = ConstantOp::create(rewriter, op.getLoc(), op.getResult().getType(),
+                                          FloatAttr::get(lhsValue.getType(), value));
+    for (NamedAttribute attr : op->getDiscardableAttrs())
+      replacement->setAttr(attr.getName(), attr.getValue());
+    rewriter.replaceOp(op, replacement);
+    return success();
+  }
+};
+
 } // namespace
 
 void CastOp::getCanonicalizationPatterns(RewritePatternSet &patterns, MLIRContext *context) {
   patterns.add<FoldCastOfConstant>(context);
+}
+
+void MulFOp::getCanonicalizationPatterns(RewritePatternSet &patterns, MLIRContext *context) {
+  patterns.add<FoldMulfOfConstants>(context);
 }
 
 LogicalResult CmpFOp::verify() {

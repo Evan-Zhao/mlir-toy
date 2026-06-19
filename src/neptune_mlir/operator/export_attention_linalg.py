@@ -260,6 +260,23 @@ def _build_module_and_args(
     raise ValueError(f"unknown variant: {variant}")
 
 
+_FLOAT_DTYPES = {torch.float16, torch.bfloat16, torch.float32, torch.float64}
+
+
+def arange_default_iota_then_cast(
+    end, *, dtype=None, layout=torch.strided, device=None, pin_memory=False
+):
+    import torch._prims as prims
+
+    index_dtype = torch.int64
+    if dtype not in _FLOAT_DTYPES and dtype is not None:
+        index_dtype = dtype
+    index = prims.iota(end, start=0, step=1, dtype=index_dtype, device=device, requires_grad=False)
+    if index_dtype != dtype:
+        index = torch.ops.aten._to_copy.default(index, dtype=dtype, layout=layout, device=device)
+    return index
+
+
 def export_attention_linalg(
     *,
     variant: AttentionVariant,
@@ -271,19 +288,22 @@ def export_attention_linalg(
     window_size: int = 128,
     func_name: str = "attention",
 ) -> str:
+    from torch_mlir.extras.fx_decomp_util import get_decomposition_table
+
+    # Custom decomposition for aten.arange. The builtin one translates
+    # `x + arange(N)` into `x[i] + 0.000 + i`, and we don't want that 0.000.
+    decomposition_table = get_decomposition_table()
+    decomposition_table[torch.ops.aten.arange.default] = arange_default_iota_then_cast
     model, example_args = _build_module_and_args(
         variant, batch, q_heads, kv_heads or q_heads, seq_len, head_dim, window_size
     )
     exported_program = torch.export.export(model, example_args)
-    # Possible to control decomposition behavior by passing this `decomp_table` to
-    # `run_decompositions`. This will be needed when we use SDPA.
-    # decomp_table = torch.export.default_decompositions().materialize()
-    # exported_program = exported_program.run_decompositions(decomp_table)
     module = fx.export_and_import(
         exported_program,
         output_type="linalg-on-tensors",
         func_name=func_name,
         import_symbolic_shape_expressions=True,
+        decomposition_table=decomposition_table,
     )
     return _module_to_text(module)
 

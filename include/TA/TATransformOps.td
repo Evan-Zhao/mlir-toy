@@ -96,8 +96,8 @@ def TAExpToExp2PatternsOp : Op<Transform_Dialect, "apply_patterns.ta.exp_to_exp2
     The pattern set also contains the minimal scalar algebra needed to push the
     new positive scalar factor through a softmax-like expression graph:
     distribution through `ta.subf` and `ta.select`, movement through
-    `ta.reduce <max>`, reassociation through `ta.mulf`, and multiplication
-    folding for scalar `ta.constant` values.
+    `ta.reduce <max>`, reassociation through `ta.mulf`, and the `ta.mulf`
+    canonicalization that folds scalar `ta.constant` values.
   }];
 
   let assemblyFormat = "attr-dict";

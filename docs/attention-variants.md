@@ -15,6 +15,7 @@ The pipeline currently covers these variants:
   window, lowered through the masked-attention schedule.
 - **Global grouped-query attention (GQA)**: Q heads grouped over fewer K/V heads.
 - **Global multi-query attention (MQA)**: the GQA case where all Q heads share one K/V head.
+- **ALiBi-fused attention**: head-dependent linear score bias fused into the attention loop.
 
 The static Transform-dialect examples live under [`test/Pipeline`](../test/Pipeline). The Python
 pipeline tests also exercise multiple shapes, including GQA with one K/V head, which is the MQA
@@ -68,17 +69,6 @@ Compiler pressure points:
 - The transform depends on token position and channel parity/pairing.
 - The Q-side and K-side transforms must remain structurally visible through TA/linalg matching.
 
-### ALiBi-Fused Attention
-
-ALiBi adds a head-dependent linear bias to attention scores based on query/key distance. It is a
-small score-side transform, but common enough to deserve a direct test.
-
-Compiler pressure points:
-
-- The bias should fuse into the score tile before row-max.
-- The bias uses query/key indices and per-head slopes, so it exercises tiled index materialization.
-- It is a good minimal test for score-bias fusion independent of masking.
-
 ### Block-Sparse Attention With Global Tokens
 
 Longformer/BigBird-style attention combines local blocks with selected global or random blocks.
@@ -119,7 +109,7 @@ Compiler pressure points:
 1. Variable-length packed attention.
 1. Decode attention with contiguous GQA/MQA KV cache.
 1. PagedAttention-style KV cache.
-1. RoPE and ALiBi score/QK fusion.
+1. RoPE Q/K fusion.
 1. Block-sparse attention with global tokens.
 1. Cross-attention.
 1. Multi-head latent attention.

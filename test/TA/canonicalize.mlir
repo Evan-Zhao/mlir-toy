@@ -26,4 +26,18 @@ module {
     } : () -> tensor<1xf32>
     return %0 : tensor<1xf32>
   }
+
+  // CHECK-LABEL: func.func @fold_mulf_of_float_constants
+  func.func @fold_mulf_of_float_constants() -> tensor<1xf32> {
+    %0 = ta.scope axes(%i "i" extent 1) {
+      // CHECK: ta.constant 7.500000e+00 : f32
+      // CHECK-NOT: ta.mulf
+      %lhs = ta.constant 2.500000e+00 : f32 : !ta.expr<f32, []>
+      %rhs = ta.constant 3.000000e+00 : f32 : !ta.expr<f32, []>
+      %mul = ta.mulf %lhs, %rhs
+          : (!ta.expr<f32, []>, !ta.expr<f32, []>) -> !ta.expr<f32, []>
+      ta.yield %mul : !ta.expr<f32, []>
+    } : () -> tensor<1xf32>
+    return %0 : tensor<1xf32>
+  }
 }

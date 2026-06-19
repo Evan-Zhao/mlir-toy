@@ -243,6 +243,7 @@ void TAExchangeDivAndMatmulPatternsOp::populatePatterns(RewritePatternSet &patte
 
 void TAExpToExp2PatternsOp::populatePatterns(RewritePatternSet &patterns) {
   ta_exp_to_exp2_pdl::populateGeneratedPDLLPatterns(patterns);
+  ta::MulFOp::getCanonicalizationPatterns(patterns, patterns.getContext());
 }
 
 void TARewriteExpToExp2Op::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
@@ -258,6 +259,7 @@ DiagnosedSilenceableFailure TARewriteExpToExp2Op::applyToOne(TransformRewriter &
   (void)state;
   RewritePatternSet patterns(getContext());
   ta_exp_to_exp2_pdl::populateGeneratedPDLLPatterns(patterns);
+  ta::MulFOp::getCanonicalizationPatterns(patterns, getContext());
 
   if (failed(rewriteGreedily(rewriter, std::move(patterns), target))) {
     auto transform = cast<TransformOpInterface>(getOperation());

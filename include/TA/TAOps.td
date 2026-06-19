@@ -81,7 +81,9 @@ def TA_AddFOp : TA_BinaryElementwiseOp<"addf", [Commutative]>;
 def TA_SubFOp : TA_BinaryElementwiseOp<"subf">;
 def TA_SubIOp : TA_BinaryElementwiseOp<"subi">;
 def TA_AndIOp : TA_BinaryElementwiseOp<"andi", [Commutative]>;
-def TA_MulFOp : TA_BinaryElementwiseOp<"mulf", [Commutative]>;
+def TA_MulFOp : TA_BinaryElementwiseOp<"mulf", [Commutative]> {
+  let hasCanonicalizer = 1;
+}
 def TA_DivFOp : TA_BinaryElementwiseOp<"divf">;
 def TA_MaximumFOp : TA_BinaryElementwiseOp<"maximumf", [Commutative]>;
 def TA_MinimumFOp : TA_BinaryElementwiseOp<"minimumf", [Commutative]>;
