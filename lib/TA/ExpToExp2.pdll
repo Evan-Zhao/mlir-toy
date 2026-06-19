@@ -46,25 +46,6 @@ Rewrite MakeLog2EConstant(input: Value) -> Value [{
   return ta::ConstantOp::create(rewriter, input.getLoc(), resultType, attr).getResult();
 }];
 
-Rewrite FoldMulfConstants(lhs: Op, rhs: Op) -> Value [{
-  auto lhsConstant = dyn_cast<ta::ConstantOp>(lhs);
-  auto rhsConstant = dyn_cast<ta::ConstantOp>(rhs);
-  if (!lhsConstant || !rhsConstant)
-    return Value();
-
-  auto lhsAttr = dyn_cast<FloatAttr>(lhsConstant.getValue());
-  auto rhsAttr = dyn_cast<FloatAttr>(rhsConstant.getValue());
-  if (!lhsAttr || !rhsAttr || lhsAttr.getType() != rhsAttr.getType())
-    return Value();
-
-  APFloat value = lhsAttr.getValue();
-  value.multiply(rhsAttr.getValue(), APFloat::rmNearestTiesToEven);
-  auto foldedAttr = FloatAttr::get(lhsAttr.getType(), value);
-  return ta::ConstantOp::create(rewriter, lhs->getLoc(), lhsConstant.getResult().getType(),
-                                foldedAttr)
-      .getResult();
-}];
-
 // exp(x) => exp2(log2(e) * x)
 Pattern ExpToExp2IntroduceLog2E {
   let input: Value;
@@ -103,11 +84,11 @@ Pattern DistributeConstantMulOverSubF {
   };
 }
 
-// c * select(p, x, y) => select(p, c * x, c * y), for finite c > 0
-Pattern PushPositiveScaleThroughSelect {
+// c * select(p, x, y) => select(p, c * x, c * y)
+Pattern PushMulScaleThroughSelect {
   let select = op<ta.select>(condition: Value, trueValue: Value, falseValue: Value);
   let mul = op<ta.mulf>(constant: Value, select);
-  PositiveAxislessConstant(constant);
+  AxislessConstant(constant);
 
   rewrite mul with {
     let scaledTrue = op<ta.mulf>(constant, trueValue);
@@ -156,17 +137,5 @@ Pattern ReassociateRightNestedConstantMulf {
   rewrite outer with {
     let combined = op<ta.mulf>(outerConstant, innerConstant);
     replace outer with op<ta.mulf>(combined, payload);
-  };
-}
-
-// c0 * c1 => constant(c0 * c1)
-Pattern FoldConstantMulf {
-  let lhs = op<ta.constant>;
-  let rhs = op<ta.constant>;
-  let mul = op<ta.mulf>(lhs, rhs);
-
-  rewrite mul with {
-    let folded = FoldMulfConstants(lhs, rhs);
-    replace mul with folded;
   };
 }
