@@ -20,6 +20,13 @@ using namespace mlir;
 
 namespace {
 
+// Normalize linalg.generic ops of the form:
+//   collapse_shape(inputs) -> linalg.generic -> expand_shape(results)
+// into a higher-rank linalg.generic over the original input/result shapes.
+// This keeps axis discovery forward-only by eliminating matched reshape
+// sandwiches before the TA importer reasons about tensor axes.
+static LogicalResult expandFullyWrappedGenericOps(func::FuncOp func);
+
 LogicalResult discoverAndPrintAxes(func::FuncOp func);
 
 struct ImportLinalgToTAPass
@@ -38,11 +45,13 @@ struct ImportLinalgToTAPass
 
   void runOnOperation() final {
     func::FuncOp func = getOperation();
-    llvm::dbgs() << "func = " << func << "\n";
-    if (failed(discoverAndPrintAxes(func))) {
-      signalPassFailure();
+    if (func.empty())
       return;
-    }
+    if (failed(expandFullyWrappedGenericOps(func)))
+      return signalPassFailure();
+    llvm::dbgs() << "func = " << func << "\n";
+    if (failed(discoverAndPrintAxes(func)))
+      return signalPassFailure();
   }
 };
 
@@ -367,8 +376,269 @@ static LogicalResult discoverAndPrintAxes(func::FuncOp func) {
   return success();
 }
 
+/* Code for expandFullyWrappedGenericOps begins: */
+
+using LoopExpansion = SmallVector<SmallVector<int64_t>>;
+
+struct FullyWrappedGenericMatch {
+  linalg::GenericOp generic;
+  SmallVector<tensor::CollapseShapeOp> inputCollapses;
+  SmallVector<tensor::ExpandShapeOp> resultExpands;
+  LoopExpansion loopExpansion;
+};
+
+// Infer how each original linalg loop dimension is split in the expanded op
+// from one wrapped operand. For example, if an operand map projects loop d0 to
+// tensor dim 0 and that tensor dim was collapsed from [0, 1], then loop d0
+// expands to two loop dimensions in the rewritten generic.
+static FailureOr<LoopExpansion>
+computeLoopExpansion(AffineMap seedMap, ArrayRef<ReassociationIndices> seedReassociation) {
+  if (seedMap.getNumResults() != seedReassociation.size())
+    return failure();
+
+  SmallVector<unsigned> numExpandedDims(seedMap.getNumDims(), 1);
+  for (auto [resultIndex, expr] : llvm::enumerate(seedMap.getResults())) {
+    auto dim = dyn_cast<AffineDimExpr>(expr);
+    if (!dim || seedReassociation[resultIndex].empty())
+      return failure();
+    numExpandedDims[dim.getPosition()] = seedReassociation[resultIndex].size();
+  }
+
+  LoopExpansion loopExpansion;
+  loopExpansion.reserve(numExpandedDims.size());
+  int64_t nextExpandedDim = 0;
+  for (unsigned dimCount : numExpandedDims) {
+    SmallVector<int64_t> expandedDims;
+    expandedDims.reserve(dimCount);
+    for (unsigned i = 0; i < dimCount; ++i)
+      expandedDims.push_back(nextExpandedDim++);
+    loopExpansion.push_back(std::move(expandedDims));
+  }
+  return loopExpansion;
+}
+
+static LogicalResult matchExpectedReassociation(AffineMap indexingMap,
+                                                ArrayRef<SmallVector<int64_t>> loopExpandedDims,
+                                                ArrayRef<ReassociationIndices> reassocs) {
+  if (indexingMap.getNumResults() != reassocs.size())
+    return failure();
+  int64_t nextTensorDim = 0;
+  for (auto [resultIndex, expr] : llvm::enumerate(indexingMap.getResults())) {
+    auto dim = dyn_cast<AffineDimExpr>(expr);
+    if (!dim || dim.getPosition() >= loopExpandedDims.size())
+      return failure();
+    auto &expectedDims = loopExpandedDims[dim.getPosition()];
+    auto &reassoc = reassocs[resultIndex];
+    if (reassoc.size() != expectedDims.size())
+      return failure();
+    for (size_t i = 0, e = expectedDims.size(); i < e; ++i)
+      if (reassoc[i] != nextTensorDim++)
+        return failure();
+  }
+  return success();
+}
+
+static FailureOr<AffineMap> getExpandedIndexingMap(OpBuilder &builder, AffineMap indexingMap,
+                                                   const LoopExpansion &loopExpansion) {
+  SmallVector<AffineExpr> newExprs;
+  for (AffineExpr expr : indexingMap.getResults()) {
+    auto dim = dyn_cast<AffineDimExpr>(expr);
+    if (!dim || dim.getPosition() >= loopExpansion.size())
+      return failure();
+
+    for (int64_t expandedDim : loopExpansion[dim.getPosition()])
+      newExprs.push_back(builder.getAffineDimExpr(static_cast<unsigned>(expandedDim)));
+  }
+
+  size_t expandedLoopRank = 0;
+  for (auto &expandedDims : loopExpansion)
+    expandedLoopRank += expandedDims.size();
+  return AffineMap::get(expandedLoopRank, indexingMap.getNumSymbols(), newExprs,
+                        builder.getContext());
+}
+
+static SmallVector<ReassociationIndices>
+getReassociationForExpansion(AffineMap indexingMap, const LoopExpansion &loopExpansion) {
+  SmallVector<ReassociationIndices> reassociation;
+  int64_t nextTensorDim = 0;
+  for (AffineExpr expr : indexingMap.getResults()) {
+    unsigned dim = cast<AffineDimExpr>(expr).getPosition();
+    ReassociationIndices group;
+    group.reserve(loopExpansion[dim].size());
+    for (size_t i = 0, e = loopExpansion[dim].size(); i < e; ++i)
+      group.push_back(nextTensorDim++);
+    reassociation.push_back(std::move(group));
+  }
+  return reassociation;
+}
+
+static bool hasOnlyProjectedPermutationIndexingMaps(linalg::GenericOp generic) {
+  return llvm::all_of(generic.getIndexingMapsArray(),
+                      [](AffineMap map) { return map.isProjectedPermutation(); });
+}
+
+static bool hasLinalgIndexOps(linalg::GenericOp generic) {
+  return !generic.getRegion().front().getOps<linalg::IndexOp>().empty();
+}
+
+static FailureOr<FullyWrappedGenericMatch> matchFullyWrappedGeneric(linalg::GenericOp genericOp) {
+  if (!genericOp.hasPureTensorSemantics() || !hasOnlyProjectedPermutationIndexingMaps(genericOp) ||
+      hasLinalgIndexOps(genericOp) || genericOp->getNumResults() == 0)
+    return failure();
+
+  OpOperand *seedOperand = nullptr;
+  tensor::CollapseShapeOp seedCollapse;
+  SmallVector<tensor::CollapseShapeOp> inputCollapses;
+  inputCollapses.reserve(genericOp.getNumDpsInputs());
+  for (OpOperand *operand : genericOp.getDpsInputOperands()) {
+    if (!isa<RankedTensorType>(operand->get().getType()))
+      return failure();
+
+    auto collapse = operand->get().getDefiningOp<tensor::CollapseShapeOp>();
+    if (!collapse || !collapse->hasOneUse())
+      return failure();
+
+    if (!seedOperand) {
+      seedOperand = operand;
+      seedCollapse = collapse;
+    }
+    inputCollapses.push_back(collapse);
+  }
+  if (!seedOperand)
+    return failure();
+
+  auto loopExpansion = computeLoopExpansion(genericOp.getMatchingIndexingMap(seedOperand),
+                                            seedCollapse.getReassociationIndices());
+  if (failed(loopExpansion))
+    return failure();
+
+  for (auto [operand, collapse] :
+       llvm::zip_equal(genericOp.getDpsInputOperands(), inputCollapses)) {
+    if (failed(matchExpectedReassociation(genericOp.getMatchingIndexingMap(operand), *loopExpansion,
+                                          collapse.getReassociationIndices())))
+      return failure();
+  }
+
+  SmallVector<tensor::ExpandShapeOp> resultExpands;
+  resultExpands.reserve(genericOp->getNumResults());
+  for (OpResult result : genericOp->getResults()) {
+    if (!isa<RankedTensorType>(result.getType()) || !result.hasOneUse())
+      return failure();
+
+    auto expand = dyn_cast<tensor::ExpandShapeOp>(*result.getUsers().begin());
+    if (!expand || expand.getSrc() != result)
+      return failure();
+
+    OpOperand *initOperand = genericOp.getDpsInitOperand(result.getResultNumber());
+    if (failed(matchExpectedReassociation(genericOp.getMatchingIndexingMap(initOperand),
+                                          *loopExpansion, expand.getReassociationIndices())))
+      return failure();
+    resultExpands.push_back(expand);
+  }
+
+  return FullyWrappedGenericMatch{genericOp, std::move(inputCollapses), std::move(resultExpands),
+                                  *loopExpansion};
+}
+
+static void debugPrintMatch(const FullyWrappedGenericMatch &match) {
+  LLVM_DEBUG({
+    llvm::dbgs() << "linalg-to-ta: fully wrapped linalg.generic candidate:\n";
+    match.generic->print(llvm::dbgs());
+    llvm::dbgs() << "\n";
+    for (tensor::CollapseShapeOp collapse : match.inputCollapses) {
+      llvm::dbgs() << "  input collapse: ";
+      collapse->print(llvm::dbgs());
+      llvm::dbgs() << "\n";
+    }
+    for (tensor::ExpandShapeOp expand : match.resultExpands) {
+      llvm::dbgs() << "  result expand: ";
+      expand->print(llvm::dbgs());
+      llvm::dbgs() << "\n";
+    }
+  });
+}
+
+static LogicalResult rewriteFullyWrappedGeneric(FullyWrappedGenericMatch match) {
+  IRRewriter rewriter(match.generic.getContext());
+  rewriter.setInsertionPoint(match.resultExpands.front());
+  Location loc = match.generic.getLoc();
+
+  SmallVector<Type> resultTypes;
+  SmallVector<Value> outputs;
+  resultTypes.reserve(match.resultExpands.size());
+  outputs.reserve(match.resultExpands.size());
+  for (auto [index, expansion] : llvm::enumerate(match.resultExpands)) {
+    RankedTensorType resultType = expansion.getResultType();
+    resultTypes.push_back(resultType);
+    OpOperand *init = match.generic.getDpsInitOperand(static_cast<int64_t>(index));
+    AffineMap indexingMap = match.generic.getMatchingIndexingMap(init);
+    SmallVector<ReassociationIndices> reassociation =
+        getReassociationForExpansion(indexingMap, match.loopExpansion);
+    outputs.push_back(tensor::ExpandShapeOp::create(
+        rewriter, loc, resultType, init->get(), reassociation, expansion.getMixedOutputShape()));
+  }
+
+  OpBuilder mapBuilder(match.generic.getContext());
+  SmallVector<AffineMap> expandedIndexingMaps;
+  expandedIndexingMaps.reserve(match.generic.getIndexingMapsArray().size());
+  for (AffineMap map : match.generic.getIndexingMapsArray()) {
+    FailureOr<AffineMap> expandedMap = getExpandedIndexingMap(mapBuilder, map, match.loopExpansion);
+    if (failed(expandedMap))
+      return failure();
+    expandedIndexingMaps.push_back(*expandedMap);
+  }
+
+  size_t expandedLoopRank = 0;
+  for (auto &expandedDims : match.loopExpansion)
+    expandedLoopRank += expandedDims.size();
+  SmallVector<utils::IteratorType> expandedIteratorTypes(expandedLoopRank,
+                                                         utils::IteratorType::parallel);
+  for (auto [index, iterator] : llvm::enumerate(match.generic.getIteratorTypesArray()))
+    for (int64_t expandedDim : match.loopExpansion[index])
+      expandedIteratorTypes[expandedDim] = iterator;
+
+  auto expandedInputs = llvm::to_vector(llvm::map_range(
+      match.inputCollapses, [](auto collapse) { return (Value)collapse.getSrc(); }));
+  auto expandedGeneric =
+      linalg::GenericOp::create(rewriter, loc, resultTypes, expandedInputs, outputs,
+                                expandedIndexingMaps, expandedIteratorTypes);
+  rewriter.cloneRegionBefore(match.generic.getRegion(), expandedGeneric.getRegion(),
+                             expandedGeneric.getRegion().begin());
+
+  for (auto [index, expand] : llvm::enumerate(match.resultExpands))
+    rewriter.replaceOp(expand, expandedGeneric->getResult(index));
+
+  rewriter.eraseOp(match.generic);
+  for (tensor::CollapseShapeOp collapse : match.inputCollapses)
+    if (collapse->use_empty())
+      rewriter.eraseOp(collapse);
+
+  return success();
+}
+
+static LogicalResult expandFullyWrappedGenericOps(func::FuncOp func) {
+  SmallVector<linalg::GenericOp> generics;
+  func.walk([&](linalg::GenericOp generic) { generics.push_back(generic); });
+
+  for (linalg::GenericOp generic : generics) {
+    FailureOr<FullyWrappedGenericMatch> match = matchFullyWrappedGeneric(generic);
+    if (failed(match))
+      continue;
+
+    debugPrintMatch(*match);
+    if (failed(rewriteFullyWrappedGeneric(std::move(*match)))) {
+      LLVM_DEBUG(llvm::dbgs() << "linalg-to-ta: skipped candidate; rewrite failed\n");
+      continue;
+    }
+  }
+
+  return success();
+}
+
 } // namespace
 
 void registerLinalgToTAPass() { PassRegistration<ImportLinalgToTAPass>(); }
 
 } // namespace ta
+
+#undef DEBUG_TYPE
