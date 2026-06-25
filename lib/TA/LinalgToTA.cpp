@@ -289,10 +289,6 @@ private:
       if (failed(processOperand(operand)))
         return failure();
     }
-    for (int64_t index = 0, end = generic.getNumDpsInits(); index < end; ++index) {
-      if (failed(processOperand(generic.getDpsInitOperand(index))))
-        return failure();
-    }
 
     for (OpResult result : generic->getResults()) {
       auto resultType = dyn_cast<RankedTensorType>(result.getType());
