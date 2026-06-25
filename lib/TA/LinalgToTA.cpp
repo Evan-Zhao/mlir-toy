@@ -458,6 +458,64 @@ public:
 
   void yield(Value value) { YieldOp::create(builder, loc, value); }
 
+  // Normalize emitted axis names after the final expression is known: output axes become i*,
+  // remaining internal axes become j*, and all TA axis attrs/types are rewritten consistently.
+  void relabelAxesForOutput(Value output) {
+    auto outputType = cast<ExprType>(output.getType());
+    llvm::MapVector<AxisName, AxisName, llvm::StringMap<unsigned>> axisRenames;
+    unsigned nextOutputAxis = 0, nextInternalAxis = 0;
+    for (Attribute attr : outputType.getAxes().getAxes()) {
+      AxisName oldName = cast<AxisAttr>(attr).getName().getValue().str();
+      if (!axes.contains(oldName) || axisRenames.contains(oldName))
+        continue;
+      axisRenames.insert({oldName, "i" + std::to_string(nextOutputAxis++)});
+    }
+    for (auto &entry : axes) {
+      if (!axisRenames.contains(entry.first))
+        axisRenames.insert({entry.first, "j" + std::to_string(nextInternalAxis++)});
+    }
+
+    AxisNames scopeAxisNames;
+    SmallVector<int64_t> staticExtents;
+    Block &body = scope.getBody().front();
+    unsigned oldNumAxes = body.getNumArguments();
+    for (auto &[oldName, newName] : axisRenames) {
+      auto &axis = axes[oldName];
+      BlockArgument arg = body.addArgument(builder.getIndexType(), loc);
+      axis.value.replaceAllUsesWith(arg);
+      axis.value = arg;
+      scopeAxisNames.push_back(newName);
+      staticExtents.push_back(axis.extent);
+    }
+    if (oldNumAxes)
+      body.eraseArguments(0, oldNumAxes);
+    scope.setAxesAttr(getAxesAttr(scopeAxisNames));
+    scope.setStaticExtentsAttr(DenseI64ArrayAttr::get(context, staticExtents));
+
+    auto renameAxes = [&axisRenames, this](AxesAttr axesAttr) {
+      SmallVector<Attribute> renamed;
+      renamed.reserve(axesAttr.getAxes().size());
+      for (Attribute attr : axesAttr.getAxes()) {
+        StringRef oldName = cast<AxisAttr>(attr).getName().getValue();
+        auto it = axisRenames.find(oldName.str());
+        renamed.push_back(AxisAttr::get(context, it == axisRenames.end() ? oldName : it->second));
+      }
+      return AxesAttr::get(context, ArrayAttr::get(context, renamed));
+    };
+
+    scope.getBody().walk([&](Operation *op) {
+      for (NamedAttribute attr : llvm::to_vector(op->getAttrs())) {
+        if (auto axesAttr = dyn_cast<AxesAttr>(attr.getValue()))
+          op->setAttr(attr.getName(), renameAxes(axesAttr));
+      }
+      for (OpResult result : op->getResults()) {
+        if (auto exprType = dyn_cast<ExprType>(result.getType()))
+          result.setType(
+              ExprType::get(context, exprType.getElementType(), renameAxes(exprType.getAxes())));
+      }
+    });
+  }
+
 private:
   template <typename OpTy> Value annotate(OpTy op) const {
     if (!importGroup)
@@ -735,6 +793,7 @@ static LogicalResult importFunctionAsTA(func::FuncOp func, func::ReturnOp return
   if (failed(result))
     return failure();
   ta.yield(*result);
+  ta.relabelAxesForOutput(*result);
   returnOp.setOperand(0, ta.getScope()->getResult(0));
 
   for (Operation *op : llvm::reverse(oldOps))
