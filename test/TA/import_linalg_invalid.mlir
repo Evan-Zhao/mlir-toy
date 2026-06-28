@@ -4,10 +4,10 @@
 
 func.func @unsupported_non_unit_expanded_pack() -> tensor<2x2xi64> {
   %src_empty = tensor.empty() : tensor<4xi64>
+  // expected-error @+1 {{cannot erase tensor axis during relabel}}
   %src = linalg.generic {indexing_maps = [#id1], iterator_types = ["parallel"]}
       outs(%src_empty : tensor<4xi64>) {
   ^bb0(%out: i64):
-    // expected-error @+1 {{cannot import linalg.index for a packed tensor dimension with multiple non-unit axes}}
     %i = linalg.index 0 : index
     %ii = arith.index_cast %i : index to i64
     linalg.yield %ii : i64
