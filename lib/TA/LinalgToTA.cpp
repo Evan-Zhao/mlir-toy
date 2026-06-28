@@ -652,7 +652,11 @@ public:
             resultAxes.push_back(axis->name);
         expr = ta.reduce(kind, *translated, redAxes, resultType.getElementType(), resultAxes);
       }
-      valueMap[result] = TensorValueInfo{expr, resultAxesIt->second};
+      // Use `getPresentTensorAxes` to trim "dummy" dimensions: axis discovery result
+      // `resultAxesIt` describes the result tensor shape, but the linalg.generic op we're looking
+      // at now may not actually traverse all dims. For example, an indexing map
+      // `(d0, d1, d2) -> (d0, d1, 0)` would imply the last dimension is a dummy one.
+      valueMap[result] = TensorValueInfo{expr, getPresentTensorAxes(expr, resultAxesIt->second)};
     }
     return success();
   }
@@ -759,7 +763,75 @@ private:
                                 : ta.subst(it->second.expr, fromAxes, toAxes, scalarTy);
     }
 
+    // Reuse the translated source expression for this specific expanded use. Example:
+    // tensor<1024> may have two expand to row tensor<1x1024> or column tensor<1024x1>; target axes
+    // tell which expanded dim carries the source axis for this use.
+    auto expand = value.getDefiningOp<tensor::ExpandShapeOp>();
+    if (expand && valueMap.contains(expand.getSrc())) {
+      FailureOr<TensorAxes> sourceAxes = projectExpandSourceAxes(expand, targetAxes);
+      if (succeeded(sourceAxes))
+        return translateValue(expand.getSrc(), *sourceAxes, scalarTy);
+    }
+
     return ta.at(value, targetAxes, scalarTy);
+  }
+
+  // Return tensor-dimension axes for a translated value, preserving tensor rank but replacing
+  // axes absent from the expression support with nullopt. For example, if a tensor has axes
+  // `[b, h, i, u]` but the emitted expr has type `expr<[b, h, i]>`, then `u` is a dummy
+  // dimension and the recorded axes become `[b, h, i, _]`.
+  TensorAxes getPresentTensorAxes(Value expr, const TensorAxes &fullAxes) {
+    auto exprType = cast<ExprType>(expr.getType());
+    DenseSet<StringRef> present;
+    for (Attribute attr : exprType.getAxes().getAxes())
+      present.insert(cast<AxisAttr>(attr).getName().getValue());
+
+    TensorAxes result;
+    result.reserve(fullAxes.size());
+    for (const std::optional<Axis> &axis : fullAxes)
+      result.push_back(axis && present.contains(axis->name) ? axis : std::optional<Axis>{});
+    return result;
+  }
+
+  // Project a particular expanded use back to source axes so reshape aliases can reuse the
+  // source expression. Example: the same tensor<1024> source may be expanded as row
+  // tensor<1x1024> or column tensor<1024x1>, so choose the source-axis target per use.
+  FailureOr<TensorAxes> projectExpandSourceAxes(tensor::ExpandShapeOp expand,
+                                                const TensorAxes &targetAxes) {
+    auto sourceIt = axisInfo.valueAxes.find(expand.getSrc());
+    if (sourceIt == axisInfo.valueAxes.end() ||
+        sourceIt->second.size() != expand.getReassociationIndices().size())
+      return failure();
+
+    TensorAxes sourceAxes;
+    sourceAxes.reserve(sourceIt->second.size());
+    for (auto [sourceDim, group] : llvm::enumerate(expand.getReassociationIndices())) {
+      const std::optional<Axis> &sourceAxis = sourceIt->second[sourceDim];
+      if (!sourceAxis) {
+        sourceAxes.push_back(std::nullopt);
+        continue;
+      }
+
+      std::optional<Axis> selected;
+      SmallVector<Axis> extentMatches;
+      for (int64_t dim : group) {
+        if (dim < 0 || dim >= static_cast<int64_t>(targetAxes.size()))
+          return failure();
+        const std::optional<Axis> &targetAxis = targetAxes[dim];
+        if (!targetAxis)
+          continue;
+        if (targetAxis->name == sourceAxis->name) {
+          selected = targetAxis;
+          break;
+        }
+        if (targetAxis->extent == sourceAxis->extent)
+          extentMatches.push_back(*targetAxis);
+      }
+      if (!selected && extentMatches.size() == 1)
+        selected = extentMatches.front();
+      sourceAxes.push_back(std::move(selected));
+    }
+    return sourceAxes;
   }
 
   ScopedTABuilder &ta;
