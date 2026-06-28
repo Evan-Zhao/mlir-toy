@@ -699,8 +699,13 @@ private:
 
     if (auto constant = dyn_cast<arith::ConstantOp>(def))
       return ta.constant(cast<TypedAttr>(constant.getValue()));
-    if (auto indexCast = dyn_cast<arith::IndexCastOp>(def))
-      return translateScalarOp(env, loopAxes, indexCast.getIn());
+    if (auto indexCast = dyn_cast<arith::IndexCastOp>(def)) {
+      if (auto index = indexCast.getIn().getDefiningOp<linalg::IndexOp>()) {
+        if (index.getDim() >= loopAxes.size())
+          return index.emitOpError("references missing TA loop axis");
+        return ta.index(loopAxes[index.getDim()], value.getType());
+      }
+    }
     if (auto index = dyn_cast<linalg::IndexOp>(def)) {
       if (index.getDim() >= loopAxes.size())
         return index.emitOpError("references missing TA loop axis");

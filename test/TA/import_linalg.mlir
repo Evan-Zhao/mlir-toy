@@ -50,8 +50,8 @@ func.func @matmul(%arg0: tensor<4x8xf32>, %arg1: tensor<8x16xf32>) -> tensor<4x1
 
 // CHECK-LABEL: func.func @index_sitofp
 // CHECK: ta.scope axes(%i0 "i0" extent 4)
-// CHECK: %[[IDX:.+]] = ta.index %i0{{.*}}!ta.expr<index, [i0]>
-// CHECK: %[[CAST:.+]] = ta.cast %[[IDX]] {{.*}} : (!ta.expr<index, [i0]>) -> !ta.expr<f32, [i0]>
+// CHECK: %[[IDX:.+]] = ta.index %i0{{.*}}!ta.expr<i64, [i0]>
+// CHECK: %[[CAST:.+]] = ta.cast %[[IDX]] {{.*}} : (!ta.expr<i64, [i0]>) -> !ta.expr<f32, [i0]>
 // CHECK: ta.yield %[[CAST]] : !ta.expr<f32, [i0]>
 // CHECK: return {{.*}} : tensor<4xf32>
 func.func @index_sitofp() -> tensor<4xf32> {
@@ -246,8 +246,8 @@ func.func @attention(%arg0: tensor<1x2x4x3xf16>,
 // CHECK: ta.scope axes(%i0 "i0" extent 4, %i1 "i1" extent 4)
 // CHECK: ta.at %{{.+}}[%i0, %i1] {{.*}} : tensor<4x4xi1> -> !ta.expr<i1, [i0, i1]>
 // CHECK: ta.at %{{.+}}[] {{.*}} : tensor<f32> -> !ta.expr<f32, []>
-// CHECK: ta.index %i1{{.*}}!ta.expr<index, [i1]>
-// CHECK: ta.index %i0{{.*}}!ta.expr<index, [i0]>
+// CHECK: ta.index %i1{{.*}}!ta.expr<i64, [i1]>
+// CHECK: ta.index %i0{{.*}}!ta.expr<i64, [i0]>
 // CHECK: ta.cmpi sle{{.*}}-> !ta.expr<i1, [i1, i0]>
 // CHECK: ta.select
 // CHECK: ta.select{{.*}}-> !ta.expr<f32, [i0, i1]>
@@ -277,8 +277,8 @@ func.func @causal_mask(%scores: tensor<4x4xf32>) -> tensor<4x4xf32> {
 
 // CHECK-LABEL: func.func @packed_unit_linalg_index_mask
 // CHECK: ta.scope axes(%i0 "i0" extent 1, %i1 "i1" extent 4, %i2 "i2" extent 4, %j0 "j0" extent 4)
-// CHECK: ta.index %i2{{.*}}!ta.expr<index, [i2]>
-// CHECK: ta.index %j0{{.*}}!ta.expr<index, [j0]>
+// CHECK: ta.index %i2{{.*}}!ta.expr<i64, [i2]>
+// CHECK: ta.index %j0{{.*}}!ta.expr<i64, [j0]>
 // CHECK-NOT: ta.index %i0
 // CHECK: ta.subst {{.*}}from_axes = #ta.axes<j0, i2>{{.*}}to_axes = #ta.axes<i1, i2>
 // CHECK: ta.select{{.*}}-> !ta.expr<f32, [i0, i1, i2]>
