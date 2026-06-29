@@ -484,8 +484,15 @@ public:
     return annotate(OpTy::create(builder, loc, getExprType(elementType, axes), lhs, rhs));
   }
 
-  Value reduce(ReduceKind kind, Value input, ArrayRef<AxisName> reductionAxes, Type elementType,
-               ArrayRef<AxisName> resultAxes) {
+  Value reduce(ReduceKind kind, Value input, ArrayRef<AxisName> reductionAxes, Type elementType) {
+    DenseSet<StringRef> reduced(reductionAxes.begin(), reductionAxes.end());
+    AxisNames resultAxes;
+    auto inputType = cast<ExprType>(input.getType());
+    for (Attribute attr : inputType.getAxes().getAxes()) {
+      StringRef axis = cast<AxisAttr>(attr).getName().getValue();
+      if (!reduced.contains(axis))
+        resultAxes.push_back(axis.str());
+    }
     return annotate(ReduceOp::create(builder, loc, getExprType(elementType, resultAxes), kind,
                                      input, Value(), getAxesAttr(reductionAxes)));
   }
@@ -731,11 +738,7 @@ public:
           return failure();
         auto redAxes =
             llvm::map_to_vector(reductionAxes, [](const Axis &axis) { return axis.name; });
-        AxisNames resultAxes;
-        for (const std::optional<Axis> &axis : resultAxesIt->second)
-          if (axis)
-            resultAxes.push_back(axis->name);
-        expr = ta.reduce(kind, *translated, redAxes, resultType.getElementType(), resultAxes);
+        expr = ta.reduce(kind, *translated, redAxes, resultType.getElementType());
       }
       // Use `getPresentTensorAxes` to trim "dummy" dimensions: axis discovery result
       // `resultAxesIt` describes the result tensor shape, but the linalg.generic op we're looking

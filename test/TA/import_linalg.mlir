@@ -14,6 +14,12 @@
 #map8 = affine_map<(d0, d1, d2, d3) -> ()>
 #mask = affine_map<(d0, d1) -> (d0, d1)>
 #scalar = affine_map<(d0, d1) -> ()>
+#mqa_q = affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d2, d3, d5)>
+#mqa_k = affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d2, d4, d5)>
+#mqa_out = affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d2, d3, d4)>
+#mqa_k_broadcast = affine_map<(d0, d1, d2, d3, d4) -> (d0, d2, d3, d4)>
+#mqa_identity_5 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>
+#mqa_scalar_5 = affine_map<(d0, d1, d2, d3, d4) -> ()>
 
 // CHECK-LABEL: func.func @matmul
 // CHECK-NEXT: %[[SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 4, %i1 "i1" extent 16, %j0 "j0" extent 8) {
@@ -86,6 +92,50 @@ func.func @expand_arg(%arg0: tensor<4x8xf32>) -> tensor<2x2x8xf32> {
     linalg.yield %in : f32
   } -> tensor<2x2x8xf32>
   return %0 : tensor<2x2x8xf32>
+}
+
+// CHECK-LABEL: func.func @mqa_unit_kv_head_reduce_order
+// CHECK: ta.scope axes(%i0 "i0" extent 1, %i1 "i1" extent 4, %i2 "i2" extent 1, %i3 "i3" extent 4, %i4 "i4" extent 4, %j0 "j0" extent 3)
+// CHECK: ta.at %{{.+}}[%i0, %i1, %{{.+}}, %j0] : tensor<1x4x4x3xf32> -> !ta.expr<f32, [i0, i1, i2, i3, j0]>
+// CHECK: ta.at %{{.+}}[%i0, %i2, %i4, %j0] {{.*}} : tensor<1x1x4x3xf32> -> !ta.expr<f32, [i0, i2, i4, j0]>
+// CHECK: ta.mulf {{.*}} -> !ta.expr<f32, [i0, i1, i2, i3, j0, i4]>
+// CHECK: ta.reduce <add> {{.*}} : !ta.expr<f32, [i0, i1, i2, i3, j0, i4]> -> !ta.expr<f32, [i0, i1, i2, i3, i4]>
+// CHECK: ta.yield {{.*}} : !ta.expr<f32, [i0, i1, i2, i3, i4]>
+// CHECK: return {{.*}} : tensor<1x4x1x4x4xf32>
+func.func @mqa_unit_kv_head_reduce_order(%q: tensor<1x4x4x3xf32>,
+                                         %k: tensor<1x1x4x3xf32>)
+    -> tensor<1x4x1x4x4xf32> {
+  %cst = arith.constant 0.000000e+00 : f32
+  %q_expanded = tensor.expand_shape %q [[0], [1], [2, 3], [4]]
+      output_shape [1, 4, 1, 4, 3]
+      : tensor<1x4x4x3xf32> into tensor<1x4x1x4x3xf32>
+  %k_empty = tensor.empty() : tensor<1x4x1x4x3xf32>
+  %k_expanded = linalg.generic {
+      indexing_maps = [#mqa_k_broadcast, #mqa_identity_5],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]}
+      ins(%k : tensor<1x1x4x3xf32>) outs(%k_empty : tensor<1x4x1x4x3xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    linalg.yield %in : f32
+  } -> tensor<1x4x1x4x3xf32>
+  %scores_empty = tensor.empty() : tensor<1x4x1x4x4xf32>
+  %zero = linalg.generic {
+      indexing_maps = [#mqa_scalar_5, #mqa_identity_5],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel"]}
+      ins(%cst : f32) outs(%scores_empty : tensor<1x4x1x4x4xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    linalg.yield %in : f32
+  } -> tensor<1x4x1x4x4xf32>
+  %scores = linalg.generic {
+      indexing_maps = [#mqa_q, #mqa_k, #mqa_out],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel", "reduction"]}
+      ins(%q_expanded, %k_expanded : tensor<1x4x1x4x3xf32>, tensor<1x4x1x4x3xf32>)
+      outs(%zero : tensor<1x4x1x4x4xf32>) {
+  ^bb0(%q_in: f32, %k_in: f32, %out: f32):
+    %mul = arith.mulf %q_in, %k_in : f32
+    %add = arith.addf %out, %mul : f32
+    linalg.yield %add : f32
+  } -> tensor<1x4x1x4x4xf32>
+  return %scores : tensor<1x4x1x4x4xf32>
 }
 
 // CHECK-LABEL: func.func @attention
