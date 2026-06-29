@@ -17,6 +17,11 @@ Constraint DivisorAxesDisjointFromReduction(den: Value, reductionAxes: Attr) [{
   return success();
 }];
 
+Constraint AddReduceKind(kind: Attr) [{
+  auto reduceKind = dyn_cast<ta::ReduceKindAttr>(kind);
+  return success(reduceKind && reduceKind.getValue() == ta::ReduceKind::Add);
+}];
+
 Pattern ExchangeDivAndMatmul {
   let axes: Attr;
   let kind: Attr;
@@ -26,6 +31,7 @@ Pattern ExchangeDivAndMatmul {
   let prod = op<ta.mulf>(div, rhs: Value) {"ta.import_group" = sourceNum2: Attr};
   let reduce = op<ta.reduce>(prod) {kind = kind, axes = axes, "ta.import_group" = sourceNum3: Attr} -> (resultType);
   DivisorAxesDisjointFromReduction(den, axes);
+  AddReduceKind(kind);
 
   rewrite reduce with {
     let newProd = op<ta.mulf>(num, rhs) {"ta.import_group" = sourceNum2};

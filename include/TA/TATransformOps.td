@@ -63,20 +63,18 @@ def TAToLinalgOp : Op<Transform_Dialect, "ta.to_linalg",
 def TAExchangeDivAndMatmulPatternsOp
     : Op<Transform_Dialect, "apply_patterns.ta.exchange_div_and_matmul",
          [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
-  let summary = "Collect TA exchange-div-and-matmul rewrite patterns";
+  let summary = "Collect TA div-matmul exchange rewrite patterns";
 
   let description = [{
-    Collects PDLL-authored TA rewrite patterns that exchange a division with a
-    reduction:
+    Collects PDLL-authored TA rewrite patterns that exchange a division with
+    an add reduction:
 
     ```
       sum((num / den) * rhs)  ->  sum(num * rhs) / den
     ```
 
-    This is intentionally narrow: it matches a `ta.reduce` marked with a
-    `target` unit attribute whose input is a `ta.mulf` with a `ta.divf` on its
-    left-hand side. The pattern preserves the matched reducer kind, axes, and
-    result type.
+    The divisor must have axes disjoint from the reduction axes. The pattern
+    preserves the matched add reducer kind, axes, and import-group attributes.
   }];
 
   let assemblyFormat = "attr-dict";
