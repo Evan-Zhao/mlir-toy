@@ -28,6 +28,7 @@ ATTENTION_TO_TRITON_INPUT_PIPELINE_BODY = (
 _VARIANT_TO_SCHEDULE = {
     AttentionVariant.GLOBAL_ATTN: AttentionSchedule.GLOBAL_ATTN,
     AttentionVariant.CAUSAL_ATTN: AttentionSchedule.MASKED_ATTN,
+    AttentionVariant.ALIBI_CAUSAL_ATTN: AttentionSchedule.ALIBI_CAUSAL_ATTN,
     AttentionVariant.WINDOWED_CAUSAL_ATTN: AttentionSchedule.MASKED_ATTN,
     AttentionVariant.GLOBAL_GQA: AttentionSchedule.GLOBAL_GQA,
 }

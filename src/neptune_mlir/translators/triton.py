@@ -155,7 +155,8 @@ class Translator:
             "arith.index_cast": self._arith_index_cast,
             "arith.cmpi": self._arith_cmpi,
             "arith.select": self._arith_select,
-            "arith.truncf": self._arith_truncf,
+            "arith.sitofp": self._arith_cast,
+            "arith.truncf": self._arith_cast,
             "math.exp2": lambda o: self._tl_unary(o, "exp2"),
             "htile.load": self._htile_load,
             "htile.store": self._htile_store,
@@ -254,7 +255,7 @@ class Translator:
         cond, true_val, false_val = map(self._expr, op.operands)
         return [_assign(name, _tl_call("where", cond, true_val, false_val))]
 
-    def _arith_truncf(self, op: ir.OpView) -> list[ast.stmt]:
+    def _arith_cast(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
         _, dtype = _tensor_shape(op.results[0].type)
         if not dtype:

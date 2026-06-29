@@ -1,0 +1,115 @@
+// Transform-dialect schedule for a Torch-MLIR ALiBi causal attention payload.
+// This extends the masked-attention schedule by fusing the score-side ALiBi
+// bias before the causal mask and online softmax.
+
+!any = !transform.any_op
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @match_3d_1d_reduction(%candidate: !any {transform.readonly}) -> !any {
+    %matched = transform.match.structured %candidate : (!any) -> !any {
+    ^bb0(%op: !any):
+      transform.match.structured.dim %op[0, 1, 2] {parallel} : !any
+      transform.match.structured.dim %op[3] {reduction} : !any
+      transform.match.structured.yield %op : !any
+    }
+    transform.yield %matched : !any
+  }
+
+  transform.named_sequence @match_4d_matmul_transb(%candidate: !any {transform.readonly}) -> !any {
+    %matched = transform.match.ta.einsum %candidate
+        {equation = "b h i d, b h j d -> b h i j"} : (!any) -> !any
+    transform.yield %matched : !any
+  }
+
+  transform.named_sequence @match_4d_matmul(%candidate: !any {transform.readonly}) -> !any {
+    %matched = transform.match.ta.einsum %candidate
+        {equation = "b h i j, b h j d -> b h i d"} : (!any) -> !any
+    transform.yield %matched : !any
+  }
+
+  transform.named_sequence @return_matched(%arg: !any {transform.readonly}) -> !any {
+    transform.yield %arg : !any
+  }
+
+  transform.named_sequence @__transform_main(%module: !any) {
+    %func0 = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
+    %func1 = transform.apply_registered_pass "linalg-generalize-named-ops" to %func0 : (!any) -> !any
+    %func = transform.apply_registered_pass "linalg-to-ta" to %func1 : (!any) -> !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+    transform.ta.rewrite_exp_to_exp2 %func : !any
+    transform.apply_patterns to %func {
+      transform.apply_patterns.ta.exchange_div_and_matmul
+    } : !any
+    %bmm0 = transform.collect_matching @match_4d_matmul_transb in %func : (!any) -> !any
+    %bmm1 = transform.collect_matching @match_4d_matmul in %func : (!any) -> !any
+    transform.ta.to_linalg %func : !any
+
+    transform.linalg.greedy_inline_elementwise %bmm0 : !any
+    transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any
+    %_1, %forall_loop = transform.structured.tile_using_forall
+        %bmm0 tile_sizes [1, 1, ${block_m}, ${block_n}, 0] : (!any) -> (!any, !any)
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+
+    %bscale = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
+    transform.fusion.into_producer %bscale into %forall_loop : (!any, !any) -> !any
+    %balibi = transform.get_consumers_of_result %forall_loop[1] : (!any) -> !any
+    transform.linalg.greedy_inline_elementwise %balibi : !any
+    transform.fusion.into_producer %balibi into %forall_loop : (!any, !any) -> !any
+    %bmask = transform.get_consumers_of_result %forall_loop[2] : (!any) -> !any
+    transform.linalg.greedy_inline_elementwise %bmask : !any
+    %fused_bmask = transform.fusion.into_producer %bmask into %forall_loop : (!any, !any) -> !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+
+    %consumers = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
+    %_2, %bmax = transform.foreach_match restrict_root in %consumers
+        @match_3d_1d_reduction -> @return_matched : (!any) -> (!any, !any)
+    transform.linalg.erase_unused_operands_and_results %bmax : !any
+    %fused_bmax, %j0_loop = transform.scf.fuse_reduction_into_forall
+        %bmax into %forall_loop : (!any, !any) -> (!any, !any)
+
+    %bmm1_2, %elemwise = transform.fusion.find_next_reduction
+        %forall_loop : (!any) -> (!any, !any)
+    %elemwise_sidecars = transform.fusion.clone_fuse_elemwise
+        %elemwise into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
+    %_3 = transform.fusion.repair_reduction_frontier
+        (%fused_bmax, %bmm1_2) and (%elemwise, %elemwise_sidecars) into %forall_loop, %j0_loop
+        : (!any, !any, !any, !any, !any, !any) -> !any
+
+    %bsum, %elemwise_1 = transform.fusion.find_next_reduction
+        %forall_loop : (!any) -> (!any, !any)
+    %elemwise_sidecars_1 = transform.fusion.clone_fuse_elemwise
+        %elemwise_1 into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
+    %_4 = transform.fusion.repair_reduction_frontier
+        (%fused_bmax, %bsum) and (%elemwise_1, %elemwise_sidecars_1) into %forall_loop, %j0_loop
+        : (!any, !any, !any, !any, !any, !any) -> !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+
+    // CSE removes duplicate affine values and helps fusion
+    // (fusion compares offset equal by comparing pointers to SSA value).
+    transform.apply_cse to %func : !any
+    %div = transform.get_consumers_of_result %forall_loop[1] : (!any) -> !any
+    transform.fusion.into_producer %div into %forall_loop : (!any, !any) -> !any
+    %trunc = transform.get_consumers_of_result %forall_loop[2] : (!any) -> !any
+    transform.fusion.into_producer %trunc into %forall_loop : (!any, !any) -> !any
+
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+    transform.scf.localize_scratch_tensors %func : !any
+    transform.apply_patterns to %func {
+      transform.apply_patterns.scf.fold_unit_extent_dims_via_reshapes
+      transform.apply_patterns.linalg.fold_unit_extent_dims_via_reshapes
+      transform.apply_patterns.canonicalization
+    } : !any
+    transform.apply_cse to %func : !any
+
+    // 0xFF800000: -inf in f32
+    %live_loop, %mixed_loop = transform.loop.specialize_dead_tile %fused_bmask in %j0_loop
+        {dead_value = 0xFF800000 : f32} : !any, !any -> !any, !any
+
+    // --- HTile lowering begins ---
+    transform.htile.linalg_to_semantic %func : !any
+    transform.htile.semantic_to_kernel_abi %func : !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+
+    transform.yield
+  }
+}

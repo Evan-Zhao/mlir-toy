@@ -49,6 +49,9 @@ TRANSLATOR_INPUT_CASES = [
         ATTN_VARIANTS, BATCHES, ATTN_HEADS, SEQ_LENS, HEAD_DIMS
     )
 ] + [
+    make_attn_pytest_param(AttentionVariant.ALIBI_CAUSAL_ATTN, batch, heads, heads, seq_len, 64)
+    for batch, heads, seq_len in product(BATCHES, ATTN_HEADS, SEQ_LENS)
+] + [
     make_attn_pytest_param(AttentionVariant.GLOBAL_GQA, batch, q_heads, kv_heads, seq_len, hd)
     for batch, (q_heads, kv_heads), seq_len, hd in product(BATCHES, GQA_HEADS, SEQ_LENS, HEAD_DIMS)
 ]
@@ -74,6 +77,7 @@ def require_export_deps():
     [
         (AttentionVariant.GLOBAL_ATTN, {"q_heads": 2}),
         (AttentionVariant.CAUSAL_ATTN, {"q_heads": 2}),
+        (AttentionVariant.ALIBI_CAUSAL_ATTN, {"q_heads": 2}),
         (AttentionVariant.WINDOWED_CAUSAL_ATTN, {"q_heads": 2, "window_size": 128}),
         (AttentionVariant.GLOBAL_GQA, {"q_heads": 4, "kv_heads": 2}),
     ],

@@ -9,6 +9,7 @@ from string import Template
 class AttentionSchedule(str, Enum):
     GLOBAL_ATTN = "global-attn"
     MASKED_ATTN = "masked-attn"
+    ALIBI_CAUSAL_ATTN = "alibi-causal-attn"
     GLOBAL_GQA = "global-gqa"
 
     def __str__(self) -> str:
@@ -33,6 +34,7 @@ class AttentionTileConfig:
 _SCHEDULE_TEMPLATES = {
     AttentionSchedule.GLOBAL_ATTN: "global_attention.mlir.in",
     AttentionSchedule.MASKED_ATTN: "masked_attention.mlir.in",
+    AttentionSchedule.ALIBI_CAUSAL_ATTN: "alibi_causal_attention.mlir.in",
     AttentionSchedule.GLOBAL_GQA: "global_gqa.mlir.in",
 }
 _PACKAGE = __name__
