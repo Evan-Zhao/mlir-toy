@@ -280,7 +280,7 @@ func.func @causal_mask(%scores: tensor<4x4xf32>) -> tensor<4x4xf32> {
 // CHECK: ta.index %i2{{.*}}!ta.expr<i64, [i2]>
 // CHECK: ta.index %j0{{.*}}!ta.expr<i64, [j0]>
 // CHECK-NOT: ta.index %i0
-// CHECK: ta.subst {{.*}}from_axes = #ta.axes<j0, i2>{{.*}}to_axes = #ta.axes<i1, i2>
+// CHECK: ta.subst {{.*}}from_axes = #ta.axes<j0>{{.*}}to_axes = #ta.axes<i1>{{.*}} : !ta.expr<i1, [j0, i2]> -> !ta.expr<i1, [i1, i2]>
 // CHECK: ta.select{{.*}}-> !ta.expr<f32, [i0, i1, i2]>
 // CHECK: return {{.*}} : tensor<1x4x4xf32>
 func.func @packed_unit_linalg_index_mask(%scores: tensor<1x4x4xf32>)

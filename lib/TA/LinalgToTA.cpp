@@ -13,7 +13,6 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Debug.h"
-#include <llvm/ADT/SmallVectorExtras.h>
 
 #define DEBUG_TYPE "linalg-to-ta"
 
@@ -335,6 +334,7 @@ private:
 
 using AxisName = std::string;
 using AxisNames = SmallVector<AxisName>;
+using AxisNameMapVector = llvm::MapVector<AxisName, AxisName, llvm::StringMap<unsigned>>;
 
 class ScopedTABuilder {
 public:
@@ -450,10 +450,27 @@ public:
                                      input, Value(), getAxesAttr(reductionAxes)));
   }
 
-  Value subst(Value input, ArrayRef<AxisName> fromAxes, ArrayRef<AxisName> toAxes,
-              Type elementType) {
-    return annotate(SubstOp::create(builder, loc, getExprType(elementType, toAxes), input,
-                                    getAxesAttr(fromAxes), getAxesAttr(toAxes)));
+  Value subst(Value input, const AxisNameMapVector &replacements) {
+    auto inputType = cast<ExprType>(input.getType());
+    AxisNames resultAxes;
+    AxisNames fromAxes, toAxes;
+    for (Attribute attr : inputType.getAxes().getAxes()) {
+      StringRef axis = cast<AxisAttr>(attr).getName().getValue();
+      auto replacement = replacements.find(axis.str());
+      if (replacement == replacements.end() || replacement->second == axis) {
+        resultAxes.push_back(axis.str());
+      } else {
+        resultAxes.push_back(replacement->second);
+        fromAxes.push_back(axis.str());
+        toAxes.push_back(replacement->second);
+      }
+    }
+    if (fromAxes.empty())
+      return input;
+
+    auto exprType = getExprType(inputType.getElementType(), resultAxes);
+    return annotate(
+        SubstOp::create(builder, loc, exprType, input, getAxesAttr(fromAxes), getAxesAttr(toAxes)));
   }
 
   void yield(Value value) { YieldOp::create(builder, loc, value); }
@@ -462,7 +479,7 @@ public:
   // remaining internal axes become j*, and all TA axis attrs/types are rewritten consistently.
   void relabelAxesForOutput(Value output) {
     auto outputType = cast<ExprType>(output.getType());
-    llvm::MapVector<AxisName, AxisName, llvm::StringMap<unsigned>> axisRenames;
+    AxisNameMapVector axisRenames;
     unsigned nextOutputAxis = 0, nextInternalAxis = 0;
     for (Attribute attr : outputType.getAxes().getAxes()) {
       AxisName oldName = cast<AxisAttr>(attr).getName().getValue().str();
@@ -752,20 +769,21 @@ private:
   FailureOr<Value> translateValue(Value value, const TensorAxes &targetAxes, Type scalarTy) {
     auto it = valueMap.find(value);
     if (it != valueMap.end()) {
+      // Apply a relabeling to the previously translated expression if the target axes differ from
+      // the original discovery result.
       if (it->second.axes.size() != targetAxes.size())
         return emitError(value.getLoc(), "cannot relabel tensor with different rank");
-
-      SmallVector<std::string> fromAxes, toAxes;
+      AxisNameMapVector replacements;
       for (auto [fromAxis, toAxis] : llvm::zip_equal(it->second.axes, targetAxes)) {
         if (!fromAxis)
           continue;
         if (!toAxis)
           return emitError(value.getLoc(), "cannot erase tensor axis during relabel");
-        fromAxes.push_back(fromAxis->name);
-        toAxes.push_back(toAxis->name);
+        auto [replacement, inserted] = replacements.try_emplace(fromAxis->name, toAxis->name);
+        if (!inserted && replacement->second != toAxis->name)
+          return emitError(value.getLoc(), "cannot relabel tensor axis to multiple targets");
       }
-      return fromAxes == toAxes ? it->second.expr
-                                : ta.subst(it->second.expr, fromAxes, toAxes, scalarTy);
+      return ta.subst(it->second.expr, replacements);
     }
 
     // Reuse the translated source expression for this specific expanded use. Example:
