@@ -6,6 +6,7 @@ Usage:
   python export_attention_linalg.py --variant global-gqa > attention_gqa.mlir
   python export_attention_linalg.py --variant alibi-causal-attn > attention_alibi.mlir
   python export_attention_linalg.py --variant windowed-causal-attn > attention_sw.mlir
+  python export_attention_linalg.py --variant kv-only-quantized > attention_kv_quant.mlir
   python export_attention_linalg.py --variant sparse-mm > sparse_probe.mlir
 """
 
@@ -94,34 +95,18 @@ class GlobalGQAModule(torch.nn.Module):
         return out_f32.to(torch.float16).reshape(q.shape)
 
 
-class Float8InputAttentionModule(torch.nn.Module):
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        scale = 1.0 / math.sqrt(q.shape[-1])
-        scores = torch.matmul(q.to(torch.float32), k.to(torch.float32).transpose(-1, -2))
-        scores = scores * scale
-        probs = torch.softmax(scores, dim=-1)
-        return torch.matmul(probs, v.to(torch.float32))
-
-
-class FakeQuantAttentionModule(torch.nn.Module):
+class KVOnlyQuantizedAttentionModule(torch.nn.Module):
     def forward(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        sq: torch.Tensor,
-        sk: torch.Tensor,
-        sv: torch.Tensor,
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sk: torch.Tensor, sv: torch.Tensor
     ) -> torch.Tensor:
-        q_q = torch.clamp(torch.round(q / sq), -448, 448).to(torch.int16)
-        k_q = torch.clamp(torch.round(k / sk), -448, 448).to(torch.int16)
-        v_q = torch.clamp(torch.round(v / sv), -448, 448).to(torch.int16)
-        q_dq = q_q.to(torch.float32) * sq
-        k_dq = k_q.to(torch.float32) * sk
-        v_dq = v_q.to(torch.float32) * sv
+        k_dq = k.to(torch.float32) * sk
+        v_dq = v.to(torch.float32) * sv
         scale = 1.0 / math.sqrt(q.shape[-1])
-        scores = torch.matmul(q_dq, k_dq.transpose(-1, -2))
+        scores = torch.matmul(q.to(torch.float32), k_dq.transpose(-1, -2))
         scores = scores * scale
+        mask = causal_mask(scores)
+        neg_inf = torch.tensor(float("-inf"), dtype=scores.dtype, device=scores.device)
+        scores = torch.where(mask, scores, neg_inf)
         probs = torch.softmax(scores, dim=-1)
         out_f32 = torch.matmul(probs, v_dq)
         return out_f32.to(torch.float16)
@@ -219,20 +204,14 @@ def _build_module_and_args(
         slopes = (torch.arange(q_heads, dtype=torch.float32) + 1.0) / q_heads
         return AlibiCausalAttentionModule().eval(), (q, k, v, slopes)
 
-    if variant == AttentionVariant.FLOAT8_INPUTS:
-        q = torch.randn(q_shape, dtype=torch.float32).to(torch.float8_e4m3fn)
-        k = torch.randn(q_shape, dtype=torch.float32).to(torch.float8_e4m3fn)
-        v = torch.randn(q_shape, dtype=torch.float32).to(torch.float8_e4m3fn)
-        return Float8InputAttentionModule().eval(), (q, k, v)
-
-    if variant == AttentionVariant.FAKE_QUANT:
-        q = torch.randn(q_shape, dtype=torch.float32)
-        k = torch.randn(q_shape, dtype=torch.float32)
-        v = torch.randn(q_shape, dtype=torch.float32)
-        sq = torch.full((1, 1, 1, 1), 0.1, dtype=torch.float32)
-        sk = torch.full((1, 1, 1, 1), 0.1, dtype=torch.float32)
-        sv = torch.full((1, 1, 1, 1), 0.1, dtype=torch.float32)
-        return FakeQuantAttentionModule().eval(), (q, k, v, sq, sk, sv)
+    if variant == AttentionVariant.KV_FP8_CAUSAL_ATTN:
+        fp32 = torch.float32
+        q = torch.randn(q_shape, dtype=torch.float16)
+        k = torch.randn(q_shape, dtype=fp32).to(torch.float8_e4m3fn)
+        v = torch.randn(q_shape, dtype=fp32).to(torch.float8_e4m3fn)
+        sk = torch.randn(kv_heads, dtype=fp32).reshape(1, q_heads, 1, 1)
+        sv = torch.randn(kv_heads, dtype=fp32).reshape(1, q_heads, 1, 1)
+        return KVOnlyQuantizedAttentionModule().eval(), (q, k, v, sk, sv)
 
     if variant == AttentionVariant.SPARSE_MM:
         indices = torch.tensor([[0, 1, 1], [2, 0, 2]], dtype=torch.int64)
