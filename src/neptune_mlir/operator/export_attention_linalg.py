@@ -33,10 +33,8 @@ class CausalAttentionModule(torch.nn.Module):
         scale = 1.0 / math.sqrt(q.shape[-1])
         scores = torch.matmul(q.to(torch.float32), k.to(torch.float32).transpose(-1, -2))
         scores = scores * scale
-        q_len = scores.shape[-2]
-        kv_len = scores.shape[-1]
+        *_, q_len, kv_len = scores.shape
         mask = torch.ones((q_len, kv_len), dtype=torch.bool, device=scores.device).tril()
-        mask = mask.view(1, 1, q_len, kv_len)
         neg_inf = torch.tensor(float("-inf"), dtype=scores.dtype, device=scores.device)
         scores = torch.where(mask, scores, neg_inf)
         probs = torch.softmax(scores, dim=-1)
@@ -51,15 +49,12 @@ class AlibiCausalAttentionModule(torch.nn.Module):
         scale = 1.0 / math.sqrt(q.shape[-1])
         scores = torch.matmul(q.to(torch.float32), k.to(torch.float32).transpose(-1, -2))
         scores = scores * scale
-        q_len = scores.shape[-2]
-        kv_len = scores.shape[-1]
-        q_heads = scores.shape[1]
+        *_, q_len, kv_len = scores.shape
         query_pos = torch.arange(q_len, dtype=torch.float32, device=scores.device)
         key_pos = torch.arange(kv_len, dtype=torch.float32, device=scores.device)
-        distance = key_pos.view(1, 1, 1, kv_len) - query_pos.view(1, 1, q_len, 1)
-        scores = scores + distance * slopes.view(1, q_heads, 1, 1)
+        distance = key_pos[None, :] - query_pos[:, None]
+        scores = scores + distance * slopes[:, None, None]
         mask = torch.ones((q_len, kv_len), dtype=torch.bool, device=scores.device).tril()
-        mask = mask.view(1, 1, q_len, kv_len)
         neg_inf = torch.tensor(float("-inf"), dtype=scores.dtype, device=scores.device)
         scores = torch.where(mask, scores, neg_inf)
         probs = torch.softmax(scores, dim=-1)
@@ -78,11 +73,9 @@ class SlidingWindowCausalAttentionModule(torch.nn.Module):
         scale = 1.0 / math.sqrt(q.shape[-1])
         scores = torch.matmul(q.to(torch.float32), k.to(torch.float32).transpose(-1, -2))
         scores = scores * scale
-        q_len = scores.shape[-2]
-        kv_len = scores.shape[-1]
+        *_, q_len, kv_len = scores.shape
         mask = torch.ones((q_len, kv_len), dtype=torch.bool, device=scores.device)
         mask = mask.tril().triu(diagonal=1 - self.window_size)
-        mask = mask.view(1, 1, q_len, kv_len)
         neg_inf = torch.tensor(float("-inf"), dtype=scores.dtype, device=scores.device)
         scores = torch.where(mask, scores, neg_inf)
         probs = torch.softmax(scores, dim=-1)
