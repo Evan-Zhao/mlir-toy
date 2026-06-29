@@ -263,8 +263,9 @@ func.func @attention(%arg0: tensor<1x2x4x3xf16>,
 
 // CHECK-LABEL: func.func @causal_mask
 // CHECK: ta.scope axes(%i0 "i0" extent 4, %i1 "i1" extent 4)
-// CHECK: ta.at %{{.+}}[%i0, %i1] {{.*}} : tensor<4x4xi1> -> !ta.expr<i1, [i0, i1]>
-// CHECK: ta.at %{{.+}}[] {{.*}} : tensor<f32> -> !ta.expr<f32, []>
+// CHECK: ta.constant true{{.*}} : !ta.expr<i1, []>
+// CHECK: ta.at %{{.+}}[%i0, %i1] {{.*}} : tensor<4x4xf32> -> !ta.expr<f32, [i0, i1]>
+// CHECK: ta.constant 0xFF800000 : f32{{.*}} : !ta.expr<f32, []>
 // CHECK: ta.index %i1{{.*}}!ta.expr<i64, [i1]>
 // CHECK: ta.index %i0{{.*}}!ta.expr<i64, [i0]>
 // CHECK: ta.cmpi sle{{.*}}-> !ta.expr<i1, [i1, i0]>
@@ -299,7 +300,7 @@ func.func @causal_mask(%scores: tensor<4x4xf32>) -> tensor<4x4xf32> {
 // CHECK: ta.index %i2{{.*}}!ta.expr<i64, [i2]>
 // CHECK: ta.index %j0{{.*}}!ta.expr<i64, [j0]>
 // CHECK-NOT: ta.index %i0
-// CHECK: ta.subst {{.*}}from_axes = #ta.axes<j0>{{.*}}to_axes = #ta.axes<i1>{{.*}} : !ta.expr<i1, [j0, i2]> -> !ta.expr<i1, [i1, i2]>
+// CHECK: ta.subst {{.*}}from_axes = #ta.axes<j0>{{.*}}to_axes = #ta.axes<i1>{{.*}} : !ta.expr<i1, [i2, j0]> -> !ta.expr<i1, [i2, i1]>
 // CHECK: ta.select{{.*}}-> !ta.expr<f32, [i0, i1, i2]>
 // CHECK: return {{.*}} : tensor<1x4x4xf32>
 func.func @packed_unit_linalg_index_mask(%scores: tensor<1x4x4xf32>)

@@ -854,6 +854,11 @@ private:
       return ta.subst(it->second.expr, replacements);
     }
 
+    if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
+      auto elements = dyn_cast<DenseElementsAttr>(constant.getValue());
+      if (elements && elements.isSplat())
+        return ta.constant(dyn_cast<TypedAttr>(elements.getSplatValue<Attribute>()));
+    }
     return ta.at(value, targetAxes, scalarTy);
   }
 
