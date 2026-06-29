@@ -822,6 +822,7 @@ DiagnosedSilenceableFailure HTileLinalgToSemanticOp::applyToOne(TransformRewrite
                                                                 TransformState &state) {
   (void)results;
   (void)state;
+  auto transform = cast<TransformOpInterface>(getOperation());
 
   SmallVector<Operation *> originalLinalgOps;
   target->walk([&](linalg::LinalgOp op) { originalLinalgOps.push_back(op); });
@@ -829,7 +830,7 @@ DiagnosedSilenceableFailure HTileLinalgToSemanticOp::applyToOne(TransformRewrite
   for (Operation *op : originalLinalgOps) {
     if (succeeded(rewriteOriginalLinalgOp(rewriter, op)))
       continue;
-    return DiagnosedSilenceableFailure::definiteFailure();
+    return emitSilenceableFailure(transform) << "failed to rewrite linalg op: " << *op;
   }
 
   if (failed(applyRewritesGreedily(rewriter, target, [&](RewritePatternSet &patterns) {
