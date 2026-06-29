@@ -409,6 +409,46 @@ public:
         AtOp::create(builder, loc, getExprType(elementType, resultAxes), source, indices));
   }
 
+  FailureOr<Value> atExpandedSource(Value source, ArrayRef<ReassociationIndices> reassociation,
+                                    const TensorAxes &resultDimAxes, Type elementType) {
+    if (static_cast<int64_t>(reassociation.size()) !=
+        cast<RankedTensorType>(source.getType()).getRank())
+      return emitError(source.getLoc(), "expand_shape reassociation does not match source rank");
+
+    SmallVector<Value> indices;
+    indices.reserve(reassociation.size());
+    for (auto &group : reassociation) {
+      SmallVector<Value> groupIndices;
+      SmallVector<int64_t> basis;
+      for (int64_t resultDim : group) {
+        if (resultDim < 0 || resultDim >= static_cast<int64_t>(resultDimAxes.size()))
+          return emitError(source.getLoc(), "expand_shape reassociation references invalid dim");
+        const std::optional<Axis> &axis = resultDimAxes[resultDim];
+        if (!axis)
+          continue;
+        if (axis->extent == ShapedType::kDynamic)
+          return emitError(source.getLoc(), "cannot linearize dynamic expanded axis");
+        groupIndices.push_back(materializeAxis(*axis));
+        basis.push_back(axis->extent);
+      }
+
+      if (groupIndices.empty())
+        indices.push_back(indexZero());
+      else if (groupIndices.size() == 1)
+        indices.push_back(groupIndices.front());
+      else
+        indices.push_back(affine::AffineLinearizeIndexOp::create(builder, loc, groupIndices, basis,
+                                                                 /*disjoint=*/true));
+    }
+
+    AxisNames resultAxes;
+    for (const std::optional<Axis> &axis : resultDimAxes)
+      if (axis)
+        resultAxes.push_back(axis->name);
+    return annotate(
+        AtOp::create(builder, loc, getExprType(elementType, resultAxes), source, indices));
+  }
+
   Value constant(TypedAttr value) {
     return annotate(ConstantOp::create(builder, loc, getExprType(value.getType(), {}), value));
   }
@@ -593,6 +633,34 @@ class FunctionEmitter {
 public:
   FunctionEmitter(ScopedTABuilder &ta, const DiscoveredAxisInfo &axisInfo)
       : ta(ta), axisInfo(axisInfo) {}
+
+  LogicalResult emitExpandShape(tensor::ExpandShapeOp expand) {
+    auto resultType = dyn_cast<RankedTensorType>(expand.getResult().getType());
+    if (!resultType)
+      return success();
+
+    auto resultAxesIt = axisInfo.valueAxes.find(expand.getResult());
+    if (resultAxesIt == axisInfo.valueAxes.end())
+      return expand.emitOpError("missing discovered expand_shape result axes");
+
+    FailureOr<Value> expr;
+    if (valueMap.contains(expand.getSrc())) {
+      FailureOr<TensorAxes> sourceAxes = projectExpandSourceAxes(expand, resultAxesIt->second);
+      if (failed(sourceAxes))
+        return expand.emitOpError("failed to project expand_shape source axes");
+      auto sourceType = cast<RankedTensorType>(expand.getSrc().getType());
+      expr = translateValue(expand.getSrc(), *sourceAxes, sourceType.getElementType());
+    } else {
+      expr = ta.atExpandedSource(expand.getSrc(), expand.getReassociationIndices(),
+                                 resultAxesIt->second, resultType.getElementType());
+    }
+    if (failed(expr))
+      return failure();
+
+    valueMap[expand.getResult()] =
+        TensorValueInfo{*expr, getPresentTensorAxes(*expr, resultAxesIt->second)};
+    return success();
+  }
 
   LogicalResult emitGenericOp(linalg::GenericOp generic, unsigned genericIndex) {
     ScopedTABuilder::ImportGroupGuard guard(ta, genericIndex);
@@ -786,16 +854,6 @@ private:
       return ta.subst(it->second.expr, replacements);
     }
 
-    // Reuse the translated source expression for this specific expanded use. Example:
-    // tensor<1024> may have two expand to row tensor<1x1024> or column tensor<1024x1>; target axes
-    // tell which expanded dim carries the source axis for this use.
-    auto expand = value.getDefiningOp<tensor::ExpandShapeOp>();
-    if (expand && valueMap.contains(expand.getSrc())) {
-      FailureOr<TensorAxes> sourceAxes = projectExpandSourceAxes(expand, targetAxes);
-      if (succeeded(sourceAxes))
-        return translateValue(expand.getSrc(), *sourceAxes, scalarTy);
-    }
-
     return ta.at(value, targetAxes, scalarTy);
   }
 
@@ -816,9 +874,9 @@ private:
     return result;
   }
 
-  // Project a particular expanded use back to source axes so reshape aliases can reuse the
+  // Project an expanded result back to source axes so `emitExpandShape` can reuse a translated
   // source expression. Example: the same tensor<1024> source may be expanded as row
-  // tensor<1x1024> or column tensor<1024x1>, so choose the source-axis target per use.
+  // tensor<1x1024> or column tensor<1024x1>, so choose the source-axis target from this expand.
   FailureOr<TensorAxes> projectExpandSourceAxes(tensor::ExpandShapeOp expand,
                                                 const TensorAxes &targetAxes) {
     auto sourceIt = axisInfo.valueAxes.find(expand.getSrc());
@@ -877,11 +935,13 @@ static LogicalResult importFunctionAsTA(func::FuncOp func, func::ReturnOp return
   FunctionEmitter emitter(ta, *axisInfo);
   unsigned genericIndex = 0;
   for (Operation *op : oldOps) {
-    auto generic = dyn_cast<linalg::GenericOp>(op);
-    if (!generic)
-      continue;
-    if (failed(emitter.emitGenericOp(generic, genericIndex++)))
-      return failure();
+    if (auto expand = dyn_cast<tensor::ExpandShapeOp>(op)) {
+      if (failed(emitter.emitExpandShape(expand)))
+        return failure();
+    } else if (auto generic = dyn_cast<linalg::GenericOp>(op)) {
+      if (failed(emitter.emitGenericOp(generic, genericIndex++)))
+        return failure();
+    }
   }
 
   FailureOr<Value> result = emitter.translateFunctionResult(returnOp.getOperand(0));

@@ -69,6 +69,25 @@ func.func @index_sitofp() -> tensor<4xf32> {
   return %0 : tensor<4xf32>
 }
 
+// CHECK-LABEL: func.func @expand_arg
+// CHECK: affine.linearize_index disjoint [%i0, %i1] by (2, 2)
+// CHECK: ta.at %{{.+}}[%{{.+}}, %i2] : tensor<4x8xf32> -> !ta.expr<f32, [i0, i1, i2]>
+// CHECK-NOT: ta.at %expanded
+// CHECK: return {{.*}} : tensor<2x2x8xf32>
+func.func @expand_arg(%arg0: tensor<4x8xf32>) -> tensor<2x2x8xf32> {
+  %expanded = tensor.expand_shape %arg0 [[0, 1], [2]] output_shape [2, 2, 8]
+      : tensor<4x8xf32> into tensor<2x2x8xf32>
+  %empty = tensor.empty() : tensor<2x2x8xf32>
+  %0 = linalg.generic {
+      indexing_maps = [#map3, #map3],
+      iterator_types = ["parallel", "parallel", "parallel"]}
+      ins(%expanded : tensor<2x2x8xf32>) outs(%empty : tensor<2x2x8xf32>) {
+  ^bb0(%in: f32, %out: f32):
+    linalg.yield %in : f32
+  } -> tensor<2x2x8xf32>
+  return %0 : tensor<2x2x8xf32>
+}
+
 // CHECK-LABEL: func.func @attention
 // CHECK: %[[SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 1, %i1 "i1" extent 2, %i2 "i2" extent 4, %i3 "i3" extent 3, %j0 "j0" extent 3, %j1 "j1" extent 4) {
 // CHECK: %[[Q16:.+]] = ta.at %{{.+}}[%i0, %i1, %i2, %j0] {{.*}} : tensor<1x2x4x3xf16> -> !ta.expr<f16, [i0, i1, i2, j0]>
