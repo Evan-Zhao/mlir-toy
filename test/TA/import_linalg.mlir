@@ -20,6 +20,10 @@
 #mqa_k_broadcast = affine_map<(d0, d1, d2, d3, d4) -> (d0, d2, d3, d4)>
 #mqa_identity_5 = affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d2, d3, d4)>
 #mqa_scalar_5 = affine_map<(d0, d1, d2, d3, d4) -> ()>
+#alibi_row = affine_map<(d0, d1, d2, d3) -> (d0, d1, 0, d3)>
+#alibi_col = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, 0)>
+#alibi_bias = affine_map<(d0, d1, d2, d3) -> (d0, 0, d2, d3)>
+#alibi_slope = affine_map<(d0, d1, d2, d3) -> (d0, d1, 0, 0)>
 
 // CHECK-LABEL: func.func @matmul
 // CHECK-NEXT: %[[SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 4, %i1 "i1" extent 16, %j0 "j0" extent 8) {
@@ -136,6 +140,76 @@ func.func @mqa_unit_kv_head_reduce_order(%q: tensor<1x4x4x3xf32>,
     linalg.yield %add : f32
   } -> tensor<1x4x1x4x4xf32>
   return %scores : tensor<1x4x1x4x4xf32>
+}
+
+// CHECK-LABEL: func.func @alibi_expand_patterns
+// CHECK: ta.scope axes(%i0 "i0" extent 1, %i1 "i1" extent 2, %i2 "i2" extent 4, %i3 "i3" extent 4
+// CHECK: ta.index
+// CHECK: ta.subf {{.*}} -> !ta.expr<f32, [i3, i2]>
+// CHECK: ta.at %{{.+}}[%i1] : tensor<2xf32> -> !ta.expr<f32, [i1]>
+// CHECK-NOT: ta.at %{{.+}}[%i0, %i1, %{{.+}}, %{{.+}}] : tensor<2xf32>
+// CHECK: ta.mulf {{.*}} -> !ta.expr<f32, [i3, i2, i1]>
+// CHECK: ta.addf
+// CHECK: ta.yield {{.*}} : !ta.expr<f32, [i0, i1, i2, i3]>
+// CHECK: return {{.*}} : tensor<1x2x4x4xf32>
+func.func @alibi_expand_patterns(%scores: tensor<1x2x4x4xf32>, %slopes: tensor<2xf32>)
+    -> tensor<1x2x4x4xf32> {
+  %idx_empty = tensor.empty() : tensor<4xi64>
+  %idx = linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0)>],
+      iterator_types = ["parallel"]}
+      outs(%idx_empty : tensor<4xi64>) {
+  ^bb0(%out: i64):
+    %i = linalg.index 0 : index
+    %ii = arith.index_cast %i : index to i64
+    linalg.yield %ii : i64
+  } -> tensor<4xi64>
+  %pos_empty = tensor.empty() : tensor<4xf32>
+  %pos = linalg.generic {
+      indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+      iterator_types = ["parallel"]}
+      ins(%idx : tensor<4xi64>) outs(%pos_empty : tensor<4xf32>) {
+  ^bb0(%in: i64, %out: f32):
+    %f = arith.sitofp %in : i64 to f32
+    linalg.yield %f : f32
+  } -> tensor<4xf32>
+  %row = tensor.expand_shape %pos [[0, 1, 2, 3]] output_shape [1, 1, 1, 4]
+      : tensor<4xf32> into tensor<1x1x1x4xf32>
+  %col = tensor.expand_shape %pos [[0, 1, 2, 3]] output_shape [1, 1, 4, 1]
+      : tensor<4xf32> into tensor<1x1x4x1xf32>
+  %bias_empty = tensor.empty() : tensor<1x1x4x4xf32>
+  %bias = linalg.generic {
+      indexing_maps = [#alibi_row, #alibi_col, #map],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+      ins(%row, %col : tensor<1x1x1x4xf32>, tensor<1x1x4x1xf32>)
+      outs(%bias_empty : tensor<1x1x4x4xf32>) {
+  ^bb0(%row_in: f32, %col_in: f32, %out: f32):
+    %sub = arith.subf %row_in, %col_in : f32
+    linalg.yield %sub : f32
+  } -> tensor<1x1x4x4xf32>
+  %slope = tensor.expand_shape %slopes [[0, 1, 2, 3]] output_shape [1, 2, 1, 1]
+      : tensor<2xf32> into tensor<1x2x1x1xf32>
+  %out_empty = tensor.empty() : tensor<1x2x4x4xf32>
+  %scaled = linalg.generic {
+      indexing_maps = [#alibi_bias, #alibi_slope, #map],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+      ins(%bias, %slope : tensor<1x1x4x4xf32>, tensor<1x2x1x1xf32>)
+      outs(%out_empty : tensor<1x2x4x4xf32>) {
+  ^bb0(%bias_in: f32, %slope_in: f32, %out: f32):
+    %mul = arith.mulf %bias_in, %slope_in : f32
+    linalg.yield %mul : f32
+  } -> tensor<1x2x4x4xf32>
+  %sum_empty = tensor.empty() : tensor<1x2x4x4xf32>
+  %sum = linalg.generic {
+      indexing_maps = [#map, #map, #map],
+      iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
+      ins(%scores, %scaled : tensor<1x2x4x4xf32>, tensor<1x2x4x4xf32>)
+      outs(%sum_empty : tensor<1x2x4x4xf32>) {
+  ^bb0(%score: f32, %alibi: f32, %out: f32):
+    %add = arith.addf %score, %alibi : f32
+    linalg.yield %add : f32
+  } -> tensor<1x2x4x4xf32>
+  return %sum : tensor<1x2x4x4xf32>
 }
 
 // CHECK-LABEL: func.func @attention

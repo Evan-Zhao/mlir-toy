@@ -411,12 +411,14 @@ public:
 
   FailureOr<Value> atExpandedSource(Value source, ArrayRef<ReassociationIndices> reassociation,
                                     const TensorAxes &resultDimAxes, Type elementType) {
-    if (static_cast<int64_t>(reassociation.size()) !=
-        cast<RankedTensorType>(source.getType()).getRank())
+    int64_t sourceRank = cast<RankedTensorType>(source.getType()).getRank();
+    if (static_cast<int64_t>(reassociation.size()) != sourceRank)
       return emitError(source.getLoc(), "expand_shape reassociation does not match source rank");
 
     SmallVector<Value> indices;
     indices.reserve(reassociation.size());
+    AxisNames resultAxes;
+    resultAxes.reserve(resultDimAxes.size());
     for (auto &group : reassociation) {
       SmallVector<Value> groupIndices;
       SmallVector<int64_t> basis;
@@ -424,12 +426,15 @@ public:
         if (resultDim < 0 || resultDim >= static_cast<int64_t>(resultDimAxes.size()))
           return emitError(source.getLoc(), "expand_shape reassociation references invalid dim");
         const std::optional<Axis> &axis = resultDimAxes[resultDim];
-        if (!axis)
+        // Rank-1 row/column/vector expands use size-1 dimensions only for broadcasting.
+        // Higher-rank expands keep those axes so operand ordered-unions stay in tensor order.
+        if (!axis || (sourceRank == 1 && group.size() > 1 && axis->extent == 1))
           continue;
         if (axis->extent == ShapedType::kDynamic)
           return emitError(source.getLoc(), "cannot linearize dynamic expanded axis");
         groupIndices.push_back(materializeAxis(*axis));
         basis.push_back(axis->extent);
+        resultAxes.push_back(axis->name);
       }
 
       if (groupIndices.empty())
@@ -441,10 +446,6 @@ public:
                                                                  /*disjoint=*/true));
     }
 
-    AxisNames resultAxes;
-    for (const std::optional<Axis> &axis : resultDimAxes)
-      if (axis)
-        resultAxes.push_back(axis->name);
     return annotate(
         AtOp::create(builder, loc, getExprType(elementType, resultAxes), source, indices));
   }
