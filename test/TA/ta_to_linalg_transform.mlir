@@ -12,7 +12,7 @@ module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
     %func = transform.structured.match ops{["func.func"]} in %module
         : (!transform.any_op) -> !transform.any_op
-    %ta_matmul = transform.collect_matching @match_ta_matmul in %func
+    %ta_matmul = transform.collect_matching @match_ta_matmul in %module
         : (!transform.any_op) -> !transform.any_op
     transform.ta.to_linalg %func : !transform.any_op
     transform.print %ta_matmul : !transform.any_op
