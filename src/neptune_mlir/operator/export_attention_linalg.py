@@ -11,35 +11,49 @@ Usage:
 
 import argparse
 import math
+from typing import Callable
 
 import torch
 from torch_mlir import fx
 
 from neptune_mlir.operator.variants import VARIANTS, AttentionVariant
 
+MaskF = Callable[[torch.Tensor], torch.Tensor | None]
 
-class GlobalAttentionModule(torch.nn.Module):
+
+class Attention4DModule(torch.nn.Module):
+    def __init__(self, mask_f: MaskF):
+        super().__init__()
+        self.mask_f = mask_f
+
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         scale = 1.0 / math.sqrt(q.shape[-1])
         scores = torch.matmul(q.to(torch.float32), k.to(torch.float32).transpose(-1, -2))
         scores = scores * scale
+        mask = self.mask_f(scores)
+        if mask is not None:
+            neg_inf = torch.tensor(float("-inf"), dtype=scores.dtype, device=scores.device)
+            scores = torch.where(mask, scores, neg_inf)
         probs = torch.softmax(scores, dim=-1)
         out_f32 = torch.matmul(probs, v.to(torch.float32))
         return out_f32.to(torch.float16)
 
 
-class CausalAttentionModule(torch.nn.Module):
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        scale = 1.0 / math.sqrt(q.shape[-1])
-        scores = torch.matmul(q.to(torch.float32), k.to(torch.float32).transpose(-1, -2))
-        scores = scores * scale
+def causal_mask(scores: torch.Tensor) -> torch.Tensor:
+    *_, q_len, kv_len = scores.shape
+    return torch.ones((q_len, kv_len), dtype=torch.bool, device=scores.device).tril()
+
+
+def windowed_causal_mask(window_size: int) -> MaskF:
+    if window_size <= 0:
+        raise ValueError("window_size must be positive")
+
+    def mask_f(scores: torch.Tensor) -> torch.Tensor:
         *_, q_len, kv_len = scores.shape
-        mask = torch.ones((q_len, kv_len), dtype=torch.bool, device=scores.device).tril()
-        neg_inf = torch.tensor(float("-inf"), dtype=scores.dtype, device=scores.device)
-        scores = torch.where(mask, scores, neg_inf)
-        probs = torch.softmax(scores, dim=-1)
-        out_f32 = torch.matmul(probs, v.to(torch.float32))
-        return out_f32.to(torch.float16)
+        mask = torch.ones((q_len, kv_len), dtype=torch.bool, device=scores.device)
+        return mask.tril().triu(diagonal=1 - window_size)
+
+    return mask_f
 
 
 class AlibiCausalAttentionModule(torch.nn.Module):
@@ -54,28 +68,7 @@ class AlibiCausalAttentionModule(torch.nn.Module):
         key_pos = torch.arange(kv_len, dtype=torch.float32, device=scores.device)
         distance = key_pos[None, :] - query_pos[:, None]
         scores = scores + distance * slopes[:, None, None]
-        mask = torch.ones((q_len, kv_len), dtype=torch.bool, device=scores.device).tril()
-        neg_inf = torch.tensor(float("-inf"), dtype=scores.dtype, device=scores.device)
-        scores = torch.where(mask, scores, neg_inf)
-        probs = torch.softmax(scores, dim=-1)
-        out_f32 = torch.matmul(probs, v.to(torch.float32))
-        return out_f32.to(torch.float16)
-
-
-class SlidingWindowCausalAttentionModule(torch.nn.Module):
-    def __init__(self, window_size: int):
-        super().__init__()
-        if window_size <= 0:
-            raise ValueError("window_size must be positive")
-        self.window_size = window_size
-
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        scale = 1.0 / math.sqrt(q.shape[-1])
-        scores = torch.matmul(q.to(torch.float32), k.to(torch.float32).transpose(-1, -2))
-        scores = scores * scale
-        *_, q_len, kv_len = scores.shape
-        mask = torch.ones((q_len, kv_len), dtype=torch.bool, device=scores.device)
-        mask = mask.tril().triu(diagonal=1 - self.window_size)
+        mask = causal_mask(scores)
         neg_inf = torch.tensor(float("-inf"), dtype=scores.dtype, device=scores.device)
         scores = torch.where(mask, scores, neg_inf)
         probs = torch.softmax(scores, dim=-1)
@@ -211,22 +204,20 @@ def _build_module_and_args(
         v = torch.randn(kv_shape, dtype=torch.float16)
         return GlobalGQAModule().eval(), (q, k, v)
 
-    if variant == AttentionVariant.GLOBAL_ATTN:
+    masked_variants = {
+        AttentionVariant.GLOBAL_ATTN: lambda _: None,
+        AttentionVariant.CAUSAL_ATTN: causal_mask,
+        AttentionVariant.WINDOWED_CAUSAL_ATTN: windowed_causal_mask(window_size),
+    }
+    mask_f = masked_variants.get(variant, None)
+    if mask_f is not None:
         example_args = tuple(torch.randn(q_shape, dtype=torch.float16) for _ in range(3))
-        return GlobalAttentionModule(), example_args
-
-    if variant == AttentionVariant.CAUSAL_ATTN:
-        example_args = tuple(torch.randn(q_shape, dtype=torch.float16) for _ in range(3))
-        return CausalAttentionModule(), example_args
+        return Attention4DModule(mask_f).eval(), example_args
 
     if variant == AttentionVariant.ALIBI_CAUSAL_ATTN:
         q, k, v = (torch.randn(q_shape, dtype=torch.float16) for _ in range(3))
         slopes = (torch.arange(q_heads, dtype=torch.float32) + 1.0) / q_heads
         return AlibiCausalAttentionModule().eval(), (q, k, v, slopes)
-
-    if variant == AttentionVariant.WINDOWED_CAUSAL_ATTN:
-        example_args = tuple(torch.randn(q_shape, dtype=torch.float16) for _ in range(3))
-        return SlidingWindowCausalAttentionModule(window_size).eval(), example_args
 
     if variant == AttentionVariant.FLOAT8_INPUTS:
         q = torch.randn(q_shape, dtype=torch.float32).to(torch.float8_e4m3fn)
