@@ -49,7 +49,7 @@ module attributes {transform.with_named_sequence} {
     %func = transform.apply_registered_pass "linalg-to-ta" to %func1 : (!any) -> !any
     transform.ta.rewrite_exp_to_exp2 %func : !any
     transform.apply_patterns to %func {
-      transform.apply_patterns.ta.exchange_div_and_matmul
+      transform.apply_patterns.ta.sink_div_after_matmul
     } : !any
     %bmm0 = transform.collect_matching @match_4d_matmul_transb in %func : (!any) -> !any
     %bmm1 = transform.collect_matching @match_4d_matmul in %func : (!any) -> !any

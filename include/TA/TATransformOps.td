@@ -60,14 +60,14 @@ def TAToLinalgOp : Op<Transform_Dialect, "ta.to_linalg",
   }];
 }
 
-def TAExchangeDivAndMatmulPatternsOp
-    : Op<Transform_Dialect, "apply_patterns.ta.exchange_div_and_matmul",
+def TASinkDivAfterMatmulPatternsOp
+    : Op<Transform_Dialect, "apply_patterns.ta.sink_div_after_matmul",
          [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
-  let summary = "Collect TA div-matmul exchange rewrite patterns";
+  let summary = "Collect TA div-after-matmul sinking rewrite patterns";
 
   let description = [{
-    Collects PDLL-authored TA rewrite patterns that exchange a division with
-    an add reduction:
+    Collects PDLL-authored TA rewrite patterns that sink a division after a
+    multiplication and add reduction:
 
     ```
       sum((num / den) * rhs)  ->  sum(num * rhs) / den

@@ -22,7 +22,7 @@ Constraint AddReduceKind(kind: Attr) [{
   return success(reduceKind && reduceKind.getValue() == ta::ReduceKind::Add);
 }];
 
-Pattern ExchangeDivAndMatmul {
+Pattern SinkDivAfterMatmul {
   let axes: Attr;
   let kind: Attr;
   let resultType: Type;

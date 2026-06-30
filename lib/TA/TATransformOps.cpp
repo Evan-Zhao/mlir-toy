@@ -12,10 +12,10 @@
 
 using namespace mlir;
 
-namespace ta_exchange_div_and_matmul_pdl {
+namespace ta_sink_div_after_matmul_pdl {
 using namespace mlir;
-#include "ExchangeDivAndMatmul.cpp.inc"
-} // namespace ta_exchange_div_and_matmul_pdl
+#include "SinkDivAfterMatmul.cpp.inc"
+} // namespace ta_sink_div_after_matmul_pdl
 
 namespace ta_exp_to_exp2_pdl {
 using namespace mlir;
@@ -237,8 +237,8 @@ DiagnosedSilenceableFailure TAToLinalgOp::apply(TransformRewriter &rewriter,
   return DiagnosedSilenceableFailure::success();
 }
 
-void TAExchangeDivAndMatmulPatternsOp::populatePatterns(RewritePatternSet &patterns) {
-  ta_exchange_div_and_matmul_pdl::populateGeneratedPDLLPatterns(patterns);
+void TASinkDivAfterMatmulPatternsOp::populatePatterns(RewritePatternSet &patterns) {
+  ta_sink_div_after_matmul_pdl::populateGeneratedPDLLPatterns(patterns);
 }
 
 void TAExpToExp2PatternsOp::populatePatterns(RewritePatternSet &patterns) {
@@ -281,7 +281,7 @@ void registerTATransformExtension(mlir::DialectRegistry &registry) {
     };
     static_cast<TransformDialectAccess *>(dialect)
         ->addOperations<mlir::transform::TAMatchEinsumOp, mlir::transform::TAToLinalgOp,
-                        mlir::transform::TAExchangeDivAndMatmulPatternsOp,
+                        mlir::transform::TASinkDivAfterMatmulPatternsOp,
                         mlir::transform::TAExpToExp2PatternsOp,
                         mlir::transform::TARewriteExpToExp2Op>();
   });

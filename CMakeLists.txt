@@ -151,9 +151,9 @@ mlir_tablegen(TATransformOps.h.inc -gen-op-decls)
 mlir_tablegen(TATransformOps.cpp.inc -gen-op-defs)
 add_public_tablegen_target(TATransformOpsIncGen)
 
-add_mlir_pdll_library(TAExchangeDivAndMatmulPDLL
-  lib/TA/ExchangeDivAndMatmul.pdll
-  ExchangeDivAndMatmul.cpp.inc
+add_mlir_pdll_library(TASinkDivAfterMatmulPDLL
+  lib/TA/SinkDivAfterMatmul.pdll
+  SinkDivAfterMatmul.cpp.inc
 )
 
 add_mlir_pdll_library(TAExpToExp2PDLL
@@ -270,7 +270,7 @@ make_mlir_opt_plugin(
     TAAttrsIncGen
     TATypesIncGen
     TATransformOpsIncGen
-    TAExchangeDivAndMatmulPDLL
+    TASinkDivAfterMatmulPDLL
     TAExpToExp2PDLL
 )
 make_mlir_opt_plugin(

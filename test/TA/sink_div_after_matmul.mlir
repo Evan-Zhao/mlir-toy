@@ -5,13 +5,13 @@ module attributes {transform.with_named_sequence} {
     %func = transform.structured.match ops{["func.func"]} in %module
         : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %func {
-      transform.apply_patterns.ta.exchange_div_and_matmul
+      transform.apply_patterns.ta.sink_div_after_matmul
     } : !transform.any_op
     transform.yield
   }
 
-  // CHECK-LABEL: func.func @ta_exchange_div_and_matmul(
-  func.func @ta_exchange_div_and_matmul(%scores: tensor<2x3xf32>, %den: tensor<2xf32>,
+  // CHECK-LABEL: func.func @ta_sink_div_after_matmul(
+  func.func @ta_sink_div_after_matmul(%scores: tensor<2x3xf32>, %den: tensor<2xf32>,
                                         %values: tensor<3x4xf32>) -> tensor<2x4xf32> {
     // CHECK: %[[OUT:.+]] = ta.scope
     %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3, %d "d" extent 4) {
@@ -43,8 +43,8 @@ module attributes {transform.with_named_sequence} {
     return %out : tensor<2x4xf32>
   }
 
-  // CHECK-LABEL: func.func @ta_exchange_div_and_matmul_reject_reduction_axis(
-  func.func @ta_exchange_div_and_matmul_reject_reduction_axis(%scores: tensor<2x3xf32>,
+  // CHECK-LABEL: func.func @ta_sink_div_after_matmul_reject_reduction_axis(
+  func.func @ta_sink_div_after_matmul_reject_reduction_axis(%scores: tensor<2x3xf32>,
                                                              %den: tensor<3xf32>,
                                                              %values: tensor<3x4xf32>) -> tensor<2x4xf32> {
     %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3, %d "d" extent 4) {

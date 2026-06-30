@@ -48,7 +48,7 @@ Note: `ts` is short for `transform.structured`.
 
 1. The schedule generalizes named linalg ops, imports the computation into TA, and uses the TA
    expression view for `transform.ta.rewrite_exp_to_exp2`,
-   `transform.apply_patterns.ta.exchange_div_and_matmul`, and `transform.match.ta.einsum`.
+   `transform.apply_patterns.ta.sink_div_after_matmul`, and `transform.match.ta.einsum`.
    See [the TA dialect design](ta-dialect-design.md).
 1. See [the upward fusion design](upward-fusion-design.md).
 1. See [the rolling update design](rolling-update-design.md).

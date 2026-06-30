@@ -18,7 +18,7 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     transform.ta.rewrite_exp_to_exp2 %ta_func : !transform.any_op
     transform.apply_patterns to %ta_func {
-      transform.apply_patterns.ta.exchange_div_and_matmul
+      transform.apply_patterns.ta.sink_div_after_matmul
     } : !transform.any_op
     %linalg_func = transform.apply_registered_pass "ta-to-linalg" to %ta_func
         : (!transform.any_op) -> !transform.any_op

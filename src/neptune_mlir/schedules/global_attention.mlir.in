@@ -45,7 +45,7 @@ module attributes {transform.with_named_sequence} {
     transform.ta.rewrite_exp_to_exp2 %func : !any
     // Replace `matmul(P_ij / s_i, V_jd)` with `matmul(P_ij, V_jd) / s_i`.
     transform.apply_patterns to %func {
-      transform.apply_patterns.ta.exchange_div_and_matmul
+      transform.apply_patterns.ta.sink_div_after_matmul
     } : !any
     // This is a special idiom: use einsum to match matmuls in `ta` dialect is easy.
     // Then the `to_linalg` translator keeps these handles alive even after the translation,
