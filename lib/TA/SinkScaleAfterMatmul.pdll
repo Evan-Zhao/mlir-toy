@@ -1,0 +1,53 @@
+#include "TA/TAOps.td"
+
+Constraint ValueAxesDisjointFromReduction(value: Value, reductionAxes: Attr) [{
+  auto valueType = dyn_cast<ta::ExprType>(value.getType());
+  auto reducedAxes = dyn_cast<ta::AxesAttr>(reductionAxes);
+  if (!valueType || !reducedAxes)
+    return failure();
+
+  for (Attribute valueAxis : valueType.getAxes().getAxes()) {
+    auto valueAxisAttr = cast<ta::AxisAttr>(valueAxis);
+    for (Attribute reducedAxis : reducedAxes.getAxes()) {
+      auto reducedAxisAttr = cast<ta::AxisAttr>(reducedAxis);
+      if (valueAxisAttr.getName() == reducedAxisAttr.getName())
+        return failure();
+    }
+  }
+  return success();
+}];
+
+Constraint AddReduceKind(kind: Attr) [{
+  auto reduceKind = dyn_cast<ta::ReduceKindAttr>(kind);
+  return success(reduceKind && reduceKind.getValue() == ta::ReduceKind::Add);
+}];
+
+// sum((lhs / denom) * rhs) => sum(lhs * rhs) / den
+Pattern SinkDivAfterMatmul {
+  let div = op<ta.divf>(lhs: Value, denom: Value) {"ta.import_group" = srcDiv: Attr};
+  let mul = op<ta.mulf>(div, rhs: Value) {"ta.import_group" = srcMul: Attr};
+  let reduce = op<ta.reduce>(mul) {kind = kind: Attr, axes = axes: Attr, "ta.import_group" = srcReduce: Attr} -> (resultType: Type);
+  ValueAxesDisjointFromReduction(denom, axes);
+  AddReduceKind(kind);
+
+  rewrite reduce with {
+    let newMul = op<ta.mulf>(lhs, rhs) {"ta.import_group" = srcMul};
+    let newReduce = op<ta.reduce>(newMul) {kind = kind, axes = axes, "ta.import_group" = srcReduce} -> (resultType);
+    replace reduce with op<ta.divf>(newReduce, denom) {"ta.import_group" = srcDiv};
+  };
+}
+
+// sum(lhs * (rhs * factor)) => sum(lhs * rhs) * factor
+Pattern SinkRightMulAfterMatmul {
+  let inner = op<ta.mulf>(rhs: Value, factor: Value) {"ta.import_group" = srcInner: Attr};
+  let outer = op<ta.mulf>(lhs: Value, inner) {"ta.import_group" = srcOuter: Attr};
+  let reduce = op<ta.reduce>(outer) {kind = kind: Attr, axes = axes: Attr, "ta.import_group" = srcReduce: Attr} -> (resultType: Type);
+  AddReduceKind(kind);
+  ValueAxesDisjointFromReduction(factor, axes);
+
+  rewrite reduce with {
+    let newMul = op<ta.mulf>(lhs, rhs) {"ta.import_group" = srcOuter};
+    let newReduce = op<ta.reduce>(newMul) {kind = kind, axes = axes, "ta.import_group" = srcReduce} -> (resultType);
+    replace reduce with op<ta.mulf>(newReduce, factor) {"ta.import_group" = srcInner};
+  };
+}

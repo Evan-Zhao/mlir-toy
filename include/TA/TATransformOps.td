@@ -70,11 +70,31 @@ def TASinkDivAfterMatmulPatternsOp
     multiplication and add reduction:
 
     ```
-      sum((num / den) * rhs)  ->  sum(num * rhs) / den
+      sum((num / denom) * rhs)  ->  sum(num * rhs) / denom
     ```
 
-    The divisor must have axes disjoint from the reduction axes. The pattern
+    The `denom` divisor must have axes disjoint from the reduction axes. The pattern
     preserves the matched add reducer kind, axes, and import-group attributes.
+  }];
+
+  let assemblyFormat = "attr-dict";
+}
+
+def TASinkRightMulAfterMatmulPatternsOp
+    : Op<Transform_Dialect, "apply_patterns.ta.sink_right_mul_after_matmul",
+        [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
+  let summary = "Collect rewrite patterns to sink an RHS multiplicative factor after a matmul";
+
+  let description = [{
+    Collects PDLL-authored TA rewrite patterns that sink a multiplicative factor
+    after an add-reduced multiply:
+
+    ```
+      sum(lhs * (rhs * factor)) -> sum(lhs * rhs) * factor
+    ```
+
+    The `factor` must have axes disjoint from the reduction axes.
+    The pattern preserves the matched add reducer kind, axes, and import-group attributes.
   }];
 
   let assemblyFormat = "attr-dict";

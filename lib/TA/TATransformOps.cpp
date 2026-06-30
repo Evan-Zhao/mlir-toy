@@ -12,10 +12,10 @@
 
 using namespace mlir;
 
-namespace ta_sink_div_after_matmul_pdl {
+namespace ta_sink_scale_after_matmul_pdl {
 using namespace mlir;
-#include "SinkDivAfterMatmul.cpp.inc"
-} // namespace ta_sink_div_after_matmul_pdl
+#include "SinkScaleAfterMatmul.cpp.inc"
+} // namespace ta_sink_scale_after_matmul_pdl
 
 namespace ta_exp_to_exp2_pdl {
 using namespace mlir;
@@ -86,8 +86,7 @@ SmallVector<std::string> axisAttrNames(ta::AxesAttr axes) {
   return names;
 }
 
-bool sameAxisEqualityPattern(ArrayRef<std::string> patternAxes,
-                             ArrayRef<std::string> actualAxes) {
+bool sameAxisEqualityPattern(ArrayRef<std::string> patternAxes, ArrayRef<std::string> actualAxes) {
   if (patternAxes.size() != actualAxes.size())
     return false;
 
@@ -238,7 +237,11 @@ DiagnosedSilenceableFailure TAToLinalgOp::apply(TransformRewriter &rewriter,
 }
 
 void TASinkDivAfterMatmulPatternsOp::populatePatterns(RewritePatternSet &patterns) {
-  ta_sink_div_after_matmul_pdl::populateGeneratedPDLLPatterns(patterns);
+  patterns.add<ta_sink_scale_after_matmul_pdl::SinkDivAfterMatmul>(patterns.getContext());
+}
+
+void TASinkRightMulAfterMatmulPatternsOp::populatePatterns(RewritePatternSet &patterns) {
+  patterns.add<ta_sink_scale_after_matmul_pdl::SinkRightMulAfterMatmul>(patterns.getContext());
 }
 
 void TAExpToExp2PatternsOp::populatePatterns(RewritePatternSet &patterns) {
@@ -282,6 +285,7 @@ void registerTATransformExtension(mlir::DialectRegistry &registry) {
     static_cast<TransformDialectAccess *>(dialect)
         ->addOperations<mlir::transform::TAMatchEinsumOp, mlir::transform::TAToLinalgOp,
                         mlir::transform::TASinkDivAfterMatmulPatternsOp,
+                        mlir::transform::TASinkRightMulAfterMatmulPatternsOp,
                         mlir::transform::TAExpToExp2PatternsOp,
                         mlir::transform::TARewriteExpToExp2Op>();
   });
