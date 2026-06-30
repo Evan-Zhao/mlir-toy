@@ -666,7 +666,7 @@ ScalarExprState evaluateScalarValue(Value value, DenseMap<Value, ScalarExprState
       return folded;
     return foldMul(evaluate(lhsValue), evaluate(rhsValue), mulf.getResult().getType());
   };
-  auto foldExpOp = [&](math::ExpOp exp) {
+  auto foldExpOp = [&](auto exp) -> ScalarExprState {
     Type resultTy = exp.getResult().getType();
     auto operand = evaluate(exp.getOperand());
     if (operand.isNegativeInfinity())
@@ -693,7 +693,7 @@ ScalarExprState evaluateScalarValue(Value value, DenseMap<Value, ScalarExprState
 
   ScalarExprState result = llvm::TypeSwitch<Operation *, ScalarExprState>(def)
                                .Case<arith::ConstantOp>(foldConstant)
-                               .Case<math::ExpOp>(foldExpOp)
+                               .Case<math::ExpOp, math::Exp2Op>(foldExpOp)
                                .Case<arith::AddFOp, arith::AddIOp>(CASE_BIN_OP(foldAdd))
                                .Case<arith::SubFOp, arith::SubIOp>(CASE_BIN_OP(foldSub))
                                .Case<arith::MulFOp>(foldMulF)

@@ -236,7 +236,11 @@ module attributes {transform.with_named_sequence} {
 // CHECK: %[[RAW_BOUND:.+]] = arith.maxsi %{{.*}}, %c0 : index
 // CHECK: %[[CAPPED_BOUND:.+]] = arith.minsi %[[RAW_BOUND]], %c16 : index
 // CHECK: %[[LIVE:.+]]:3 = scf.for %{{.*}} = %c0 to %[[CAPPED_BOUND]] step %c1 iter_args(
-// CHECK: %[[MIXED:.+]]:3 = scf.for %{{.*}} = %[[CAPPED_BOUND]] to %c16 step %c1 iter_args(%{{.*}} = %[[LIVE]]#0, %{{.*}} = %[[LIVE]]#1, %{{.*}} = %[[LIVE]]#2) -> (tensor<128xf32>, tensor<128x64xf32>, tensor<128xf32>)
+// CHECK: scf.yield
+// CHECK: %[[DEAD_BOUND_RAW:.+]] = affine.apply
+// CHECK: %[[DEAD_BOUND_MAX:.+]] = arith.maxsi %[[DEAD_BOUND_RAW]], %c0 : index
+// CHECK: %[[DEAD_BOUND:.+]] = arith.minsi %[[DEAD_BOUND_MAX]], %c16 : index
+// CHECK: %[[MIXED:.+]]:3 = scf.for %{{.*}} = %[[CAPPED_BOUND]] to %[[DEAD_BOUND]] step %c1 iter_args(%{{.*}} = %[[LIVE]]#0, %{{.*}} = %[[LIVE]]#1, %{{.*}} = %[[LIVE]]#2) -> (tensor<128xf32>, tensor<128x64xf32>, tensor<128xf32>)
 // CHECK: htile.load %arg0{{\[}}%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}{{\]}} : memref<1x4x1024x64xf16> -> tensor<128x64xf16>
 // CHECK: htile.load %arg1{{\[}}%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}{{\]}} : memref<1x4x1024x64xf16> -> tensor<64x64xf16>
 // CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} {transpose_b}

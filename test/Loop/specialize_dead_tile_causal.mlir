@@ -29,7 +29,10 @@ module attributes {transform.with_named_sequence} {
   // CHECK-NOT: tag = "producer"
   // CHECK: ins(%arg1 : tensor<1x128x64xf32>) outs(%{{.*}} : tensor<1x128xf32>)
   // CHECK: ins(%arg1 : tensor<1x128x64xf32>) outs(%0 : tensor<1x128x64xf32>)
-  // CHECK: %[[MIXED_LOOP:.*]]:3 = scf.for %{{.*}} = %[[LIVE_UPPER]] to %[[DEAD_BOUND:.*]] step %c1 iter_args(%{{.*}} = %[[LIVE_LOOP]]#0, %{{.*}} = %[[LIVE_LOOP]]#1, %{{.*}} = %[[LIVE_LOOP]]#2) -> (tensor<1x128xf32>, tensor<1x128xf32>, tensor<1x128x32xf32>) {
+  // CHECK: %[[DEAD_RAW:.*]] = affine.apply
+  // CHECK: %[[DEAD_BOUND_MAX:.*]] = arith.maxsi %[[DEAD_RAW]], %c0 : index
+  // CHECK: %[[DEAD_BOUND:.*]] = arith.minsi %[[DEAD_BOUND_MAX]], %c16 : index
+  // CHECK: %[[MIXED_LOOP:.*]]:3 = scf.for %{{.*}} = %[[LIVE_UPPER]] to %[[DEAD_BOUND]] step %c1 iter_args(%{{.*}} = %[[LIVE_LOOP]]#0, %{{.*}} = %[[LIVE_LOOP]]#1, %{{.*}} = %[[LIVE_LOOP]]#2) -> (tensor<1x128xf32>, tensor<1x128xf32>, tensor<1x128x32xf32>) {
   // CHECK: tag = "producer"
   func.func @propagate_dead_tile(
       %q_block: index,
@@ -78,7 +81,7 @@ module attributes {transform.with_named_sequence} {
           ins(%producer : tensor<1x128x64xf32>)
           outs(%tmp : tensor<1x128x64xf32>) {
       ^bb0(%in: f32, %out: f32):
-        %exp = math.exp %in : f32
+        %exp = math.exp2 %in : f32
         linalg.yield %exp : f32
       } -> tensor<1x128x64xf32>
       %rowsum_next = linalg.generic {
