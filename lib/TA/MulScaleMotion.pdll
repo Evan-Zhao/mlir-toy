@@ -22,6 +22,31 @@ Constraint AddReduceKind(kind: Attr) [{
   return success(reduceKind && reduceKind.getValue() == ta::ReduceKind::Add);
 }];
 
+Constraint RightAssociatedMulIsCheaper(a: Value, b: Value, c: Value) [{
+  auto aType = dyn_cast<ta::ExprType>(a.getType());
+  auto bType = dyn_cast<ta::ExprType>(b.getType());
+  auto cType = dyn_cast<ta::ExprType>(c.getType());
+  if (!aType || !bType || !cType)
+    return failure();
+
+  Operation *anchor = a.getDefiningOp();
+  if (!anchor)
+    return failure();
+  auto scope = anchor->getParentOfType<ta::ScopeOp>();
+  if (!scope)
+    return failure();
+
+  // C++ helper defined in TATransformOps.cpp
+  FailureOr<int64_t> rightElementCount =
+      getStaticUnionElementCount(scope, bType.getAxes(), cType.getAxes());
+  FailureOr<int64_t> leftElementCount =
+      getStaticUnionElementCount(scope, aType.getAxes(), bType.getAxes());
+  if (failed(rightElementCount) || failed(leftElementCount))
+    return failure();
+
+  return success(*rightElementCount < *leftElementCount);
+}];
+
 // sum((lhs / denom) * rhs) => sum(lhs * rhs) / den
 Pattern SinkDivAfterMatmul {
   let div = op<ta.divf>(lhs: Value, denom: Value) {"ta.import_group" = srcDiv: Attr};
@@ -49,5 +74,17 @@ Pattern SinkRightMulAfterMatmul {
     let newMul = op<ta.mulf>(lhs, rhs) {"ta.import_group" = srcOuter};
     let newReduce = op<ta.reduce>(newMul) {kind = kind, axes = axes, "ta.import_group" = srcReduce} -> (resultType);
     replace reduce with op<ta.mulf>(newReduce, factor) {"ta.import_group" = srcInner};
+  };
+}
+
+// c * (a * b) => a * (b * c), when b * c has a smaller footprint.
+Pattern ReassociateRightMulfIfCheaper {
+  let inner = op<ta.mulf>(a: Value, b: Value) {"ta.import_group" = srcInner: Attr};
+  let outer = op<ta.mulf>(c: Value, inner) {"ta.import_group" = srcOuter: Attr} -> (resultType: Type);
+  RightAssociatedMulIsCheaper(a, b, c);
+
+  rewrite outer with {
+    let newInner = op<ta.mulf>(b, c) {"ta.import_group" = srcOuter};
+    replace outer with op<ta.mulf>(a, newInner) {"ta.import_group" = srcInner} -> (resultType);
   };
 }

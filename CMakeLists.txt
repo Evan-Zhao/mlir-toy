@@ -151,9 +151,9 @@ mlir_tablegen(TATransformOps.h.inc -gen-op-decls)
 mlir_tablegen(TATransformOps.cpp.inc -gen-op-defs)
 add_public_tablegen_target(TATransformOpsIncGen)
 
-add_mlir_pdll_library(TASinkScaleAfterMatmulPDLL
-  lib/TA/SinkScaleAfterMatmul.pdll
-  SinkScaleAfterMatmul.cpp.inc
+add_mlir_pdll_library(TAMulScaleMotionPDLL
+  lib/TA/MulScaleMotion.pdll
+  MulScaleMotion.cpp.inc
 )
 
 add_mlir_pdll_library(TAExpToExp2PDLL
@@ -270,7 +270,7 @@ make_mlir_opt_plugin(
     TAAttrsIncGen
     TATypesIncGen
     TATransformOpsIncGen
-    TASinkScaleAfterMatmulPDLL
+    TAMulScaleMotionPDLL
     TAExpToExp2PDLL
 )
 make_mlir_opt_plugin(

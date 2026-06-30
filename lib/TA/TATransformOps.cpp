@@ -12,10 +12,34 @@
 
 using namespace mlir;
 
-namespace ta_sink_scale_after_matmul_pdl {
+namespace ta_mul_scale_motion_pdl {
 using namespace mlir;
-#include "SinkScaleAfterMatmul.cpp.inc"
-} // namespace ta_sink_scale_after_matmul_pdl
+
+static FailureOr<int64_t> getStaticUnionElementCount(ta::ScopeOp scope, ta::AxesAttr lhs,
+                                                     ta::AxesAttr rhs) {
+  llvm::StringMap<int64_t> axisExtents;
+  for (auto [scopeAxisAttr, staticExtent] :
+       llvm::zip_equal(scope.getAxes().getAxes(), scope.getStaticExtents())) {
+    auto scopeAxis = cast<ta::AxisAttr>(scopeAxisAttr);
+    axisExtents.try_emplace(scopeAxis.getName().getValue(), staticExtent);
+  }
+
+  llvm::DenseSet<StringRef> axes;
+  for (Attribute attr : llvm::concat<const Attribute>(lhs.getAxes(), rhs.getAxes()))
+    axes.insert(cast<ta::AxisAttr>(attr).getName().getValue());
+
+  int64_t elementCount = 1;
+  for (StringRef axis : axes) {
+    auto it = axisExtents.find(axis);
+    if (it == axisExtents.end() || it->second == ShapedType::kDynamic)
+      return failure();
+    elementCount *= it->second;
+  }
+  return elementCount;
+}
+
+#include "MulScaleMotion.cpp.inc"
+} // namespace ta_mul_scale_motion_pdl
 
 namespace ta_exp_to_exp2_pdl {
 using namespace mlir;
@@ -237,11 +261,15 @@ DiagnosedSilenceableFailure TAToLinalgOp::apply(TransformRewriter &rewriter,
 }
 
 void TASinkDivAfterMatmulPatternsOp::populatePatterns(RewritePatternSet &patterns) {
-  patterns.add<ta_sink_scale_after_matmul_pdl::SinkDivAfterMatmul>(patterns.getContext());
+  patterns.add<ta_mul_scale_motion_pdl::SinkDivAfterMatmul>(patterns.getContext());
 }
 
 void TASinkRightMulAfterMatmulPatternsOp::populatePatterns(RewritePatternSet &patterns) {
-  patterns.add<ta_sink_scale_after_matmul_pdl::SinkRightMulAfterMatmul>(patterns.getContext());
+  patterns.add<ta_mul_scale_motion_pdl::SinkRightMulAfterMatmul>(patterns.getContext());
+}
+
+void TAReassociateRightMulfPatternsOp::populatePatterns(RewritePatternSet &patterns) {
+  patterns.add<ta_mul_scale_motion_pdl::ReassociateRightMulfIfCheaper>(patterns.getContext());
 }
 
 void TAExpToExp2PatternsOp::populatePatterns(RewritePatternSet &patterns) {
@@ -286,6 +314,7 @@ void registerTATransformExtension(mlir::DialectRegistry &registry) {
         ->addOperations<mlir::transform::TAMatchEinsumOp, mlir::transform::TAToLinalgOp,
                         mlir::transform::TASinkDivAfterMatmulPatternsOp,
                         mlir::transform::TASinkRightMulAfterMatmulPatternsOp,
+                        mlir::transform::TAReassociateRightMulfPatternsOp,
                         mlir::transform::TAExpToExp2PatternsOp,
                         mlir::transform::TARewriteExpToExp2Op>();
   });

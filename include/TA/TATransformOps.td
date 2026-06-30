@@ -82,19 +82,37 @@ def TASinkDivAfterMatmulPatternsOp
 
 def TASinkRightMulAfterMatmulPatternsOp
     : Op<Transform_Dialect, "apply_patterns.ta.sink_right_mul_after_matmul",
-        [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
+         [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
   let summary = "Collect rewrite patterns to sink an RHS multiplicative factor after a matmul";
 
   let description = [{
     Collects PDLL-authored TA rewrite patterns that sink a multiplicative factor
-    after an add-reduced multiply:
+    after an add-reduced multiply. The pattern set may first reassociate a
+    multiply when the right-associated multiply has a smaller axis footprint:
 
     ```
+      c * (a * b) -> a * (b * c)
       sum(lhs * (rhs * factor)) -> sum(lhs * rhs) * factor
     ```
 
     The `factor` must have axes disjoint from the reduction axes.
     The pattern preserves the matched add reducer kind, axes, and import-group attributes.
+  }];
+
+  let assemblyFormat = "attr-dict";
+}
+
+def TAReassociateRightMulfPatternsOp
+    : Op<Transform_Dialect, "apply_patterns.ta.reassociate_right_mulf",
+         [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
+  let summary = "Collect rewrite patterns to reassociate TA multiplications to the right";
+
+  let description = [{
+    Collects PDLL-authored TA rewrite patterns that reassociate a nested multiplication
+    ```
+      c * (a * b) -> a * (b * c)
+    ```
+    if the right-associated multiply involves fewer computed elements.
   }];
 
   let assemblyFormat = "attr-dict";
