@@ -16,6 +16,8 @@ The pipeline currently covers these variants:
 - **Global grouped-query attention (GQA)**: Q heads grouped over fewer K/V heads.
 - **Global multi-query attention (MQA)**: the GQA case where all Q heads share one K/V head.
 - **ALiBi-fused attention**: head-dependent linear score bias fused into the attention loop.
+- **KV-FP8 causal attention**: causal attention with FP16 Q, FP8 K/V inputs, and per-head K/V
+  dequantization scales fused into the tiled loop.
 
 The static Transform-dialect examples live under [`test/Pipeline`](../test/Pipeline). The Python
 pipeline tests also exercise multiple shapes, including GQA with one K/V head, which is the MQA

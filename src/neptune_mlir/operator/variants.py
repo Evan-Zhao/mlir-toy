@@ -5,12 +5,11 @@ from enum import Enum
 
 class AttentionVariant(str, Enum):
     GLOBAL_ATTN = "global-attn"
+    GLOBAL_GQA = "global-gqa"
     CAUSAL_ATTN = "causal-attn"
     ALIBI_CAUSAL_ATTN = "alibi-causal-attn"
     WINDOWED_CAUSAL_ATTN = "windowed-causal-attn"
-    GLOBAL_GQA = "global-gqa"
-    FLOAT8_INPUTS = "float8-inputs"
-    FAKE_QUANT = "fake-quant"
+    KV_FP8_CAUSAL_ATTN = "kv-fp8-causal-attn"
     SPARSE_MM = "sparse-mm"
 
     def __str__(self) -> str:

@@ -456,21 +456,32 @@ LogicalResult rewriteOriginalLinalgOp(RewriterBase &rewriter, Operation *op) {
 LogicalResult foldExpandShapeOfSingleResultForall(RewriterBase &rewriter,
                                                   tensor::ExpandShapeOp expandOp) {
   auto forallOp = expandOp.getSrc().getDefiningOp<scf::ForallOp>();
-  if (!forallOp)
+  if (!forallOp) {
+    expandOp.emitError() << "expected tensor.expand_shape source to be an scf.forall result";
     return failure();
-  if (forallOp.getNumResults() != 1 || !forallOp.getResult(0).hasOneUse())
+  }
+  if (forallOp.getNumResults() != 1 || !forallOp.getResult(0).hasOneUse()) {
+    forallOp.emitError() << "expected single-result scf.forall with one use by tensor.expand_shape";
     return failure();
+  }
 
   BlockArgument oldOutArg = forallOp.getRegionOutArgs().front();
   SmallVector<tensor::ParallelInsertSliceOp> inserts;
   for (OpOperand &use : oldOutArg.getUses()) {
     auto insert = dyn_cast<tensor::ParallelInsertSliceOp>(use.getOwner());
-    if (!insert || insert.getDest() != oldOutArg)
+    if (!insert || insert.getDest() != oldOutArg) {
+      use.getOwner()->emitError()
+          << "expected scf.forall shared_out use to be tensor.parallel_insert_slice into the "
+             "shared output";
       return failure();
+    }
     inserts.push_back(insert);
   }
-  if (inserts.empty())
+  if (inserts.empty()) {
+    forallOp.emitError()
+        << "expected scf.forall shared_out to be published by tensor.parallel_insert_slice";
     return failure();
+  }
 
   OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPoint(forallOp);
@@ -490,8 +501,11 @@ LogicalResult foldExpandShapeOfSingleResultForall(RewriterBase &rewriter,
           int64_t unitValue) -> FailureOr<SmallVector<OpFoldResult>> {
     RankedTensorType expandedType = expandOp.getResultType();
     SmallVector<ReassociationIndices> reassociation = expandOp.getReassociationIndices();
-    if (reassociation.size() != oldParams.size())
+    if (reassociation.size() != oldParams.size()) {
+      expandOp.emitError()
+          << "expand_shape reassociation rank does not match tensor.parallel_insert_slice params";
       return failure();
+    }
 
     OpFoldResult unit = rewriter.getIndexAttr(unitValue);
     SmallVector<OpFoldResult> expandedParams;
@@ -502,8 +516,12 @@ LogicalResult foldExpandShapeOfSingleResultForall(RewriterBase &rewriter,
         int64_t dimSize = expandedType.getDimSize(expandedDim);
         if (dimSize == 1)
           continue;
-        if (ShapedType::isDynamic(dimSize) || carriedDim)
+        if (ShapedType::isDynamic(dimSize) || carriedDim) {
+          expandOp.emitError()
+              << "expected each reassociation group to have at most one static non-unit "
+                 "dimension";
           return failure();
+        }
         carriedDim = expandedDim;
       }
 
@@ -519,8 +537,11 @@ LogicalResult foldExpandShapeOfSingleResultForall(RewriterBase &rewriter,
     auto expandedOffsetsR = expandRankReducedSliceParams(insert.getMixedOffsets(), 0),
          expandedSizesR = expandRankReducedSliceParams(insert.getMixedSizes(), 1),
          expandedStridesR = expandRankReducedSliceParams(insert.getMixedStrides(), 1);
-    if (failed(expandedOffsetsR) || failed(expandedSizesR) || failed(expandedStridesR))
+    if (failed(expandedOffsetsR) || failed(expandedSizesR) || failed(expandedStridesR)) {
+      insert.emitError()
+          << "failed to remap tensor.parallel_insert_slice params for expanded forall result";
       return failure();
+    }
     rewriter.setInsertionPoint(insert);
     tensor::ParallelInsertSliceOp::create(rewriter, insert.getLoc(), insert.getSource(),
                                           newForallOp.getRegionOutArgs().front(), *expandedOffsetsR,
@@ -540,8 +561,10 @@ LogicalResult foldForallResultExpands(RewriterBase &rewriter, Operation *target)
   for (tensor::ExpandShapeOp expandOp : expandOps) {
     if (!expandOp->getBlock())
       continue;
-    if (failed(foldExpandShapeOfSingleResultForall(rewriter, expandOp)))
+    if (failed(foldExpandShapeOfSingleResultForall(rewriter, expandOp))) {
+      expandOp.emitError() << "failed to fold tensor.expand_shape into producer scf.forall";
       return failure();
+    }
   }
   return success();
 }
@@ -787,11 +810,15 @@ LogicalResult rewriteOutputStores(RewriterBase &rewriter, KernelAbiRewriteInfo &
     if (!group.forallOp->getBlock())
       continue;
     for (OutputStore store : group.outputStores) {
-      if (failed(materializeStoreForForallResult(rewriter, store)))
+      if (failed(materializeStoreForForallResult(rewriter, store))) {
+        group.forallOp.emitError() << "failed to materialize htile.store for scf.forall result";
         return failure();
+      }
     }
-    if (failed(rebuildForallWithoutOutputs(rewriter, group.forallOp)))
+    if (failed(rebuildForallWithoutOutputs(rewriter, group.forallOp))) {
+      group.forallOp.emitError() << "failed to rebuild scf.forall without tensor outputs";
       return failure();
+    }
   }
   return success();
 }
@@ -803,8 +830,10 @@ LogicalResult rewriteExtractSlicesAsLoads(RewriterBase &rewriter, func::FuncOp f
   for (tensor::ExtractSliceOp extract : extracts) {
     if (!extract->getBlock())
       continue;
-    if (failed(rewriteExtractSliceAsLoad(rewriter, funcOp, extract)))
+    if (failed(rewriteExtractSliceAsLoad(rewriter, funcOp, extract))) {
+      extract.emitError() << "failed to rewrite tensor.extract_slice as htile.load";
       return failure();
+    }
   }
   return success();
 }
@@ -839,13 +868,13 @@ DiagnosedSilenceableFailure HTileLinalgToSemanticOp::applyToOne(TransformRewrite
         tensor::populateReassociativeReshapeFoldingPatterns(patterns);
         tensor::populateFoldTensorEmptyPatterns(patterns);
       })))
-    return DiagnosedSilenceableFailure::definiteFailure();
+    return emitSilenceableFailure(transform, "failed to apply tensor cleanup patterns");
   if (failed(foldForallResultExpands(rewriter, target)))
-    return DiagnosedSilenceableFailure::definiteFailure();
+    return emitSilenceableFailure(transform, "failed to fold forall result expand_shape ops");
   if (failed(applyRewritesGreedily(rewriter, target, [&](RewritePatternSet &patterns) {
         tensor::populateFoldTensorEmptyPatterns(patterns);
       })))
-    return DiagnosedSilenceableFailure::definiteFailure();
+    return emitSilenceableFailure(transform, "failed to fold tensor.empty ops");
 
   return DiagnosedSilenceableFailure::success();
 }
@@ -862,20 +891,19 @@ DiagnosedSilenceableFailure HTileSemanticToKernelAbiOp::applyToOne(TransformRewr
                                                                    TransformState &state) {
   (void)results;
   (void)state;
+  auto transform = cast<TransformOpInterface>(getOperation());
 
   auto funcOp = dyn_cast<func::FuncOp>(target);
-  if (!funcOp) {
-    target->emitError() << "expected func.func target";
-    return DiagnosedSilenceableFailure::definiteFailure();
-  }
+  if (!funcOp)
+    return emitSilenceableFailure(transform, "expected func.func target");
 
   FailureOr<KernelAbiRewriteInfo> info = rewriteFunctionAbi(rewriter, funcOp);
   if (failed(info))
-    return DiagnosedSilenceableFailure::definiteFailure();
+    return emitSilenceableFailure(transform, "failed to rewrite function ABI");
   if (failed(rewriteOutputStores(rewriter, *info)))
-    return DiagnosedSilenceableFailure::definiteFailure();
+    return emitSilenceableFailure(transform, "failed to rewrite output stores");
   if (failed(rewriteExtractSlicesAsLoads(rewriter, funcOp)))
-    return DiagnosedSilenceableFailure::definiteFailure();
+    return emitSilenceableFailure(transform, "failed to rewrite extract_slice ops as loads");
   return DiagnosedSilenceableFailure::success();
 }
 
