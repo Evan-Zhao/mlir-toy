@@ -14,37 +14,6 @@ namespace {
 #define BAIL(message) return emitSilenceableFailure(transform, message);
 using linalg::GenericOp;
 
-void replaceUsesAfterElementwiseFusion(RewriterBase &rewriter,
-                                       const linalg::ElementwiseOpFusionResult &fusionResult,
-                                       Operation *producer) {
-  for (auto &[origVal, replacement] : fusionResult.replacements) {
-    if (origVal.getDefiningOp() != producer)
-      rewriter.replaceUsesWithIf(origVal, replacement,
-                                 [&](OpOperand &use) { return use.getOwner() != producer; });
-  }
-}
-
-FailureOr<Operation *> tryDirectElementwiseFusion(TransformRewriter &rewriter,
-                                                  linalg::LinalgOp linalgTarget,
-                                                  size_t operandNumber) {
-  OpOperand &fusedOperand = linalgTarget->getOpOperand(operandNumber);
-  if (!linalg::areElementwiseOpsFusable(&fusedOperand))
-    return static_cast<Operation *>(nullptr);
-
-  Operation *producer = fusedOperand.get().getDefiningOp();
-  rewriter.setInsertionPoint(linalgTarget);
-  FailureOr<linalg::ElementwiseOpFusionResult> fusionResult =
-      linalg::fuseElementwiseOps(rewriter, &fusedOperand);
-  if (failed(fusionResult))
-    return static_cast<Operation *>(nullptr);
-
-  replaceUsesAfterElementwiseFusion(rewriter, *fusionResult, producer);
-  if (failed(rewriter.notifyPayloadOperationReplaced(linalgTarget, fusionResult->fusedOp)))
-    return failure();
-  rewriter.eraseOp(linalgTarget);
-  return fusionResult->fusedOp;
-}
-
 LogicalResult rewriteGreedilyWithPatternSet(MLIRContext *context, OpBuilder &rewriter,
                                             RewritePatternSet &patterns, Operation *target) {
   GreedyRewriteConfig config;
@@ -97,28 +66,13 @@ LinalgGreedyInlineElementwiseOp::applyToOne(TransformRewriter &rewriter, linalg:
     BAIL("operand_number is out of range");
   }
 
-  GenericOp currentOp = target;
-  bool applied = false;
-  while (true) {
-    size_t beginOprndNum = operandNumber ? *operandNumber : 0,
-           endOprndNum = operandNumber ? beginOprndNum + 1 : currentOp.getNumDpsInputs();
-    bool changed = false;
-    for (size_t i = beginOprndNum; i < endOprndNum; ++i) {
-      auto folded = tryDirectElementwiseFusion(rewriter, currentOp, i);
-      if (failed(folded))
-        return emitDefiniteFailure()
-               << "failed to update payload tracking after elementwise fusion";
-      if (*folded) {
-        currentOp = cast<GenericOp>(*folded);
-        changed = applied = true;
-        break;
-      }
-    }
-    if (!changed)
-      break;
-  }
-  if (!applied)
+  FailureOr<ElementwiseInlineResult> inlineResult =
+      greedyInlineElementwiseProducers(rewriter, target, operandNumber);
+  if (failed(inlineResult))
+    return emitDefiniteFailure() << "failed to update payload tracking after elementwise fusion";
+  if (!inlineResult->applied)
     BAIL("no eligible elementwise inlining or reshape folding");
+  GenericOp currentOp = cast<GenericOp>(inlineResult->fusedOp);
 
   RewritePatternSet cleanupPatterns(getContext());
   linalg::populateEraseUnusedOperandsAndResultsPatterns(cleanupPatterns);

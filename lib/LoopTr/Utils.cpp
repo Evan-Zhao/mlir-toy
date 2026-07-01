@@ -1,5 +1,7 @@
 #include "LoopTr/Utils.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
+#include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Transforms/CSE.h"
@@ -9,6 +11,37 @@
 namespace mlir {
 
 namespace {
+
+void replaceUsesAfterElementwiseFusion(RewriterBase &rewriter,
+                                       const linalg::ElementwiseOpFusionResult &fusionResult,
+                                       Operation *producer) {
+  for (auto &[origVal, replacement] : fusionResult.replacements) {
+    if (origVal.getDefiningOp() != producer)
+      rewriter.replaceUsesWithIf(origVal, replacement,
+                                 [&](OpOperand &use) { return use.getOwner() != producer; });
+  }
+}
+
+FailureOr<Operation *> tryDirectElementwiseFusion(transform::TransformRewriter &rewriter,
+                                                  linalg::LinalgOp linalgTarget,
+                                                  int64_t operandNumber) {
+  OpOperand &fusedOperand = linalgTarget->getOpOperand(static_cast<unsigned>(operandNumber));
+  if (!linalg::areElementwiseOpsFusable(&fusedOperand))
+    return static_cast<Operation *>(nullptr);
+
+  Operation *producer = fusedOperand.get().getDefiningOp();
+  rewriter.setInsertionPoint(linalgTarget);
+  FailureOr<linalg::ElementwiseOpFusionResult> fusionResult =
+      linalg::fuseElementwiseOps(rewriter, &fusedOperand);
+  if (failed(fusionResult))
+    return static_cast<Operation *>(nullptr);
+
+  replaceUsesAfterElementwiseFusion(rewriter, *fusionResult, producer);
+  if (failed(rewriter.notifyPayloadOperationReplaced(linalgTarget, fusionResult->fusedOp)))
+    return failure();
+  rewriter.eraseOp(linalgTarget);
+  return fusionResult->fusedOp;
+}
 
 /// Dispatch to the appropriate loop result mediator getter based on the loop type.
 template <typename LoopOp> struct GetLoopResults;
@@ -319,6 +352,31 @@ tileAndFuseConsumerWithDebug(RewriterBase &rewriter, Operation &consumer,
       llvm::errs() << "  - " << msg << "\n";
   }
   return result;
+}
+
+FailureOr<ElementwiseInlineResult>
+greedyInlineElementwiseProducers(transform::TransformRewriter &rewriter, linalg::GenericOp target,
+                                 std::optional<int64_t> operandNumber) {
+  linalg::GenericOp currentOp = target;
+  bool applied = false;
+  while (true) {
+    int64_t beginOperandNumber = operandNumber ? *operandNumber : 0;
+    int64_t endOperandNumber =
+        operandNumber ? beginOperandNumber + 1 : currentOp.getNumDpsInputs();
+    bool changed = false;
+    for (int64_t i = beginOperandNumber; i < endOperandNumber; ++i) {
+      FailureOr<Operation *> folded = tryDirectElementwiseFusion(rewriter, currentOp, i);
+      if (failed(folded))
+        return failure();
+      if (*folded) {
+        currentOp = cast<linalg::GenericOp>(*folded);
+        changed = applied = true;
+        break;
+      }
+    }
+    if (!changed)
+      return ElementwiseInlineResult{.fusedOp = currentOp.getOperation(), .applied = applied};
+  }
 }
 
 FailureOr<std::pair<Operation *, Operation *>>

@@ -1,6 +1,7 @@
 #include "LoopTr/LoopTransformOps.h"
 #include "LoopTr/Utils.h"
 
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
@@ -81,6 +82,7 @@ FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewrite
   const size_t resultNumber = getResultNumber();
   if (resultNumber >= loop->getNumResults())
     BAIL("result number is out of range for producer loop");
+  const bool inlineElemwise = getInlineElementwise();
 
   SmallVector<Operation *> fusedOps;
   while (true) {
@@ -104,6 +106,15 @@ FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewrite
     });
 
     for (Operation *consumer : consumers) {
+      auto genericConsumer = dyn_cast<linalg::GenericOp>(consumer);
+      if (inlineElemwise && genericConsumer) {
+        FailureOr<ElementwiseInlineResult> inlineResult =
+            greedyInlineElementwiseProducers(rewriter, genericConsumer);
+        if (failed(inlineResult))
+          BAIL("failed to inline elementwise producer into consumer");
+        consumer = inlineResult->fusedOp;
+      }
+
       SmallVector<LoopLikeOpInterface> loops{loop};
       FailureOr<scf::SCFFuseConsumerOfSliceResult> fuseResult =
           tileAndFuseConsumerWithDebug(rewriter, *consumer, loops);

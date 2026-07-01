@@ -8,8 +8,13 @@
 #include "mlir/Dialect/Transform/Utils/DiagnosedSilenceableFailure.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
+#include <optional>
 
 namespace mlir {
+
+namespace transform {
+class TransformRewriter;
+} // namespace transform
 
 #define CHECK_NON_EMPTY_OPS(state, transform, getter, nameStr, varName)                            \
   SmallVector<Operation *> varName = llvm::to_vector((state).getPayloadOps(getter()));             \
@@ -143,6 +148,19 @@ LogicalResult recursiveMoveOperandsBeforeOp(Operation &toMoveOperands, RewriterB
 FailureOr<scf::SCFFuseConsumerOfSliceResult>
 tileAndFuseConsumerWithDebug(RewriterBase &rewriter, Operation &consumer,
                              MutableArrayRef<LoopLikeOpInterface> loops);
+
+struct ElementwiseInlineResult {
+  Operation *fusedOp;
+  bool applied;
+};
+
+/// Greedily inline elementwise producers into a linalg.generic op.
+///
+/// If `operandNumber` is set, only that DPS input operand is considered.
+/// Returns the final rewritten op and whether any inlining happened.
+FailureOr<ElementwiseInlineResult>
+greedyInlineElementwiseProducers(transform::TransformRewriter &rewriter, linalg::GenericOp target,
+                                 std::optional<int64_t> operandNumber = std::nullopt);
 
 /// Tiles and fuses `operation` into a double loop structure, in two steps.
 /// Returns the results of these two fusions as a pair.
