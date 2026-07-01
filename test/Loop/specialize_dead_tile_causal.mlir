@@ -18,7 +18,7 @@ module attributes {transform.with_named_sequence} {
         attributes {tag = "producer"} in %func : (!any) -> !any
     %live_loop, %mixed_loop =
       transform.loop.specialize_dead_tile %producer in %loop
-        {dead_value = 0xFF800000 : f32} : !any, !any -> !any, !any
+        {dead_value = 0xFF800000 : f32} : (!any, !any) -> (!any, !any)
     transform.yield
   }
 

@@ -293,18 +293,19 @@ def LoopSpecializeDeadTileOp
     new loops. The transform returns handles to those new loops explicitly:
     `live_loop` and `mixed_loop`.
 
-    The `producer_op` handle is read-only and remains valid after the rewrite.
-    It is remapped to the cloned producer operation in the mixed suffix loop.
+    The optional `producer_op` handle is read-only and remains valid after the rewrite.
+    If provided, it is remapped to the cloned producer operation in the mixed suffix loop.
+    If omitted or empty, the producer is inferred as the unique dead-select
+    `linalg.generic` nested in `loop`.
   }];
 
-  let arguments = (ins TransformHandleTypeInterface:$producer_op,
+  let arguments = (ins Optional<TransformHandleTypeInterface>:$producer_op,
       TransformHandleTypeInterface:$loop, AnyAttr:$dead_value);
   let results = (outs TransformHandleTypeInterface:$live_loop,
       TransformHandleTypeInterface:$mixed_loop);
 
-  let assemblyFormat = "$producer_op `in` $loop attr-dict "
-                       " `:` type($producer_op) `,` type($loop) `->` "
-                       " type($live_loop) `,` type($mixed_loop)";
+  let assemblyFormat = "($producer_op^)? `in` $loop attr-dict "
+                       " `:` functional-type(operands, results)";
 }
 
 def FusionCloneFuseElemwiseOp
