@@ -373,7 +373,9 @@ DiagnosedSilenceableFailure FusionCloneFuseElemwiseOp::apply(transform::Transfor
                                                              TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
   CHECK_NON_EMPTY_OPS(state, transform, getElemwiseChainOps, "elementwise", elemwiseOps)
+  ForallOp outerLoop;
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getOuterLoop, "outer loop", outerLoop, ForallOp);
+  ForOp innerLoop;
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getInnerLoop, "inner loop", innerLoop, ForOp);
 
   IRMapping mapping;
@@ -489,9 +491,12 @@ FusionRepairReductionFrontierOp::apply(transform::TransformRewriter &rewriter,
   // Do some basic validation.
   auto transform = cast<TransformOpInterface>(getOperation());
   CHECK_NON_EMPTY_OPS(state, transform, getProducerReduces, "producer reductions", producerReds);
+  GenericOp thisRed;
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getThisReduce, "this reduction", thisRed,
                                GenericOp);
+  ForallOp outerLoop;
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getOuterLoop, "outer loop", outerLoop, ForallOp);
+  ForOp innerLoop;
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getInnerLoop, "inner loop", innerLoop, ForOp);
   CHECK_NON_EMPTY_OPS(state, transform, getElemwiseOrig, "original elementwise", elemwiseOrig);
   CHECK_NON_EMPTY_OPS(state, transform, getElemwiseSidecars, "sidecar elementwise",

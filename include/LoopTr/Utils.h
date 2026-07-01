@@ -28,13 +28,10 @@ namespace mlir {
   }
 
 #define CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getter, nameStr, varName, Type)             \
-  Type varName;                                                                                    \
-  {                                                                                                \
-    CHECK_EXTRACT_UNIQUE_OP(state, transform, getter, nameStr, varName##1);                        \
-    (varName) = dyn_cast<Type>(varName##1);                                                        \
-    if (!(varName))                                                                                \
-      return emitSilenceableFailure(transform, "expected " nameStr " to be a " #Type);             \
-  }
+  CHECK_EXTRACT_UNIQUE_OP(state, transform, getter, nameStr, varName##1);                          \
+  (varName) = dyn_cast<Type>(varName##1);                                                          \
+  if (!(varName))                                                                                  \
+    return emitSilenceableFailure(transform, "expected " nameStr " to be a " #Type);
 
 #define RETURN_DIAGNOSTICS_OR_BIND_VAL(OtherType, var, expr)                                       \
   OtherType var;                                                                                   \

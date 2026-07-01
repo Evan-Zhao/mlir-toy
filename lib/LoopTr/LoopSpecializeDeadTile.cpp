@@ -987,7 +987,7 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
                                                             TransformState &state) {
   (void)transformResults;
   auto transform = cast<TransformOpInterface>(getOperation());
-
+  scf::ForOp loop;
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getLoop, "loop", loop, scf::ForOp);
 
   SmallVector<Operation *> producerOps = llvm::to_vector(state.getPayloadOps(getProducerOp()));

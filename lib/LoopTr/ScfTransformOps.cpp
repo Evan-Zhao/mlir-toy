@@ -833,7 +833,9 @@ DiagnosedSilenceableFailure ScfFuseReductionIntoForallOp::apply(TransformRewrite
                                                                 TransformResults &transformResults,
                                                                 TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
+  scf::ForallOp loop;
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getForallLoop, "loop", loop, scf::ForallOp);
+  linalg::GenericOp consumer;
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getConsumerOp, "consumer", consumer,
                                linalg::GenericOp);
   FailureOr<uint64_t> reductionDim = matchUnarySingleReductionGeneric(consumer);
