@@ -141,7 +141,10 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="number of KV heads for GQA variants (defaults to --q-heads)",
     )
-    parser.add_argument("-s", "--seq-len", type=int, default=128, help="sequence length")
+    parser.add_argument("-s", "--seq-len", type=int, default=128, help="query sequence length")
+    parser.add_argument(
+        "--kv-seq-len", type=int, default=None, help="K/V sequence length (defaults to --seq-len)"
+    )
     parser.add_argument("-d", "--head-dim", type=int, default=64, help="head dimension")
     parser.add_argument(
         "--window-size",
@@ -177,18 +180,27 @@ def _build_module_and_args(
     q_heads: int,
     kv_heads: int,
     seq_len: int,
+    kv_seq_len: int,
     head_dim: int,
     window_size: int,
 ) -> tuple[torch.nn.Module, tuple[torch.Tensor, ...]]:
     q_shape = (batch, q_heads, seq_len, head_dim)
+    kv_shape = (batch, kv_heads, kv_seq_len, head_dim)
+    fp16 = torch.float16
+    fp32 = torch.float32
+
+    def make_qkv():
+        q = torch.randn(q_shape, dtype=fp16)
+        k, v = [torch.randn(kv_shape, dtype=fp16) for _ in range(2)]
+        return q, k, v
 
     if variant == AttentionVariant.GLOBAL_GQA:
-        q = torch.randn(q_shape, dtype=torch.float16)
-        kv_shape = (batch, kv_heads, seq_len, head_dim)
-        k = torch.randn(kv_shape, dtype=torch.float16)
-        v = torch.randn(kv_shape, dtype=torch.float16)
-        return GlobalGQAModule().eval(), (q, k, v)
+        return GlobalGQAModule().eval(), make_qkv()
 
+    if q_heads != kv_heads:
+        raise ValueError(
+            f"q_heads ({q_heads}) must equal kv_heads ({kv_heads}) for {variant.value}"
+        )
     masked_variants = {
         AttentionVariant.GLOBAL_ATTN: lambda _: None,
         AttentionVariant.CAUSAL_ATTN: causal_mask,
@@ -196,28 +208,26 @@ def _build_module_and_args(
     }
     mask_f = masked_variants.get(variant, None)
     if mask_f is not None:
-        example_args = tuple(torch.randn(q_shape, dtype=torch.float16) for _ in range(3))
-        return Attention4DModule(mask_f).eval(), example_args
+        return Attention4DModule(mask_f).eval(), make_qkv()
 
     if variant == AttentionVariant.ALIBI_CAUSAL_ATTN:
-        q, k, v = (torch.randn(q_shape, dtype=torch.float16) for _ in range(3))
-        slopes = (torch.arange(q_heads, dtype=torch.float32) + 1.0) / q_heads
+        q, k, v = make_qkv()
+        slopes = (torch.arange(q_heads, dtype=fp32) + 1.0) / q_heads
         return AlibiCausalAttentionModule().eval(), (q, k, v, slopes)
 
     if variant == AttentionVariant.KV_FP8_CAUSAL_ATTN:
-        fp32 = torch.float32
-        q = torch.randn(q_shape, dtype=torch.float16)
-        k = torch.randn(q_shape, dtype=fp32).to(torch.float8_e4m3fn)
-        v = torch.randn(q_shape, dtype=fp32).to(torch.float8_e4m3fn)
+        q, k, v = make_qkv()
+        k = k.to(torch.float8_e4m3fn)
+        v = v.to(torch.float8_e4m3fn)
         sk = torch.randn(kv_heads, dtype=fp32).reshape(1, q_heads, 1, 1)
         sv = torch.randn(kv_heads, dtype=fp32).reshape(1, q_heads, 1, 1)
         return KVOnlyQuantizedAttentionModule().eval(), (q, k, v, sk, sv)
 
     if variant == AttentionVariant.SPARSE_MM:
         indices = torch.tensor([[0, 1, 1], [2, 0, 2]], dtype=torch.int64)
-        values = torch.tensor([3.0, 4.0, 5.0], dtype=torch.float32)
+        values = torch.tensor([3.0, 4.0, 5.0], dtype=fp32)
         a = torch.sparse_coo_tensor(indices, values, (2, 3))
-        b = torch.randn(3, 4, dtype=torch.float32)
+        b = torch.randn(3, 4, dtype=fp32)
         return SparseMMModule().eval(), (a, b)
 
     raise ValueError(f"unknown variant: {variant}")
@@ -247,6 +257,7 @@ def export_attention_linalg(
     q_heads: int = 4,
     kv_heads: int | None = None,
     seq_len: int = 128,
+    kv_seq_len: int | None = None,
     head_dim: int = 64,
     window_size: int = 128,
     func_name: str = "attention",
@@ -257,8 +268,9 @@ def export_attention_linalg(
     # `x + arange(N)` into `x[i] + 0.000 + i`, and we don't want that 0.000.
     decomposition_table = get_decomposition_table()
     decomposition_table[torch.ops.aten.arange.default] = arange_default_iota_then_cast
+    kv_seq_len = kv_seq_len or seq_len
     model, example_args = _build_module_and_args(
-        variant, batch, q_heads, kv_heads or q_heads, seq_len, head_dim, window_size
+        variant, batch, q_heads, kv_heads or q_heads, seq_len, kv_seq_len, head_dim, window_size
     )
     exported_program = torch.export.export(model, example_args)
     module = fx.export_and_import(
@@ -280,6 +292,7 @@ def main():
             q_heads=args.q_heads,
             kv_heads=args.kv_heads,
             seq_len=args.seq_len,
+            kv_seq_len=args.kv_seq_len,
             head_dim=args.head_dim,
             window_size=args.window_size,
             func_name=args.func_name,

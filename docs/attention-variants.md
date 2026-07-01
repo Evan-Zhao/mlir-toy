@@ -18,6 +18,8 @@ The pipeline currently covers these variants:
 - **ALiBi-fused attention**: head-dependent linear score bias fused into the attention loop.
 - **KV-FP8 causal attention**: causal attention with FP16 Q, FP8 K/V inputs, and per-head K/V
   dequantization scales fused into the tiled loop.
+- **Rectangular/cross-attention shape coverage**: Q and K/V sequence lengths may differ, with a
+  static masked-attention pipeline example that avoids square score-matrix assumptions.
 
 The static Transform-dialect examples live under [`test/Pipeline`](../test/Pipeline). The Python
 pipeline tests also exercise multiple shapes, including GQA with one K/V head, which is the MQA
@@ -84,17 +86,6 @@ Compiler pressure points:
 - A practical implementation needs a representation for sparse block patterns before lowering to
   backend-specific launch code.
 
-### Cross-Attention
-
-Cross-attention uses Q from one sequence and K/V from another. It is not as exotic as sparse or
-paged attention, but it is common in encoder-decoder and multimodal models.
-
-Compiler pressure points:
-
-- Q and K/V sequence lengths differ.
-- Masks may be non-causal but still batch- or modality-dependent.
-- Shape matching should not assume square score matrices.
-
 ### Multi-Head Latent Attention
 
 Multi-head latent attention (MLA) compresses K/V cache state into latent vectors and reconstructs
@@ -113,5 +104,4 @@ Compiler pressure points:
 1. PagedAttention-style KV cache.
 1. RoPE Q/K fusion.
 1. Block-sparse attention with global tokens.
-1. Cross-attention.
 1. Multi-head latent attention.
