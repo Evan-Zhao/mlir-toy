@@ -10,18 +10,6 @@
 #map2 = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, 0)>
 
 module attributes {transform.with_named_sequence} {
-  // Checks if an op is a linalg operation with exactly 4D of an iteration space,
-  // where the first 3 dims are parallel and the last dim is reduction.
-  transform.named_sequence @match_3d_1d_reduction(%candidate: !any {transform.readonly}) -> !any {
-    %matched = transform.match.structured %candidate : (!any) -> !any {
-    ^bb0(%op: !any):
-      transform.match.structured.dim %op[0, 1, 2] {parallel} : !any
-      transform.match.structured.dim %op[3] {reduction} : !any
-      transform.match.structured.yield %op : !any
-    }
-    transform.yield %matched : !any
-  }
-
   transform.named_sequence @match_4d_matmul_transb(%candidate: !any {transform.readonly}) -> !any {
     %matched = transform.match.ta.einsum %candidate
         {equation = "b h i d, b h j d -> b h i j"} : (!any) -> !any
@@ -32,10 +20,6 @@ module attributes {transform.with_named_sequence} {
     %matched = transform.match.ta.einsum %candidate
         {equation = "b h i j, b h j d -> b h i d"} : (!any) -> !any
     transform.yield %matched : !any
-  }
-
-  transform.named_sequence @return_matched(%arg: !any {transform.readonly}) -> !any {
-    transform.yield %arg : !any
   }
 
   transform.named_sequence @__transform_main(%module: !any) {
@@ -76,19 +60,17 @@ module attributes {transform.with_named_sequence} {
     // So we want to do this before we start fusion.
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
-    // Fusion 1. Match an element-wise op that is a consumer of mm0, and fuse it into mm0.
+    // Fusion 1. Match element-wise ops that consumes mm0. Keep going until we reach a reduction
+    // (`find_next_reduction` finds the nearest reduction).
+    // In this case, the nearest reduction is the row-wise max of the softmax,
+    // and we only have one elementwise op (the scale op) to fuse.
     //   TVM: sch.reverse_compute_at(bscale, j0)
-    %bscale = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
-    transform.fusion.into_producer %bscale into %forall_loop : (!any, !any) -> !any
-    // Fusion can create redundant loop-carried values, and canonicalization removes them.
-    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+    %bmax, %_2 = transform.fusion.find_next_reduction %forall_loop : (!any) -> (!any, !any)
+    transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %bmax : (!any, !any) -> !any
 
     // Fusion 2. Fuse row-max into forall, splitting a serial `for` loop from forall in the process.
     // Because of how MLIR scf.for works, this fusion implicitly also r-factors the reduction.
     //   TVM: sch.reverse_compute_at(bmax, j0); sch.rfactor(...)
-    %consumers = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
-    %_2, %bmax = transform.foreach_match restrict_root in %consumers
-        @match_3d_1d_reduction -> @return_matched : (!any) -> (!any, !any)
     // The "row-max" in the input program has two outputs: the max value and the argmax.
     // The subsequent fusion only supports single-output ops, so we remove the unused argmax
     // output before fusion.

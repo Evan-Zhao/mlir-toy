@@ -204,6 +204,49 @@ def FusionIntoProducerOp
                        " `:` functional-type(operands, results)";
 }
 
+def FusionGreedyConsumersIntoProducerOp
+    : Op<Transform_Dialect, "fusion.greedy_consumers_into_producer",
+         [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Greedily fuse consumers into a producer loop";
+
+  let description = [{
+    Starting from `producer_loop[result_number]`, repeatedly fuse the unique
+    direct consumer of the current loop result into `producer_loop`.
+
+    This transform follows a single def-use chain. The `result_number`
+    identifies only the initial loop result. After each successful consumer
+    fusion, the implementation is expected to advance the frontier to the loop
+    result produced by the fused consumer, rather than continuing to query the
+    original result number.
+
+    If `stop_op` is provided and the next direct consumer is one of its payload
+    operations, fusion stops before that consumer and succeeds. This is useful
+    for fusing the elementwise prefix of a chain and stopping at a reduction
+    frontier.
+
+    If `inline_elementwise` is present, the transform should first try to
+    greedily inline elementwise producers into each selected consumer before
+    fusing that consumer into the loop. This inlining is best-effort: a
+    consumer with no eligible elementwise producers should still be considered
+    for loop fusion.
+
+    The `producer_loop` handle is preserved and remapped to the rewritten loop.
+    The optional `stop_op` handle is read-only. The result handle contains the
+    fused consumer operations in fusion order.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$producer_loop, I64Attr:$result_number,
+      Optional<TransformHandleTypeInterface>:$stop_op, UnitAttr:$inline_elementwise);
+  let results = (outs TransformHandleTypeInterface:$fused_ops);
+
+  let assemblyFormat = "$producer_loop `[` $result_number `]` "
+                       "(`until` $stop_op^)? "
+                       "(`inline_elementwise` $inline_elementwise^)? "
+                       "attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
 def FusionFindNextReductionOp
     : Op<Transform_Dialect, "fusion.find_next_reduction",
          [NavigationTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,

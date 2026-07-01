@@ -21,6 +21,7 @@ void registerLoopTransformExtension(mlir::DialectRegistry &registry) {
             mlir::transform::ScfFoldUnitExtentDimsViaReshapesPatternsOp,
             mlir::transform::LinalgEraseUnusedOperandsAndResultsOp,
             mlir::transform::LinalgGreedyInlineElementwiseOp, mlir::transform::FusionIntoProducerOp,
+            mlir::transform::FusionGreedyConsumersIntoProducerOp,
             mlir::transform::ScfFuseReductionIntoForallOp,
             mlir::transform::FusionFindNextReductionOp, mlir::transform::FusionCloneFuseElemwiseOp,
             mlir::transform::FusionRepairReductionFrontierOp,
