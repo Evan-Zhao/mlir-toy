@@ -168,15 +168,18 @@ private:
 
     // If there is an existing list of factor axes, unify each with the incoming ones.
     // Quit if any incompatibility is seen (without returning an error).
-    for (AxisId &axis : it->second)
+    // Copy the factors out into `existingFactors` because unionAxes can recursively mutate
+    // productAxes and make `it` invalid.
+    SmallVector<AxisId> existingFactors = it->second;
+    for (AxisId &axis : existingFactors)
       axis = find(axis);
-    if (it->second.size() != incomingFactors.size())
+    if (existingFactors.size() != incomingFactors.size())
       return success();
-    for (auto [lhs, rhs] : llvm::zip_equal(it->second, incomingFactors)) {
+    for (auto [lhs, rhs] : llvm::zip_equal(existingFactors, incomingFactors)) {
       if (!axesCompatible(lhs, rhs))
         return success();
     }
-    for (auto [lhs, rhs] : llvm::zip_equal(it->second, incomingFactors)) {
+    for (auto [lhs, rhs] : llvm::zip_equal(existingFactors, incomingFactors)) {
       if (failed(unionAxes(op, lhs, rhs)))
         return failure();
     }
@@ -194,8 +197,9 @@ private:
 
     auto result = success();
     if (auto it = productAxes.find(rhs); it != productAxes.end()) {
-      result = mergeProductFactors(op, lhs, it->second);
+      SmallVector<AxisId> rhsFactors = std::move(it->second);
       productAxes.erase(it);
+      result = mergeProductFactors(op, lhs, rhsFactors);
     }
     return result;
   }
