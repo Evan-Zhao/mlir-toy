@@ -207,7 +207,8 @@ def FusionIntoProducerOp
 def FusionGreedyConsumersIntoProducerOp
     : Op<Transform_Dialect, "fusion.greedy_consumers_into_producer",
          [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
-          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+          ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Greedily fuse consumers into a producer loop";
 
   let description = [{

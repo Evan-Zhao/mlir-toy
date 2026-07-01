@@ -203,7 +203,45 @@ LogicalResult sinkYieldInsertSlices(RewriterBase &rewriter, scf::ForOp loop) {
   return success();
 }
 
+Operation *getCommonDefiningOp(ValueRange values) {
+  DenseSet<Operation *> defOps;
+  for (Value value : values) {
+    if (value)
+      defOps.insert(value.getDefiningOp());
+  }
+  if (defOps.contains(nullptr) || defOps.size() != 1)
+    return nullptr;
+  return *defOps.begin();
+}
+
 } // namespace
+
+TrackedOperationListener::TrackedOperationListener(Operation *trackedOp,
+                                                   OpBuilder::Listener *previous)
+    : RewriterBase::ForwardingListener(previous), trackedOp(trackedOp) {}
+
+void TrackedOperationListener::notifyOperationReplaced(Operation *op, Operation *newOp) {
+  RewriterBase::ForwardingListener::notifyOperationReplaced(op, newOp);
+  if (op == trackedOp)
+    trackedOp = newOp;
+}
+
+void TrackedOperationListener::notifyOperationReplaced(Operation *op, ValueRange replacement) {
+  RewriterBase::ForwardingListener::notifyOperationReplaced(op, replacement);
+  if (op == trackedOp) {
+    auto newOp = getCommonDefiningOp(replacement);
+    if (!newOp || newOp->getName() != op->getName())
+      trackedOp = nullptr;
+    else
+      trackedOp = newOp;
+  }
+}
+
+void TrackedOperationListener::notifyOperationErased(Operation *op) {
+  RewriterBase::ForwardingListener::notifyOperationErased(op);
+  if (op == trackedOp)
+    trackedOp = nullptr;
+}
 
 LogicalResult isSingleOutputElemwiseLinalgOp(Operation *op) {
   auto generic = dyn_cast<linalg::GenericOp>(op);
@@ -361,8 +399,7 @@ greedyInlineElementwiseProducers(transform::TransformRewriter &rewriter, linalg:
   bool applied = false;
   while (true) {
     int64_t beginOperandNumber = operandNumber ? *operandNumber : 0;
-    int64_t endOperandNumber =
-        operandNumber ? beginOperandNumber + 1 : currentOp.getNumDpsInputs();
+    int64_t endOperandNumber = operandNumber ? beginOperandNumber + 1 : currentOp.getNumDpsInputs();
     bool changed = false;
     for (int64_t i = beginOperandNumber; i < endOperandNumber; ++i) {
       FailureOr<Operation *> folded = tryDirectElementwiseFusion(rewriter, currentOp, i);

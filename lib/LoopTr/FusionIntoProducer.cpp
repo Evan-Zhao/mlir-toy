@@ -57,13 +57,20 @@ void FusionGreedyConsumersIntoProducerOp::getEffects(
   modifiesPayload(effects);
 }
 
-static LogicalResult canonicalizeForLoop(RewriterBase &rewriter, scf::ForallOp loop) {
+static FailureOr<scf::ForallOp> canonicalizeForLoop(RewriterBase &rewriter, scf::ForallOp loop) {
   RewritePatternSet patterns(rewriter.getContext());
   scf::ForallOp::getCanonicalizationPatterns(patterns, rewriter.getContext());
+  TrackedOperationListener listener(loop, rewriter.getListener());
   GreedyRewriteConfig config;
-  config.setListener(static_cast<RewriterBase::Listener *>(rewriter.getListener()));
+  config.setListener(&listener);
   config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
-  return applyOpPatternsGreedily({loop}, FrozenRewritePatternSet(std::move(patterns)), config);
+  if (failed(applyOpPatternsGreedily({loop}, FrozenRewritePatternSet(std::move(patterns)), config)))
+    return failure();
+
+  auto rewrittenLoop = dyn_cast_if_present<scf::ForallOp>(listener.getOperation());
+  if (!rewrittenLoop)
+    return failure();
+  return rewrittenLoop;
 }
 
 DiagnosedSilenceableFailure
@@ -128,11 +135,12 @@ FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewrite
         rewriter.eraseOp(consumer);
     }
 
-    if (failed(canonicalizeForLoop(rewriter, loop)))
+    FailureOr<scf::ForallOp> canonicalizedLoop = canonicalizeForLoop(rewriter, loop);
+    if (failed(canonicalizedLoop))
       BAIL("failed to canonicalize the producer loop after consumer fusion");
-    // Update `loop` from the handle because canonicalization may have replaced the forall.
-    CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getProducerLoop, "producer loop", loop,
-                                 scf::ForallOp);
+    loop = *canonicalizedLoop;
+    if (resultNumber >= loop->getNumResults())
+      BAIL("result number is out of range for producer loop after canonicalization");
   }
 }
 
