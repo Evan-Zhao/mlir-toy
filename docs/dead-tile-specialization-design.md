@@ -21,7 +21,7 @@ It takes as input:
 
 ```mlir
 %live_loop, %mixed_loop = transform.loop.specialize_dead_tile %producer in %loop
-    {dead_value = 0xFF800000 : f32} : !any, !any -> !any, !any
+    {dead_value = 0xFF800000 : f32} : (!any, !any) -> !any, !any
 ```
 
 Contract:

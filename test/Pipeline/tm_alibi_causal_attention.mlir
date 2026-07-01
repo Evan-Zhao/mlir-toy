@@ -114,7 +114,7 @@ module attributes {transform.with_named_sequence} {
 
     // 0xFF800000: -inf in f32
     %live_loop, %mixed_loop = transform.loop.specialize_dead_tile %fused_bmask in %j0_loop
-        {dead_value = 0xFF800000 : f32} : !any, !any -> !any, !any
+        {dead_value = 0xFF800000 : f32} : (!any, !any) -> (!any, !any)
 
     // --- HTile lowering begins ---
     transform.htile.linalg_to_semantic %func : !any

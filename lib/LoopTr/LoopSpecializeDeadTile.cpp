@@ -976,7 +976,8 @@ LogicalResult canSpecializeFullyLiveProducer(linalg::GenericOp producer,
 } // namespace
 
 void LoopSpecializeDeadTileOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  onlyReadsHandle(getProducerOpMutable(), effects);
+  if (getProducerOp())
+    onlyReadsHandle(getProducerOpMutable(), effects);
   consumesHandle(getLoopMutable(), effects);
   producesHandle(getOperation()->getOpResults(), effects);
   modifiesPayload(effects);
@@ -990,9 +991,13 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
   scf::ForOp loop;
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getLoop, "loop", loop, scf::ForOp);
 
-  SmallVector<Operation *> producerOps = llvm::to_vector(state.getPayloadOps(getProducerOp()));
+  SmallVector<Operation *> producerOps;
+  bool producerWasTracked = false;
+  if (Value producerHandle = getProducerOp()) {
+    producerOps = llvm::to_vector(state.getPayloadOps(producerHandle));
+    producerWasTracked = true;
+  }
   linalg::GenericOp producer;
-  bool producerWasTracked = llvm::hasSingleElement(producerOps);
   if (llvm::hasSingleElement(producerOps)) {
     producer = dyn_cast<linalg::GenericOp>(producerOps.front());
     if (!producer)
@@ -1004,11 +1009,11 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
         candidates.push_back(generic);
     });
     if (!llvm::hasSingleElement(candidates))
-      BAIL("expected exactly one dead-select producer in loop when producer handle is empty");
+      BAIL("expected exactly one dead-select producer in loop when producer handle is empty, got ")
+          << candidates.size();
     producer = candidates.front();
   } else {
-    return emitSilenceableFailure(transform, "expected exactly one producer payload op, got " +
-                                                 std::to_string(producerOps.size()));
+    BAIL("expected exactly one producer payload op, got ") << producerOps.size();
   }
 
   FailureOr<MatchedDeadSelect> match = matchDeadSelect(producer, getDeadValue());
