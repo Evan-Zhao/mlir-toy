@@ -32,6 +32,9 @@ Contract:
   predicate.
 - `dead_value` is an explicit hint. The pass does not try to rediscover it.
 - The transform may fail if it cannot prove the rewrite preserves loop state.
+- When the producer handle is omitted or empty, the transform infers a unique
+  matching producer. If no producer matches, it succeeds as a no-op and returns
+  empty handles. Multiple inferred matches remain an ambiguity and fail.
 
 The op returns handles to the new fully-live prefix loop and mixed loop. The
 producer handle remains valid when tracking succeeds.

@@ -1008,8 +1008,13 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
       if (succeeded(matchDeadSelect(generic, getDeadValue())))
         candidates.push_back(generic);
     });
+    if (candidates.empty()) {
+      transformResults.set(getOperation()->getResult(0), {});
+      transformResults.set(getOperation()->getResult(1), {});
+      return DiagnosedSilenceableFailure::success();
+    }
     if (!llvm::hasSingleElement(candidates))
-      BAIL("expected exactly one dead-select producer in loop when producer handle is empty, got ")
+      BAIL("expected a single dead-select producer in loop when producer handle is empty, got ")
           << candidates.size();
     producer = candidates.front();
   } else {
