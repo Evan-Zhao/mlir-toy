@@ -38,15 +38,6 @@ class TransformRewriter;
   if (!(varName))                                                                                  \
     return emitSilenceableFailure(transform, "expected " nameStr " to be a " #Type);
 
-#define RETURN_DIAGNOSTICS_OR_BIND_VAL(OtherType, var, expr)                                       \
-  OtherType var;                                                                                   \
-  {                                                                                                \
-    auto var##1 = expr;                                                                            \
-    if (std::holds_alternative<DiagnosedSilenceableFailure>(var##1))                               \
-      return std::get<DiagnosedSilenceableFailure>(std::move(var##1));                             \
-    (var) = std::get<OtherType>(var##1);                                                           \
-  }
-
 /// Verifies that `op` is an elementwise linalg.generic operation with a single output.
 LogicalResult isSingleOutputElemwiseLinalgOp(Operation *op);
 

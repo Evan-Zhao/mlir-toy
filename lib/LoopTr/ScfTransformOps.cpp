@@ -19,8 +19,6 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/STLExtras.h"
 
-#include <variant>
-
 using namespace mlir;
 
 namespace mlir::transform {
@@ -293,6 +291,8 @@ FailureOr<uint64_t> matchUnarySingleReductionGeneric(linalg::GenericOp generic) 
 }
 
 std::optional<unsigned> findLoopIvIndex(Value value, ArrayRef<Value> ivs) {
+  if (!value)
+    return std::nullopt;
   for (auto [index, iv] : llvm::enumerate(ivs))
     if (value == iv)
       return index;
@@ -316,35 +316,35 @@ struct ReductionForallSplitPlan {
 
 #define BAIL(message) return emitSilenceableFailure(transform, message);
 
-std::variant<ReductionForallSplitPlan, DiagnosedSilenceableFailure>
+FailureOr<ReductionForallSplitPlan>
 detectReductionForallSplit(const TransformOpInterface &transform, scf::ForallOp loop,
                            linalg::GenericOp consumer, uint64_t reductionDim) {
   auto producerResult = dyn_cast<OpResult>(consumer.getInputs().front());
-  if (!producerResult || producerResult.getOwner() != loop.getOperation())
-    BAIL("expected the reduction input to be produced by the target scf.forall");
+  if (!producerResult || producerResult.getOwner() != loop.getOperation()) {
+    emitError(consumer.getInputs().front().getLoc())
+        << "expected the reduction input to be produced by the target scf.forall";
+    return failure();
+  }
   auto insertSliceF = getParallelInsertSliceForLoopResult(loop, producerResult);
   if (failed(insertSliceF)) {
-    loop.emitRemark() << "when analyzing this loop (scf.forall); #result = "
-                      << producerResult.getResultNumber();
-    BAIL("failed to find the tensor.parallel_insert_slice operation in the loop that published a "
-         "loop result");
+    loop.emitError() << "failed to find the tensor.parallel_insert_slice operation in this loop "
+                     << "that published result #" << producerResult.getResultNumber();
+    return failure();
   }
   tensor::ParallelInsertSliceOp producerInsert = *insertSliceF;
 
   OpFoldResult reductionOffset = producerInsert.getMixedOffsets()[reductionDim];
   Value reductionOffsetValue = dyn_cast<Value>(reductionOffset);
-  if (!reductionOffsetValue) {
-    producerInsert.emitError() << "for this insert operation, on dim " << reductionDim;
-    BAIL("expected the reduced producer dimension to have a dynamic tile offset");
-  }
-
+  // findLoopIvIndex handles the case where `reductionOffsetValue` is null, so we can have a single
+  // point of failure reporting.
   std::optional<unsigned> removedIvIndex =
       findLoopIvIndex(reductionOffsetValue, loop.getInductionVars());
   if (!removedIvIndex) {
-    producerInsert->emitRemark() << "dim " << reductionDim << " of this op has offset "
-                                 << reductionOffsetValue << ", which violates our assumptions";
-    BAIL("expected the reduced producer dimension to be controlled by a single scf.forall "
-         "induction variable");
+    producerInsert.emitError()
+        << "expected the offset on dimension " << reductionDim
+        << " to be a dynamic value controlled by a single scf.forall induction variable; got "
+        << reductionOffsetValue;
+    return failure();
   }
 
   return ReductionForallSplitPlan{
@@ -577,8 +577,10 @@ template <> struct LoopSharedTrait<scf::ForallOp> {
     for (Operation &oldCombiningOp : oldLoop.getTerminator().getYieldingOps()) {
       FailureOr<Operation *> newCombiningOp = cloneOrRewriteForallCombiningOp(
           oldLoop, rewriter, oldCombiningOp, mapping, infos, newLoop);
-      if (failed(newCombiningOp))
+      if (failed(newCombiningOp)) {
+        oldCombiningOp.emitError() << "failed to clone or rewrite this combining operation";
         return failure();
+      }
       clonedCombiningOps.emplace_back(&oldCombiningOp, *newCombiningOp);
     }
     return clonedCombiningOps;
@@ -683,7 +685,7 @@ struct SplitForallIntoForResult {
   OpPairs clonedOps;
 };
 
-std::variant<SplitForallIntoForResult, DiagnosedSilenceableFailure>
+FailureOr<SplitForallIntoForResult>
 splitForallDimensionForReduction(TransformOpInterface transform, RewriterBase &rewriter,
                                  scf::ForallOp loop, ReductionForallSplitPlan &plan) {
   auto loc = loop.getLoc();
@@ -721,8 +723,8 @@ splitForallDimensionForReduction(TransformOpInterface transform, RewriterBase &r
 
   auto outerTileOffsets = plan.producerInsert.getMixedOffsets();
   if (failed(remapAffineIndices(rewriter, loc, outerTileOffsets, outerIvMapping.getValueMap()))) {
-    plan.producerInsert->emitRemark() << "failed to remap offsets of this operation";
-    return emitSilenceableFailure(transform, "failed to remap offsets of insert operation");
+    plan.producerInsert.emitError() << "failed to remap offsets of this operation";
+    return failure();
   }
   SmallVector<OpFoldResult> outerTileSizes = plan.producerInsert.getMixedSizes();
   outerTileSizes[plan.reductionDim] =
@@ -808,14 +810,14 @@ DiagnosedSilenceableFailure ScfLocalizeScratchTensorsOp::applyToOne(TransformRew
     return emitSilenceableFailure(target, "expected target to be nested in an isolated op");
 
   if (failed(runGreedyCleanup(rewriter, isolatedTarget)))
-    return ::mlir::emitDefiniteFailure(target, "initial greedy cleanup did not converge");
+    return emitSilenceableFailure(target, "initial greedy cleanup did not converge");
 
   localizeScratchSlices(rewriter, isolatedTarget);
   dropUnusedScratchForResults(rewriter, isolatedTarget);
   eraseTriviallyDeadOps(rewriter, isolatedTarget);
 
   if (failed(runGreedyCleanup(rewriter, isolatedTarget)))
-    return ::mlir::emitDefiniteFailure(target, "final greedy cleanup did not converge");
+    return emitSilenceableFailure(target, "final greedy cleanup did not converge");
 
   return DiagnosedSilenceableFailure::success();
 }
@@ -840,17 +842,16 @@ DiagnosedSilenceableFailure ScfFuseReductionIntoForallOp::apply(TransformRewrite
                                linalg::GenericOp);
   FailureOr<uint64_t> reductionDim = matchUnarySingleReductionGeneric(consumer);
   if (failed(reductionDim))
-    return emitSilenceableFailure(transform,
-                                  "expected a unary single-reduction linalg.generic consumer");
-
-  RETURN_DIAGNOSTICS_OR_BIND_VAL(
-      ReductionForallSplitPlan, splitPlan,
-      detectReductionForallSplit(transform, loop, consumer, *reductionDim));
+    BAIL("expected a unary single-reduction linalg.generic consumer");
+  auto splitPlan = detectReductionForallSplit(transform, loop, consumer, *reductionDim);
+  if (failed(splitPlan))
+    BAIL("failed to detect a split plan for the reduction");
 
   rewriter.setInsertionPoint(consumer);
-  RETURN_DIAGNOSTICS_OR_BIND_VAL(
-      SplitForallIntoForResult, split,
-      splitForallDimensionForReduction(transform, rewriter, loop, splitPlan));
+  auto splitR = splitForallDimensionForReduction(transform, rewriter, loop, *splitPlan);
+  if (failed(splitR))
+    BAIL("failed to split the forall loop for the reduction");
+  SplitForallIntoForResult &split = *splitR;
   for (auto [oldOp, newOp] : split.clonedOps) {
     if (succeeded(rewriter.notifyPayloadOperationReplaced(oldOp, newOp)))
       continue;
