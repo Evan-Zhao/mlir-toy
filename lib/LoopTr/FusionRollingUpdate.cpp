@@ -386,6 +386,9 @@ DiagnosedSilenceableFailure FusionFindNextReductionOp::apply(transform::Transfor
                                                              TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
   CHECK_EXTRACT_UNIQUE_OP(state, transform, getProducerOp, "producer", producer);
+  std::optional<uint64_t> resultNumber = getResultNumber();
+  if (resultNumber && *resultNumber >= producer->getNumResults())
+    BAIL("result number is out of range for producer op");
 
   // Forward BFS: find the nearest reduction.
   SmallPtrSet<Operation *, 16> visited({producer});
@@ -398,7 +401,12 @@ DiagnosedSilenceableFailure FusionFindNextReductionOp::apply(transform::Transfor
       reduce = current;
       break;
     }
-    for (Value result : current->getOpResults())
+    SmallVector<Value> results;
+    if (current == producer && resultNumber)
+      results.push_back(producer->getResult(*resultNumber));
+    else
+      llvm::append_range(results, current->getOpResults());
+    for (Value result : results)
       for (Operation *user : result.getUsers())
         if (visited.insert(user).second)
           queue.push_back(user);

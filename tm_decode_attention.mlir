@@ -37,6 +37,12 @@ module attributes {transform.with_named_sequence} {
     %fused_bmax, %bmax_writeback = transform.scf.fuse_partial_reduction_into_forall
         %bmax into %forall_loop : (!any, !any) -> (!any, !any)
 
+    // Find the next reduction forward from the loop, but only look for users of the 0th result of the loop.
+    // %bmax_writeback would be using the 1st result of the loop, and we don't want that one.
+    %bmm1, %elemwise = transform.fusion.find_next_reduction %forall_loop[0] : (!any) -> (!any, !any)
+    transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+
     transform.yield
   }
 

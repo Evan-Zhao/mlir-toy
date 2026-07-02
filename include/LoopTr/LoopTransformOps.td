@@ -303,14 +303,19 @@ def FusionFindNextReductionOp
     Returns the reduction op and the elementwise chain (def-to-use order).
     Fails if no reduction is reachable.
 
+    If `result_number` is present, the BFS starts only from that result of
+    `producer_op`. Otherwise, it starts from all results of `producer_op`.
+
     This analysis is a part of a larger "rolling-update" fusion transformation.
   }];
 
-  let arguments = (ins TransformHandleTypeInterface:$producer_op);
+  let arguments = (ins TransformHandleTypeInterface:$producer_op,
+      OptionalAttr<I64Attr>:$result_number);
   let results = (outs TransformHandleTypeInterface:$next_reduce_op,
       TransformHandleTypeInterface:$elemwise_ops);
 
-  let assemblyFormat = "$producer_op attr-dict `:` functional-type(operands, results)";
+  let assemblyFormat = "$producer_op (`[` $result_number^ `]`)? attr-dict "
+                       " `:` functional-type(operands, results)";
 }
 
 def LoopSpecializeDeadTileOp
