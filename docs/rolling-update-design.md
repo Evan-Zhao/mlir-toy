@@ -133,13 +133,13 @@ acc_next = exp2(m_prev - m_next) * acc_prev + p_tile @ v_tile
 out      = acc_final / l_final
 ```
 
-## SplitKUpdate TODO
+## SplitKUpdate Status
 
-SplitKUpdate is a planned extension for decode-input attention, where the query
-length is one and the K/V dimension should remain parallel across splits. Unlike
-rolling update, SplitKUpdate should not create a scan dependency over K/V blocks.
-Instead, each split computes partial reduction results, and a write-back
-reduction merges those partials after the split loop.
+SplitKUpdate is an in-progress extension for decode-input attention, where the query
+length is one and the K/V dimension should remain parallel across splits.
+Unlike rolling update, SplitKUpdate should not create a scan dependency over K/V blocks.
+Instead, each split computes partial reduction results, and a write-back reduction merges
+those partials after the split loop.
 
 At the IR level this should be treated as a split-k rfactor/write-back plan:
 
@@ -156,16 +156,9 @@ acc = reduce_sum(exp2(m_rf - m) * acc_rf over k_split)
 out = acc / l
 ```
 
-### Planned: Partial-Reduction Wrapper
+### `transform.scf.fuse_partial_reduction_into_forall`
 
-This component should introduce:
-
-```text
-transform.scf.fuse_partial_reduction_into_forall
-```
-
-This is the partial-reduction counterpart to the existing
-`transform.scf.fuse_reduction_into_forall` upward-fusion primitive:
+This is the partial-reduction counterpart to `transform.scf.fuse_reduction_into_forall`:
 
 ```text
 transform.scf.fuse_reduction_into_forall
@@ -176,9 +169,7 @@ transform.scf.fuse_partial_reduction_into_forall
      final merge reduction is emitted after the forall
 ```
 
-The new transform should take a reduction frontier and an existing producer
-`scf.forall`, then return the split-local partial reduction and the final
-write-back reduction:
+Signature:
 
 ```text
 (reduce_op, forall_loop) -> (rf_reduce_op, wb_reduce_op)
@@ -196,6 +187,45 @@ Use this to create the first rfactor/write-back pair, starting with the row-max
 frontier. The related builtin transforms are less directly useful here:
 `tile_reduction_using_for` creates a serial `scf.for`, and `split_reduction`
 does not by itself create the parallel split-k loop shape.
+
+The transform takes a reduction frontier whose input is produced by an existing `scf.forall`.
+It keeps the split dimension parallel, creates a split-local rfactor reduction under that forall,
+and emits the final write-back reduction after the forall.
+This is enough to form the first SplitK pair, starting with the row-max frontier.
+
+It reuses MLIR's `PartialReductionOpInterface` for identity-tensor creation and
+merge-reduction construction. This wrapper exists because the upstream
+partial-reduction transforms do not fuse into an existing attention
+`scf.forall`: `tile_reduction_using_for` creates a serial `scf.for`, and
+`split_reduction` does not create the parallel split-k loop shape by itself.
+
+The transform performs the following steps:
+
+1. Identify the producer `tensor.parallel_insert_slice` and the reduced tensor
+   dimension controlled by one forall induction variable.
+1. Create an identity-filled rfactor tensor with result shape plus one split dimension.
+1. Rebuild the forall with the rfactor tensor as an extra `shared_out`, clone the original body,
+   and compute the split-local reduction on the loop-local producer tile.
+1. Insert the split-local result into the rfactor tensor, then call
+   `PartialReductionOpInterface::mergeReductions` to create the write-back reduction.
+
+The `forall_loop` handle is preserved and remapped to the rebuilt loop.
+The `reduce_op` handle is consumed. The returned handles are the split-local
+rfactor reduction and the final write-back reduction.
+
+For decode attention row max, the resulting shape is (note `%m_rf` vs. `%m`):
+
+```text
+%score, %m_rf = scf.forall (...) shared_outs(...) {
+  %score_tile = ...
+  %m_part = linalg.generic ... row max over local K tile ...
+
+  tensor.parallel_insert_slice %score_tile into %score[..., k_tile]
+  tensor.parallel_insert_slice %m_part into %m_rf[..., k_split]
+}
+
+%m = linalg.reduce ins(%m_rf) ... dimensions = [k_split_dim]
+```
 
 ### Planned: SplitK Sidecar Fusion
 

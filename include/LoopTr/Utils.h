@@ -131,6 +131,9 @@ matchBinaryReductionCombiner(linalg::GenericOp generic, unsigned resultNumber,
 
 SmallVector<OpFoldResult> getUnitStrides(RewriterBase &rewriter, size_t rank);
 
+/// Returns the sizes of each dimension of `tensor` as a vector of `OpFoldResult`.
+/// For dynamic dimensions, creates a `tensor.dim` op to query the size at runtime;
+/// for static dimensions, returns the constant integer attribute directly.
 SmallVector<OpFoldResult> getMixedTensorSizes(RewriterBase &rewriter, Location loc, Value tensor);
 
 SmallVector<std::pair<Operation *, Operation *>>

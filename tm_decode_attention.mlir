@@ -30,6 +30,13 @@ module attributes {transform.with_named_sequence} {
     %prefix = transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %bmax { inline_elementwise } : (!any, !any) -> !any
     transform.linalg.erase_unused_operands_and_results %prefix : !any
 
+    // Use fuse_partial_reduction_into_forall here (similar to RFactor in TVM).
+    // It splits bmax into a local reduction and a global one (bmax_writeback),
+    // and fuses the local one under the forall loop (becomes fused_bmax).
+    transform.linalg.erase_unused_operands_and_results %bmax : !any
+    %fused_bmax, %bmax_writeback = transform.scf.fuse_partial_reduction_into_forall
+        %bmax into %forall_loop : (!any, !any) -> (!any, !any)
+
     transform.yield
   }
 
