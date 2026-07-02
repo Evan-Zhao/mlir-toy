@@ -70,9 +70,6 @@ module attributes {transform.with_named_sequence} {
         : (!any, !any, !any, !any, !any, !any) -> !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
-    // CSE removes duplicate affine values and helps fusion
-    // (fusion compares offset equal by comparing pointers to SSA value).
-    transform.apply_cse to %func : !any
     %ret = transform.structured.match ops{["func.return"]} in %func : (!any) -> !any
     transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %ret : (!any, !any) -> !any
 

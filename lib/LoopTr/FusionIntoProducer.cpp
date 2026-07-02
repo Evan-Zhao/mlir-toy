@@ -93,6 +93,11 @@ FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewrite
 
   SmallVector<Operation *> fusedOps;
   while (true) {
+    // Run CSE on the loop body because fusion may fail without it (fusion compares indices by
+    // operation equality of affine ops, so we want to make sure that we don't have duplicate affine
+    // ops in the loop body).
+    eliminateLocalCommonSubexpressions(rewriter, loop);
+
     SmallVector<Operation *> consumers;
     for (Operation *consumer : loop->getResult(resultNumber).getUsers()) {
       if (stopOps.contains(consumer)) {
