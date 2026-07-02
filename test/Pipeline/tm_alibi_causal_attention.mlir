@@ -23,12 +23,6 @@ module attributes {transform.with_named_sequence} {
     transform.yield %matched : !any
   }
 
-  transform.named_sequence @match_4d_matmul(%candidate: !any {transform.readonly}) -> !any {
-    %matched = transform.match.ta.einsum %candidate
-        {equation = "b h i j, b h j d -> b h i d"} : (!any) -> !any
-    transform.yield %matched : !any
-  }
-
   transform.named_sequence @__transform_main(%module: !any) {
     %func0 = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
     %func1 = transform.apply_registered_pass "linalg-generalize-named-ops" to %func0 : (!any) -> !any
@@ -38,11 +32,9 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.ta.sink_div_after_matmul
     } : !any
     %bmm0 = transform.collect_matching @match_4d_matmul_transb in %func : (!any) -> !any
-    %bmm1 = transform.collect_matching @match_4d_matmul in %func : (!any) -> !any
     transform.ta.to_linalg %func : !any
 
     transform.linalg.greedy_inline_elementwise %bmm0 : !any
-    transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any
     %_1, %forall_loop = transform.structured.tile_using_forall
         %bmm0 tile_sizes [1, 1, 64, 64, 0] : (!any) -> (!any, !any)
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
@@ -55,12 +47,13 @@ module attributes {transform.with_named_sequence} {
     %fused_bmax, %j0_loop = transform.scf.fuse_reduction_into_forall
         %bmax into %forall_loop : (!any, !any) -> (!any, !any)
 
-    %bmm1_2, %elemwise = transform.fusion.find_next_reduction
+    %bmm1, %elemwise = transform.fusion.find_next_reduction
         %forall_loop : (!any) -> (!any, !any)
     %elemwise_sidecars = transform.fusion.clone_fuse_elemwise
         %elemwise into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
+    transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any
     %_3 = transform.fusion.repair_reduction_frontier
-        (%fused_bmax, %bmm1_2) and (%elemwise, %elemwise_sidecars) into %forall_loop, %j0_loop
+        (%fused_bmax, %bmm1) and (%elemwise, %elemwise_sidecars) into %forall_loop, %j0_loop
         : (!any, !any, !any, !any, !any, !any) -> !any
 
     %bsum, %elemwise_1 = transform.fusion.find_next_reduction
