@@ -133,11 +133,136 @@ acc_next = exp2(m_prev - m_next) * acc_prev + p_tile @ v_tile
 out      = acc_final / l_final
 ```
 
+## SplitKUpdate TODO
+
+SplitKUpdate is a planned extension for decode-input attention, where the query
+length is one and the K/V dimension should remain parallel across splits. Unlike
+rolling update, SplitKUpdate should not create a scan dependency over K/V blocks.
+Instead, each split computes partial reduction results, and a write-back
+reduction merges those partials after the split loop.
+
+At the IR level this should be treated as a split-k rfactor/write-back plan:
+
+```text
+parallel for k_split:
+  m_rf[k_split]   = row_max(score_tile)
+  p_tile          = exp2(score_tile - m_rf[k_split])
+  l_rf[k_split]   = row_sum(p_tile)
+  acc_rf[k_split] = p_tile @ v_tile
+
+m   = reduce_max(m_rf over k_split)
+l   = reduce_sum(exp2(m_rf - m) * l_rf over k_split)
+acc = reduce_sum(exp2(m_rf - m) * acc_rf over k_split)
+out = acc / l
+```
+
+### Planned: Partial-Reduction Wrapper
+
+This component should introduce:
+
+```text
+transform.scf.fuse_partial_reduction_into_forall
+```
+
+This is the partial-reduction counterpart to the existing
+`transform.scf.fuse_reduction_into_forall` upward-fusion primitive:
+
+```text
+transform.scf.fuse_reduction_into_forall
+  -> scan/rolling form: the existing forall dimension becomes an inner scf.for
+
+transform.scf.fuse_partial_reduction_into_forall
+  -> split/partial form: the existing forall dimension stays parallel, and a
+     final merge reduction is emitted after the forall
+```
+
+The new transform should take a reduction frontier and an existing producer
+`scf.forall`, then return the split-local partial reduction and the final
+write-back reduction:
+
+```text
+(reduce_op, forall_loop) -> (rf_reduce_op, wb_reduce_op)
+```
+
+Internally, it should reuse MLIR's partial-reduction interfaces instead of
+implementing the raw rfactor/write-back primitive from scratch. In particular,
+`PartialReductionOpInterface` already provides the identity-tensor creation,
+partial-reduction tiling, and merge-reduction construction used by upstream
+`transform.structured.tile_reduction_using_forall`. The wrapper differs from
+that upstream transform because it must fuse into an existing attention
+`scf.forall` rather than creating a new one.
+
+Use this to create the first rfactor/write-back pair, starting with the row-max
+frontier. The related builtin transforms are less directly useful here:
+`tile_reduction_using_for` creates a serial `scf.for`, and `split_reduction`
+does not by itself create the parallel split-k loop shape.
+
+### Planned: SplitK Sidecar Fusion
+
+Clone and fuse the elementwise chain under the split-k loop, like
+`clone_fuse_elemwise`, but substitute reads of prior write-back results with
+matching rfactor reads. For example, a split-local sidecar that originally reads
+the final row max `m` should read `m_rf[..., k_split]` instead.
+
+### Planned: SplitK Repair
+
+Reuse the rolling-update solver to derive `H`, but apply the result to rfactor
+partials before the write-back reduction. For row sum and output accumulation,
+this materializes the familiar repair factors:
+
+```text
+l_repaired   = exp2(m_rf - m) * l_rf
+acc_repaired = exp2(m_rf - m) * acc_rf
+```
+
+Those repaired tensors then feed the final split-dimension merge reductions.
+
+### Planned SplitK Output Shape
+
+The target tensor-level MLIR shape before lower-level lowering is:
+
+```text
+%m_rf, %l_rf, %acc_rf = scf.forall (...) shared_outs(...) {
+  %score_tile = ...
+  %m_part = linalg.generic ... row max over local K tile ...
+  %p_tile = linalg.generic ... exp2(score_tile - m_part) ...
+  %l_part = linalg.generic ... row sum over local K tile ...
+  %acc_part = linalg.matmul ins(%p_tile, %v_tile) ...
+
+  tensor.parallel_insert_slice %m_part into %m_rf[..., k_split]
+  tensor.parallel_insert_slice %l_part into %l_rf[..., k_split]
+  tensor.parallel_insert_slice %acc_part into %acc_rf[..., k_split]
+}
+
+%m = linalg.reduce ins(%m_rf) ... dimensions = [k_split_dim]
+
+%l_repaired = linalg.generic ins(%l_rf, %m_rf, %m) {
+  exp2(m_rf - m) * l_rf
+}
+%l = linalg.reduce ins(%l_repaired) ... dimensions = [k_split_dim]
+
+%acc_repaired = linalg.generic ins(%acc_rf, %m_rf, %m) {
+  exp2(m_rf - m) * acc_rf
+}
+%acc = linalg.reduce ins(%acc_repaired) ... dimensions = [k_split_dim]
+
+%out = linalg.generic ins(%acc, %l) {
+  acc / l
+}
+```
+
+For decode attention, canonicalization and unit-dimension folding should still
+be able to remove the query-length-one dimension after the split-k structure is
+formed.
+
 ## Transform-Dialect Notes
 
 - `transform.fusion.find_next_reduction` is analysis-only and does not consume its input handle.
 - `clone_fuse_elemwise` and `repair_reduction_frontier` rewrite explicit ops in functional style,
   while loop handles are read-only inputs remapped to rebuilt loops.
+- SplitKUpdate should use explicit rfactor/write-back handle pairs for values
+  produced by partial-reduction tiling. Later SplitK steps need both sides of
+  the pair to rewrite reads correctly.
 - Ordered multi-op handles are part of the contract: the elementwise chain is
   not treated as an unordered set.
 - The fusion helpers depend on loop results being traceable through
@@ -153,3 +278,14 @@ Useful coverage is:
 2. synthetic tests for cloned and fused elementwise sidecar chains,
 3. reduction-frontier repair tests for supported single-result reduction cases,
 4. end-to-end attention tests that check the repaired loop-carried recurrence shape.
+
+For the planned SplitKUpdate work, useful additional coverage is:
+
+1. direct tests that `transform.scf.fuse_partial_reduction_into_forall`
+   produces the expected partial-reduction and merge-reduction handles for
+   attention-like max and sum reductions,
+2. tests for write-back-to-rfactor read substitution in split-k sidecar chains,
+3. repair tests where `H` is materialized on rfactor partials before the
+   write-back reduction,
+4. end-to-end decode attention tests that check for split-k partial tensors and
+   no scan-style `scf.for` dependency over K/V splits.
