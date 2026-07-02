@@ -176,6 +176,47 @@ def ScfFuseReductionIntoForallOp
                        " `:` functional-type(operands, results)";
 }
 
+def ScfFusePartialReductionIntoForallOp
+    : Op<Transform_Dialect, "scf.fuse_partial_reduction_into_forall",
+         [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+          ReportTrackingListenerFailuresOpTrait]> {
+  let summary =
+      "Fuse a reduction consumer into a forall producer as a partial reduction";
+
+  let description = [{
+    Fuse a one-dimension reduction `linalg.generic` op into an existing
+    `scf.forall`, keeping the reduction-tiled forall dimension parallel.
+
+    This is the partial-reduction counterpart to
+    `transform.scf.fuse_reduction_into_forall`:
+    - `fuse_reduction_into_forall` rewrites the existing forall dimension into
+      an inner sequential `scf.for` and produces a scan/rolling form,
+    - `fuse_partial_reduction_into_forall` keeps the existing forall dimension
+      parallel, publishes split-local partial reductions through an extra
+      `shared_out`, and creates a final write-back reduction after the forall.
+
+    Prerequisites:
+    - The reduction consumer must take one reduced input produced by the target
+      `scf.forall`.
+    - The reduced dimension of that input tensor must correspond to one dynamic
+      `scf.forall` induction variable.
+    - The reduction must implement `PartialReductionOpInterface`.
+
+    The `forall_loop` handle is preserved and remapped to the rewritten loop.
+    The `consumer_op` handle is consumed. The returned handles are the fused
+    split-local partial reduction op and the final write-back reduction op.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$consumer_op,
+      TransformHandleTypeInterface:$forall_loop);
+  let results = (outs TransformHandleTypeInterface:$partial_reduce_op,
+      TransformHandleTypeInterface:$writeback_reduce_op);
+
+  let assemblyFormat = "$consumer_op `into` $forall_loop attr-dict "
+                       " `:` functional-type(operands, results)";
+}
+
 def FusionIntoProducerOp
     : Op<Transform_Dialect, "fusion.into_producer",
          [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,

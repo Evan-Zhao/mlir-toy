@@ -866,4 +866,25 @@ DiagnosedSilenceableFailure ScfFuseReductionIntoForallOp::apply(TransformRewrite
   return DiagnosedSilenceableFailure::success();
 }
 
+void ScfFusePartialReductionIntoForallOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  consumesHandle(getConsumerOpMutable(), effects);
+  onlyReadsHandle(getForallLoopMutable(), effects);
+
+  producesHandle(getOperation()->getOpResults(), effects);
+  modifiesPayload(effects);
+}
+
+DiagnosedSilenceableFailure
+ScfFusePartialReductionIntoForallOp::apply(TransformRewriter &rewriter,
+                                           TransformResults &transformResults,
+                                           TransformState &state) {
+  (void)rewriter;
+  (void)transformResults;
+  (void)state;
+
+  auto transform = cast<TransformOpInterface>(getOperation());
+  return emitSilenceableFailure(transform, "not implemented");
+}
+
 } // namespace mlir::transform
