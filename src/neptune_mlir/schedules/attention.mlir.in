@@ -6,13 +6,13 @@
 module attributes {transform.with_named_sequence} {
   transform.named_sequence @match_4d_matmul_transb(%candidate: !any {transform.readonly}) -> !any {
     %matched = transform.match.ta.einsum %candidate
-        {equation = "b h i d, b h j d -> b h i j"} : (!any) -> !any
+        {equation = "b ... h i d, b h j d -> b ... h i j"} : (!any) -> !any
     transform.yield %matched : !any
   }
 
   transform.named_sequence @match_4d_matmul(%candidate: !any {transform.readonly}) -> !any {
     %matched = transform.match.ta.einsum %candidate
-        {equation = "b h i j, b h j d -> b h i d"} : (!any) -> !any
+        {equation = "b ... h i j, b h j d -> b ... h i d"} : (!any) -> !any
     transform.yield %matched : !any
   }
 
@@ -47,7 +47,7 @@ module attributes {transform.with_named_sequence} {
     // Tile all parallel dimensions of bmm0 (b, h, i, j) into a scf.forall loop.
     // We'll fuse everything else into this loop nest.
     %_1, %forall_loop = transform.structured.tile_using_forall
-        %bmm0 tile_sizes [1, 1, ${block_m}, ${block_n}, 0] : (!any) -> (!any, !any)
+        %bmm0 tile_sizes ${tile_sizes} : (!any) -> (!any, !any)
     // Canonicalization removes trivial (size-1) dimensions. This copies the loop and invalidates
     // all handles pointing to ops inside the loop body.
     // So we want to do this before we start fusion.

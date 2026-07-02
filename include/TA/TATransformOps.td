@@ -24,6 +24,13 @@ def TAMatchEinsumOp
 
     Axis names in the equation are pattern symbols: they do not have
     to match the concrete TA axis names, but repeated symbols must map to the same concrete axis.
+
+    The special token `...` matches a variadic axis sequence and may appear at
+    most once per input/result axis list. All `...` occurrences in an equation
+    must match the same number of axes and the same concrete axes. For example,
+    `b ... h i d, b h j d -> b ... h i j` matches both
+    `b h i d, b h j d -> b h i j` and
+    `b g h i d, b h j d -> b g h i j`.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$operand_handle, StrAttr:$equation);

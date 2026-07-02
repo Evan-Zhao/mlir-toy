@@ -9,6 +9,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/Twine.h"
 
 using namespace mlir;
 
@@ -51,11 +52,6 @@ namespace mlir::transform {
 
 namespace {
 
-struct ParsedEinsum {
-  SmallVector<SmallVector<std::string>, 2> inputs;
-  SmallVector<std::string> result;
-};
-
 class TAHandleUpdater : public TransformState::Extension {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TAHandleUpdater)
@@ -67,13 +63,17 @@ public:
   }
 };
 
-SmallVector<std::string> parseAxisList(StringRef text) {
+using AxisNames = SmallVector<std::string>;
+using AxisNamesRef = ArrayRef<std::string>;
+
+struct ParsedEinsum {
+  AxisNames lhs, rhs, result;
+};
+
+AxisNames parseAxisList(StringRef text) {
   SmallVector<StringRef> tokens;
   llvm::SplitString(text.trim(), tokens);
-  SmallVector<std::string> axes;
-  for (StringRef token : tokens)
-    axes.push_back(token.str());
-  return axes;
+  return llvm::map_to_vector(tokens, [](StringRef token) { return token.str(); });
 }
 
 FailureOr<ParsedEinsum> parseEinsumEquation(StringRef equation) {
@@ -87,13 +87,58 @@ FailureOr<ParsedEinsum> parseEinsumEquation(StringRef equation) {
   if (inputs.size() != 2)
     return failure();
 
-  ParsedEinsum parsed;
-  parsed.inputs.push_back(parseAxisList(inputs[0]));
-  parsed.inputs.push_back(parseAxisList(inputs[1]));
-  parsed.result = parseAxisList(sides[1]);
-  if (parsed.inputs[0].empty() || parsed.inputs[1].empty())
+  auto lhs = parseAxisList(inputs[0]), rhs = parseAxisList(inputs[1]),
+       result = parseAxisList(sides[1]);
+  if (lhs.empty() || rhs.empty() || result.empty())
     return failure();
-  return parsed;
+  return ParsedEinsum{std::move(lhs), std::move(rhs), std::move(result)};
+}
+
+FailureOr<AxisNames> expandAxisList(AxisNamesRef patternAxes, AxisNamesRef actualAxes,
+                                    std::optional<size_t> &ellipsisRank) {
+  size_t ellipsisCount = llvm::count(patternAxes, "...");
+  if (ellipsisCount > 1)
+    return failure();
+  if (ellipsisCount == 0) {
+    if (patternAxes.size() != actualAxes.size())
+      return failure();
+    return AxisNames(patternAxes.begin(), patternAxes.end());
+  }
+
+  size_t fixedRank = patternAxes.size() - 1;
+  if (actualAxes.size() < fixedRank)
+    return failure();
+  size_t rank = actualAxes.size() - fixedRank;
+  if (ellipsisRank && *ellipsisRank != rank)
+    return failure();
+  ellipsisRank = rank;
+
+  AxisNames expanded;
+  expanded.reserve(actualAxes.size());
+  for (StringRef axis : patternAxes) {
+    if (axis != "...") {
+      expanded.push_back(axis.str());
+      continue;
+    }
+    for (size_t i = 0; i < rank; ++i)
+      expanded.push_back((Twine("\1ta_einsum_ellipsis_") + Twine(i)).str());
+  }
+  return expanded;
+}
+
+FailureOr<ParsedEinsum> expandEinsumEquation(const ParsedEinsum &equation, AxisNamesRef lhsAxes,
+                                             AxisNamesRef rhsAxes, AxisNamesRef resultAxes) {
+  std::optional<size_t> ellipsisRank;
+  auto lhsPattern = expandAxisList(equation.lhs, lhsAxes, ellipsisRank);
+  if (failed(lhsPattern))
+    return failure();
+  auto rhsPattern = expandAxisList(equation.rhs, rhsAxes, ellipsisRank);
+  if (failed(rhsPattern))
+    return failure();
+  auto resultPattern = expandAxisList(equation.result, resultAxes, ellipsisRank);
+  if (failed(resultPattern))
+    return failure();
+  return ParsedEinsum{std::move(*lhsPattern), std::move(*rhsPattern), std::move(*resultPattern)};
 }
 
 SmallVector<std::string> exprAxisNames(ta::ExprType expr) {
@@ -124,8 +169,8 @@ bool sameAxisEqualityPattern(ArrayRef<std::string> patternAxes, ArrayRef<std::st
 SmallVector<std::string> reductionAxesForEquation(const ParsedEinsum &equation) {
   llvm::SmallSetVector<StringRef, 8> resultAxes(equation.result.begin(), equation.result.end());
   llvm::SmallSetVector<StringRef, 8> reductionAxes;
-  for (ArrayRef<std::string> input : equation.inputs) {
-    for (StringRef axis : input) {
+  for (const AxisNames *input : {&equation.lhs, &equation.rhs}) {
+    for (StringRef axis : *input) {
       if (!resultAxes.contains(axis))
         reductionAxes.insert(axis);
     }
@@ -195,17 +240,24 @@ DiagnosedSilenceableFailure TAMatchEinsumOp::matchOperation(Operation *target,
   auto lhsType = cast<ta::ExprType>(mul.getLhs().getType());
   auto rhsType = cast<ta::ExprType>(mul.getRhs().getType());
   auto resultType = cast<ta::ExprType>(reduce.getResult().getType());
+  auto lhsAxes = exprAxisNames(lhsType);
+  auto rhsAxes = exprAxisNames(rhsType);
+  auto resultAxes = exprAxisNames(resultType);
 
-  SmallVector<std::string> patternAxes;
-  patternAxes.append((*parsed).inputs[0]);
-  patternAxes.append((*parsed).inputs[1]);
-  patternAxes.append((*parsed).result);
-  patternAxes.append(reductionAxesForEquation(*parsed));
+  auto expanded = expandEinsumEquation(*parsed, lhsAxes, rhsAxes, resultAxes);
+  if (failed(expanded))
+    return emitSilenceableFailure(transform, "axes do not match einsum rank structure");
 
-  SmallVector<std::string> actualAxes;
-  actualAxes.append(exprAxisNames(lhsType));
-  actualAxes.append(exprAxisNames(rhsType));
-  actualAxes.append(exprAxisNames(resultType));
+  AxisNames patternAxes;
+  patternAxes.append(expanded->lhs);
+  patternAxes.append(expanded->rhs);
+  patternAxes.append(expanded->result);
+  patternAxes.append(reductionAxesForEquation(*expanded));
+
+  AxisNames actualAxes;
+  actualAxes.append(lhsAxes);
+  actualAxes.append(rhsAxes);
+  actualAxes.append(resultAxes);
   actualAxes.append(axisAttrNames(reduce.getAxes()));
 
   if (!sameAxisEqualityPattern(patternAxes, actualAxes))

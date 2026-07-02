@@ -30,12 +30,17 @@ class AttentionTileConfig:
             if value % 16 != 0:
                 raise ValueError(f"{name} must be a multiple of 16")
 
+    def get_tile_sizes(self, n_batch_dims: int) -> str:
+        tile_sizes = [1] * n_batch_dims + [self.block_m, self.block_n] + [0]
+        return "[" + ", ".join(str(size) for size in tile_sizes) + "]"
 
+
+# Schedule file name (relative to this __init__.py) and the number of batch dimensions in the attention tensor.
 _SCHEDULE_TEMPLATES = {
-    AttentionSchedule.GLOBAL_ATTN: "attention_4d.mlir.in",
-    AttentionSchedule.MASKED_ATTN: "attention_4d.mlir.in",
-    AttentionSchedule.ALIBI_CAUSAL_ATTN: "attention_4d.mlir.in",
-    AttentionSchedule.GLOBAL_GQA: "global_gqa.mlir.in",
+    AttentionSchedule.GLOBAL_ATTN: ("attention.mlir.in", 2),
+    AttentionSchedule.MASKED_ATTN: ("attention.mlir.in", 2),
+    AttentionSchedule.ALIBI_CAUSAL_ATTN: ("attention.mlir.in", 2),
+    AttentionSchedule.GLOBAL_GQA: ("attention.mlir.in", 3),
 }
 _PACKAGE = __name__
 
@@ -56,12 +61,9 @@ def materialize_attention_schedule(
     schedule = _coerce_schedule(schedule)
     tile_config = tile_config or AttentionTileConfig()
     tile_config.validate()
-    template_name = _SCHEDULE_TEMPLATES[schedule]
+    template_name, n_batch_dims = _SCHEDULE_TEMPLATES[schedule]
     template_text = resources.files(_PACKAGE).joinpath(template_name).read_text()
-    return Template(template_text).substitute(
-        block_m=tile_config.block_m,
-        block_n=tile_config.block_n,
-    )
+    return Template(template_text).substitute(tile_sizes=tile_config.get_tile_sizes(n_batch_dims))
 
 
 def read_attention_schedule(schedule: AttentionSchedule | str) -> str:
