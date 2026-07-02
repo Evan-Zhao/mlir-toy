@@ -66,7 +66,8 @@ module attributes {transform.with_named_sequence} {
     // and we only have one elementwise op (the scale op) to fuse.
     //   TVM: sch.reverse_compute_at(bscale, j0)
     %bmax, %_2 = transform.fusion.find_next_reduction %forall_loop : (!any) -> (!any, !any)
-    transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %bmax : (!any, !any) -> !any
+    %prefix = transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %bmax { inline_elementwise } : (!any, !any) -> !any
+    transform.linalg.erase_unused_operands_and_results %prefix : !any
 
     // Fusion 2. Fuse row-max into forall, splitting a serial `for` loop from forall in the process.
     // Because of how MLIR scf.for works, this fusion implicitly also r-factors the reduction.
@@ -105,14 +106,12 @@ module attributes {transform.with_named_sequence} {
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     // Fusion 5. Fuse the trailing elemwise ops into the forall loop (but outside the for loop):
-    // elemwise division, then FP32->FP16 cast.
+    // elemwise division, then FP32->FP16 cast. Keep going until we see the return op.
     // CSE removes duplicate affine values and helps fusion
     // (fusion compares offset equal by comparing pointers to SSA value).
     transform.apply_cse to %func : !any
-    %div = transform.get_consumers_of_result %forall_loop[1] : (!any) -> !any
-    transform.fusion.into_producer %div into %forall_loop : (!any, !any) -> !any
-    %trunc = transform.get_consumers_of_result %forall_loop[2] : (!any) -> !any
-    transform.fusion.into_producer %trunc into %forall_loop : (!any, !any) -> !any
+    %ret = transform.structured.match ops{["func.return"]} in %func : (!any) -> !any
+    transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %ret : (!any, !any) -> !any
 
     // Post-pass: pushes lingering init tensor (see destination-passing style)
     // before and outside the loops into the loop body.

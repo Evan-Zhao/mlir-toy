@@ -41,7 +41,8 @@ module attributes {transform.with_named_sequence} {
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     %bmax, %_2 = transform.fusion.find_next_reduction %forall_loop : (!any) -> (!any, !any)
-    transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %bmax : (!any, !any) -> !any
+    %prefix = transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %bmax { inline_elementwise } : (!any, !any) -> !any
+    transform.linalg.erase_unused_operands_and_results %prefix : !any
 
     transform.linalg.erase_unused_operands_and_results %bmax : !any
     %fused_bmax, %j0_loop = transform.scf.fuse_reduction_into_forall
@@ -67,10 +68,8 @@ module attributes {transform.with_named_sequence} {
     // CSE removes duplicate affine values and helps fusion
     // (fusion compares offset equal by comparing pointers to SSA value).
     transform.apply_cse to %func : !any
-    %div = transform.get_consumers_of_result %forall_loop[1] : (!any) -> !any
-    transform.fusion.into_producer %div into %forall_loop : (!any, !any) -> !any
-    %trunc = transform.get_consumers_of_result %forall_loop[2] : (!any) -> !any
-    transform.fusion.into_producer %trunc into %forall_loop : (!any, !any) -> !any
+    %ret = transform.structured.match ops{["func.return"]} in %func : (!any) -> !any
+    transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %ret : (!any, !any) -> !any
 
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.scf.localize_scratch_tensors %func : !any

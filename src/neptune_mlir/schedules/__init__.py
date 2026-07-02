@@ -32,9 +32,9 @@ class AttentionTileConfig:
 
 
 _SCHEDULE_TEMPLATES = {
-    AttentionSchedule.GLOBAL_ATTN: "global_attention.mlir.in",
-    AttentionSchedule.MASKED_ATTN: "masked_attention.mlir.in",
-    AttentionSchedule.ALIBI_CAUSAL_ATTN: "alibi_causal_attention.mlir.in",
+    AttentionSchedule.GLOBAL_ATTN: "attention_4d.mlir.in",
+    AttentionSchedule.MASKED_ATTN: "attention_4d.mlir.in",
+    AttentionSchedule.ALIBI_CAUSAL_ATTN: "attention_4d.mlir.in",
     AttentionSchedule.GLOBAL_GQA: "global_gqa.mlir.in",
 }
 _PACKAGE = __name__

@@ -17,16 +17,6 @@
 #map8 = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>
 
 module attributes {transform.with_named_sequence} {
-  transform.named_sequence @match_3d_1d_reduction(%candidate: !any {transform.readonly}) -> !any {
-    %matched = transform.match.structured %candidate : (!any) -> !any {
-    ^bb0(%op: !any):
-      transform.match.structured.dim %op[0, 1, 2] {parallel} : !any
-      transform.match.structured.dim %op[3] {reduction} : !any
-      transform.match.structured.yield %op : !any
-    }
-    transform.yield %matched : !any
-  }
-
   transform.named_sequence @match_4d_matmul_transb(%candidate: !any {transform.readonly}) -> !any {
     %matched = transform.match.ta.einsum %candidate
         {equation = "b h i d, b h j d -> b h i j"} : (!any) -> !any
@@ -37,10 +27,6 @@ module attributes {transform.with_named_sequence} {
     %matched = transform.match.ta.einsum %candidate
         {equation = "b h i j, b h j d -> b h i d"} : (!any) -> !any
     transform.yield %matched : !any
-  }
-
-  transform.named_sequence @return_matched(%arg: !any {transform.readonly}) -> !any {
-    transform.yield %arg : !any
   }
 
   transform.named_sequence @__transform_main(%module: !any) {
@@ -61,19 +47,10 @@ module attributes {transform.with_named_sequence} {
         %bmm0 tile_sizes [1, 1, 64, 64, 0] : (!any) -> (!any, !any)
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
-    %bscale = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
-    transform.fusion.into_producer %bscale into %forall_loop : (!any, !any) -> !any
-    %balibi = transform.get_consumers_of_result %forall_loop[1] : (!any) -> !any
-    transform.linalg.greedy_inline_elementwise %balibi : !any
-    transform.fusion.into_producer %balibi into %forall_loop : (!any, !any) -> !any
-    %bmask = transform.get_consumers_of_result %forall_loop[2] : (!any) -> !any
-    transform.linalg.greedy_inline_elementwise %bmask : !any
-    %fused_bmask = transform.fusion.into_producer %bmask into %forall_loop : (!any, !any) -> !any
-    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+    %bmax, %_2 = transform.fusion.find_next_reduction %forall_loop : (!any) -> (!any, !any)
+    %prefix = transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %bmax { inline_elementwise } : (!any, !any) -> !any
+    transform.linalg.erase_unused_operands_and_results %prefix : !any
 
-    %consumers = transform.get_consumers_of_result %forall_loop[0] : (!any) -> !any
-    %_2, %bmax = transform.foreach_match restrict_root in %consumers
-        @match_3d_1d_reduction -> @return_matched : (!any) -> (!any, !any)
     transform.linalg.erase_unused_operands_and_results %bmax : !any
     %fused_bmax, %j0_loop = transform.scf.fuse_reduction_into_forall
         %bmax into %forall_loop : (!any, !any) -> (!any, !any)
@@ -98,10 +75,8 @@ module attributes {transform.with_named_sequence} {
     // CSE removes duplicate affine values and helps fusion
     // (fusion compares offset equal by comparing pointers to SSA value).
     transform.apply_cse to %func : !any
-    %div = transform.get_consumers_of_result %forall_loop[1] : (!any) -> !any
-    transform.fusion.into_producer %div into %forall_loop : (!any, !any) -> !any
-    %trunc = transform.get_consumers_of_result %forall_loop[2] : (!any) -> !any
-    transform.fusion.into_producer %trunc into %forall_loop : (!any, !any) -> !any
+    %ret = transform.structured.match ops{["func.return"]} in %func : (!any) -> !any
+    transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %ret : (!any, !any) -> !any
 
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.scf.localize_scratch_tensors %func : !any
@@ -113,8 +88,8 @@ module attributes {transform.with_named_sequence} {
     transform.apply_cse to %func : !any
 
     // 0xFF800000: -inf in f32
-    %live_loop, %mixed_loop = transform.loop.specialize_dead_tile %fused_bmask in %j0_loop
-        {dead_value = 0xFF800000 : f32} : (!any, !any) -> (!any, !any)
+    %live_loop, %mixed_loop = transform.loop.specialize_dead_tile in %j0_loop
+        {dead_value = 0xFF800000 : f32} : (!any) -> (!any, !any)
 
     // --- HTile lowering begins ---
     transform.htile.linalg_to_semantic %func : !any

@@ -24,16 +24,6 @@ def test_custom_attention_schedule_tile_sizes() -> None:
     assert "transform.loop.specialize_dead_tile" in text
 
 
-def test_alibi_attention_schedule_fuses_alibi_bias() -> None:
-    text = materialize_attention_schedule(
-        AttentionSchedule.ALIBI_CAUSAL_ATTN,
-        AttentionTileConfig(block_m=64, block_n=32),
-    )
-    assert "tile_sizes [1, 1, 64, 32, 0]" in text
-    assert "%balibi = transform.get_consumers_of_result %forall_loop[1]" in text
-    assert "%bmask = transform.get_consumers_of_result %forall_loop[2]" in text
-
-
 def test_gqa_keeps_batch_group_head_tiles_fixed() -> None:
     text = materialize_attention_schedule(
         AttentionSchedule.GLOBAL_GQA,

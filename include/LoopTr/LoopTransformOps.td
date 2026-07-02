@@ -297,7 +297,8 @@ def LoopSpecializeDeadTileOp
     The optional `producer_op` handle is read-only and remains valid after the rewrite.
     If provided, it is remapped to the cloned producer operation in the mixed suffix loop.
     If omitted or empty, the producer is inferred as the unique dead-select
-    `linalg.generic` nested in `loop`.
+    `linalg.generic` nested in `loop`. If no such producer is found, the op is
+    a no-op and returns empty handles. If more than one is found, the op fails.
   }];
 
   let arguments = (ins Optional<TransformHandleTypeInterface>:$producer_op,
