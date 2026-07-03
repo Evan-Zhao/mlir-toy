@@ -43,6 +43,10 @@ module attributes {transform.with_named_sequence} {
     transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
+    %sidecars = transform.fusion.clone_fuse_rfactor_elemwise
+        %elemwise into %forall_loop substituting (%bmax_writeback -> %fused_bmax)
+        : (!any, !any, !any, !any) -> !any
+
     transform.yield
   }
 

@@ -181,8 +181,7 @@ def ScfFusePartialReductionIntoForallOp
          [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
           ReportTrackingListenerFailuresOpTrait]> {
-  let summary =
-      "Fuse a reduction consumer into a forall producer as a partial reduction";
+  let summary = "Fuse a reduction consumer into a forall producer as a partial reduction";
 
   let description = [{
     Fuse a one-dimension reduction `linalg.generic` op into an existing
@@ -383,6 +382,44 @@ def FusionCloneFuseElemwiseOp
   let results = (outs TransformHandleTypeInterface:$sidecar_chain_ops);
 
   let assemblyFormat = "$elemwise_chain_ops `into` $outer_loop `,` $inner_loop attr-dict "
+                       " `:` functional-type(operands, results)";
+}
+
+def FusionCloneFuseRfactorElemwiseOp
+    : Op<Transform_Dialect, "fusion.clone_fuse_rfactor_elemwise",
+         [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Clone elementwise ops and fuse them into a forall with rfactor substitution";
+
+  let description = [{
+    Create a duplicated version of each elementwise op (a "sidecar") and fuse
+    it under an existing `scf.forall`.
+
+    This is the rfactor/write-back counterpart to
+    `transform.fusion.clone_fuse_elemwise`. Instead of fusing through an
+    `scf.forall` + inner `scf.for` loop nest, it keeps the split dimension
+    parallel and rewrites reads of write-back reductions to the corresponding
+    split-local rfactor reductions.
+
+    The `writeback_reduce_ops` and `rfactor_reduce_ops` handles are paired in
+    handle order. During cloning, any sidecar read of a write-back reduction
+    result is substituted with the matching rfactor reduction result inside the
+    forall body. The original out-of-loop elementwise chain is left unchanged;
+    the fused sidecar chain is returned for later repair.
+
+    The `forall_loop` handle is preserved and remapped to the rebuilt loop.
+    The `elemwise_chain_ops`, `writeback_reduce_ops`, and `rfactor_reduce_ops`
+    handles are read-only.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$elemwise_chain_ops,
+      TransformHandleTypeInterface:$forall_loop, TransformHandleTypeInterface:$writeback_reduce_ops,
+      TransformHandleTypeInterface:$rfactor_reduce_ops);
+  let results = (outs TransformHandleTypeInterface:$sidecar_chain_ops);
+
+  let assemblyFormat = "$elemwise_chain_ops `into` $forall_loop "
+                       "`substituting` `(` $writeback_reduce_ops `->` "
+                       "$rfactor_reduce_ops `)` attr-dict "
                        " `:` functional-type(operands, results)";
 }
 

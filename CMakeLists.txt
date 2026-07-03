@@ -278,6 +278,7 @@ make_mlir_opt_plugin(
   TARGET LoopTransform
   SOURCES
     lib/LoopTr/FusionIntoProducer.cpp
+    lib/LoopTr/FusionSplitKUpdate.cpp
     lib/LoopTr/FusionRollingUpdate.cpp
     lib/LoopTr/LinalgTransformOps.cpp
     lib/LoopTr/LoopSpecializeDeadTile.cpp
