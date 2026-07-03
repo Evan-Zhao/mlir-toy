@@ -245,7 +245,6 @@ def FusionGreedyConsumersIntoProducerOp
                        "(`until` $stop_op^)? "
                        "(`inline_elementwise` $inline_elementwise^)? "
                        "attr-dict `:` functional-type(operands, results)";
-  let hasVerifier = 1;
 }
 
 def FusionFindNextReductionOp

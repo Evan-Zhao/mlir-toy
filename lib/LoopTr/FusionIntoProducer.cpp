@@ -149,6 +149,4 @@ FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewrite
   }
 }
 
-LogicalResult FusionGreedyConsumersIntoProducerOp::verify() { return success(); }
-
 } // namespace mlir::transform
