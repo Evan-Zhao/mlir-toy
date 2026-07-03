@@ -31,42 +31,6 @@ bool isReductionLike(Operation *op) {
   });
 }
 
-FailureOr<uint64_t> matchOneDimReductionGeneric(linalg::GenericOp generic) {
-#define POINT_THEN_FAIL(messageExpr)                                                               \
-  {                                                                                                \
-    generic.emitError() << (messageExpr);                                                          \
-    return failure();                                                                              \
-  }
-
-  if (generic.getNumDpsInits() != 1 || generic->getNumResults() != 1)
-    POINT_THEN_FAIL("expected exactly one init operand and one output");
-  auto resultType = dyn_cast<RankedTensorType>(generic.getResults().front().getType());
-  if (!resultType)
-    POINT_THEN_FAIL("expected output to be a ranked tensor");
-
-  auto reductionDim = getReductionIteratorIndex(generic);
-  if (failed(reductionDim))
-    return failure();
-  int64_t nLoops = static_cast<int64_t>(generic.getNumLoops());
-  if (resultType.getRank() != nLoops - 1)
-    POINT_THEN_FAIL("expected output rank to match the number of non-reduction iterators");
-
-  AffineMap outputMap = generic.getIndexingMapsArray().back();
-  if (outputMap.getNumResults() != resultType.getRank())
-    return failure();
-  int64_t reductionDimI64 = static_cast<int64_t>(*reductionDim);
-  for (int64_t dim = 0, outIdx = 0; dim < nLoops; ++dim) {
-    if (dim == reductionDimI64)
-      continue;
-    auto expr = outputMap.getResult(outIdx++);
-    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
-    if (!dimExpr || dimExpr.getPosition() != dim)
-      POINT_THEN_FAIL("expected output indexing map to be the iteration space with the reduction "
-                      "dimension dropped");
-  }
-  return *reductionDim;
-}
-
 static FailureOr<AffineMap> dropDomainDim(AffineMap map, unsigned droppedDim) {
   MLIRContext *ctx = map.getContext();
   unsigned oldNumDims = map.getNumDims();

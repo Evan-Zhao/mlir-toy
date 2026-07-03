@@ -44,6 +44,12 @@ LogicalResult isSingleOutputElemwiseLinalgOp(Operation *op);
 /// Check that `generic` has a single reduction iterator, and return its index.
 FailureOr<uint64_t> getReductionIteratorIndex(linalg::GenericOp generic);
 
+/// Match a single-result linalg.generic reduction with exactly one reduction iterator.
+///
+/// The output indexing map must be the iteration space with the reduction dimension dropped.
+/// This intentionally does not constrain the number of input operands or their indexing maps.
+FailureOr<uint64_t> matchOneDimReductionGeneric(linalg::GenericOp generic);
+
 /// Returns the unique tensor.parallel_insert_slice in `loop` that publishes `result`.
 FailureOr<tensor::ParallelInsertSliceOp> getParallelInsertSliceForLoopResult(scf::ForallOp loop,
                                                                              OpResult result);
