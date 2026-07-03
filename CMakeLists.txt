@@ -283,6 +283,7 @@ make_mlir_opt_plugin(
     lib/LoopTr/LoopSpecializeDeadTile.cpp
     lib/LoopTr/LoopTransformPlugin.cpp
     lib/LoopTr/PythonSolver.cpp
+    lib/LoopTr/ScfLocalizeScratchTensors.cpp
     lib/LoopTr/ScfTransformOps.cpp
     lib/LoopTr/Utils.cpp
     DEPS LoopTransformOpsIncGen
