@@ -80,18 +80,16 @@ template <> struct GetLoopResults<scf::ForOp> {
   }
 };
 
-template <typename LoopOp>
-FailureOr<SmallVector<LoopResultRelay>> getLoopResultRelays(LoopOp loop) {
+template <typename LoopOp> SmallVector<LoopResultRelay> getLoopResultRelays(LoopOp loop) {
   SmallVector<LoopResultRelay> relays;
   relays.reserve(loop.getNumResults());
   for (auto [index, result] : llvm::enumerate(loop.getResults())) {
     auto resultRelay = GetLoopResults<LoopOp>::get(loop, result);
-    if (failed(resultRelay)) {
-      loop->emitError() << "failed to get loop result relay for result " << index
-                        << " of this loop";
-      return failure();
-    }
-    relays.push_back(*resultRelay);
+    if (succeeded(resultRelay))
+      relays.push_back(*resultRelay);
+    else
+      relays.push_back(LoopResultRelay{
+          .inLoopResult = nullptr, .loopReturnResult = result, .mediator = nullptr});
   }
   return relays;
 }
@@ -103,47 +101,18 @@ getNestedLoopResultRelays(ArrayRef<Operation *> loops) {
   for (auto [index, loop] : llvm::enumerate(loops)) {
     if (index + 1 < loops.size() && loops[index + 1]->getParentOp() != loop)
       return failure();
-    FailureOr<SmallVector<LoopResultRelay>> relays = failure();
+    SmallVector<LoopResultRelay> relays;
     if (auto forall = dyn_cast<scf::ForallOp>(loop)) {
       relays = getLoopResultRelays(forall);
     } else if (auto forOp = dyn_cast<scf::ForOp>(loop)) {
       relays = getLoopResultRelays(forOp);
-    }
-    if (failed(relays))
+    } else {
+      loop->emitError() << "expected a scf.for or scf.forall loop";
       return failure();
-    relaysByLoop.push_back(*relays);
+    }
+    relaysByLoop.push_back(relays);
   }
   return relaysByLoop;
-}
-
-FailureOr<Value> cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Value value,
-                                                    IRMapping &mapping) {
-  if (Value mapped = mapping.lookupOrNull(value))
-    return mapped;
-
-  Operation *def = value.getDefiningOp();
-  if (!def)
-    return value;
-
-  Block *insertBlock = rewriter.getInsertionBlock();
-  auto insertPoint = rewriter.getInsertionPoint();
-  Operation *insertPointOp = insertPoint == insertBlock->end() ? nullptr : &*insertPoint;
-  if (!insertPointOp || def->getBlock() != insertBlock || !insertPointOp->isBeforeInBlock(def))
-    return value;
-
-  IRMapping localMapping = mapping;
-  for (Value operand : def->getOperands()) {
-    FailureOr<Value> remappedOperand =
-        cloneValueDefChainAtInsertionPoint(rewriter, operand, mapping);
-    if (failed(remappedOperand))
-      return failure();
-    localMapping.map(operand, *remappedOperand);
-  }
-
-  Operation *cloned = rewriter.clone(*def, localMapping);
-  for (auto [oldResult, newResult] : llvm::zip_equal(def->getResults(), cloned->getResults()))
-    mapping.map(oldResult, newResult);
-  return mapping.lookup(value);
 }
 
 void cloneSingleRegionBody(OpBuilder &builder, Location nestedLoc, Block &oldBlock,
@@ -380,6 +349,35 @@ SmallVector<OpFoldResult> getMixedTensorSizes(RewriterBase &rewriter, Location l
     }
   }
   return sizes;
+}
+
+FailureOr<Value> cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Value value,
+                                                    IRMapping &mapping) {
+  if (Value mapped = mapping.lookupOrNull(value))
+    return mapped;
+
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return value;
+
+  Block *insertBlock = rewriter.getInsertionBlock();
+  auto insertPoint = rewriter.getInsertionPoint();
+  Operation *insertPointOp = insertPoint == insertBlock->end() ? nullptr : &*insertPoint;
+  if (!insertPointOp || def->getBlock() != insertBlock || !insertPointOp->isBeforeInBlock(def))
+    return value;
+
+  IRMapping localMapping = mapping;
+  for (Value operand : def->getOperands()) {
+    FailureOr<Value> remappedOperand =
+        cloneValueDefChainAtInsertionPoint(rewriter, operand, mapping);
+    if (failed(remappedOperand))
+      return failure();
+    localMapping.map(operand, *remappedOperand);
+  }
+
+  Operation *cloned = rewriter.clone(*def, localMapping);
+  mapping.map(def->getResults(), cloned->getResults());
+  return mapping.lookup(value);
 }
 
 LogicalResult recursiveMoveOperandsBeforeOp(Operation &toMoveOperands, RewriterBase &rewriter,

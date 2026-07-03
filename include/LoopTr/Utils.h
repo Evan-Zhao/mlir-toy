@@ -141,6 +141,9 @@ SmallVector<OpFoldResult> getMixedTensorSizes(RewriterBase &rewriter, Location l
 SmallVector<std::pair<Operation *, Operation *>>
 cloneBlockWithoutTerminator(OpBuilder &builder, Block &block, IRMapping &mapping);
 
+FailureOr<Value> cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Value value,
+                                                    IRMapping &mapping);
+
 /// A wrapper around `cloneValueDefChainAtInsertionPoint` that applies to all operands of
 /// `toMoveOperands`.
 LogicalResult recursiveMoveOperandsBeforeOp(Operation &toMoveOperands, RewriterBase &rewriter,
