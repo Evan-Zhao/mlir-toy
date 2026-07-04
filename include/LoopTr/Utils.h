@@ -136,6 +136,8 @@ SmallVector<OpFoldResult> getUnitStrides(RewriterBase &rewriter, size_t rank);
 /// for static dimensions, returns the constant integer attribute directly.
 SmallVector<OpFoldResult> getMixedTensorSizes(RewriterBase &rewriter, Location loc, Value tensor);
 
+/// Clone the operations in `block` into the current insertion point of `builder`, except for the
+/// terminator. Returns a vector of pairs of the original and cloned operations.
 SmallVector<std::pair<Operation *, Operation *>>
 cloneBlockWithoutTerminator(OpBuilder &builder, Block &block, IRMapping &mapping);
 

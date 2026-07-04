@@ -617,18 +617,6 @@ template <> struct LoopSharedTrait<scf::ForOp> {
   }
 };
 
-// Clones the body of a loop operation using `rewriter` and `mapping`, at the insertion point of
-// `rewriter`. Returns a vector of pairs of the original and cloned operations.
-template <typename LoopOp>
-OpPairs cloneLoopBody(RewriterBase &rewriter, LoopOp cloneFrom, IRMapping &mapping) {
-  OpPairs clonedOps;
-  for (Operation &op : cloneFrom.getBody()->without_terminator()) {
-    Operation *newOp = rewriter.clone(op, mapping);
-    clonedOps.emplace_back(&op, newOp);
-  }
-  return clonedOps;
-}
-
 template <typename LoopOp>
 FailureOr<LoopOp> foldUnitExtentDimsInLoop(PatternRewriter &rewriter, LoopOp loop) {
   auto infosR = getFoldedTensorInfos(rewriter, loop.getResults());
@@ -655,7 +643,7 @@ FailureOr<LoopOp> foldUnitExtentDimsInLoop(PatternRewriter &rewriter, LoopOp loo
        llvm::zip(loop.getRegionIterArgs(), newLoop.getRegionIterArgs(), infos))
     mapping.map(oldArg, info ? expandTensor(rewriter, loc, newArg, *info) : newArg);
   // Clone loop body operations, adding to `mapping` as we go.
-  OpPairs clonedOps = cloneLoopBody(rewriter, loop, mapping);
+  OpPairs clonedOps = cloneBlockWithoutTerminator(rewriter, *loop.getBody(), mapping);
   // Clone the "combining operations" (e.g., the yield operations in scf.for and parallel insert in
   // scf.forall).
   auto clonedCombiningOpsR = LoopTrait::cloneCombiningOps(loop, rewriter, mapping, infos, newLoop);
@@ -756,7 +744,7 @@ splitForallDimensionForReduction(TransformOpInterface transform, RewriterBase &r
                                     ValueRange{tileInit, redTileInit});
   outerIvMapping.map(loop.getInductionVars()[plan.removedIvIndex], forLoop.getInductionVar());
   rewriter.setInsertionPointToStart(forLoop.getBody());
-  OpPairs clonedOps = cloneLoopBody(rewriter, loop, outerIvMapping);
+  OpPairs clonedOps = cloneBlockWithoutTerminator(rewriter, *loop.getBody(), outerIvMapping);
 
   Value outerTile = outerIvMapping.lookup(plan.producerInsert.getSource());
   rewriter.setInsertionPointToEnd(forLoop.getBody());
@@ -847,7 +835,7 @@ fusePartialReductionIntoForall(TransformOpInterface transform, RewriterBase &rew
   for (auto [oldArg, newArg] : llvm::zip(loop.getRegionOutArgs(), newForall.getRegionOutArgs()))
     mapping.map(oldArg, newArg);
   rewriter.setInsertionPointToStart(newForall.getBody());
-  OpPairs clonedOps = cloneLoopBody(rewriter, loop, mapping);
+  OpPairs clonedOps = cloneBlockWithoutTerminator(rewriter, *loop.getBody(), mapping);
 
   // Calculate (offset, size, stride) for a tile of the RF tensor under the loop.
   auto viewTriple =
