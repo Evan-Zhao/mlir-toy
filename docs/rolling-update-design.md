@@ -227,12 +227,65 @@ For decode attention row max, the resulting shape is (note `%m_rf` vs. `%m`):
 %m = linalg.reduce ins(%m_rf) ... dimensions = [k_split_dim]
 ```
 
-### Planned: SplitK Sidecar Fusion
+### `transform.fusion.clone_fuse_rfactor_elemwise`
 
-Clone and fuse the elementwise chain under the split-k loop, like
-`clone_fuse_elemwise`, but substitute reads of prior write-back results with
-matching rfactor reads. For example, a split-local sidecar that originally reads
-the final row max `m` should read `m_rf[..., k_split]` instead.
+This is the SplitK sidecar-fusion counterpart to `transform.fusion.clone_fuse_elemwise`.
+
+Signature:
+
+```text
+(elemwise_ops, forall_loop, writeback_reduce_ops, rfactor_reduce_ops) -> (sidecar_ops)
+```
+
+The transform clones the ordered elementwise chain under the split-k `scf.forall`,
+publishes each sidecar tensor as an extra `shared_out` / loop result, and substitutes
+write-back reduction reads with split-local rfactor tiles. For example, a sidecar that
+reads the final row max `%m` outside the loop reads the local `%m_part` tile inside the loop.
+
+The `writeback_reduce_ops` and `rfactor_reduce_ops` handles are paired by handle order.
+For each pair, the transform follows the rfactor result through its
+`tensor.parallel_insert_slice`, drops the split dimension from the recorded tile, and
+maps the write-back result to that in-loop tile.
+
+The transform:
+
+1. Rebuilds the `scf.forall` once with extra `shared_out` operands for all sidecar
+   DPS init tensors, then clones the original body and `scf.forall.in_parallel` region.
+1. Builds a relay map from program values to in-loop tiles, including write-back
+   results mapped to paired rfactor tiles.
+1. Tiles each elementwise op in producer-to-consumer order, patches generated inputs
+   to known in-loop tiles, and patches DPS inits to slices of the new forall block args.
+1. Publishes each sidecar tile with `tensor.parallel_insert_slice`, records it for later
+   sidecars, and erases temporary operand slices produced by the tiling interface.
+
+The `forall_loop` handle is preserved and remapped to the rebuilt loop. The original
+out-of-loop elementwise chain is intentionally left unchanged; the returned sidecar ops
+are used by later SplitK repair steps.
+
+For decode attention after row-max rfactoring, the resulting shape is:
+
+```text
+%score, %m_rf, %p = scf.forall (...) shared_outs(...) {
+  %score_tile = ...
+  %m_part = linalg.generic ... row max over local K tile ...
+  %p_tile = linalg.generic ins(%score_tile, %m_part) {
+    exp2(score_tile - m_part)
+  }
+
+  tensor.parallel_insert_slice %score_tile into %score[..., k_tile]
+  tensor.parallel_insert_slice %m_part into %m_rf[..., k_split]
+  tensor.parallel_insert_slice %p_tile into %p[..., k_tile]
+}
+
+%m = linalg.reduce ins(%m_rf) ... dimensions = [k_split_dim]
+%p_original = linalg.generic ins(%score, %m) {
+  exp2(score - m)
+}
+```
+
+The duplicated `%p_original` remains valid payload IR and preserves the original
+program value. The sidecar `%p_tile` is the split-local value that later repair
+steps should use to build repaired rfactor partials.
 
 ### Planned: SplitK Repair
 
@@ -314,7 +367,8 @@ For the planned SplitKUpdate work, useful additional coverage is:
 1. direct tests that `transform.scf.fuse_partial_reduction_into_forall`
    produces the expected partial-reduction and merge-reduction handles for
    attention-like max and sum reductions,
-2. tests for write-back-to-rfactor read substitution in split-k sidecar chains,
+2. tests for write-back-to-rfactor read substitution in split-k sidecar chains
+   (`test/Loop/clone_fuse_rfactor_elemwise.mlir`),
 3. repair tests where `H` is materialized on rfactor partials before the
    write-back reduction,
 4. end-to-end decode attention tests that check for split-k partial tensors and
