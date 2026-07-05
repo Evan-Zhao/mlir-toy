@@ -136,10 +136,23 @@ SmallVector<OpFoldResult> getUnitStrides(RewriterBase &rewriter, size_t rank);
 /// for static dimensions, returns the constant integer attribute directly.
 SmallVector<OpFoldResult> getMixedTensorSizes(RewriterBase &rewriter, Location loc, Value tensor);
 
+/// Move the insertion point of `builder` to the combining op region of the `forall` loop.
+/// We have a helper for this action because it is error-prone.
+void pointBuilderToForallParallel(OpBuilder &builder, scf::ForallOp forall);
+
 /// Clone the operations in `block` into the current insertion point of `builder`, except for the
 /// terminator. Returns a vector of pairs of the original and cloned operations.
 SmallVector<std::pair<Operation *, Operation *>>
 cloneBlockWithoutTerminator(OpBuilder &builder, Block &block, IRMapping &mapping);
+
+/// Clone the operations in `fromLoop`, including body ops and combining ops
+/// (tensor.parallel_insert_slice ops), into `intoLoop`.
+/// It calls `cloneBlockWithoutTerminator` to clone the body ops, and then clones the combining ops.
+/// Returns a vector of pairs of the original and cloned operations, and updates `mapping` to map the
+/// original operations to the cloned ones.
+SmallVector<std::pair<Operation *, Operation *>>
+cloneForallLoopBody(scf::ForallOp fromLoop, OpBuilder &builder, scf::ForallOp intoLoop,
+                    IRMapping &mapping);
 
 FailureOr<Value> cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Value value,
                                                     IRMapping &mapping);
@@ -200,8 +213,6 @@ void eliminateLocalCommonSubexpressions(RewriterBase &rewriter, Operation *op);
 Value createExtractSliceFromState(RewriterBase &rewriter, Location loc, Value fullTensor,
                                   ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes,
                                   ArrayRef<OpFoldResult> strides);
-
-void pointRewriterToForallParallel(RewriterBase &rewriter, scf::ForallOp forall);
 
 linalg::GenericOp cloneGenericOnTile(RewriterBase &rewriter, linalg::GenericOp sourceGeneric,
                                      Value inputTile, Value initTile, Location loc);

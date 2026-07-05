@@ -5,64 +5,64 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
-#include "mlir/IR/PatternMatch.h"
-#include "mlir/Interfaces/TilingInterface.h"
-#include "llvm/ADT/SmallVector.h"
-
-#include <utility>
 
 namespace mlir::transform {
 
 /// Describes how a reduction over a tensor produced by an scf.forall can be split.
 ///
-/// The split dimension is the producer tensor dimension whose tile offset is controlled by one
-/// forall induction variable. Partial-reduction fusion removes that dimension from the split-local
-/// tile and appends a new rfactor dimension indexed by the forall split id.
+/// The split dimension is described both in consumer iteration-space coordinates and in the
+/// producer tensor coordinates whose tile offset is controlled by one forall induction variable.
+/// Partial-reduction fusion removes that producer tensor dimension from the split-local tile and
+/// appends a new rfactor dimension indexed by the forall split id.
 struct ReductionForallSplitPlan {
   // The result of the loop that is consumed by the reduction.
-  Value producerResult;
+  OpOperand *loopProducedInput;
+  // The initial value of the reduction.
+  Value reductionInit;
   // The tensor.parallel_insert_slice that publishes the loop result to the reduction input.
   tensor::ParallelInsertSliceOp producerInsert;
   // The index of the forall induction variable that controls the offset on the reduction dimension.
   unsigned removedIvIndex;
-  // The reduction dimension in the forall-produced tensor.
-  uint64_t reductionDim;
-  // The initial value of the reduction.
-  Value reductionInit;
+  // The reduction dimension in the consumer's linalg iteration space.
+  uint64_t opRedDim;
+  // The corresponding dimension in the forall-produced operand tensor.
+  uint64_t producerRedDim;
 };
 
 /// Result of cloning a reduction into an existing scf.forall as an rfactor partial.
-///
-/// `newForall` is the rebuilt loop with one extra shared output, `partialReduce` is the
-/// split-local reduction cloned inside the loop, and the op-pair lists record payload clones so
-/// transform handle tracking can be updated by the caller.
 struct PartialReductionForallResult {
+  /// The rebuilt forall loop with extras output for the rfactor tensor.
   scf::ForallOp newForall;
-  linalg::GenericOp partialReduce;
+  /// The tiled, fused op inside the loop that performs the partial reduction.
+  linalg::GenericOp rFactorOp;
+  /// The reduction after the loop that merges the rfactor result output.
+  linalg::ReduceOp writebackOp;
+  /// Old-to-new operation pairs for ops cloned while rebuilding the forall body.
   SmallVector<std::pair<Operation *, Operation *>> clonedOps;
-  SmallVector<std::pair<Operation *, Operation *>> clonedCombiningOps;
 };
 
 /// Detect which forall induction variable tiles the reduction dimension of `consumer`.
 ///
 /// The reduction input must be a result of `loop`, and that result must be published by a
-/// tensor.parallel_insert_slice whose offset on `reductionDim` is controlled by one forall IV.
+/// tensor.parallel_insert_slice whose offset on the producer tensor dimension corresponding to the
+/// consumer reduction iterator is controlled by one forall IV.
 FailureOr<ReductionForallSplitPlan>
 detectReductionForallSplit(const TransformOpInterface &transform, scf::ForallOp loop,
-                           linalg::GenericOp consumer, uint64_t reductionDim);
+                           linalg::GenericOp consumer);
 
-/// Clone `consumer` into `loop` as a split-local rfactor reduction.
+/// Decompose the reduction `consumer` which uses `loop` result, over a reduction split plan `plan`,
+/// into a in-loop partial (rfactor) reduction, and an out-loop merge (writeback) reduction.
 ///
-/// Rebuilds the forall with an extra rfactor shared output, clones the original body and combining
-/// ops, extracts the split-local rfactor tile, clones the reduction on the in-loop producer tile,
-/// and publishes the partial result into the rfactor tensor. The final write-back merge reduction
-/// is intentionally left to the caller.
+/// Rebuilds the forall with an extra rfactor shared output, extracts the split-local rfactor tile,
+/// clones the reduction into the loop to run over the tile, and creates the writeback reduction
+/// after the loop.
 ///
-FailureOr<PartialReductionForallResult>
-fusePartialReductionIntoForall(TransformOpInterface transform, RewriterBase &rewriter,
-                               scf::ForallOp loop, linalg::GenericOp consumer,
-                               PartialReductionOpInterface consumerPR,
-                               ReductionForallSplitPlan &plan);
+/// This op also notifies the rewriter of the op rewrite events.
+FailureOr<PartialReductionForallResult> rFactorReductionUnderForall(TransformOpInterface transform,
+                                                                    TransformRewriter &rewriter,
+                                                                    scf::ForallOp forall,
+                                                                    linalg::GenericOp consumer,
+                                                                    ReductionForallSplitPlan &plan);
 
 } // namespace mlir::transform
 

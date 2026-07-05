@@ -1,6 +1,8 @@
 #include "LoopTr/LoopTransformOps.h"
+#include "LoopTr/PartialReduction.h"
 #include "LoopTr/Utils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
@@ -24,6 +26,8 @@ struct ForallResultRelay {
   SmallVector<OpFoldResult> offsets, sizes;
 };
 
+using RelayMap = DenseMap<OpResult, ForallResultRelay>;
+
 SmallVector<OpFoldResult> dropAt(SmallVector<OpFoldResult> values, unsigned index) {
   values.erase(values.begin() + index);
   return values;
@@ -41,11 +45,13 @@ FailureOr<uint64_t> getSingleReductionDim(Operation *op) {
   return failure();
 }
 
-FailureOr<DenseMap<OpResult, ForallResultRelay>>
-mapWriteBackResultsToTilesInLoop(scf::ForallOp loop, size_t nOldResults, auto &&pairs) {
-  // Connect loop results to their "in-loop tile" results, which are results produced by ops
-  // in the loop body. These are published via tensor.parallel_insert_slice ops for scf.forall
-  // loops, so we find these too.
+// A specialized version of getChainedLoopResultMap that only works for a single forall loop.
+// Compared to getChainedLoopResultMap, it always check that the mediator is a
+// tensor.parallel_insert_slice op.
+// Returns a pair of maps, first one keyed by loop results, second one by in-loop (tile) results.
+FailureOr<std::pair<RelayMap, RelayMap>>
+getForallLoopResultMaps(scf::ForallOp loop,
+                        std::optional<size_t> takeFirstNResults = std::nullopt) {
   auto loopResultMap = getChainedLoopResultMap({loop});
   if (failed(loopResultMap))
     return failure();
@@ -53,8 +59,8 @@ mapWriteBackResultsToTilesInLoop(scf::ForallOp loop, size_t nOldResults, auto &&
   // (2) make a reverse map keyed by in-loop tile results.
   DenseMap<OpResult, ForallResultRelay> loopResultToRelay, tileToRelay;
   for (const auto &[loopResult, relays] : *loopResultMap) {
-    // Skip results that are not from the original forall loop.
-    if (loopResult.getResultNumber() >= nOldResults)
+    // Skip results that are beyond the specified range.
+    if (takeFirstNResults && loopResult.getResultNumber() >= takeFirstNResults)
       continue;
     assert(relays.size() == 1 && "expected exactly one relay for each forall loop result");
     auto &relay = relays.front();
@@ -67,11 +73,19 @@ mapWriteBackResultsToTilesInLoop(scf::ForallOp loop, size_t nOldResults, auto &&
                           parallelInsert.getMixedOffsets(), parallelInsert.getMixedSizes()};
     loopResultToRelay[loopResult] = tileToRelay[relay.inLoopResult] = forallRelay;
   }
+  return std::make_pair(std::move(loopResultToRelay), std::move(tileToRelay));
+}
 
+FailureOr<DenseMap<OpResult, ForallResultRelay>>
+mapWriteBackResultsToTilesInLoop(scf::ForallOp loop, size_t nOldResults, auto &&pairs) {
+  // Connect loop results to their "in-loop tile" results.
+  auto loopResultMaps = getForallLoopResultMaps(loop, nOldResults);
+  if (failed(loopResultMaps))
+    return failure();
   // Pair write-back and rfactor reductions.
-  // Take loopResultToRelay and replace rfactor-produced loop results with writeback results.
-  // Then later we can use this opResultToRelay as a subst map.
-  DenseMap<OpResult, ForallResultRelay> opResultToRelay = std::move(loopResultToRelay);
+  // Start from the forward map `opResultToRelay` and replace rfactor-produced loop results with
+  // writeback results. Then later we can use this opResultToRelay as a subst map.
+  auto [opResultToRelay, tileToRelay] = std::move(*loopResultMaps);
   for (auto [wbOp, rfOp] : pairs) {
     size_t nWbResults = wbOp->getNumResults(), nRfResults = rfOp->getNumResults();
     if (nWbResults != nRfResults) {
@@ -154,6 +168,52 @@ patchTiledOpDpsInits(RewriterBase &rewriter, linalg::LinalgOp tiledOp,
     slices.push_back(newOutSlice);
   }
   return slices;
+}
+
+LogicalResult isElemwiseLinalgOp(Operation *op) {
+  auto generic = dyn_cast<linalg::GenericOp>(op);
+  if (!generic)
+    return failure();
+  return linalg::isElementwise(generic) ? success() : failure();
+}
+
+FailureOr<IRMapping> matchElemwisePairsGetSubstMap(ArrayRef<Operation *> outLoopOps,
+                                                   scf::ForallOp loop,
+                                                   ArrayRef<Operation *> inLoopOps,
+                                                   const RelayMap &tileToLoopRelay) {
+  // This isn't a good place to emit a diagnostic for this error (we don't have the handle).
+  // It's recommended that the caller checks for equal length.
+  if (inLoopOps.size() != outLoopOps.size())
+    return failure();
+
+  // Check that all the in-loop and out-loop ops are valid ops (such as elementwise linalg op), and
+  // that the in-loop ops are directly inside the loop.
+  // Check that each in-loop op has the same number of results as its corresponding out-loop op.
+  // Finally pair them and build a subst map.
+  IRMapping mapping;
+  for (auto [inOp, outOp] : llvm::zip_equal(inLoopOps, outLoopOps)) {
+    if (failed(isElemwiseLinalgOp(inOp)))
+      return inOp->emitError() << "expected this op to be an elementwise linalg op";
+    if (failed(isElemwiseLinalgOp(outOp)))
+      return outOp->emitError() << "expected this op to be an elementwise linalg op";
+    if (inOp->getParentOp() != loop)
+      return inOp->emitError() << "expected this op to be directly inside the loop";
+
+    size_t nInResults = inOp->getNumResults(), nOutResults = outOp->getNumResults();
+    if (nInResults != nOutResults) {
+      inOp->emitError() << "this in-loop sidecar op has " << nInResults << " result(s)";
+      return outOp->emitError() << "this out-loop op has " << nOutResults
+                                << " result(s), expected the same number of results";
+    }
+    for (size_t idx = 0; idx < inOp->getNumResults(); ++idx) {
+      auto it = tileToLoopRelay.find(inOp->getResult(idx));
+      if (it == tileToLoopRelay.end())
+        return inOp->emitError() << "result #" << idx
+                                 << " of this in-loop op is not published to a loop result";
+      mapping.map(outOp->getResult(idx), it->second.loopReturnResult);
+    }
+  }
+  return mapping;
 }
 
 } // namespace
@@ -240,26 +300,20 @@ FusionCloneFuseRfactorElemwiseOp::apply(transform::TransformRewriter &rewriter,
   IRMapping mapping;
   mapping.map(forallLoop.getInductionVars(), newForall.getInductionVars());
   mapping.map(forallLoop.getRegionOutArgs(), newForall.getRegionOutArgs().take_front(nOldResults));
-  // Clone loop body ops.
+  // Clone loop body ops and terminators.
   rewriter.setInsertionPointToStart(newForall.getBody());
-  auto clonedBodyOps = cloneBlockWithoutTerminator(rewriter, *forallLoop.getBody(), mapping);
-  // Clone the terminator (tensor.parallel_insert_slice ops).
-  pointRewriterToForallParallel(rewriter, newForall);
-  for (Operation &oldCombiningOp : forallLoop.getTerminator())
-    rewriter.clone(oldCombiningOp, mapping);
+  cloneForallLoopBody(forallLoop, rewriter, newForall, mapping);
   // Map rfactor ops from the old loop to the new loop.
   for (auto &op : rfactorOps) {
     if (op->getParentOp() != forallLoop) {
       op->emitRemark() << "this rfactor reduction op";
       BAIL("expected rfactor reduction to be inside the forall loop");
     }
-    op = mapping.lookup(op);
+    Operation *newOp = mapping.lookup(op);
+    if (failed(rewriter.notifyPayloadOperationReplaced(op, newOp)))
+      BAIL("failed to preserve the rfactor reduction handle");
+    op = newOp;
   }
-  // Notify the rewriter of op replacements.
-  for (auto [oldOp, newOp] : clonedBodyOps)
-    auto _ = rewriter.notifyPayloadOperationReplaced(oldOp, newOp);
-  if (failed(rewriter.notifyPayloadOperationReplaced(forallLoop, newForall.getOperation())))
-    BAIL("failed to preserve the scf.forall handle");
   // Replace uses of the old forall results with new forall results, then erase the old loop.
   rewriter.replaceOp(forallLoop, newForall.getResults().take_front(nOldResults));
 
@@ -303,7 +357,7 @@ FusionCloneFuseRfactorElemwiseOp::apply(transform::TransformRewriter &rewriter,
 
     // Add parallel_insert_slice ops to the loop for these new results that tiledLinalgOp produces.
     // Also add these results to opResultToRelay.
-    pointRewriterToForallParallel(rewriter, newForall);
+    pointBuilderToForallParallel(rewriter, newForall);
     for (size_t i = 0; i < tiledLinalgOp->getNumResults(); ++i) {
       auto sliceOp = (*slices)[i];
       auto tileResult = tiledLinalgOp->getResult(i);
@@ -344,14 +398,75 @@ void FusionRepairRfactorReductionFrontierOp::getEffects(
   modifiesPayload(effects);
 }
 
-DiagnosedSilenceableFailure FusionRepairRfactorReductionFrontierOp::apply(
-    transform::TransformRewriter &rewriter, TransformResults &transformResults,
-    TransformState &state) {
+DiagnosedSilenceableFailure
+FusionRepairRfactorReductionFrontierOp::apply(transform::TransformRewriter &rewriter,
+                                              TransformResults &transformResults,
+                                              TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
-  (void)rewriter;
-  (void)transformResults;
-  (void)state;
-  BAIL("transform.fusion.repair_rfactor_reduction_frontier is declared but not implemented yet");
+
+  // Step 1. Validate the forall loop; get a relay map from in-loop (tiled) ops to loop's return
+  // results.
+  ForallOp forallLoop;
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getForallLoop, "forall loop", forallLoop,
+                               ForallOp);
+  auto loopRelayResult = getForallLoopResultMaps(forallLoop);
+  if (failed(loopRelayResult))
+    BAIL("failed to get loop result map for the forall loop");
+  auto &tileToLoopRelay = loopRelayResult->second;
+
+  // Step 2. Validate the elementwise ops; match the original and sidecar elementwise ops, and build
+  // a subst map from the results of the original ops to the loop result produced by sidecar ops.
+  CHECK_NON_EMPTY_OPS(state, transform, getElemwiseOrig, "original elementwise", elemwiseOrig);
+  CHECK_NON_EMPTY_OPS(state, transform, getElemwiseSidecars, "sidecar elementwise",
+                      elemwiseSidecars);
+  auto substMapping =
+      matchElemwisePairsGetSubstMap(elemwiseOrig, forallLoop, elemwiseSidecars, tileToLoopRelay);
+  if (failed(substMapping))
+    BAIL("failed to match original and sidecar elementwise ops and their results");
+
+  // Step 3. Validate the rfactor / writeback reductions and the "this reduction" op.
+  CHECK_NON_EMPTY_OPS(state, transform, getReducesWb, "producer write-back reductions", reducesWb);
+  CHECK_NON_EMPTY_OPS(state, transform, getReducesRf, "producer rfactor reductions", reducesRf);
+  if (reducesWb.size() != reducesRf.size())
+    BAIL("expected the same number of producer write-back and rfactor reductions");
+  linalg::GenericOp thisReduce;
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getThisReduce, "this reduction", thisReduce,
+                               linalg::GenericOp);
+  auto thisReducePR = dyn_cast<PartialReductionOpInterface>(thisReduce.getOperation());
+  if (!thisReducePR)
+    BAIL("expected this reduction to implement PartialReductionOpInterface");
+
+  // Step 4. Remap the reduction under `substMapping` to use loop results produced by sidecars.
+  {
+    rewriter.setInsertionPoint(forallLoop);
+    auto clonedReduce = cast<linalg::GenericOp>(rewriter.clone(*thisReduce, *substMapping));
+    rewriter.replaceOp(thisReduce, clonedReduce);
+    thisReduce = clonedReduce;
+  }
+  // Move DPS init operands of clonedReduce before the forall loop.
+  if (failed(recursiveMoveOperandsBeforeOp(*thisReduce, rewriter, *forallLoop)))
+    BAIL("failed to move staged reduction operands before the forall loop");
+  // Now we can detect a split plan for the reduction once it uses loop outputs.
+  auto splitPlan = detectReductionForallSplit(transform, forallLoop, thisReduce);
+  if (failed(splitPlan))
+    BAIL("failed to detect a split plan for the reduction");
+
+  // Step 5. Fuse the reduction op into the forall loop while r-factoring it, using the same logic
+  // as in ScfFusePartialReductionIntoForallOp.
+  auto rfactorResult =
+      rFactorReductionUnderForall(transform, rewriter, forallLoop, thisReduce, *splitPlan);
+  if (failed(rfactorResult))
+    BAIL("failed to split the forall loop for the reduction");
+
+  rewriter.replaceOp(thisReduce, rfactorResult->writebackOp);
+  rewriter.replaceOp(forallLoop,
+                     rfactorResult->newForall.getResults().take_front(forallLoop.getNumResults()));
+
+  transformResults.set(getOperation()->getResult(0), {rfactorResult->rFactorOp.getOperation()});
+  transformResults.set(getOperation()->getResult(1), {rfactorResult->writebackOp});
+
+  BAIL("transform.fusion.repair_rfactor_reduction_frontier is WIP -- H-expr repair has not been "
+       "implemented yet");
 }
 
 } // namespace mlir::transform

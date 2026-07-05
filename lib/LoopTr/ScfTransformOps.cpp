@@ -29,17 +29,6 @@ using OpPairs = SmallVector<std::pair<Operation *, Operation *>>;
 
 #define BAIL(message) return emitSilenceableFailure(transform, message);
 
-FailureOr<uint64_t> matchUnarySingleReductionGeneric(linalg::GenericOp generic) {
-  auto reductionDim = matchOneDimReductionGeneric(generic);
-  // In addition, check that there is exactly one input, and that its indexing map is the identity.
-  if (generic.getInputs().size() != 1)
-    return failure();
-  AffineMap inputMap = generic.getIndexingMapsArray()[0];
-  if (!inputMap.isIdentity())
-    return failure();
-  return reductionDim;
-}
-
 std::optional<unsigned> findLoopIvIndex(Value value, ArrayRef<Value> ivs) {
   if (!value)
     return std::nullopt;
@@ -106,17 +95,6 @@ remapAffineOffsetSizeStride(RewriterBase &rewriter, Location loc,
 SmallVector<OpFoldResult> dropAt(SmallVector<OpFoldResult> values, uint64_t index) {
   values.erase(values.begin() + index);
   return values;
-}
-
-RankedTensorType getTensorTypeFromMixedSizes(Type sourceType, ArrayRef<OpFoldResult> sizes) {
-  Type elementType = getElementTypeOrSelf(sourceType);
-  SmallVector<int64_t> shape;
-  shape.reserve(sizes.size());
-  for (OpFoldResult size : sizes) {
-    auto maybeConst = getConstantIntValue(size);
-    shape.push_back(maybeConst ? *maybeConst : ShapedType::kDynamic);
-  }
-  return RankedTensorType::get(shape, elementType);
 }
 
 struct FoldedTensorInfo {
@@ -296,7 +274,7 @@ template <> struct LoopSharedTrait<scf::ForallOp> {
                     const SmallVector<std::optional<FoldedTensorInfo>> &infos,
                     scf::ForallOp newLoop) {
     OpPairs clonedCombiningOps;
-    rewriter.setInsertionPointToEnd(&newLoop.getTerminator().getRegion().front());
+    pointBuilderToForallParallel(rewriter, newLoop);
     for (Operation &oldCombiningOp : oldLoop.getTerminator().getYieldingOps()) {
       FailureOr<Operation *> newCombiningOp = cloneOrRewriteForallCombiningOp(
           oldLoop, rewriter, oldCombiningOp, mapping, infos, newLoop);
@@ -449,14 +427,14 @@ splitForallDimensionForReduction(TransformOpInterface transform, RewriterBase &r
     return failure();
   }
   auto [outerTileOffsets, outerTileSizes, outerTileStrides] = *viewTriple;
-  outerTileSizes[plan.reductionDim] =
-      getMixedTensorSizes(rewriter, loc, plan.producerResult)[plan.reductionDim];
+  outerTileSizes[plan.producerRedDim] =
+      getMixedTensorSizes(rewriter, loc, plan.loopProducedInput->get())[plan.producerRedDim];
   Value tileInit = createExtractSliceFromState(rewriter, loc, outerProducerArg, outerTileOffsets,
                                                outerTileSizes, outerTileStrides);
 
-  auto redTileOffsets = dropAt(outerTileOffsets, plan.reductionDim);
-  auto redTileSizes = dropAt(outerTileSizes, plan.reductionDim);
-  auto redTileStrides = dropAt(outerTileStrides, plan.reductionDim);
+  auto redTileOffsets = dropAt(outerTileOffsets, plan.producerRedDim);
+  auto redTileSizes = dropAt(outerTileSizes, plan.producerRedDim);
+  auto redTileStrides = dropAt(outerTileStrides, plan.producerRedDim);
   Value redTileInit = createExtractSliceFromState(rewriter, loc, outerReductionArg, redTileOffsets,
                                                   redTileSizes, redTileStrides);
 
@@ -471,13 +449,13 @@ splitForallDimensionForReduction(TransformOpInterface transform, RewriterBase &r
   rewriter.setInsertionPointToEnd(forLoop.getBody());
   auto offsets = plan.producerInsert.getMixedOffsets();
   SmallVector<OpFoldResult> localOffsets(offsets.size(), rewriter.getIndexAttr(0));
-  localOffsets[plan.reductionDim] =
-      *remapAffineIndex(rewriter, loc, offsets[plan.reductionDim], outerIvMapping.getValueMap());
+  localOffsets[plan.producerRedDim] =
+      *remapAffineIndex(rewriter, loc, offsets[plan.producerRedDim], outerIvMapping.getValueMap());
   Value innerTile = tensor::InsertSliceOp::create(
       rewriter, loc, outerTile, forLoop.getRegionIterArgs()[0], localOffsets,
       plan.producerInsert.getMixedSizes(), outerTileStrides);
 
-  pointRewriterToForallParallel(rewriter, newForall);
+  pointBuilderToForallParallel(rewriter, newForall);
   tensor::ParallelInsertSliceOp::create(rewriter, loc, forLoop.getResult(0), outerProducerArg,
                                         outerTileOffsets, outerTileSizes, outerTileStrides);
   return SplitForallIntoForResult{.newForall = newForall,
@@ -494,22 +472,46 @@ splitForallDimensionForReduction(TransformOpInterface transform, RewriterBase &r
 
 FailureOr<ReductionForallSplitPlan>
 detectReductionForallSplit(const TransformOpInterface &transform, scf::ForallOp loop,
-                           linalg::GenericOp consumer, uint64_t reductionDim) {
-  auto producerResult = dyn_cast<OpResult>(consumer.getInputs().front());
-  if (!producerResult || producerResult.getOwner() != loop.getOperation()) {
-    emitError(consumer.getInputs().front().getLoc())
-        << "expected the reduction input to be produced by the target scf.forall";
-    return failure();
-  }
-  auto insertSliceF = getParallelInsertSliceForLoopResult(loop, producerResult);
-  if (failed(insertSliceF)) {
-    loop.emitError() << "failed to find the tensor.parallel_insert_slice operation in this loop "
-                     << "that published result #" << producerResult.getResultNumber();
-    return failure();
-  }
-  tensor::ParallelInsertSliceOp producerInsert = *insertSliceF;
+                           linalg::GenericOp consumer) {
+  FailureOr<uint64_t> opReductionDim = matchOneDimReductionGeneric(consumer);
+  if (failed(opReductionDim))
+    return consumer.emitError() << "expected a single-dimension reduction linalg.generic consumer";
 
-  OpFoldResult reductionOffset = producerInsert.getMixedOffsets()[reductionDim];
+  SmallVector<OpOperand *> loopProducedOperands;
+  for (auto [inputIndex, operand] : llvm::enumerate(consumer.getDpsInputOperands())) {
+    auto operandResult = dyn_cast<OpResult>(operand->get());
+    if (operandResult && operandResult.getOwner() == loop.getOperation())
+      loopProducedOperands.push_back(operand);
+  }
+  if (loopProducedOperands.size() != 1)
+    return consumer.emitError()
+           << "expected exactly one input of this op to be produced by the target scf.forall";
+  OpOperand *loopProducedOpnd = loopProducedOperands.front();
+  auto loopResult = cast<OpResult>(loopProducedOpnd->get());
+
+  std::optional<uint64_t> producerReductionDim;
+  AffineMap producerIndexingMap =
+      consumer.getIndexingMapsArray()[loopProducedOpnd->getOperandNumber()];
+  for (auto [resultIndex, expr] : llvm::enumerate(producerIndexingMap.getResults())) {
+    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+    if (dimExpr && dimExpr.getPosition() == *opReductionDim) {
+      producerReductionDim = resultIndex;
+      break;
+    }
+  }
+  if (!producerReductionDim)
+    return consumer.emitError() << "expected the loop-produced input to be a reduction argument "
+                                   "and use the reduction iterator";
+
+  auto insertSliceR = getParallelInsertSliceForLoopResult(loop, loopResult);
+  if (failed(insertSliceR)) {
+    loop.emitError() << "failed to find the tensor.parallel_insert_slice operation in this loop "
+                     << "that published result #" << loopResult.getResultNumber();
+    return failure();
+  }
+  tensor::ParallelInsertSliceOp producerInsert = *insertSliceR;
+
+  OpFoldResult reductionOffset = producerInsert.getMixedOffsets()[*producerReductionDim];
   Value reductionOffsetValue = dyn_cast<Value>(reductionOffset);
   // findLoopIvIndex handles the case where `reductionOffsetValue` is null, so we can have a single
   // point of failure reporting.
@@ -517,27 +519,25 @@ detectReductionForallSplit(const TransformOpInterface &transform, scf::ForallOp 
       findLoopIvIndex(reductionOffsetValue, loop.getInductionVars());
   if (!removedIvIndex) {
     producerInsert.emitError()
-        << "expected the offset on dimension " << reductionDim
+        << "expected the offset on dimension " << *producerReductionDim
         << " to be a dynamic value controlled by a single scf.forall induction variable; got "
         << reductionOffsetValue;
     return failure();
   }
 
-  return ReductionForallSplitPlan{
-      .producerResult = producerResult,
-      .producerInsert = producerInsert,
-      .removedIvIndex = *removedIvIndex,
-      .reductionDim = reductionDim,
-      .reductionInit = consumer.getDpsInits().front(),
-  };
+  auto reductionInit = consumer.getDpsInits().front();
+  return ReductionForallSplitPlan{loopProducedOpnd, reductionInit,   producerInsert,
+                                  *removedIvIndex,  *opReductionDim, *producerReductionDim};
 }
 
 FailureOr<PartialReductionForallResult>
-fusePartialReductionIntoForall(TransformOpInterface transform, RewriterBase &rewriter,
-                               scf::ForallOp loop, linalg::GenericOp consumer,
-                               PartialReductionOpInterface consumerPR,
-                               ReductionForallSplitPlan &plan) {
-  Location loc = loop.getLoc();
+rFactorReductionUnderForall(TransformOpInterface transform, TransformRewriter &rewriter,
+                            scf::ForallOp forall, linalg::GenericOp consumer,
+                            ReductionForallSplitPlan &plan) {
+  Location loc = forall.getLoc();
+  auto consumerPR = dyn_cast<PartialReductionOpInterface>(consumer.getOperation());
+  if (!consumerPR)
+    return consumer.emitError() << "expected the consumer to implement PartialReductionInterface";
 
   auto makeSub = [&](OpFoldResult lhs, OpFoldResult rhs) {
     AffineExpr s0, s1;
@@ -565,80 +565,88 @@ fusePartialReductionIntoForall(TransformOpInterface transform, RewriterBase &rew
         loop.getMixedStep()[ivIndex]);
   };
 
-  // Create the init value for the "rf" (r-factor) tensor with the size of the reduction dimension
-  // set to the trip count of the loop.
-  SmallVector<OpFoldResult> partialItSizes =
-      getMixedTensorSizes(rewriter, loc, plan.producerResult);
-  partialItSizes[plan.reductionDim] = getForallTripCount(loop, plan.removedIvIndex);
+  // Create the init value for the RF (r-factor) tensor with shape `outputShape`. The shape is
+  // based on the iteration domain with the reduction dim set to the trip count of the loop.
+  auto iterDomain = consumerPR.getIterationDomain(rewriter);
+  auto outputShape = llvm::map_to_vector(iterDomain, [](const Range &r) { return r.size; });
+  outputShape[plan.opRedDim] = getForallTripCount(forall, plan.removedIvIndex);
   SetVector<unsigned> reductionDims;
-  reductionDims.insert(static_cast<unsigned>(plan.reductionDim));
+  reductionDims.insert(static_cast<unsigned>(plan.opRedDim));
   FailureOr<SmallVector<Value>> rfInits = consumerPR.generateInitialTensorForPartialReduction(
-      rewriter, consumer.getLoc(), partialItSizes, reductionDims);
-  if (failed(rfInits) || rfInits->size() != 1) {
-    consumer.emitError() << "failed to create partial reduction init tensor";
-    return failure();
-  }
+      rewriter, consumer.getLoc(), outputShape, reductionDims);
+  if (failed(rfInits) || rfInits->size() != 1)
+    return consumer.emitError() << "failed to create partial reduction init tensor";
 
   // Create a new forall loop that has the RF init tensor as an additional output.
-  SmallVector<Value> newOutputs = llvm::to_vector(loop.getOutputs());
+  SmallVector<Value> newOutputs = llvm::to_vector(forall.getOutputs());
   newOutputs.push_back(rfInits->front());
   auto newForall =
-      scf::ForallOp::create(rewriter, loc, loop.getMixedLowerBound(), loop.getMixedUpperBound(),
-                            loop.getMixedStep(), newOutputs, loop.getMapping());
+      scf::ForallOp::create(rewriter, loc, forall.getMixedLowerBound(), forall.getMixedUpperBound(),
+                            forall.getMixedStep(), newOutputs, forall.getMapping());
   IRMapping mapping;
-  for (auto [oldIv, newIv] : llvm::zip(loop.getInductionVars(), newForall.getInductionVars()))
-    mapping.map(oldIv, newIv);
-  for (auto [oldArg, newArg] : llvm::zip(loop.getRegionOutArgs(), newForall.getRegionOutArgs()))
-    mapping.map(oldArg, newArg);
+  mapping.map(forall.getInductionVars(), newForall.getInductionVars());
+  mapping.map(forall.getRegionIterArgs(), newForall.getRegionIterArgs());
   rewriter.setInsertionPointToStart(newForall.getBody());
-  OpPairs clonedOps = cloneBlockWithoutTerminator(rewriter, *loop.getBody(), mapping);
+  auto clonedOps = cloneForallLoopBody(forall, rewriter, newForall, mapping);
 
-  // Calculate (offset, size, stride) for a tile of the RF tensor under the loop.
-  auto viewTriple =
-      remapAffineOffsetSizeStride(rewriter, loc, plan.producerInsert, mapping.getValueMap());
-  if (failed(viewTriple)) {
-    plan.producerInsert.emitError() << "failed to remap offsets of this operation";
-    return failure();
-  }
-  auto [producerOffsets, producerSizes, _] = *viewTriple;
-  auto partialOffsets = dropAt(producerOffsets, plan.reductionDim);
-  // The split index must be derived from the new induction variable. Using the old loop IV here
-  // would leave a dangling operand after the old forall is replaced.
+  // Get the under-loop tile of the reduction input, and use tiling interface method to map this
+  // input tile to a tile of the reduction's iter domain.
+  auto producerInsert =
+      dyn_cast_if_present<tensor::ParallelInsertSliceOp>(mapping.lookup(plan.producerInsert));
+  if (!producerInsert)
+    return plan.producerInsert.emitError()
+           << "failed to find this op in the new forall loop that corresponds";
+  unsigned producerInputIndex = plan.loopProducedInput->getOperandNumber();
+  SmallVector<OpFoldResult> iterDomainOffsets, iterDomainShape;
+  if (failed(consumerPR.getIterationDomainTileFromOperandTiles(
+          rewriter, {producerInputIndex}, {producerInsert.getMixedOffsets()},
+          {producerInsert.getMixedSizes()}, iterDomainOffsets, iterDomainShape)))
+    return consumer.emitError()
+           << "failed to infer iteration-domain tile from forall-produced input tile";
+
+  // Create the rfactor op under the loop.
   OpFoldResult loopSplitIndex = getForallSplitIndex(newForall, plan.removedIvIndex);
-  partialOffsets.push_back(loopSplitIndex);
-  auto rankReducedSizes = dropAt(producerSizes, plan.reductionDim);
-  auto partialSizes = rankReducedSizes;
-  partialSizes.push_back(rewriter.getIndexAttr(1));
-  auto partialStrides = getUnitStrides(rewriter, partialOffsets.size());
-
-  // Extract a tile of the RF tensor.
-  Value inputTile = mapping.lookup(plan.producerInsert.getSource());
-  Value partialOutArg = newForall.getRegionOutArgs().back();
-  auto partialTileType = getTensorTypeFromMixedSizes(
-      cast<RankedTensorType>(partialOutArg.getType()).getElementType(), rankReducedSizes);
+  Value rfOutArg = newForall.getRegionOutArgs().back();
   rewriter.setInsertionPoint(newForall.getTerminator());
-  auto partialTileInit = tensor::ExtractSliceOp::create(
-      rewriter, loc, partialTileType, partialOutArg, partialOffsets, partialSizes, partialStrides);
+  FailureOr<TilingResult> tilingResult = consumerPR.tileToPartialReduction(
+      rewriter, consumer.getLoc(), ReductionTilingStrategy::PartialReductionOuterParallel,
+      {rfOutArg}, iterDomainOffsets, iterDomainShape, reductionDims, {loopSplitIndex});
+  if (failed(tilingResult) || tilingResult->tiledOps.size() != 1)
+    return consumer.emitError() << "failed to tile this op to a partial reduction";
+  auto tiledConsumer = cast<linalg::GenericOp>(tilingResult->tiledOps.front());
+  auto partialTileInit =
+      tiledConsumer.getDpsInits().front().getDefiningOp<tensor::ExtractSliceOp>();
+  if (!partialTileInit)
+    return tiledConsumer.emitError()
+           << "expected partial reduction init to be a tensor.extract_slice";
 
-  // Clone the consumer into the loop while making it read from the tile of the RF tensor.
-  auto partialReduce =
-      cloneGenericOnTile(rewriter, consumer, inputTile, partialTileInit, consumer.getLoc());
+  // The tiling interface slices every input from the original op operands. For the forall-produced
+  // input, use the already-cloned in-loop producer tile instead of slicing the old forall result.
+  Value generatedInput = tiledConsumer->getOperand(producerInputIndex);
+  rewriter.modifyOpInPlace(tiledConsumer, [&]() {
+    tiledConsumer->setOperand(producerInputIndex, producerInsert.getSource());
+  });
+  auto inputSliceOp = generatedInput.getDefiningOp<tensor::ExtractSliceOp>();
+  if (inputSliceOp && inputSliceOp->use_empty())
+    rewriter.eraseOp(inputSliceOp);
 
-  // Clone the combining operations (e.g., the parallel insert slice) into the new forall loop.
-  SmallVector<std::optional<FoldedTensorInfo>> noFoldInfos(loop.getNumResults());
-  auto clonedCombiningOps = LoopSharedTrait<scf::ForallOp>::cloneCombiningOps(
-      loop, rewriter, mapping, noFoldInfos, newForall);
-  if (failed(clonedCombiningOps))
-    return failure();
   // Add a parallel insert slice to write the result of the partial reduction into the RF tensor.
-  pointRewriterToForallParallel(rewriter, newForall);
-  tensor::ParallelInsertSliceOp::create(rewriter, loc, partialReduce.getResult(0), partialOutArg,
-                                        partialOffsets, partialSizes, partialStrides);
+  pointBuilderToForallParallel(rewriter, newForall);
+  tensor::ParallelInsertSliceOp::create(
+      rewriter, loc, tiledConsumer.getResult(0), rfOutArg, partialTileInit.getMixedOffsets(),
+      partialTileInit.getMixedSizes(), partialTileInit.getMixedStrides());
+
+  rewriter.setInsertionPointAfter(newForall);
+  FailureOr<MergeResult> mergeResult = consumerPR.mergeReductions(
+      rewriter, consumer.getLoc(), ValueRange{newForall.getResults().back()}, reductionDims);
+  if (failed(mergeResult) || mergeResult->mergeOps.size() != 1)
+    return consumer.emitError() << "failed to create write-back reduction";
 
   return PartialReductionForallResult{.newForall = newForall,
-                                      .partialReduce = partialReduce,
-                                      .clonedOps = std::move(clonedOps),
-                                      .clonedCombiningOps = std::move(*clonedCombiningOps)};
+                                      .rFactorOp = tiledConsumer,
+                                      .writebackOp =
+                                          cast<linalg::ReduceOp>(mergeResult->mergeOps.front()),
+                                      .clonedOps = std::move(clonedOps)};
 }
 
 void ScfFoldUnitExtentDimsViaReshapesPatternsOp::populatePatterns(RewritePatternSet &patterns) {
@@ -674,10 +682,7 @@ DiagnosedSilenceableFailure ScfFuseReductionIntoForallOp::apply(TransformRewrite
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getConsumerOp, "consumer", consumer,
                                linalg::GenericOp);
 
-  FailureOr<uint64_t> reductionDim = matchUnarySingleReductionGeneric(consumer);
-  if (failed(reductionDim))
-    BAIL("expected a unary single-reduction linalg.generic consumer");
-  auto splitPlan = detectReductionForallSplit(transform, loop, consumer, *reductionDim);
+  auto splitPlan = detectReductionForallSplit(transform, loop, consumer);
   if (failed(splitPlan))
     BAIL("failed to detect a split plan for the reduction");
 
@@ -707,7 +712,7 @@ DiagnosedSilenceableFailure ScfFuseReductionIntoForallOp::apply(TransformRewrite
   scf::YieldOp::create(rewriter, loop.getLoc(),
                        ValueRange{split.innerTile, insertedReduction.getResult()});
 
-  pointRewriterToForallParallel(rewriter, split.newForall);
+  pointBuilderToForallParallel(rewriter, split.newForall);
   Value outerReductionArg = split.newForall.getRegionOutArgs().back();
   tensor::ParallelInsertSliceOp::create(rewriter, loop.getLoc(), split.innerFor.getResult(1),
                                         outerReductionArg, split.reductionSlice.offsets,
@@ -741,42 +746,20 @@ DiagnosedSilenceableFailure ScfFusePartialReductionIntoForallOp::apply(
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getConsumerOp, "consumer", consumer,
                                linalg::GenericOp);
 
-  FailureOr<uint64_t> reductionDim = matchUnarySingleReductionGeneric(consumer);
-  if (failed(reductionDim))
-    BAIL("expected a unary single-reduction linalg.generic consumer");
-  auto partialReductionOp = dyn_cast<PartialReductionOpInterface>(consumer.getOperation());
-  if (!partialReductionOp)
-    BAIL("expected reduction to implement PartialReductionOpInterface");
-  auto splitPlan = detectReductionForallSplit(transform, loop, consumer, *reductionDim);
+  auto splitPlan = detectReductionForallSplit(transform, loop, consumer);
   if (failed(splitPlan))
     BAIL("failed to detect a split plan for the reduction");
 
   rewriter.setInsertionPoint(consumer);
-  auto partial = fusePartialReductionIntoForall(transform, rewriter, loop, consumer,
-                                                partialReductionOp, *splitPlan);
-  if (failed(partial))
+  auto rFactorResult = rFactorReductionUnderForall(transform, rewriter, loop, consumer, *splitPlan);
+  if (failed(rFactorResult))
     BAIL("failed to split the forall loop for the reduction");
-  notifyClonedOpsRecursively(rewriter, partial->clonedOps);
-  notifyClonedOpsRecursively(rewriter, partial->clonedCombiningOps);
 
-  SetVector<unsigned> reductionDims;
-  reductionDims.insert(static_cast<unsigned>(*reductionDim));
-  rewriter.setInsertionPointAfter(partial->newForall);
-  FailureOr<MergeResult> mergeResult = partialReductionOp.mergeReductions(
-      rewriter, consumer.getLoc(), ValueRange{partial->newForall.getResults().back()},
-      reductionDims);
-  if (failed(mergeResult))
-    BAIL("failed to create write-back reduction");
-  if (mergeResult->mergeOps.size() != 1 || mergeResult->replacements.size() != 1)
-    BAIL("expected exactly one write-back reduction and one replacement");
+  rewriter.replaceOp(consumer, rFactorResult->writebackOp);
+  rewriter.replaceOp(loop, rFactorResult->newForall.getResults().take_front(loop.getNumResults()));
 
-  if (failed(rewriter.notifyPayloadOperationReplaced(loop, partial->newForall.getOperation())))
-    BAIL("failed to preserve the scf.forall handle");
-  rewriter.replaceOp(consumer, mergeResult->replacements);
-  rewriter.replaceOp(loop, partial->newForall.getResults().take_front(loop.getNumResults()));
-
-  transformResults.set(getOperation()->getResult(0), {partial->partialReduce.getOperation()});
-  transformResults.set(getOperation()->getResult(1), {mergeResult->mergeOps.front()});
+  transformResults.set(getOperation()->getResult(0), {rFactorResult->rFactorOp.getOperation()});
+  transformResults.set(getOperation()->getResult(1), {rFactorResult->writebackOp});
   return DiagnosedSilenceableFailure::success();
 }
 

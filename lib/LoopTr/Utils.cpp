@@ -272,12 +272,30 @@ FailureOr<uint64_t> matchOneDimReductionGeneric(linalg::GenericOp generic) {
   return *reductionDim;
 }
 
+void pointBuilderToForallParallel(OpBuilder &builder, scf::ForallOp forall) {
+  builder.setInsertionPointToEnd(&forall.getTerminator().getRegion().front());
+}
+
 SmallVector<std::pair<Operation *, Operation *>>
 cloneBlockWithoutTerminator(OpBuilder &builder, Block &block, IRMapping &mapping) {
   SmallVector<std::pair<Operation *, Operation *>> clonedOps;
   for (Operation &op : block.without_terminator()) {
     Operation *cloned = builder.clone(op, mapping);
     clonedOps.emplace_back(&op, cloned);
+  }
+  return clonedOps;
+}
+
+SmallVector<std::pair<Operation *, Operation *>>
+cloneForallLoopBody(scf::ForallOp fromLoop, OpBuilder &builder, scf::ForallOp intoLoop,
+                    IRMapping &mapping) {
+  builder.setInsertionPoint(intoLoop.getTerminator());
+  SmallVector<std::pair<Operation *, Operation *>> clonedOps =
+      cloneBlockWithoutTerminator(builder, *fromLoop.getBody(), mapping);
+  pointBuilderToForallParallel(builder, intoLoop);
+  for (Operation &combiningOp : fromLoop.getTerminator()) {
+    Operation *cloned = builder.clone(combiningOp, mapping);
+    clonedOps.emplace_back(&combiningOp, cloned);
   }
   return clonedOps;
 }
@@ -503,10 +521,6 @@ Value createExtractSliceFromState(RewriterBase &rewriter, Location loc, Value fu
   auto tileType = RankedTensorType::get(shape, tensorType.getElementType());
   return tensor::ExtractSliceOp::create(rewriter, loc, tileType, fullTensor, offsets, sizes,
                                         strides);
-}
-
-void pointRewriterToForallParallel(RewriterBase &rewriter, scf::ForallOp forall) {
-  rewriter.setInsertionPointToEnd(&forall.getTerminator().getRegion().front());
 }
 
 linalg::GenericOp cloneGenericOnTile(RewriterBase &rewriter, linalg::GenericOp sourceGeneric,

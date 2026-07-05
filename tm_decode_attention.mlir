@@ -31,21 +31,24 @@ module attributes {transform.with_named_sequence} {
     transform.linalg.erase_unused_operands_and_results %prefix : !any
 
     // Use fuse_partial_reduction_into_forall here (similar to RFactor in TVM).
-    // It splits bmax into a local reduction and a global one (bmax_writeback),
-    // and fuses the local one under the forall loop (becomes fused_bmax).
+    // It splits bmax into a local reduction and a global one (bmax_wb),
+    // and fuses the local one under the forall loop (becomes bmax_rf).
     transform.linalg.erase_unused_operands_and_results %bmax : !any
-    %fused_bmax, %bmax_writeback = transform.scf.fuse_partial_reduction_into_forall
+    %bmax_rf, %bmax_wb = transform.scf.fuse_partial_reduction_into_forall
         %bmax into %forall_loop : (!any, !any) -> (!any, !any)
 
     // Find the next reduction forward from the loop, but only look for users of the 0th result of the loop.
-    // %bmax_writeback would be using the 1st result of the loop, and we don't want that one.
+    // %bmax_rf would be using the 1st result of the loop, and we don't want that one.
     %bmm1, %elemwise = transform.fusion.find_next_reduction %forall_loop[0] : (!any) -> (!any, !any)
     transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     %sidecars = transform.fusion.clone_fuse_rfactor_elemwise
-        %elemwise into %forall_loop substituting (%bmax_writeback -> %fused_bmax)
+        %elemwise into %forall_loop substituting (%bmax_wb -> %bmax_rf)
         : (!any, !any, !any, !any) -> !any
+    %fused_bmm1, %bmm1_writeback = transform.fusion.repair_rfactor_reduction_frontier
+        %bmm1 substituting reduce %bmax_wb -> %bmax_rf elemwise %elemwise -> %sidecars
+        into %forall_loop : (!any, !any, !any, !any, !any, !any) -> (!any, !any)
 
     transform.yield
   }
