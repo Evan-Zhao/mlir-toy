@@ -456,3 +456,49 @@ def FusionRepairReductionFrontierOp
                        "$outer_loop `,` $inner_loop attr-dict "
                        " `:` functional-type(operands, results)";
 }
+
+def FusionRepairRfactorReductionFrontierOp
+    : Op<Transform_Dialect, "fusion.repair_rfactor_reduction_frontier",
+         [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Repair a SplitK rfactor reduction frontier before write-back";
+
+  let description = [{
+    SplitK reduction-frontier repair.
+
+    This is the rfactor/write-back counterpart to
+    `transform.fusion.repair_reduction_frontier`. Instead of repairing a
+    loop-carried accumulator under an `scf.forall` + inner `scf.for` rolling
+    loop nest, this transform repairs split-local rfactor partials before the
+    final write-back reduction.
+
+    The producer write-back and rfactor reductions are paired in handle order.
+    They describe values that the sidecar chain reads as final write-back
+    tensors outside the loop, but which should be interpreted as split-local
+    rfactor tensors when deriving and materializing the repair term.
+
+    The transform is expected to:
+    - stage the frontier reduction to consume the fused rfactor sidecar chain,
+    - split that frontier into a new rfactor/write-back pair under the existing
+      `scf.forall`,
+    - derive a repair term `H` using the shared fusion expression solver, and
+    - materialize `H` over rfactor tensors before rebuilding the write-back
+      reduction to consume the repaired rfactor tensor.
+
+    The `forall_loop`, producer reduction handles, and elementwise-chain
+    handles are read-only. The `this_reduce` handle is consumed and replaced by
+    the repaired write-back result. The returned handles are the split-local
+    rfactor reduction for this frontier and the repaired write-back reduction.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$this_reduce,
+      TransformHandleTypeInterface:$reduces_wb, TransformHandleTypeInterface:$reduces_rf,
+      TransformHandleTypeInterface:$elemwise_orig, TransformHandleTypeInterface:$elemwise_sidecars,
+      TransformHandleTypeInterface:$forall_loop);
+  let results = (outs TransformHandleTypeInterface:$repaired_rfactor_reduce,
+      TransformHandleTypeInterface:$repaired_writeback_reduce);
+
+  let assemblyFormat = "$this_reduce `substituting` `reduce` $reduces_wb `->` $reduces_rf "
+                       "`elemwise` $elemwise_orig `->` $elemwise_sidecars "
+                       "`into` $forall_loop attr-dict `:` functional-type(operands, results)";
+}

@@ -331,4 +331,27 @@ FusionCloneFuseRfactorElemwiseOp::apply(transform::TransformRewriter &rewriter,
   return DiagnosedSilenceableFailure::success();
 }
 
+void FusionRepairRfactorReductionFrontierOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  onlyReadsHandle(getReducesWbMutable(), effects);
+  onlyReadsHandle(getReducesRfMutable(), effects);
+  consumesHandle(getThisReduceMutable(), effects);
+  onlyReadsHandle(getElemwiseOrigMutable(), effects);
+  onlyReadsHandle(getElemwiseSidecarsMutable(), effects);
+  onlyReadsHandle(getForallLoopMutable(), effects);
+
+  producesHandle(getOperation()->getOpResults(), effects);
+  modifiesPayload(effects);
+}
+
+DiagnosedSilenceableFailure FusionRepairRfactorReductionFrontierOp::apply(
+    transform::TransformRewriter &rewriter, TransformResults &transformResults,
+    TransformState &state) {
+  auto transform = cast<TransformOpInterface>(getOperation());
+  (void)rewriter;
+  (void)transformResults;
+  (void)state;
+  BAIL("transform.fusion.repair_rfactor_reduction_frontier is declared but not implemented yet");
+}
+
 } // namespace mlir::transform
