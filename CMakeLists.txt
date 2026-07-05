@@ -277,13 +277,13 @@ make_mlir_opt_plugin(
 make_mlir_opt_plugin(
   TARGET LoopTransform
   SOURCES
+    lib/LoopTr/FusionExprSolver.cpp
     lib/LoopTr/FusionIntoProducer.cpp
     lib/LoopTr/FusionSplitKUpdate.cpp
     lib/LoopTr/FusionRollingUpdate.cpp
     lib/LoopTr/LinalgTransformOps.cpp
     lib/LoopTr/LoopSpecializeDeadTile.cpp
     lib/LoopTr/LoopTransformPlugin.cpp
-    lib/LoopTr/PythonSolver.cpp
     lib/LoopTr/ScfLocalizeScratchTensors.cpp
     lib/LoopTr/ScfTransformOps.cpp
     lib/LoopTr/Utils.cpp
@@ -297,7 +297,7 @@ set_target_properties(LoopTransform PROPERTIES
   INSTALL_RPATH "${Python3_LIBRARY_DIRS}"
 )
 set_source_files_properties(
-  lib/LoopTr/PythonSolver.cpp
+  lib/LoopTr/FusionExprSolver.cpp
   PROPERTIES COMPILE_OPTIONS "-frtti;-fexceptions"
 )
 

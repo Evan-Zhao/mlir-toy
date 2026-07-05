@@ -1,9 +1,15 @@
-#include "LoopTr/PythonSolver.h"
+#include "LoopTr/FusionExprSolver.h"
+#include "LoopTr/Utils.h"
 
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Interfaces/DestinationStyleOpInterface.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
@@ -382,6 +388,11 @@ FailureOr<Value> deserializeJSONExprToMLIR(const json::Value &expr, Deserializat
 
 } // namespace
 
+struct DeserializedValueExpr {
+  Value result;
+  llvm::StringMap<Value> variablesByName;
+};
+
 FailureOr<json::Value> serializeMLIRExprToJSON(Value output,
                                                const DenseMap<Value, std::string> &variableNames,
                                                Operation *scope) {
@@ -458,6 +469,214 @@ llvm::Expected<json::Value> solveRollingUpdaterWithPython(const json::Value &fEx
                                                    std::string(e.what()),
                                                llvm::inconvertibleErrorCode());
   }
+}
+
+FailureOr<AffineMap> dropDomainDim(AffineMap map, unsigned droppedDim) {
+  MLIRContext *ctx = map.getContext();
+  unsigned oldNumDims = map.getNumDims();
+  if (droppedDim >= oldNumDims)
+    return failure();
+
+  for (AffineExpr expr : map.getResults()) {
+    if (expr.isFunctionOfDim(droppedDim))
+      return failure();
+  }
+  SmallVector<AffineExpr> dimRepls = llvm::to_vector(llvm::map_range(
+      llvm::index_range(0, oldNumDims), [&](size_t i) { return getAffineDimExpr(i, ctx); }));
+  dimRepls.insert(dimRepls.begin() + droppedDim, getAffineConstantExpr(0, ctx));
+
+  return map.replaceDimsAndSymbols(dimRepls, map.getResults(), oldNumDims - 1, map.getNumSymbols());
+}
+
+FailureOr<FusionRepairSolverInput> extractRepairInputExprs(RewriterBase &rewriter,
+                                                           ArrayRef<Operation *> producingReds,
+                                                           linalg::GenericOp thisRed,
+                                                           ArrayRef<Operation *> elemwiseSidecars) {
+  SmallPtrSet<Operation *, 4> sidecarSet(elemwiseSidecars.begin(), elemwiseSidecars.end());
+  auto findFusableOperand =
+      [&sidecarSet](Operation *consumer) -> std::optional<std::pair<Operation *, unsigned>> {
+    for (auto &operand : consumer->getOpOperands()) {
+      auto producer = operand.get().getDefiningOp();
+      if (producer && sidecarSet.count(producer))
+        return std::make_pair(producer, operand.getOperandNumber());
+    }
+    return std::nullopt;
+  };
+
+  OpResult reductionResult = cast<OpResult>(thisRed->getResult(0));
+  linalg::GenericOp currentOp = thisRed;
+  while (auto nextFusionTarget = findFusableOperand(currentOp)) {
+    auto [producer, consumerOpndNum] = *nextFusionTarget;
+    FailureOr<linalg::ElementwiseOpFusionResult> fusionResult =
+        linalg::fuseElementwiseOps(rewriter, &currentOp->getOpOperand(consumerOpndNum));
+    if (failed(fusionResult)) {
+      producer->emitError("failed to fuse this op...");
+      currentOp->emitError("into this op...");
+      return failure();
+    }
+    auto it = fusionResult->replacements.find(reductionResult);
+    if (it == fusionResult->replacements.end())
+      return failure();
+    if (currentOp != thisRed)
+      rewriter.eraseOp(currentOp);
+    reductionResult = cast<OpResult>(it->second);
+    currentOp = cast<linalg::GenericOp>(fusionResult->fusedOp);
+  }
+  auto scopeGuard = llvm::scope_exit([&]() {
+    if (currentOp != thisRed)
+      rewriter.eraseOp(currentOp);
+  });
+
+  auto match = matchBinaryReductionCombiner(currentOp, reductionResult.getResultNumber(),
+                                            /*emitDiagnostics=*/true);
+  if (failed(match))
+    return failure();
+
+  SmallPtrSet<Value, 4> prodRedResults;
+  for (Operation *prodRed : producingReds)
+    prodRedResults.insert(prodRed->result_begin(), prodRed->result_end());
+
+  auto genericBodyBlk = currentOp.getBlock();
+  size_t nInputs = currentOp.getNumDpsInputs();
+  size_t rCounter = 0, cCounter = 0;
+  DenseMap<Value, std::string> gExprVarNames;
+  SmallVector<LinalgProvenance> reductionVars;
+  for (size_t i = 0; i < nInputs; ++i) {
+    Value operand = currentOp.getOperand(i);
+    AffineMap indexMap = currentOp.getIndexingMapsArray()[i];
+    BlockArgument blkArg = genericBodyBlk->getArgument(i);
+    if (prodRedResults.contains(operand)) {
+      auto rName = "r" + std::to_string(rCounter++);
+      gExprVarNames[blkArg] = rName;
+      reductionVars.emplace_back(cast<OpResult>(operand), indexMap, rName);
+    } else {
+      gExprVarNames[blkArg] = "c" + std::to_string(cCounter++);
+    }
+  }
+
+  auto gExpr = serializeMLIRExprToJSON(match->nonAccumulator, gExprVarNames, currentOp);
+  if (failed(gExpr)) {
+    currentOp->emitRemark("this is the compute operation we're extracting from");
+    return failure();
+  }
+
+  static const std::string accVarName = "acc";
+  DenseMap<Value, std::string> fExprVarNames{
+      {match->accumulatorArg, accVarName},
+      {match->nonAccumulator, "x"},
+  };
+  auto fExpr = serializeMLIRExprToJSON(match->yieldedValue, fExprVarNames, currentOp);
+  if (failed(fExpr))
+    return failure();
+
+  return FusionRepairSolverInput{
+      .varProvenances = std::move(reductionVars),
+      .accVarName = accVarName,
+      .fExpr = std::move(*fExpr),
+      .gExpr = std::move(*gExpr),
+  };
+}
+
+llvm::Expected<FusionRepairSolverResult>
+solveFusionRepairExpr(RewriterBase &rewriter, ArrayRef<Operation *> producingReds,
+                      linalg::GenericOp thisRed, ArrayRef<Operation *> elemwiseSidecars) {
+  rewriter.setInsertionPointAfter(thisRed);
+  auto solverInput = extractRepairInputExprs(rewriter, producingReds, thisRed, elemwiseSidecars);
+  if (failed(solverInput))
+    return llvm::make_error<llvm::StringError>(
+        "failed to extract reducer/elemwise expressions from the program",
+        llvm::inconvertibleErrorCode());
+
+  auto redVars = llvm::to_vector(llvm::map_range(
+      solverInput->varProvenances, [](const LinalgProvenance &prov) { return prov.varName; }));
+  auto hExpr = solveRollingUpdaterWithPython(solverInput->fExpr, solverInput->gExpr, redVars,
+                                             solverInput->accVarName);
+  if (!hExpr)
+    return llvm::make_error<llvm::StringError>(
+        "failed to solve rolling updater with Python: " + llvm::toString(hExpr.takeError()),
+        llvm::inconvertibleErrorCode());
+
+  return FusionRepairSolverResult{
+      .input = std::move(*solverInput),
+      .hExpr = std::move(*hExpr),
+  };
+}
+
+FailureOr<linalg::GenericOp> buildLinalgFromRepairTerm(RewriterBase &rewriter,
+                                                       const json::Value &hExpr,
+                                                       linalg::GenericOp sourceReduce,
+                                                       size_t reduceDim,
+                                                       const FusionRepairSolverInput &solverInput) {
+  auto loc = sourceReduce.getLoc();
+  if (sourceReduce.getNumResults() != 1)
+    return failure();
+  auto dpsInit = sourceReduce.getDpsInitOperand(0)->get();
+  auto resultMap = sourceReduce.getIndexingMapsArray()[sourceReduce.getNumDpsInputs() + 0];
+
+  // Deserialize the repair term solution into MLIR expressions into a scratch block.
+  Block scratchBlock;
+  DeserializedValueExpr deserialized;
+  {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(&scratchBlock);
+    auto deserializedR = deserializeMLIRExprFromJSON(hExpr, rewriter, loc);
+    if (failed(deserializedR))
+      return failure();
+    deserialized = *std::move(deserializedR);
+  }
+
+  llvm::StringMap<std::pair<Value, AffineMap>> varNameToValue;
+  varNameToValue[solverInput.accVarName] = {dpsInit, resultMap};
+  for (const auto &[opResult, sourceMap, varName] : solverInput.varProvenances) {
+    auto producerOp = dyn_cast<DestinationStyleOpInterface>(opResult.getDefiningOp());
+    if (!producerOp)
+      return failure();
+    varNameToValue[varName + "'"] = {opResult, sourceMap};
+    auto initValue = producerOp.getDpsInitOperand(opResult.getResultNumber());
+    varNameToValue[varName] = {initValue->get(), sourceMap};
+  }
+
+  auto sortedVars =
+      llvm::to_vector(llvm::map_range(deserialized.variablesByName, [](const auto &it) {
+        return std::make_pair(it.getKey().str(), it.getValue());
+      }));
+  llvm::sort(sortedVars, [](const auto &a, const auto &b) { return a.first < b.first; });
+
+  SmallVector<Value> inputTensors;
+  inputTensors.reserve(sortedVars.size());
+  SmallVector<AffineMap> indexingMaps;
+  indexingMaps.reserve(sortedVars.size() + 1);
+  for (const auto &[name, _] : sortedVars) {
+    auto it = varNameToValue.find(name);
+    if (it == varNameToValue.end()) {
+      llvm::errs() << "no tensor binding provided for symbolic variable `" << name << "`\n";
+      return failure();
+    }
+    inputTensors.push_back(it->second.first);
+    indexingMaps.push_back(it->second.second);
+  }
+  indexingMaps.push_back(resultMap);
+  for (auto &map : indexingMaps) {
+    auto trimmedIndexMap = dropDomainDim(map, reduceDim);
+    if (failed(trimmedIndexMap))
+      return failure();
+    map = *trimmedIndexMap;
+  }
+
+  SmallVector<utils::IteratorType> iteratorTypes(indexingMaps.back().getNumDims(),
+                                                 utils::IteratorType::parallel);
+  return linalg::GenericOp::create(
+      rewriter, loc, TypeRange{dpsInit.getType()}, inputTensors, ValueRange{dpsInit}, indexingMaps,
+      iteratorTypes, [&](OpBuilder &builder, Location nestedLoc, ValueRange newArgs) {
+        IRMapping mapping;
+        for (auto [pair, arg] :
+             llvm::zip_equal(sortedVars, newArgs.take_front(inputTensors.size())))
+          mapping.map(pair.second, arg);
+        for (Operation &op : scratchBlock)
+          builder.clone(op, mapping);
+        Value mappedResult = mapping.lookupOrDefault(deserialized.result);
+        linalg::YieldOp::create(builder, nestedLoc, mappedResult);
+      });
 }
 
 } // namespace mlir
