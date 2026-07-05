@@ -242,7 +242,7 @@ FusionCloneFuseRfactorElemwiseOp::apply(transform::TransformRewriter &rewriter,
   mapping.map(forallLoop.getRegionOutArgs(), newForall.getRegionOutArgs().take_front(nOldResults));
   // Clone loop body ops.
   rewriter.setInsertionPointToStart(newForall.getBody());
-  cloneBlockWithoutTerminator(rewriter, *forallLoop.getBody(), mapping);
+  auto clonedBodyOps = cloneBlockWithoutTerminator(rewriter, *forallLoop.getBody(), mapping);
   // Clone the terminator (tensor.parallel_insert_slice ops).
   pointRewriterToForallParallel(rewriter, newForall);
   for (Operation &oldCombiningOp : forallLoop.getTerminator())
@@ -255,6 +255,11 @@ FusionCloneFuseRfactorElemwiseOp::apply(transform::TransformRewriter &rewriter,
     }
     op = mapping.lookup(op);
   }
+  // Notify the rewriter of op replacements.
+  for (auto [oldOp, newOp] : clonedBodyOps)
+    auto _ = rewriter.notifyPayloadOperationReplaced(oldOp, newOp);
+  if (failed(rewriter.notifyPayloadOperationReplaced(forallLoop, newForall.getOperation())))
+    BAIL("failed to preserve the scf.forall handle");
   // Replace uses of the old forall results with new forall results, then erase the old loop.
   rewriter.replaceOp(forallLoop, newForall.getResults().take_front(nOldResults));
 
