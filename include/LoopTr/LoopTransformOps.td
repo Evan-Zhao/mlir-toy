@@ -445,16 +445,16 @@ def FusionRepairReductionFrontierOp
     reduction state through the rebuilt outer loop.
   }];
 
-  let arguments = (ins TransformHandleTypeInterface:$producer_reduces,
-      TransformHandleTypeInterface:$this_reduce, TransformHandleTypeInterface:$elemwise_orig,
+  let arguments = (ins TransformHandleTypeInterface:$this_reduce,
+      TransformHandleTypeInterface:$producer_reduces, TransformHandleTypeInterface:$elemwise_orig,
       TransformHandleTypeInterface:$elemwise_sidecars, TransformHandleTypeInterface:$outer_loop,
       TransformHandleTypeInterface:$inner_loop);
   let results = (outs TransformHandleTypeInterface:$repaired_reduce);
 
-  let assemblyFormat = "`(` $producer_reduces `,` $this_reduce `)` `and` "
-                       "`(` $elemwise_orig `,` $elemwise_sidecars `)` `into` "
-                       "$outer_loop `,` $inner_loop attr-dict "
-                       " `:` functional-type(operands, results)";
+  let assemblyFormat =
+      "$this_reduce `reduce_producer` $producer_reduces "
+      "`substituting` `elemwise` $elemwise_orig `->` $elemwise_sidecars "
+      "`into` $outer_loop `,` $inner_loop attr-dict `:` functional-type(operands, results)";
 }
 
 def FusionRepairRfactorReductionFrontierOp

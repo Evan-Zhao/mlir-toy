@@ -51,7 +51,9 @@ module attributes {transform.with_named_sequence} {
         %elemwise into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
     transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any
     %_3 = transform.fusion.repair_reduction_frontier
-        (%fused_bmax, %bmm1) and (%elemwise, %elemwise_sidecars) into %forall_loop, %j0_loop
+        %bmm1 reduce_producer %fused_bmax
+        substituting elemwise %elemwise -> %elemwise_sidecars
+        into %forall_loop, %j0_loop
         : (!any, !any, !any, !any, !any, !any) -> !any
 
     %bsum, %elemwise_1 = transform.fusion.find_next_reduction
@@ -59,7 +61,9 @@ module attributes {transform.with_named_sequence} {
     %elemwise_sidecars_1 = transform.fusion.clone_fuse_elemwise
         %elemwise_1 into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
     %_4 = transform.fusion.repair_reduction_frontier
-        (%fused_bmax, %bsum) and (%elemwise_1, %elemwise_sidecars_1) into %forall_loop, %j0_loop
+        %bsum reduce_producer %fused_bmax
+        substituting elemwise %elemwise_1 -> %elemwise_sidecars_1
+        into %forall_loop, %j0_loop
         : (!any, !any, !any, !any, !any, !any) -> !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 

@@ -31,7 +31,9 @@ module attributes {transform.with_named_sequence} {
       transform.fusion.clone_fuse_elemwise %elemwise into %forall_loop, %inner_loop
         : (!any, !any, !any) -> !any
     %_ = transform.fusion.repair_reduction_frontier
-        (%producer_rowmax, %rowsum_reduce) and (%elemwise, %sidecars) into %forall_loop, %inner_loop
+        %rowsum_reduce reduce_producer %producer_rowmax
+        substituting elemwise %elemwise -> %sidecars
+        into %forall_loop, %inner_loop
         : (!any, !any, !any, !any, !any, !any) -> !any
     transform.yield
   }
