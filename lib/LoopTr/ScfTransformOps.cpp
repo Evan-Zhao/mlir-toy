@@ -1,4 +1,5 @@
 #include "LoopTr/LoopTransformOps.h"
+#include "LoopTr/PartialReduction.h"
 #include "LoopTr/Utils.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -53,54 +54,6 @@ std::optional<unsigned> findLoopIvIndex(Value value, ArrayRef<Value> ivs) {
     if (affineApply.getOperand(0) == iv)
       return index;
   return std::nullopt;
-}
-
-struct ReductionForallSplitPlan {
-  Value producerResult;
-  tensor::ParallelInsertSliceOp producerInsert;
-  unsigned removedIvIndex;
-  uint64_t reductionDim;
-  Value reductionInit;
-};
-
-FailureOr<ReductionForallSplitPlan>
-detectReductionForallSplit(const TransformOpInterface &transform, scf::ForallOp loop,
-                           linalg::GenericOp consumer, uint64_t reductionDim) {
-  auto producerResult = dyn_cast<OpResult>(consumer.getInputs().front());
-  if (!producerResult || producerResult.getOwner() != loop.getOperation()) {
-    emitError(consumer.getInputs().front().getLoc())
-        << "expected the reduction input to be produced by the target scf.forall";
-    return failure();
-  }
-  auto insertSliceF = getParallelInsertSliceForLoopResult(loop, producerResult);
-  if (failed(insertSliceF)) {
-    loop.emitError() << "failed to find the tensor.parallel_insert_slice operation in this loop "
-                     << "that published result #" << producerResult.getResultNumber();
-    return failure();
-  }
-  tensor::ParallelInsertSliceOp producerInsert = *insertSliceF;
-
-  OpFoldResult reductionOffset = producerInsert.getMixedOffsets()[reductionDim];
-  Value reductionOffsetValue = dyn_cast<Value>(reductionOffset);
-  // findLoopIvIndex handles the case where `reductionOffsetValue` is null, so we can have a single
-  // point of failure reporting.
-  std::optional<unsigned> removedIvIndex =
-      findLoopIvIndex(reductionOffsetValue, loop.getInductionVars());
-  if (!removedIvIndex) {
-    producerInsert.emitError()
-        << "expected the offset on dimension " << reductionDim
-        << " to be a dynamic value controlled by a single scf.forall induction variable; got "
-        << reductionOffsetValue;
-    return failure();
-  }
-
-  return ReductionForallSplitPlan{
-      .producerResult = producerResult,
-      .producerInsert = producerInsert,
-      .removedIvIndex = *removedIvIndex,
-      .reductionDim = reductionDim,
-      .reductionInit = consumer.getDpsInits().front(),
-  };
 }
 
 FailureOr<OpFoldResult> remapAffineIndex(RewriterBase &rewriter, Location loc, OpFoldResult ofr,
@@ -537,12 +490,47 @@ splitForallDimensionForReduction(TransformOpInterface transform, RewriterBase &r
                                   .clonedOps = std::move(clonedOps)};
 }
 
-struct PartialReductionForallResult {
-  scf::ForallOp newForall;
-  linalg::GenericOp partialReduce;
-  OpPairs clonedOps;
-  OpPairs clonedCombiningOps;
-};
+} // namespace
+
+FailureOr<ReductionForallSplitPlan>
+detectReductionForallSplit(const TransformOpInterface &transform, scf::ForallOp loop,
+                           linalg::GenericOp consumer, uint64_t reductionDim) {
+  auto producerResult = dyn_cast<OpResult>(consumer.getInputs().front());
+  if (!producerResult || producerResult.getOwner() != loop.getOperation()) {
+    emitError(consumer.getInputs().front().getLoc())
+        << "expected the reduction input to be produced by the target scf.forall";
+    return failure();
+  }
+  auto insertSliceF = getParallelInsertSliceForLoopResult(loop, producerResult);
+  if (failed(insertSliceF)) {
+    loop.emitError() << "failed to find the tensor.parallel_insert_slice operation in this loop "
+                     << "that published result #" << producerResult.getResultNumber();
+    return failure();
+  }
+  tensor::ParallelInsertSliceOp producerInsert = *insertSliceF;
+
+  OpFoldResult reductionOffset = producerInsert.getMixedOffsets()[reductionDim];
+  Value reductionOffsetValue = dyn_cast<Value>(reductionOffset);
+  // findLoopIvIndex handles the case where `reductionOffsetValue` is null, so we can have a single
+  // point of failure reporting.
+  std::optional<unsigned> removedIvIndex =
+      findLoopIvIndex(reductionOffsetValue, loop.getInductionVars());
+  if (!removedIvIndex) {
+    producerInsert.emitError()
+        << "expected the offset on dimension " << reductionDim
+        << " to be a dynamic value controlled by a single scf.forall induction variable; got "
+        << reductionOffsetValue;
+    return failure();
+  }
+
+  return ReductionForallSplitPlan{
+      .producerResult = producerResult,
+      .producerInsert = producerInsert,
+      .removedIvIndex = *removedIvIndex,
+      .reductionDim = reductionDim,
+      .reductionInit = consumer.getDpsInits().front(),
+  };
+}
 
 FailureOr<PartialReductionForallResult>
 fusePartialReductionIntoForall(TransformOpInterface transform, RewriterBase &rewriter,
@@ -652,8 +640,6 @@ fusePartialReductionIntoForall(TransformOpInterface transform, RewriterBase &rew
                                       .clonedOps = std::move(clonedOps),
                                       .clonedCombiningOps = std::move(*clonedCombiningOps)};
 }
-
-} // namespace
 
 void ScfFoldUnitExtentDimsViaReshapesPatternsOp::populatePatterns(RewritePatternSet &patterns) {
   patterns.add<FoldUnitExtentDimsInLoopPattern<scf::ForOp>,
