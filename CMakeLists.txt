@@ -162,11 +162,6 @@ add_mlir_pdll_library(TAExpToExp2PDLL
 )
 
 function(setup_mlir_target TARGET)
-  # Resolve MLIR/LLVM symbols from the host process at runtime.
-  if(APPLE)
-    target_link_options(${TARGET} PRIVATE -undefined dynamic_lookup)
-  endif()
-
   llvm_update_compile_flags(${TARGET})
   target_include_directories(${TARGET} PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}
@@ -206,6 +201,12 @@ function(make_mlir_opt_plugin)
   add_library(${ARG_TARGET} SHARED ${ARG_SOURCES})
   add_dependencies(${ARG_TARGET} ${ARG_DEPS})
   setup_mlir_target(${ARG_TARGET})
+  if(APPLE)
+    # Do not rely on late dynamic lookup for mlir-opt plugins. Link against the shared
+    # MLIR/LLVM dylibs so missing definitions in this target fail at link time without
+    # statically embedding MLIR/LLVM into the plugin.
+    target_link_libraries(${ARG_TARGET} PRIVATE MLIR LLVM)
+  endif()
   install(TARGETS ${ARG_TARGET} LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}")
 endfunction()
 
