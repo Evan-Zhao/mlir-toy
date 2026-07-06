@@ -18,6 +18,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/Debug.h"
+#include <mlir/Dialect/Linalg/Transforms/Transforms.h>
 
 #define DEBUG_TYPE "htile-transform-ops"
 
@@ -303,19 +304,11 @@ LogicalResult rewriteReduction(RewriterBase &rewriter, linalg::GenericOp op) {
   if (!isSingleResultTensorGeneric(op) || op.getInputs().size() != 1)
     return failure();
 
-  SmallVector<utils::IteratorType> iterators = op.getIteratorTypesArray();
-  std::optional<size_t> reductionAxis;
-  for (auto [index, iterator] : llvm::enumerate(iterators)) {
-    if (iterator == utils::IteratorType::reduction) {
-      if (reductionAxis)
-        return failure();
-      reductionAxis = index;
-    } else if (iterator != utils::IteratorType::parallel) {
-      return failure();
-    }
-  }
-  if (!reductionAxis)
+  SmallVector<unsigned> reductionDims;
+  op.getReductionDims(reductionDims);
+  if (reductionDims.size() != 1)
     return failure();
+  unsigned reductionAxis = reductionDims[0];
 
   SmallVector<AffineMap> maps = op.getIndexingMapsArray();
   if (!maps.front().isIdentity())
@@ -325,7 +318,7 @@ LogicalResult rewriteReduction(RewriterBase &rewriter, linalg::GenericOp op) {
   auto resultType = cast<RankedTensorType>(op.getResult(0).getType());
   if (outputDims.size() != static_cast<size_t>(resultType.getRank()))
     return failure();
-  if (llvm::is_contained(outputDims, *reductionAxis))
+  if (llvm::is_contained(outputDims, reductionAxis))
     return failure();
 
   FailureOr<BinaryReductionCombinerMatch> combiner = matchBinaryReductionCombiner(op, 0);
@@ -338,7 +331,7 @@ LogicalResult rewriteReduction(RewriterBase &rewriter, linalg::GenericOp op) {
   rewriter.setInsertionPoint(op);
   auto reduce =
       htile::ReduceOp::create(rewriter, op.getLoc(), op.getResult(0).getType(), op.getInputs()[0],
-                              rewriter.getI64IntegerAttr(static_cast<int64_t>(*reductionAxis)),
+                              rewriter.getI64IntegerAttr(static_cast<int64_t>(reductionAxis)),
                               rewriter.getStringAttr(*kind));
   Value combined;
   if (*kind == "sum")
@@ -356,9 +349,9 @@ LogicalResult rewriteReduction(RewriterBase &rewriter, linalg::GenericOp op) {
 LogicalResult rewriteElementwise(RewriterBase &rewriter, linalg::GenericOp op) {
   if (!isSingleResultTensorGeneric(op))
     return failure();
-  if (!llvm::all_of(op.getIteratorTypesArray(), [](utils::IteratorType iterator) {
-        return iterator == utils::IteratorType::parallel;
-      }))
+  SmallVector<unsigned> parallelDims;
+  op.getParallelDims(parallelDims);
+  if (parallelDims.size() != op.getNumLoops())
     return failure();
   if (failed(expandAffineApplyOpsInLinalgBody(op)))
     return failure();
@@ -446,6 +439,13 @@ LogicalResult rewriteOriginalLinalgOp(RewriterBase &rewriter, Operation *op) {
     return rewriteFill(rewriter, fill);
   if (auto broadcast = dyn_cast<linalg::BroadcastOp>(op))
     return rewriteBroadcast(rewriter, broadcast);
+  if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op); linalgOp && !isa<linalg::GenericOp>(op)) {
+    rewriter.setInsertionPoint(op);
+    FailureOr<linalg::GenericOp> generic = linalg::generalizeNamedOp(rewriter, linalgOp);
+    if (failed(generic))
+      return failure();
+    return rewriteOriginalLinalgOp(rewriter, *generic);
+  }
   if (auto generic = dyn_cast<linalg::GenericOp>(op)) {
     if (succeeded(rewriteContraction(rewriter, generic)))
       return success();

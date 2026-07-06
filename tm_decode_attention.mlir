@@ -56,7 +56,25 @@ module attributes {transform.with_named_sequence} {
     %fused_bsum, %bsum_writeback = transform.fusion.repair_rfactor_reduction_frontier
         %bsum substituting reduce %bmax_wb -> %bmax_rf elemwise %elemwise_1 -> %sidecars_1
         into %forall_loop : (!any, !any, !any, !any, !any, !any) -> (!any, !any)
+
+    %_3, %writeback_loop = transform.structured.tile_using_forall
+        %bmax_wb tile_sizes [1, 1, 1] : (!any) -> (!any, !any)
+    %ret = transform.structured.match ops{["func.return"]} in %func : (!any) -> !any
+    transform.fusion.greedy_consumers_into_producer
+        %writeback_loop[0] until %ret { inline_elementwise } : (!any, !any) -> !any
+
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+    transform.scf.localize_scratch_tensors %func : !any
+    transform.apply_patterns to %func {
+      transform.apply_patterns.scf.fold_unit_extent_dims_via_reshapes
+      transform.apply_patterns.linalg.fold_unit_extent_dims_via_reshapes
+      transform.apply_patterns.canonicalization
+    } : !any
+    transform.apply_cse to %func : !any
+
+    transform.htile.linalg_to_semantic %func : !any
+    // transform.htile.semantic_to_kernel_abi %func : !any
+    // transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     transform.yield
   }
