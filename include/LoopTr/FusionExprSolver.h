@@ -5,30 +5,52 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LogicalResult.h"
-#include "llvm/Support/Error.h"
-#include "llvm/Support/JSON.h"
 
 namespace mlir {
 
-struct LinalgProvenance {
-  OpResult tileValue;
-  AffineMap indexMap;
-  std::string varName;
+/// A binding from a reduction result (which implicitly corresponds to an r_i)
+/// to two values: r_i (current) and r_i' (next).
+struct FusionRepairReductionBinding {
+  OpResult reductionResult;
+  Value current;
+  Value next;
 };
 
-/// Solver input extracted from a reduction frontier and its fused sidecar
-/// elementwise producers.
-struct FusionRepairSolverInput {
-  SmallVector<LinalgProvenance> varProvenances;
-  std::string accVarName;
-  llvm::json::Value fExpr, gExpr;
+/// A switch for FusionRepairTerm::build that controls how the linalg generic is built.
+/// It influences the indexing maps and expectation of how many dims each input tensor should have.
+enum class FusionRepairTermMode : uint8_t {
+  RollingUpdate,
+  SplitKUpdate,
 };
 
-/// Result of solving the repair expression. The original solver input is kept
-/// because materialization still needs variable provenance.
-struct FusionRepairSolverResult {
-  FusionRepairSolverInput input;
-  llvm::json::Value hExpr;
+/// A solved scalar repair term h(r0, r0', r1, r1', ..., acc), plus the producer reduction order and
+/// base indexing maps needed to materialize it as a linalg.generic.
+class FusionRepairTerm {
+public:
+  FusionRepairTerm(SmallVector<OpResult> reductionOrder, SmallVector<AffineMap> argsIndexingMaps,
+                   AffineMap accIndexingMap, std::unique_ptr<Block> scalarBlock, Value scalarResult)
+      : reductionOrder(std::move(reductionOrder)), argsIndexingMaps(std::move(argsIndexingMaps)),
+        accIndexingMap(accIndexingMap), scalarBlock(std::move(scalarBlock)),
+        scalarResult(scalarResult) {}
+
+  FailureOr<linalg::GenericOp> build(RewriterBase &rewriter, Location loc,
+                                     ArrayRef<FusionRepairReductionBinding> reduceArgs,
+                                     Value accArg, FusionRepairTermMode mode,
+                                     unsigned reduceDim) const;
+
+private:
+  /// Results from the producer reductions. reductionOrder[i] corresponds to r_i.
+  SmallVector<OpResult> reductionOrder;
+  /// Base maps from the fused reduction expression. argsIndexingMaps[i] is the
+  /// common base map for r_i and r_i' before mode-specific patching.
+  SmallVector<AffineMap> argsIndexingMaps;
+  /// Base affine map for the accumulator/output argument before mode-specific patching.
+  AffineMap accIndexingMap;
+  /// Detached scalar expression block. Its 2N + 1 arguments are ordered by the
+  /// solver ABI: r0, r0', r1, r1', ..., acc.
+  std::unique_ptr<Block> scalarBlock;
+  /// Value inside scalarBlock that represents the repair term result.
+  Value scalarResult;
 };
 
 /// Extracts the frontier reduction and sidecar expression, then calls the
@@ -36,19 +58,10 @@ struct FusionRepairSolverResult {
 ///
 /// The insertion point is moved after `thisRed`, where temporary fused
 /// expression ops can be safely created during extraction.
-llvm::Expected<FusionRepairSolverResult>
-solveFusionRepairExpr(RewriterBase &rewriter, ArrayRef<Operation *> producingReds,
-                      linalg::GenericOp thisRed, ArrayRef<Operation *> elemwiseSidecars);
-
-/// Make an elementwise linalg.generic op that applies the repair term found by
-/// the solver. This is the rolling-update binding policy: `acc` is bound to
-/// the frontier DPS init, `r*` to producer reduction inits, and `r*'` to
-/// producer reduction results.
-FailureOr<linalg::GenericOp> buildLinalgFromRepairTerm(RewriterBase &rewriter,
-                                                       const llvm::json::Value &hExpr,
-                                                       linalg::GenericOp sourceReduce,
-                                                       size_t reduceDim,
-                                                       const FusionRepairSolverInput &solverInput);
+FailureOr<FusionRepairTerm> solveFusionRepairExpr(RewriterBase &rewriter,
+                                                  ArrayRef<Operation *> producingReds,
+                                                  linalg::GenericOp thisRed,
+                                                  ArrayRef<Operation *> elemwiseSidecars);
 
 } // namespace mlir
 

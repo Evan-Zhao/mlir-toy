@@ -5,8 +5,8 @@
 // CHECK-SAME: shared_outs({{.*}}, {{.*}}, {{.*}}, {{.*}})
 // CHECK: scf.for {{.*}} iter_args({{.*}}, {{.*}}, {{.*}}, {{.*}})
 // CHECK: %{{.*}} = linalg.generic {{.*}}iterator_types = ["parallel", "parallel"]{{.*}}outs(%{{.*}} : tensor<2x2xf32>)
-// CHECK: ^bb0(%[[IN:.+]]: f32, %[[OLDSUM:.+]]: f32, %[[NEWSUM:.+]]: f32, %[[OUT:.+]]: f32):
-// CHECK: %[[MUL0:.+]] = arith.mulf %[[IN]], %[[OLDSUM]] : f32
+// CHECK: ^bb0(%[[OLDSUM:.+]]: f32, %[[NEWSUM:.+]]: f32, %[[ACC:.+]]: f32, %[[OUT:.+]]: f32):
+// CHECK: %[[MUL0:.+]] = arith.mulf %[[ACC]], %[[OLDSUM]] : f32
 // CHECK: %[[ONE:.+]] = arith.constant 1.000000e+00 : f32
 // CHECK: %[[INV:.+]] = arith.divf %[[ONE]], %[[NEWSUM]] : f32
 // CHECK: %[[MUL1:.+]] = arith.mulf %[[MUL0]], %[[INV]] : f32

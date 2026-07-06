@@ -41,14 +41,22 @@ module attributes {transform.with_named_sequence} {
     // %bmax_rf would be using the 1st result of the loop, and we don't want that one.
     %bmm1, %elemwise = transform.fusion.find_next_reduction %forall_loop[0] : (!any) -> (!any, !any)
     transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any
-    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
-
     %sidecars = transform.fusion.clone_fuse_rfactor_elemwise
         %elemwise into %forall_loop substituting (%bmax_wb -> %bmax_rf)
         : (!any, !any, !any, !any) -> !any
     %fused_bmm1, %bmm1_writeback = transform.fusion.repair_rfactor_reduction_frontier
         %bmm1 substituting reduce %bmax_wb -> %bmax_rf elemwise %elemwise -> %sidecars
         into %forall_loop : (!any, !any, !any, !any, !any, !any) -> (!any, !any)
+
+    // Apply SplitK repair again for the remaining row-sum reduction frontier.
+    %bsum, %elemwise_1 = transform.fusion.find_next_reduction %forall_loop[0] : (!any) -> (!any, !any)
+    %sidecars_1 = transform.fusion.clone_fuse_rfactor_elemwise
+        %elemwise_1 into %forall_loop substituting (%bmax_wb -> %bmax_rf)
+        : (!any, !any, !any, !any) -> !any
+    %fused_bsum, %bsum_writeback = transform.fusion.repair_rfactor_reduction_frontier
+        %bsum substituting reduce %bmax_wb -> %bmax_rf elemwise %elemwise_1 -> %sidecars_1
+        into %forall_loop : (!any, !any, !any, !any, !any, !any) -> (!any, !any)
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     transform.yield
   }

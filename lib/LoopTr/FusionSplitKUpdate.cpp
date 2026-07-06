@@ -1,3 +1,4 @@
+#include "LoopTr/FusionExprSolver.h"
 #include "LoopTr/LoopTransformOps.h"
 #include "LoopTr/PartialReduction.h"
 #include "LoopTr/Utils.h"
@@ -7,6 +8,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/Interfaces/TilingInterface.h"
+#include <llvm/ADT/ArrayRef.h>
 
 namespace {
 
@@ -457,16 +459,84 @@ FusionRepairRfactorReductionFrontierOp::apply(transform::TransformRewriter &rewr
       rFactorReductionUnderForall(transform, rewriter, forallLoop, thisReduce, *splitPlan);
   if (failed(rfactorResult))
     BAIL("failed to split the forall loop for the reduction");
+  // Update reducesRf and elemwiseSidecars to point to the cloned ops inside the new forall loop.
+  auto &clonedOps = rfactorResult->clonedOps;
+  DenseMap<Operation *, Operation *> clonedOpMap(clonedOps.begin(), clonedOps.end());
+  auto updateOps = [&clonedOpMap, &rewriter](MutableArrayRef<Operation *> ops) -> LogicalResult {
+    for (auto &op : ops) {
+      auto it = clonedOpMap.find(op);
+      if (it == clonedOpMap.end())
+        return op->emitError() << "failed to find this op in the cloned forall loop";
+      if (failed(rewriter.notifyPayloadOperationReplaced(op, it->second)))
+        return op->emitError() << "failed to preserve the transform handle for this cloned op";
+      op = cast<linalg::GenericOp>(it->second);
+    }
+    return success();
+  };
+  if (failed(updateOps(reducesRf)) || failed(updateOps(elemwiseSidecars)))
+    BAIL("failed to remap producer reductions into the rebuilt forall");
 
-  rewriter.replaceOp(thisReduce, rfactorResult->writebackOp);
+  // Step 6. Call the repair expression solver to get the H expression.
+  auto repairExpr =
+      solveFusionRepairExpr(rewriter, reducesRf, rfactorResult->rFactorOp, elemwiseSidecars);
+  if (failed(repairExpr))
+    BAIL("failed to solve rolling updater expressions");
+
+  // Step 7. Start collecting values we want to feed `repairExpr` to build a new linalg.generic op.
+  // Find an insertion point, which needs to be after all the producer writeback reductions.
+  Operation *insertAfter = reducesWb.front();
+  for (Operation *wbOp : reducesWb) {
+    if (wbOp->getBlock() != insertAfter->getBlock())
+      BAIL("expected producer writeback reductions to be in the same block");
+    if (insertAfter->isBeforeInBlock(wbOp))
+      insertAfter = wbOp;
+  }
+  rewriter.setInsertionPointAfter(insertAfter);
+
+  // Collect the "panel" (full tensor) for accumulator and reducesRf operations.
+  // Call `getForallLoopResultMaps` again (simplest way to update the relay map).
+  loopRelayResult = getForallLoopResultMaps(rfactorResult->newForall);
+  if (failed(loopRelayResult))
+    BAIL("failed to get loop result map for the rebuilt forall loop");
+  DenseMap<OpResult, OpResult> rfactorTensorByTile;
+  for (const auto &[tileResult, relay] : loopRelayResult->second)
+    rfactorTensorByTile[tileResult] = relay.loopReturnResult;
+  auto it = rfactorTensorByTile.find(rfactorResult->rFactorOp->getResult(0));
+  if (it == rfactorTensorByTile.end())
+    BAIL("failed to find the loop result for the repair accumulator tensor");
+  auto accTensor = it->second;
+  SmallVector<FusionRepairReductionBinding> repairBindings;
+  for (auto [rfOp, wbOp] : llvm::zip_equal(reducesRf, reducesWb)) {
+    for (auto [rfResult, wbResult] : llvm::zip_equal(rfOp->getResults(), wbOp->getResults())) {
+      it = rfactorTensorByTile.find(rfResult);
+      if (it == rfactorTensorByTile.end())
+        BAIL("failed to find the loop result for a repair reduction tensor");
+      repairBindings.emplace_back(rfResult, it->second, wbResult);
+    }
+  }
+
+  // Step 8. Build a new linalg.generic that applies the repair term in split-k update mode.
+  auto repairUpdateOp =
+      repairExpr->build(rewriter, rfactorResult->rFactorOp.getLoc(), repairBindings, accTensor,
+                        FusionRepairTermMode::SplitKUpdate, splitPlan->opRedDim);
+  if (failed(repairUpdateOp))
+    BAIL("failed to build linalg.generic around the h-expression returned by the solver");
+
+  // Step 9. Update the writeback op of "this reduction" to use the calculated repair term.
+  IRMapping repairedWritebackMapping;
+  repairedWritebackMapping.map(rfactorResult->writebackOp.getDpsInputOperand(0)->get(),
+                               repairUpdateOp->getResult(0));
+  rewriter.setInsertionPointAfter(*repairUpdateOp);
+  auto repairedWritebackOp =
+      cast<linalg::ReduceOp>(rewriter.clone(*rfactorResult->writebackOp, repairedWritebackMapping));
+  rewriter.replaceOp(rfactorResult->writebackOp, repairedWritebackOp);
+
+  rewriter.replaceOp(thisReduce, repairedWritebackOp);
   rewriter.replaceOp(forallLoop,
                      rfactorResult->newForall.getResults().take_front(forallLoop.getNumResults()));
-
   transformResults.set(getOperation()->getResult(0), {rfactorResult->rFactorOp.getOperation()});
-  transformResults.set(getOperation()->getResult(1), {rfactorResult->writebackOp});
-
-  BAIL("transform.fusion.repair_rfactor_reduction_frontier is WIP -- H-expr repair has not been "
-       "implemented yet");
+  transformResults.set(getOperation()->getResult(1), {repairedWritebackOp});
+  return DiagnosedSilenceableFailure::success();
 }
 
 } // namespace mlir::transform

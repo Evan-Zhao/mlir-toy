@@ -7,6 +7,7 @@
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Value.h"
+#include "mlir/Interfaces/DestinationStyleOpInterface.h"
 #include "llvm/ADT/STLExtras.h"
 
 #define BAIL(message) return emitSilenceableFailure(transform, message);
@@ -248,12 +249,26 @@ FusionRepairReductionFrontierOp::apply(transform::TransformRewriter &rewriter,
   // Extract scalar expressions that describe the reduction and its producers, then send them to the
   // solver to get a repair term (h-expression).
   auto repairExpr = solveFusionRepairExpr(rewriter, producerReds, thisRed, elemwiseSidecars);
-  if (!repairExpr)
-    BAIL(llvm::toString(repairExpr.takeError()));
+  if (failed(repairExpr))
+    BAIL("failed to solve rolling updater expressions");
+
+  SmallVector<FusionRepairReductionBinding> repairBindings;
+  for (Operation *producerRed : producerReds) {
+    auto producerOp = dyn_cast<DestinationStyleOpInterface>(producerRed);
+    if (!producerOp)
+      BAIL("expected producer reduction to implement DestinationStyleOpInterface");
+    for (OpResult result : producerRed->getResults()) {
+      auto init = producerOp.getDpsInitOperand(result.getResultNumber());
+      if (!init)
+        BAIL("failed to find producer reduction init for repair binding");
+      repairBindings.push_back({result, init->get(), result});
+    }
+  }
 
   // Build a new linalg.generic that applies the repair term.
-  auto repairUpdateOp =
-      buildLinalgFromRepairTerm(rewriter, repairExpr->hExpr, thisRed, *redDimR, repairExpr->input);
+  auto repairUpdateOp = repairExpr->build(rewriter, thisRed.getLoc(), repairBindings,
+                                          thisRed.getDpsInitOperand(0)->get(),
+                                          FusionRepairTermMode::RollingUpdate, *redDimR);
   if (failed(repairUpdateOp))
     BAIL("failed to build linalg.generic around the h-expression returned by the solver");
 

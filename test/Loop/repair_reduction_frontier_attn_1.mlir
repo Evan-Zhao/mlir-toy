@@ -5,7 +5,7 @@
 // CHECK-SAME: shared_outs({{.*}}, {{.*}}, {{.*}}, {{.*}}, {{.*}})
 // CHECK: scf.for {{.*}} iter_args({{.*}}, {{.*}}, {{.*}}, {{.*}}, {{.*}})
 // CHECK: %{{.*}} = linalg.generic {{.*}}iterator_types = ["parallel"]{{.*}}outs(%{{.*}} : tensor<2xf32>)
-// CHECK: ^bb0(%[[ACC:.+]]: f32, %[[OLDMAX:.+]]: f32, %[[NEWMAX:.+]]: f32, %[[OUT:.+]]: f32):
+// CHECK: ^bb0(%[[OLDMAX:.+]]: f32, %[[NEWMAX:.+]]: f32, %[[ACC:.+]]: f32, %[[OUT:.+]]: f32):
 // CHECK: %[[DELTA:.+]] = arith.subf %[[OLDMAX]], %[[NEWMAX]] : f32
 // CHECK: %[[EXP:.+]] = math.exp %[[DELTA]] : f32
 // CHECK: %[[SCALED:.+]] = arith.mulf %[[ACC]], %[[EXP]] : f32
