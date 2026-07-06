@@ -33,15 +33,8 @@ dialect schedule, and our custom transform operations that enable it.
 The schedule is also given in the integrated example
 [`test/Pipeline/tm_global_attention.mlir`](../test/Pipeline/tm_global_attention.mlir).
 
-The scheduled L1 program exposes:
-
-- an outer `scf.forall` over independent `(B, H, M-block)` output tiles,
-- an inner sequential `scf.for` over K/V blocks,
-- loop-carried online-softmax state `(m, acc, l)`,
-- tile-local structured ops for matmul, row reductions, broadcasts, and elementwise arithmetic,
-- no GPU hierarchy, memory placement, warp roles, layouts, or fragment details.
-
-The schedule mirrors the FlashAttention online-softmax recurrence:
+The transform recipe creates a program that resembles **FlashAttention**,
+with online-softmax recurrence:
 
 ```text
 m_next   = max(m_prev, row_max(score_tile))
@@ -51,8 +44,19 @@ acc_next = exp2(m_prev - m_next) * acc_prev + p_tile @ v_tile
 out      = acc_final / l_final
 ```
 
+Automatic discovery of FlashAttention from attention is enabled by our **rolling update** fusion;
+see the [rolling update design doc](rolling-update-design.md) for details.
+
 Some key expression rewrites, such as `exp` to `exp2`, are powered by a custom **tensor algebra** (TA)
-dialect that makes expression rewriting easier.
+dialect that makes expression rewriting easier; see [the TA dialect design doc](ta-dialect-design.md).
+
+The scheduled L1 program exposes:
+
+- an outer `scf.forall` over independent `(B, H, M-block)` output tiles,
+- an inner sequential `scf.for` over K/V blocks,
+- loop-carried online-softmax state `(m, acc, l)`,
+- tile-local structured ops for matmul, row reductions, broadcasts, and elementwise arithmetic,
+- no GPU hierarchy, memory placement, warp roles, layouts, or fragment details.
 
 ## L1 To HTile
 

@@ -44,6 +44,9 @@ Decode attention computes one or a few new query positions against a growing K/V
 inference-critical form for autoregressive serving, and MQA/GQA make it especially memory-layout
 sensitive.
 
+This is a work in progresss. The split-k reduction schedule is tracked in the
+[SplitK update design](split-k-update-design.md).
+
 Compiler pressure points:
 
 - Q has a very small sequence length while K/V can be long.
