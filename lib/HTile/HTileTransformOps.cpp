@@ -39,17 +39,6 @@ FailureOr<size_t> getDimPosition(AffineExpr expr) {
   return dim.getPosition();
 }
 
-bool isMapEqualToDims(AffineMap map, ArrayRef<size_t> dims) {
-  if (map.getNumResults() != dims.size())
-    return false;
-  for (auto [expr, dim] : llvm::zip_equal(map.getResults(), dims)) {
-    auto maybePos = getDimPosition(expr);
-    if (failed(maybePos) || *maybePos != dim)
-      return false;
-  }
-  return true;
-}
-
 SmallVector<size_t> getMapDims(AffineMap map) {
   SmallVector<size_t> dims;
   dims.reserve(map.getNumResults());
@@ -242,45 +231,63 @@ LogicalResult rewriteContraction(RewriterBase &rewriter, linalg::GenericOp op) {
   if (!isSingleResultTensorGeneric(op) || op.getInputs().size() != 2)
     return failure();
 
-  SmallVector<utils::IteratorType> iterators = op.getIteratorTypesArray();
-  if (iterators.size() != 3)
+  SmallVector<unsigned> parallelDims, reductionDims;
+  op.getParallelDims(parallelDims);
+  op.getReductionDims(reductionDims);
+  if (reductionDims.size() != 1)
     return failure();
 
-  SmallVector<size_t> parallelDims;
-  SmallVector<size_t> reductionDims;
-  for (auto [index, iterator] : llvm::enumerate(iterators)) {
-    if (iterator == utils::IteratorType::parallel)
-      parallelDims.push_back(index);
-    else if (iterator == utils::IteratorType::reduction)
-      reductionDims.push_back(index);
+  auto isMapEqualToDims = [](AffineMap map, ArrayRef<unsigned> dims) {
+    if (map.getNumResults() != dims.size())
+      return false;
+    for (auto [expr, dim] : llvm::zip_equal(map.getResults(), dims)) {
+      auto maybePos = getDimPosition(expr);
+      if (failed(maybePos) || *maybePos != dim)
+        return false;
+    }
+    return true;
+  };
+  auto detectTranspose = [&](AffineMap map, unsigned dim0, unsigned dim1,
+                             bool &result) -> LogicalResult {
+    if (isMapEqualToDims(map, {dim0, dim1}))
+      result = false;
+    else if (isMapEqualToDims(map, {dim1, dim0}))
+      result = true;
     else
       return failure();
-  }
-  if (parallelDims.size() != 2 || reductionDims.size() != 1)
-    return failure();
+    return success();
+  };
 
   SmallVector<AffineMap> maps = op.getIndexingMapsArray();
-  size_t m = parallelDims[0];
-  size_t n = parallelDims[1];
-  size_t k = reductionDims[0];
-  if (!isMapEqualToDims(maps.back(), {m, n}))
+  AffineMap lhsMap = maps[0], rhsMap = maps[1], outMap = maps[2];
+  unsigned k = reductionDims[0];
+  // Output map must trivially cover all parallel dims.
+  if (!isMapEqualToDims(outMap, parallelDims))
     return failure();
-
-  bool transposeA = false;
-  if (isMapEqualToDims(maps[0], {m, k}))
-    transposeA = false;
-  else if (isMapEqualToDims(maps[0], {k, m}))
-    transposeA = true;
-  else
+  bool transposeA = false, transposeB = false;
+  if (parallelDims.size() == 2) {
+    // mat-mat contraction.
+    unsigned n = parallelDims[0], m = parallelDims[1];
+    if (failed(detectTranspose(lhsMap, n, k, transposeA)) ||
+        failed(detectTranspose(rhsMap, k, m, transposeB)))
+      return failure();
+  } else if (parallelDims.size() == 1 && lhsMap.getNumResults() == 1) {
+    // vec-mat contraction, lhs is a vector, rhs is a matrix.
+    size_t m = parallelDims[0];
+    if (!isMapEqualToDims(lhsMap, {k}))
+      return failure();
+    if (failed(detectTranspose(rhsMap, k, m, transposeB)))
+      return failure();
+  } else if (parallelDims.size() == 1 && rhsMap.getNumResults() == 1) {
+    // mat-vec contraction, lhs is a matrix, rhs is a vector.
+    size_t n = parallelDims[0];
+    if (!isMapEqualToDims(rhsMap, {k}))
+      return failure();
+    if (failed(detectTranspose(lhsMap, n, k, transposeA)))
+      return failure();
+  } else {
     return failure();
-
-  bool transposeB = false;
-  if (isMapEqualToDims(maps[1], {k, n}))
-    transposeB = false;
-  else if (isMapEqualToDims(maps[1], {n, k}))
-    transposeB = true;
-  else
-    return failure();
+  }
 
   rewriter.setInsertionPoint(op);
   auto lhsAttr = transposeA ? rewriter.getUnitAttr() : UnitAttr{},
