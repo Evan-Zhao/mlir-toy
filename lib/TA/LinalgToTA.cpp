@@ -353,15 +353,21 @@ public:
 
   class ImportGroupGuard {
   public:
-    ImportGroupGuard(ScopedTABuilder &ta, int64_t group) : ta(ta), oldGroup(ta.importGroup) {
+    ImportGroupGuard(ScopedTABuilder &ta, int64_t group, Location loc)
+        : ta(ta), oldGroup(ta.importGroup), oldLoc(ta.loc) {
       ta.importGroup = group;
+      ta.loc = loc;
     }
 
-    ~ImportGroupGuard() { ta.importGroup = oldGroup; }
+    ~ImportGroupGuard() {
+      ta.importGroup = oldGroup;
+      ta.loc = oldLoc;
+    }
 
   private:
     ScopedTABuilder &ta;
     std::optional<int64_t> oldGroup;
+    Location oldLoc;
   };
 
   ScopeOp getScope() const { return scope; }
@@ -627,7 +633,7 @@ private:
   };
 
   MLIRContext *context;
-  const Location loc;
+  Location loc;
   OpBuilder builder;
 
   Value zero;
@@ -675,7 +681,7 @@ public:
   }
 
   LogicalResult emitGenericOp(linalg::GenericOp generic, unsigned genericIndex) {
-    ScopedTABuilder::ImportGroupGuard guard(ta, genericIndex);
+    ScopedTABuilder::ImportGroupGuard guard(ta, genericIndex, generic.getLoc());
     Block &block = generic.getRegion().front();
     DenseMap<Value, Value> env;
     auto loopIt = axisInfo.genericLoopAxes.find(generic);
