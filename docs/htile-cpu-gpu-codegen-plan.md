@@ -63,13 +63,13 @@ debug quickly and broad enough to prove the CPU+GPU split.
 
 - [x] Define `htile.kernel`, `htile.launch_func`, and `htile.return`.
 - [x] Add targeted bufferization across kernel (loop nest) boundaries.
-- [ ] Add kernel outlining for selected top-level loop nests.
-- [ ] Add a verifier or late legality check that rejects inline executable HTile code before final
-      runtime lowering.
-- [ ] Add per-temp `htile.runtime.alloc` / `htile.runtime.free`.
+- [x] Add kernel outlining for selected top-level loop nests.
 - [ ] Rename/refactor `semantic_to_kernel_abi`; "kernel ABI" should mean the
       `htile.kernel`/`htile.launch_func` boundary, while the existing transform mostly materializes
       tile memory ops such as `htile.load` and `htile.store`.
+- [ ] Add per-temp `htile.runtime.alloc` / `htile.runtime.free`.
+- [ ] Add a verifier or late legality check that rejects inline executable HTile code before final
+      runtime lowering.
 
 ### Kernel Ops
 
@@ -89,109 +89,9 @@ The minimal kernel boundary operations are now:
 1. `htile.return`
    Result-free terminator for `htile.kernel`.
 
-### Implementation Contract
-
-Thrust 1 starts from the HTile semantic form produced by the decode attention schedule: a
-`func.func` that contains two or more top-level `scf.forall` loop nests, with HTile ops inside those
-loops and tensor SSA values connecting the loop nests. The implementation should not try to infer
-arbitrary GPU regions; the transform schedule must explicitly select each loop nest to outline.
-
-For decode attention, outlining and the first stupid bufferization pass should move toward this
-shape:
-
-```mlir
-func.func @attention(%q: tensor<1x4x1x64xf16>,
-                     %k: tensor<1x4x1024x64xf16>,
-                     %v: tensor<1x4x1024x64xf16>) -> tensor<1x4x1x64xf16> {
-  // Split-local partials produced by the first forall. These correspond to the
-  // current HTile semantic tensors with shapes tensor<4x16xf32>,
-  // tensor<4x64x16xf32>, and tensor<4x16xf32>.
-  %m_rf = htile.runtime.alloc : memref<4x16xf32, #htile.device>
-  %acc_rf = htile.runtime.alloc : memref<4x64x16xf32, #htile.device>
-  %l_rf = htile.runtime.alloc : memref<4x16xf32, #htile.device>
-
-  htile.launch_func @decode_partial(%q, %k, %v, %m_rf, %acc_rf, %l_rf)
-      {grid = [4, 16, 1], block = [...]}
-
-  %out = htile.runtime.alloc : memref<4x64xf16, #htile.device>
-  htile.launch_func @decode_merge(%m_rf, %acc_rf, %l_rf, %out)
-      {grid = [4, 1, 1], block = [...]}
-
-  %result = htile.runtime.to_tensor %out
-      : memref<4x64xf16, #htile.device> -> tensor<1x4x1x64xf16>
-  htile.runtime.free %l_rf
-  htile.runtime.free %acc_rf
-  htile.runtime.free %m_rf
-  return %result : tensor<1x4x1x64xf16>
-}
-
-htile.kernel @decode_partial(%q: tensor<1x4x1x64xf16>,
-                             %k: tensor<1x4x1024x64xf16>,
-                             %v: tensor<1x4x1024x64xf16>,
-                             %m_rf: memref<4x16xf32, #htile.device>,
-                             %acc_rf: memref<4x64x16xf32, #htile.device>,
-                             %l_rf: memref<4x16xf32, #htile.device>) {
-  scf.forall (%head, %split) in (4, 16) {
-    %k_offset = affine.apply affine_map<(d0) -> (d0 * 64)>(%split)
-    %q_tile = htile.load %q[0, %head, 0, 0] : tensor<64xf16>
-    %k_tile = htile.load %k[0, %head, %k_offset, 0] : tensor<64x64xf16>
-    %scores = htile.dot %q_tile, %k_tile {transpose_b}
-        : tensor<64xf16>, tensor<64x64xf16> -> tensor<64xf32>
-    %m_part = htile.reduce %scores axis 0 kind "max"
-        : tensor<64xf32> -> tensor<f32>
-    %p_tile = math.exp2(%scores - broadcast(%m_part))
-        : tensor<64xf32>
-    %v_tile = htile.load %v[0, %head, %k_offset, 0] : tensor<64x64xf16>
-    %acc_part = htile.dot %p_tile, %v_tile
-        : tensor<64xf32>, tensor<64x64xf16> -> tensor<64xf32>
-    %l_part = htile.reduce %p_tile axis 0 kind "sum"
-        : tensor<64xf32> -> tensor<f32>
-    htile.store %m_part, %m_rf[%head, %split] : tensor<f32>
-    htile.store %acc_part, %acc_rf[%head, 0, %split] : tensor<64xf32>
-    htile.store %l_part, %l_rf[%head, %split] : tensor<f32>
-  }
-  htile.return
-}
-
-htile.kernel @decode_merge(%m_rf: memref<4x16xf32, #htile.device>,
-                           %acc_rf: memref<4x64x16xf32, #htile.device>,
-                           %l_rf: memref<4x16xf32, #htile.device>,
-                           %out: memref<4x64xf16, #htile.device>) {
-  scf.forall (%head) in (4) {
-    %m_parts = htile.load %m_rf[%head, 0] [1, 16] : tensor<16xf32>
-    %m = htile.reduce %m_parts axis 0 kind "max"
-        : tensor<16xf32> -> tensor<f32>
-    %l_parts = htile.load %l_rf[%head, 0] [1, 16] : tensor<16xf32>
-    %l_scale = math.exp2(%m_parts - broadcast(%m)) : tensor<16xf32>
-    %l = htile.reduce (%l_parts * %l_scale) axis 0 kind "sum"
-        : tensor<16xf32> -> tensor<f32>
-
-    %acc_parts = htile.load %acc_rf[%head, 0, 0] [1, 64, 16]
-        : tensor<64x16xf32>
-    %acc_scale = htile.broadcast %l_scale dimensions = [0]
-        : tensor<16xf32> -> tensor<64x16xf32>
-    %acc = htile.reduce (%acc_parts * %acc_scale) axis 1 kind "sum"
-        : tensor<64x16xf32> -> tensor<64xf32>
-    %out_vec = arith.truncf (%acc / broadcast(%l))
-        : tensor<64xf32> to tensor<64xf16>
-    htile.store %out_vec, %out[%head, 0] : tensor<64xf16>
-  }
-  htile.return
-}
-```
-
-`htile.launch_func` should not return tensor results in this thrust. Values that must survive past a
-kernel boundary should be explicit output buffer operands. If a selected loop currently produces a
-tensor consumed by a later loop, the stupid bufferization pass should create a device temp and pass it
-to both the producing and consuming kernels.
-
-The first implementation may reject anything outside the decode pattern: nested unselected kernel
-regions, complex control flow around selected loops, nontrivial tensor aliasing, dynamic workspace
-packing, and async launch ordering. These are later-thrust problems.
-
 ### Transform-Driven Outlining
 
-Add `transform.htile.outline_kernels`, an explicit transform op that takes an ordered set of selected
+`transform.htile.outline_kernels` is an explicit transform op that takes an ordered set of selected
 top-level `scf.forall` loop nests and turns them into result-free `htile.launch_func` operations plus
 `htile.kernel` definitions.
 
@@ -207,13 +107,15 @@ The transform first performs targeted kernel-boundary bufferization:
 
 1. Validate that all selected loops are top-level `scf.forall` ops in the same host `func.func`;
    use handle order as launch order and `kernel_names` or deterministic generated names.
-1. Allocate one explicit memref temporary for each ranked tensor result of each selected forall.
-1. Rewrite uses of those tensor results, and uses of their tied forall output block arguments, to
-   read through the corresponding memref. `tensor.extract_slice` users become `memref.subview`
-   followed by `bufferization.to_tensor`; other supported users may read the whole buffer through
-   `bufferization.to_tensor`.
-1. Rewrite each result publication `tensor.parallel_insert_slice` to `memref.subview` plus
-   `bufferization.materialize_in_destination`.
+1. Allocate one explicit memref temporary for each ranked tensor result of each selected forall and
+   map both the forall result and its tied output block argument to that buffer.
+1. Rewrite tensor reads inside selected foralls to read from explicit memrefs. `tensor.extract_slice`
+   users become `htile.load`; whole-tensor reads use an `htile.load` at zero offsets. External
+   tensor operands that do not already have a mapped buffer get a `bufferization.to_buffer`
+   materialization before the forall.
+1. Rewrite each result publication `tensor.parallel_insert_slice` to `htile.store`.
+1. Rewrite remaining host-side uses of selected forall tensor results, such as `func.return`, to
+   read the corresponding memref through `bufferization.to_tensor`.
 1. Rebuild selected foralls without tensor `shared_outs` / tensor results, leaving their bodies
    connected to explicit memrefs instead of result SSA.
 
@@ -223,14 +125,14 @@ lifetime reasoning; those belong to later bufferization and allocation work.
 
 After boundary bufferization, the transform outlines kernels:
 
-1. Track the explicit read/write buffers for each selected forall; these become the basis for the
-   eventual kernel and launch operands.
-1. Compute remaining live-ins with `getUsedValuesDefinedAbove`, rejecting unsupported captures or
-   cloning simple constants/index computations.
-1. Create one `htile.kernel` per selected loop, move or clone the loop body into it with
-   `IRMapping`, and replace the original loop with result-free `htile.launch_func`.
-1. Fail if selected loops still have tensor results after boundary materialization; return handles
-   for the launches and kernels.
+1. Create one `htile.kernel` per selected loop and set `program_bounds` from the static normalized
+   forall trip counts.
+1. Replace the forall induction variables with `htile.program_id` values and clone the forall body,
+   not the enclosing forall op, into the kernel body with `IRMapping`.
+1. Legalize remaining captures: memrefs become explicit kernel block arguments and launch operands;
+   `arith.constant` values are cloned into the kernel; other captures fail.
+1. Replace each original loop with result-free `htile.launch_func`, carrying the same
+   `program_bounds` metadata, and return handles for the launches and kernels.
 
 This should be schedule-driven rather than automatic discovery. The decode attention schedule already
 knows which top-level loop nests should become kernels. Because `htile.launch_func` has no data

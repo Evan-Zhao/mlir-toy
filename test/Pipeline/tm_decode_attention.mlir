@@ -1,3 +1,5 @@
+// RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin --load-dialect-plugin=%neptune_ta_plugin --load-dialect-plugin=%neptune_htile_plugin %s --transform-interpreter 2>&1 | FileCheck %s
+
 !any = !transform.any_op
 #map = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
 #map1 = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>
@@ -78,8 +80,6 @@ module attributes {transform.with_named_sequence} {
         {kernel_names = ["decode_partial", "decode_merge"]}
         : (!any) -> (!any, !any)
     transform.verify %func : !any
-    // transform.htile.semantic_to_kernel_abi %func : !any
-    // transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     transform.yield
   }
@@ -171,3 +171,57 @@ module attributes {transform.with_named_sequence} {
     return %26 : tensor<1x4x1x64xf16>
   }
 }
+
+// CHECK-LABEL: func.func @attention(
+// CHECK-SAME: %arg0: tensor<1x4x1x64xf16>, %arg1: tensor<1x4x1024x64xf16>, %arg2: tensor<1x4x1024x64xf16>) -> tensor<1x4x1x64xf16>
+// CHECK: memref.alloc() : memref<4x16xf32>
+// CHECK: memref.alloc() : memref<4x64x16xf32>
+// CHECK: memref.alloc() : memref<4x16xf32>
+// CHECK: htile.launch_func @decode_partial
+// CHECK-SAME: {program_bounds = array<i64: 4, 16>}
+// CHECK: htile.launch_func @decode_merge
+// CHECK-SAME: {program_bounds = array<i64: 4>}
+// CHECK: bufferization.to_tensor
+// CHECK: return
+
+// CHECK-LABEL: htile.kernel @decode_partial
+// CHECK-SAME: memref<1x4x1x64xf16>
+// CHECK-SAME: memref<1x4x1024x64xf16>
+// CHECK-SAME: memref<4x16xf32>
+// CHECK-SAME: memref<1x4x1024x64xf16>
+// CHECK-SAME: memref<4x64x16xf32>
+// CHECK-SAME: memref<4x16xf32>
+// CHECK-SAME: attributes {program_bounds = array<i64: 4, 16>}
+// CHECK: htile.program_id 0
+// CHECK: htile.program_id 1
+// CHECK: htile.load %arg0
+// CHECK: htile.load %arg1
+// CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} {transpose_b}
+// CHECK: htile.reduce %{{.*}} axis 0 kind "max" : tensor<64xf32> -> tensor<f32>
+// CHECK: math.exp2
+// CHECK: htile.load %arg3
+// CHECK: htile.load %arg4
+// CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<64xf32>, tensor<64x64xf16>, tensor<64xf32> -> tensor<64xf32>
+// CHECK: htile.reduce %{{.*}} axis 0 kind "sum" : tensor<64xf32> -> tensor<f32>
+// CHECK: htile.store %{{.*}}, %arg2
+// CHECK: htile.store %{{.*}}, %arg4
+// CHECK: htile.store %{{.*}}, %arg5
+// CHECK: htile.return
+
+// CHECK-LABEL: htile.kernel @decode_merge
+// CHECK-SAME: memref<4x16xf32>
+// CHECK-SAME: memref<4x16xf32>
+// CHECK-SAME: memref<4x64x16xf32>
+// CHECK-SAME: memref<1x4x1x64xf16>
+// CHECK-SAME: attributes {program_bounds = array<i64: 4>}
+// CHECK: htile.program_id 0
+// CHECK: htile.load %arg0
+// CHECK: htile.reduce %{{.*}} axis 3 kind "max"
+// CHECK: htile.load %arg1
+// CHECK: math.exp2
+// CHECK: htile.load %arg2
+// CHECK: htile.reduce %{{.*}} axis 4 kind "sum"
+// CHECK: arith.divf
+// CHECK: arith.truncf
+// CHECK: htile.store %{{.*}}, %arg3
+// CHECK: htile.return
