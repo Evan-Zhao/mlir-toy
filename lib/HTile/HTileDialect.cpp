@@ -27,8 +27,7 @@ void HTileDialect::initialize() {
 
 mlir::ParseResult KernelOp::parse(mlir::OpAsmParser &parser, mlir::OperationState &result) {
   mlir::StringAttr nameAttr;
-  if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(),
-                             result.attributes))
+  if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(), result.attributes))
     return mlir::failure();
 
   llvm::SmallVector<mlir::OpAsmParser::Argument> args;
@@ -48,12 +47,12 @@ void KernelOp::print(mlir::OpAsmPrinter &printer) {
   printer << ' ';
   printer.printSymbolName(getSymName());
   printer << '(';
-  llvm::interleaveComma(getBody().getArguments(), printer, [&](mlir::BlockArgument arg) {
-    printer << arg << " : " << arg.getType();
-  });
-  printer << ") ";
-  printer.printOptionalAttrDictWithKeyword(
-      (*this)->getAttrs(), {mlir::SymbolTable::getSymbolAttrName()});
+  llvm::interleaveComma(getBody().getArguments(), printer,
+                        [&](mlir::BlockArgument arg) { printer << arg << " : " << arg.getType(); });
+  printer << ")";
+  printer.printOptionalAttrDictWithKeyword((*this)->getAttrs(),
+                                           {mlir::SymbolTable::getSymbolAttrName()});
+  printer << ' ';
   printer.printRegion(getBody(), /*printEntryBlockArgs=*/false);
 }
 
@@ -81,8 +80,8 @@ mlir::LogicalResult BroadcastOp::verify() {
   std::optional<int64_t> previous;
   for (int64_t dim : dimensions) {
     if (dim < 0 || dim >= resultRank)
-      return emitOpError() << "broadcast dimension " << dim
-                           << " is outside result rank " << resultRank;
+      return emitOpError() << "broadcast dimension " << dim << " is outside result rank "
+                           << resultRank;
     if (previous && dim <= *previous)
       return emitOpError() << "requires broadcast dimensions to be strictly increasing";
     isBroadcastDim[static_cast<size_t>(dim)] = true;
@@ -95,8 +94,7 @@ mlir::LogicalResult BroadcastOp::verify() {
       continue;
     int64_t inputExtent = inputType.getDimSize(inputDim);
     int64_t resultExtent = resultType.getDimSize(resultDim);
-    if (inputExtent != mlir::ShapedType::kDynamic &&
-        resultExtent != mlir::ShapedType::kDynamic &&
+    if (inputExtent != mlir::ShapedType::kDynamic && resultExtent != mlir::ShapedType::kDynamic &&
         inputExtent != resultExtent)
       return emitOpError() << "input dimension " << inputDim << " has extent " << inputExtent
                            << " but mapped result dimension " << resultDim << " has extent "

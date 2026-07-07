@@ -32,24 +32,46 @@ def HTile_HelloOp : Op<HTile_Dialect, "hello"> {
   let assemblyFormat = "attr-dict";
 }
 
-def HTile_KernelOp : Op<HTile_Dialect, "kernel",
-                         [IsolatedFromAbove, SingleBlock,
-                          SingleBlockImplicitTerminator<"ReturnOp">, Symbol]> {
+def HTile_KernelOp
+    : Op<HTile_Dialect, "kernel",
+         [IsolatedFromAbove, SingleBlock, SingleBlockImplicitTerminator<"ReturnOp">, Symbol]> {
   let summary = "HTile device kernel";
   let description = [{
     `htile.kernel` is a symbol-like device-code container. Values used by the
     kernel body must be explicit entry block arguments; the region is isolated
     from above and terminates with `htile.return`.
+
+    `program_bounds` records the generic static launch-domain extent for each
+    `htile.program_id` dimension used by the kernel body.
   }];
 
-  let arguments = (ins SymbolNameAttr:$sym_name);
+  let arguments = (ins SymbolNameAttr:$sym_name, OptionalAttr<DenseI64ArrayAttr>:$program_bounds);
   let regions = (region SizedRegion<1>:$body);
+
+  let builders = [OpBuilder<(ins "::llvm::StringRef":$symName), [{
+      build($_builder, $_state, $_builder.getStringAttr(symName),
+            /*programBounds=*/nullptr);
+    }]>];
 
   let hasCustomAssemblyFormat = 1;
 }
 
-def HTile_LaunchFuncOp : Op<HTile_Dialect, "launch_func",
-                            [DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+def HTile_ProgramIdOp : Op<HTile_Dialect, "program_id", [Pure, HasParent<"KernelOp">]> {
+  let summary = "get the current HTile program id";
+  let description = [{
+    Returns the id of the current logical program instance along a generic
+    launch-domain dimension. The dimension is target-independent and may later
+    be mapped to GPU blocks, CPU parallel workers, or another backend schedule.
+  }];
+
+  let arguments = (ins I64Attr:$dimension);
+  let results = (outs Index:$result);
+
+  let assemblyFormat = "$dimension attr-dict";
+}
+
+def HTile_LaunchFuncOp
+    : Op<HTile_Dialect, "launch_func", [DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
   let summary = "launch an HTile device kernel";
   let description = [{
     `htile.launch_func` is a host-side launch operation that references an
@@ -63,8 +85,8 @@ def HTile_LaunchFuncOp : Op<HTile_Dialect, "launch_func",
   let assemblyFormat = "$kernel `(` $operands `)` attr-dict `:` type($operands)";
 }
 
-def HTile_ReturnOp : Op<HTile_Dialect, "return",
-                        [Pure, HasParent<"KernelOp">, ReturnLike, Terminator]> {
+def HTile_ReturnOp
+    : Op<HTile_Dialect, "return", [Pure, HasParent<"KernelOp">, ReturnLike, Terminator]> {
   let summary = "return from an HTile kernel";
   let description = [{
     Terminates an `htile.kernel` body. Kernel results are intentionally not

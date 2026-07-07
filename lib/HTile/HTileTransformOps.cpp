@@ -14,8 +14,10 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Transforms/Transforms.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
@@ -1023,6 +1025,175 @@ LogicalResult bufferizeForallResultUses(RewriterBase &rewriter, ArrayRef<scf::Fo
   return success();
 }
 
+std::string getRequestedKernelName(ArrayAttr kernelNames, size_t index) {
+  if (kernelNames)
+    return cast<StringAttr>(kernelNames[index]).getValue().str();
+  return ("outlined_kernel_" + Twine(index)).str();
+}
+
+std::string getUniqueKernelName(Operation *symbolTableOp, StringRef baseName) {
+  if (!SymbolTable::lookupSymbolIn(symbolTableOp, baseName))
+    return baseName.str();
+
+  unsigned uniquingCounter = 0;
+  SmallString<32> name = SymbolTable::generateSymbolName<32>(
+      baseName,
+      [&](StringRef candidate) {
+        return SymbolTable::lookupSymbolIn(symbolTableOp, candidate) != nullptr;
+      },
+      uniquingCounter);
+  return name.str().str();
+}
+
+struct OutlinedKernel {
+  scf::ForallOp forall;
+  htile::KernelOp kernel;
+  SmallVector<Value> operands;
+  htile::LaunchFuncOp launch;
+};
+
+FailureOr<std::pair<SmallVector<Value>, SmallVector<int64_t>>>
+getLoopNormalizedIVsAndTripCounts(RewriterBase &rewriter, scf::ForallOp forall) {
+  auto lowerBounds = forall.getMixedLowerBound(), upperBounds = forall.getMixedUpperBound(),
+       steps = forall.getMixedStep();
+  Location loc = forall.getLoc();
+  Type indexType = rewriter.getIndexType();
+
+  size_t nDims = lowerBounds.size();
+  SmallVector<int64_t> tripCounts;
+  tripCounts.reserve(nDims);
+  SmallVector<Value> ids;
+  ids.reserve(nDims);
+  for (size_t index = 0; index < nDims; ++index) {
+    std::optional<int64_t> maybeLower = getConstantIntValue(lowerBounds[index]),
+                           maybeUpper = getConstantIntValue(upperBounds[index]),
+                           maybeStep = getConstantIntValue(steps[index]);
+    if (!maybeLower || !maybeUpper || !maybeStep)
+      return forall.emitError() << "expected static lower/upper/step for forall dimension "
+                                << index;
+    if (*maybeStep <= 0)
+      return forall.emitError() << "expected positive static step for forall dimension " << index;
+    if (*maybeUpper < *maybeLower)
+      return forall.emitError() << "expected upper bound to be >= lower bound for dimension "
+                                << index;
+
+    Value id = htile::ProgramIdOp::create(rewriter, loc, indexType, index);
+    if (*maybeStep != 1) {
+      Value stepValue = arith::ConstantIndexOp::create(rewriter, loc, *maybeStep);
+      id = arith::MulIOp::create(rewriter, loc, id, stepValue);
+    }
+    if (*maybeLower != 0) {
+      Value lowerValue = arith::ConstantIndexOp::create(rewriter, loc, *maybeLower);
+      id = arith::AddIOp::create(rewriter, loc, id, lowerValue);
+    }
+    ids.push_back(id);
+
+    int64_t distance = *maybeUpper - *maybeLower;
+    tripCounts.push_back((distance + *maybeStep - 1) / *maybeStep);
+  }
+
+  return std::make_pair(ids, tripCounts);
+}
+
+FailureOr<SmallVector<Value>> legalizeKernelExternalValues(RewriterBase &rewriter,
+                                                           htile::KernelOp kernel) {
+  Region &region = kernel.getBody();
+  Block &entryBlock = region.front();
+
+  llvm::SetVector<Value> captures;
+  kernel.walk([&](Operation *op) {
+    for (Value operand : op->getOperands()) {
+      if (!region.isAncestor(operand.getParentRegion()))
+        captures.insert(operand);
+    }
+  });
+
+  SmallVector<Value> operands;
+  OpBuilder::InsertionGuard guard(rewriter);
+  // Allow captures to be memrefs or arith.constant. If it's a constant, copy it into the kernel.
+  for (Value capture : captures) {
+    if (isa<MemRefType>(capture.getType())) {
+      BlockArgument arg = entryBlock.addArgument(capture.getType(), capture.getLoc());
+      rewriter.replaceUsesWithIf(capture, arg, [&](OpOperand &use) {
+        return region.isAncestor(use.getOwner()->getParentRegion());
+      });
+      operands.push_back(capture);
+      continue;
+    }
+
+    Operation *def = capture.getDefiningOp();
+    if (!isa_and_nonnull<arith::ConstantOp>(def))
+      return kernel.emitError() << "unsupported non-memref kernel capture: " << capture;
+    rewriter.setInsertionPointToStart(&entryBlock);
+    Operation *cloned = rewriter.clone(*def);
+    rewriter.replaceUsesWithIf(capture, cloned->getResult(0), [&](OpOperand &use) {
+      return region.isAncestor(use.getOwner()->getParentRegion());
+    });
+  }
+
+  return operands;
+}
+
+FailureOr<SmallVector<OutlinedKernel>> createKernelOps(RewriterBase &rewriter, Operation *hostOp,
+                                                       ArrayRef<scf::ForallOp> forallOps,
+                                                       ArrayAttr kernelNames) {
+  Operation *symbolTableOp = SymbolTable::getNearestSymbolTable(hostOp);
+  if (!symbolTableOp)
+    return hostOp->emitError() << "expected selected forall parent to have a symbol table";
+
+  SmallVector<OutlinedKernel> kernels;
+  kernels.reserve(forallOps.size());
+  Operation *insertAfter = hostOp;
+  for (auto [index, forallValue] : llvm::enumerate(forallOps)) {
+    scf::ForallOp forall = forallValue;
+    std::string requestedName = getRequestedKernelName(kernelNames, index);
+    std::string kernelName = getUniqueKernelName(symbolTableOp, requestedName);
+
+    // Create the kernel after the current hostOp (typically a func.func).
+    rewriter.setInsertionPointAfter(insertAfter);
+    auto kernel = htile::KernelOp::create(rewriter, forall.getLoc(), kernelName);
+    Block *body = new Block();
+    kernel.getBody().push_back(body);
+
+    // Map the induction variables to the program IDs, then clone the forall body into the kernel.
+    rewriter.setInsertionPointToStart(body);
+    auto ivsAndTripCounts = getLoopNormalizedIVsAndTripCounts(rewriter, forall);
+    if (failed(ivsAndTripCounts))
+      return failure();
+    auto [programIds, programBounds] = *ivsAndTripCounts;
+    kernel.setProgramBoundsAttr(DenseI64ArrayAttr::get(rewriter.getContext(), programBounds));
+    IRMapping mapping;
+    mapping.map(forall.getInductionVars(), programIds);
+    cloneBlockWithoutTerminator(rewriter, *forall.getBody(), mapping);
+    htile::ReturnOp::create(rewriter, forall.getLoc());
+
+    // Check what values are used from the body of the kernel, and list them as operands for the
+    // kernel. Only allow memrefs in the operands. Constants are copied into the kernel.
+    FailureOr<SmallVector<Value>> operands = legalizeKernelExternalValues(rewriter, kernel);
+    if (failed(operands))
+      return failure();
+    kernels.push_back(OutlinedKernel{.forall = forall,
+                                     .kernel = kernel,
+                                     .operands = std::move(*operands),
+                                     .launch = htile::LaunchFuncOp()});
+    insertAfter = kernel.getOperation();
+  }
+
+  return kernels;
+}
+
+void createLaunchOpsAndEraseForalls(RewriterBase &rewriter,
+                                    MutableArrayRef<OutlinedKernel> kernels) {
+  for (OutlinedKernel &outlined : kernels) {
+    rewriter.setInsertionPoint(outlined.forall);
+    outlined.launch = htile::LaunchFuncOp::create(rewriter, outlined.forall.getLoc(),
+                                                  outlined.kernel.getSymName(), outlined.operands);
+    if (auto programBounds = outlined.kernel.getProgramBoundsAttr())
+      outlined.launch->setAttr("program_bounds", programBounds);
+    rewriter.eraseOp(outlined.forall);
+  }
+}
+
 } // namespace
 
 void HTileLinalgToSemanticOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
@@ -1096,7 +1267,6 @@ void HTileOutlineKernelsOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInst
 DiagnosedSilenceableFailure HTileOutlineKernelsOp::apply(TransformRewriter &rewriter,
                                                          TransformResults &results,
                                                          TransformState &state) {
-  (void)results;
   auto transform = cast<TransformOpInterface>(getOperation());
 
   SmallVector<scf::ForallOp> forallOps;
@@ -1134,9 +1304,21 @@ DiagnosedSilenceableFailure HTileOutlineKernelsOp::apply(TransformRewriter &rewr
       BAIL("failed to rebuild forall without outputs");
     forall = *newForall;
   }
-  llvm::errs() << "Current module: " << *hostOp->getParentOp() << "\n";
+  // Create an htile.kernel op for each forall op, with the boundary memrefs as operands.
+  FailureOr<SmallVector<OutlinedKernel>> kernels =
+      createKernelOps(rewriter, hostOp, forallOps, kernelNames);
+  if (failed(kernels))
+    BAIL("failed to create htile.kernel ops");
+  createLaunchOpsAndEraseForalls(rewriter, *kernels);
 
-  BAIL("transform.htile.outline_kernels is not implemented yet");
+  SmallVector<Operation *> launchOps =
+      llvm::map_to_vector(*kernels, [](auto &kernel) { return kernel.launch.getOperation(); });
+  SmallVector<Operation *> kernelOps =
+      llvm::map_to_vector(*kernels, [](auto &kernel) { return kernel.kernel.getOperation(); });
+  results.set(getOperation()->getResult(0), launchOps);
+  results.set(getOperation()->getResult(1), kernelOps);
+
+  return DiagnosedSilenceableFailure::success();
 }
 
 } // namespace mlir::transform
