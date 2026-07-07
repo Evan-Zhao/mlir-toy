@@ -5,6 +5,7 @@
 #include "HTile/HTileTransformOps.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Tools/Plugins/DialectPlugin.h"
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -22,6 +23,46 @@ void HTileDialect::initialize() {
 #define GET_OP_LIST
 #include "HTileOps.cpp.inc"
       >();
+}
+
+mlir::ParseResult KernelOp::parse(mlir::OpAsmParser &parser, mlir::OperationState &result) {
+  mlir::StringAttr nameAttr;
+  if (parser.parseSymbolName(nameAttr, mlir::SymbolTable::getSymbolAttrName(),
+                             result.attributes))
+    return mlir::failure();
+
+  llvm::SmallVector<mlir::OpAsmParser::Argument> args;
+  if (parser.parseArgumentList(args, mlir::OpAsmParser::Delimiter::Paren,
+                               /*allowType=*/true) ||
+      parser.parseOptionalAttrDictWithKeyword(result.attributes))
+    return mlir::failure();
+
+  mlir::Region *body = result.addRegion();
+  if (parser.parseRegion(*body, args, /*enableNameShadowing=*/true))
+    return mlir::failure();
+  KernelOp::ensureTerminator(*body, parser.getBuilder(), result.location);
+  return mlir::success();
+}
+
+void KernelOp::print(mlir::OpAsmPrinter &printer) {
+  printer << ' ';
+  printer.printSymbolName(getSymName());
+  printer << '(';
+  llvm::interleaveComma(getBody().getArguments(), printer, [&](mlir::BlockArgument arg) {
+    printer << arg << " : " << arg.getType();
+  });
+  printer << ") ";
+  printer.printOptionalAttrDictWithKeyword(
+      (*this)->getAttrs(), {mlir::SymbolTable::getSymbolAttrName()});
+  printer.printRegion(getBody(), /*printEntryBlockArgs=*/false);
+}
+
+mlir::LogicalResult LaunchFuncOp::verifySymbolUses(mlir::SymbolTableCollection &symbolTable) {
+  KernelOp kernelOp = symbolTable.lookupNearestSymbolFrom<KernelOp>(*this, getKernelAttr());
+  if (!kernelOp)
+    return emitOpError() << "'" << getKernelAttr().getValue()
+                         << "' does not reference a valid htile.kernel";
+  return mlir::success();
 }
 
 mlir::LogicalResult BroadcastOp::verify() {

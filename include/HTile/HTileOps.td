@@ -7,6 +7,9 @@
 include "HTile/HTileDialect.td"
 include "mlir/IR/CommonTypeConstraints.td"
 include "mlir/IR/CommonAttrConstraints.td"
+include "mlir/IR/SymbolInterfaces.td"
+include "mlir/Interfaces/ControlFlowInterfaces.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
 
 def HTile_WarpPolicyAttr
     : Attr<And<[StrAttr.predicate,
@@ -26,6 +29,49 @@ def HTile_HelloOp : Op<HTile_Dialect, "hello"> {
     A zero-operand, zero-result operation used to demonstrate a custom op.
   }];
 
+  let assemblyFormat = "attr-dict";
+}
+
+def HTile_KernelOp : Op<HTile_Dialect, "kernel",
+                         [IsolatedFromAbove, SingleBlock,
+                          SingleBlockImplicitTerminator<"ReturnOp">, Symbol]> {
+  let summary = "HTile device kernel";
+  let description = [{
+    `htile.kernel` is a symbol-like device-code container. Values used by the
+    kernel body must be explicit entry block arguments; the region is isolated
+    from above and terminates with `htile.return`.
+  }];
+
+  let arguments = (ins SymbolNameAttr:$sym_name);
+  let regions = (region SizedRegion<1>:$body);
+
+  let hasCustomAssemblyFormat = 1;
+}
+
+def HTile_LaunchFuncOp : Op<HTile_Dialect, "launch_func",
+                            [DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "launch an HTile device kernel";
+  let description = [{
+    `htile.launch_func` is a host-side launch operation that references an
+    `htile.kernel` symbol and passes explicit launch operands. Thrust 1 keeps
+    launches result-free; inter-kernel values must flow through explicit buffer
+    operands.
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$kernel, Variadic<AnyType>:$operands);
+
+  let assemblyFormat = "$kernel `(` $operands `)` attr-dict `:` type($operands)";
+}
+
+def HTile_ReturnOp : Op<HTile_Dialect, "return",
+                        [Pure, HasParent<"KernelOp">, ReturnLike, Terminator]> {
+  let summary = "return from an HTile kernel";
+  let description = [{
+    Terminates an `htile.kernel` body. Kernel results are intentionally not
+    supported in the minimal launch ABI.
+  }];
+
+  let builders = [OpBuilder<(ins), [{ /* nothing to do */ }]>];
   let assemblyFormat = "attr-dict";
 }
 

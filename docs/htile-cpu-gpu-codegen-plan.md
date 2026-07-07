@@ -61,7 +61,7 @@ debug quickly and broad enough to prove the CPU+GPU split.
 
 ### Checklist
 
-- [ ] Define `htile.kernel`, `htile.launch_func`, and `htile.return`.
+- [x] Define `htile.kernel`, `htile.launch_func`, and `htile.return`.
 - [ ] Add transform-driven outlining for selected top-level `scf.forall` loop nests.
 - [ ] Allow mixed host functions with outlined kernels and remaining inline HTile code.
 - [ ] Add a verifier or late legality check that rejects inline executable HTile code before final
@@ -72,27 +72,21 @@ debug quickly and broad enough to prove the CPU+GPU split.
 
 ### Kernel Ops
 
-Introduce the minimal kernel boundary operations:
+The minimal kernel boundary operations are now:
 
-1. `htile.kernel`
-   A symbol op with one device-code region. The region is isolated from above. Kernel operands are
-   explicit block arguments. The body terminates with `htile.return`.
+1. `htile.kernel @name(%arg0: type, ...) { ... }`
+   Symbol-like device-code container with one isolated single-block region. Kernel operands are
+   explicit block arguments and are expected not to be tensors in the launchable form. The body
+   terminates with `htile.return`.
 
-1. `htile.launch_func`
-   A host op that references an `htile.kernel` symbol and passes explicit operands. Launch
-   configuration should live primarily on the launch op; kernel attributes can record ABI or codegen
-   assumptions.
+1. `htile.launch_func @name(%arg0, ...) {launch_attrs} : type(%arg0), ...`
+   Host-side launch operation that references an `htile.kernel` symbol and passes explicit operands.
+   Launch configuration should live primarily on the launch op; kernel attributes can record codegen
+   assumptions. It is designed to have no data results, so tensor values crossing this boundary must
+   already have been bufferized into explicit operands.
 
 1. `htile.return`
-   Terminator for `htile.kernel`.
-
-Initial restrictions:
-
-- support only single-block kernel bodies,
-- support operands only, no kernel results,
-- require inter-kernel data to be passed through explicit temp buffers,
-- outline only selected top-level `scf.forall` loop nests,
-- allow mixed host functions during partial lowering.
+   Result-free terminator for `htile.kernel`.
 
 ### Implementation Contract
 
