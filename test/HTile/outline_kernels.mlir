@@ -53,7 +53,7 @@ module attributes {transform.with_named_sequence} {
 // CHECK-SAME: attributes {program_bounds = array<i64: 4>}
 // CHECK: htile.program_id 0
 // CHECK-NOT: scf.forall
-// CHECK: bufferization.materialize_in_destination
+// CHECK: htile.store
 // CHECK: htile.return
 
 // CHECK-LABEL: htile.kernel @consumer
@@ -61,7 +61,7 @@ module attributes {transform.with_named_sequence} {
 // CHECK-SAME: attributes {program_bounds = array<i64: 4>}
 // CHECK: htile.program_id 0
 // CHECK-NOT: scf.forall
-// CHECK: bufferization.materialize_in_destination
+// CHECK: htile.store
 // CHECK: htile.return
 
 // -----
@@ -115,6 +115,6 @@ module attributes {transform.with_named_sequence} {
 // CHECK-SAME: attributes {program_bounds = array<i64: 4>}
 // CHECK: htile.program_id 0
 // CHECK-NOT: scf.forall
-// CHECK: bufferization.materialize_in_destination
-// CHECK: bufferization.materialize_in_destination
+// CHECK: htile.store
+// CHECK: htile.store
 // CHECK: htile.return

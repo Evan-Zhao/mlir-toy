@@ -793,8 +793,10 @@ LogicalResult materializeStoreForForallResult(RewriterBase &rewriter, OutputStor
 FailureOr<scf::ForallOp> rebuildForallWithoutOutputs(RewriterBase &rewriter,
                                                      scf::ForallOp forallOp) {
   for (BlockArgument outputArg : forallOp.getRegionOutArgs()) {
-    if (!outputArg.use_empty())
+    if (!outputArg.use_empty()) {
+      outputArg.user_begin()->emitRemark() << "one of the remaining uses here";
       return forallOp.emitError() << "unsupported remaining use of scf.forall shared_out";
+    }
   }
   for (OpResult result : forallOp->getResults()) {
     if (!result.use_empty())
@@ -903,33 +905,54 @@ struct TensorToBufferMap {
   DenseMap<Value, Value> tensorToMemref;
 };
 
-void materializeStoreForInsertSlice(RewriterBase &rewriter, scf::ForallOp forall,
-                                    tensor::ParallelInsertSliceOp insert, Value buffer) {
-  using bufferization::MaterializeInDestinationOp;
-  auto sourceType = cast<RankedTensorType>(insert.getSourceType());
-  auto bufferType = cast<MemRefType>(buffer.getType());
-  auto subviewType = memref::SubViewOp::inferRankReducedResultType(
-      sourceType.getShape(), bufferType, insert.getMixedOffsets(), insert.getMixedSizes(),
-      insert.getMixedStrides());
-  Value subview = memref::SubViewOp::create(rewriter, insert.getLoc(), subviewType, buffer,
-                                            insert.getMixedOffsets(), insert.getMixedSizes(),
-                                            insert.getMixedStrides());
-  MaterializeInDestinationOp::create(rewriter, insert.getLoc(), TypeRange{}, insert.getSource(),
-                                     subview, rewriter.getUnitAttr(), rewriter.getUnitAttr());
+LogicalResult materializeStoreForInsertSlice(RewriterBase &rewriter,
+                                             tensor::ParallelInsertSliceOp insert, Value buffer) {
+  if (!insert.hasUnitStride())
+    return insert.emitError() << "unsupported non-unit tensor.parallel_insert_slice stride";
+  SmallVector<Value> offsets =
+      getValueOrCreateConstantIndexOp(rewriter, insert.getLoc(), insert.getMixedOffsets());
+  htile::StoreOp::create(rewriter, insert.getLoc(), insert.getSource(), buffer, offsets);
+  return success();
 }
 
-Value materializeLoadForExtractSlice(OpBuilder &builder, tensor::ExtractSliceOp extract,
-                                     Value buffer) {
-  auto sourceMemrefType = cast<MemRefType>(buffer.getType());
-  auto resultType = cast<RankedTensorType>(extract.getResultType());
-  auto subviewType = memref::SubViewOp::inferRankReducedResultType(
-      resultType.getShape(), sourceMemrefType, extract.getMixedOffsets(), extract.getMixedSizes(),
-      extract.getMixedStrides());
-  Value subview = memref::SubViewOp::create(builder, extract.getLoc(), subviewType, buffer,
-                                            extract.getMixedOffsets(), extract.getMixedSizes(),
-                                            extract.getMixedStrides());
-  return ToTensorOp::create(builder, extract.getLoc(), resultType, subview, /*restrict=*/true,
-                            /*writable=*/true);
+FailureOr<Value> materializeLoadForExtractSlice(OpBuilder &builder, tensor::ExtractSliceOp extract,
+                                                Value buffer, bool emitHTileLoad) {
+  if (emitHTileLoad) {
+    if (!extract.hasUnitStride())
+      return extract.emitError() << "unsupported non-unit tensor.extract_slice stride";
+    SmallVector<Value> offsets =
+        getValueOrCreateConstantIndexOp(builder, extract.getLoc(), extract.getMixedOffsets());
+    auto loadOp =
+        htile::LoadOp::create(builder, extract.getLoc(), extract.getResultType(), buffer, offsets);
+    return loadOp.getResult();
+  } else {
+    auto sourceMemrefType = cast<MemRefType>(buffer.getType());
+    auto resultType = cast<RankedTensorType>(extract.getResultType());
+    auto subviewType = memref::SubViewOp::inferRankReducedResultType(
+        resultType.getShape(), sourceMemrefType, extract.getMixedOffsets(), extract.getMixedSizes(),
+        extract.getMixedStrides());
+    Value subview = memref::SubViewOp::create(builder, extract.getLoc(), subviewType, buffer,
+                                              extract.getMixedOffsets(), extract.getMixedSizes(),
+                                              extract.getMixedStrides());
+    auto loadOp =
+        ToTensorOp::create(builder, extract.getLoc(), resultType, subview, /*restrict=*/true,
+                           /*writable=*/true);
+    return loadOp.getResult();
+  }
+}
+
+Value materializeLoadForWholeTensor(OpBuilder &builder, Location loc, RankedTensorType tensorType,
+                                    Value buffer, bool emitHTileLoad) {
+  if (emitHTileLoad) {
+    SmallVector<Value> offsets;
+    offsets.reserve(tensorType.getRank());
+    for (int64_t i = 0, e = tensorType.getRank(); i < e; ++i)
+      offsets.push_back(arith::ConstantIndexOp::create(builder, loc, 0));
+    return htile::LoadOp::create(builder, loc, tensorType, buffer, offsets);
+  } else {
+    return ToTensorOp::create(builder, loc, tensorType, buffer,
+                              /*restrict=*/true, /*writable=*/true);
+  }
 }
 
 LogicalResult bufferizeForallResults(RewriterBase &rewriter, ArrayRef<scf::ForallOp> forallOps,
@@ -965,30 +988,33 @@ LogicalResult bufferizeForallResults(RewriterBase &rewriter, ArrayRef<scf::Foral
       if (!buffer)
         return insert.emitError()
                << "this op doesn't publish to a tensor-typed block argument of the loop";
-      materializeStoreForInsertSlice(rewriter, forall, insert, buffer);
+      if (failed(materializeStoreForInsertSlice(rewriter, insert, buffer)))
+        return failure();
       rewriter.eraseOp(insert);
     }
   }
   return success();
 }
 
-bool materializeLoadsForTensorUsers(RewriterBase &rewriter, OpOperand &use,
-                                    RankedTensorType tensorType, Value buffer) {
+FailureOr<bool> materializeLoadsForTensorUsers(RewriterBase &rewriter, OpOperand &use,
+                                               RankedTensorType tensorType, Value buffer,
+                                               bool emitHTileLoad) {
   Operation *owner = use.getOwner();
   OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPoint(owner);
   if (auto extract = dyn_cast<tensor::ExtractSliceOp>(owner)) {
-    // If the use is a tensor.extract_slice, we materialize a sliced load of the buffer.
-    Value sliced = materializeLoadForExtractSlice(rewriter, extract, buffer);
-    rewriter.replaceOp(extract, sliced);
-    return true; // Op erased
+    // If the use is a tensor.extract_slice, materialize a sliced read of the buffer.
+    auto loaded = materializeLoadForExtractSlice(rewriter, extract, buffer, emitHTileLoad);
+    if (failed(loaded))
+      return failure();
+    rewriter.replaceOp(extract, *loaded);
+    return FailureOr<bool>(true); // Op erased
   } else {
-    // Otherwise, fall back to a full load of the buffer.
+    // Otherwise, fall back to a full read of the buffer.
     Value loaded =
-        ToTensorOp::create(rewriter, owner->getLoc(), tensorType, buffer, /*restrict=*/true,
-                           /*writable=*/true);
+        materializeLoadForWholeTensor(rewriter, owner->getLoc(), tensorType, buffer, emitHTileLoad);
     use.set(loaded);
-    return false; // Op not erased
+    return FailureOr<bool>(false); // Op not erased
   }
 }
 
@@ -996,23 +1022,35 @@ LogicalResult bufferizeTensorReadInForalls(RewriterBase &rewriter,
                                            ArrayRef<scf::ForallOp> forallOps,
                                            TensorToBufferMap &map) {
   for (auto forall : forallOps) {
-    forall.getBody()->walk([&](Operation *op) {
+    DenseSet<Value> blockArgs;
+    for (auto arg : forall.getBody()->getArguments()) {
+      blockArgs.insert(arg);
+    }
+    WalkResult walkResult = forall.getBody()->walk([&](Operation *op) {
       for (OpOperand &operand : op->getOpOperands()) {
         // Skip non-tensors, and tensors defined inside the loop body (not block arguments).
         Value tensor = operand.get();
         auto tensorType = dyn_cast<RankedTensorType>(tensor.getType());
         if (!tensorType)
           continue;
+        bool isBlockArg = blockArgs.count(tensor);
         bool isInLoop = forall.getRegion().isAncestor(tensor.getParentRegion());
-        if (isInLoop)
+        if (isInLoop && !isBlockArg)
           continue;
-        Value buffer = map.getOrCreateTensorMemrefForRead(rewriter, forall, tensor);
+        auto buffer = map.getOrCreateTensorMemrefForRead(rewriter, forall, tensor);
         // If this op is an extract_slice, it may be entirely removed.
-        if (materializeLoadsForTensorUsers(rewriter, operand, tensorType, buffer))
+        FailureOr<bool> erased =
+            materializeLoadsForTensorUsers(rewriter, operand, tensorType, buffer,
+                                           /*emitHTileLoad=*/true);
+        if (failed(erased))
+          return WalkResult::interrupt();
+        if (*erased)
           return WalkResult::skip();
       }
       return WalkResult::advance();
     });
+    if (walkResult.wasInterrupted())
+      return failure();
   }
   return success();
 }
@@ -1026,7 +1064,9 @@ LogicalResult bufferizeForallResultUses(RewriterBase &rewriter, ArrayRef<scf::Fo
       if (!buffer)
         continue;
       auto tensorType = cast<RankedTensorType>(tensor.getType());
-      materializeLoadsForTensorUsers(rewriter, use, tensorType, buffer);
+      if (failed(materializeLoadsForTensorUsers(rewriter, use, tensorType, buffer,
+                                                /*emitHTileLoad=*/false)))
+        return failure();
     }
   }
   return success();

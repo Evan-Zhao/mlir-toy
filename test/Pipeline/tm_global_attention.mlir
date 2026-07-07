@@ -240,21 +240,17 @@ module attributes {transform.with_named_sequence} {
 // CHECK: htile.full %{{.*}} : f32 -> tensor<128xf32>
 // CHECK: htile.full %{{.*}} : f32 -> tensor<128x128xf32>
 // CHECK: %{{.*}}:3 = scf.for %{{.*}} = %c0 to %c2 step %c1 iter_args(%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}) -> (tensor<128xf32>, tensor<128x128xf32>, tensor<128xf32>)
-// CHECK: memref.subview %arg0
-// CHECK: bufferization.to_tensor
-// CHECK: memref.subview %arg1
-// CHECK: bufferization.to_tensor
+// CHECK: htile.load %arg0
+// CHECK: htile.load %arg1
 // CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} {transpose_b} : tensor<128x128xf16>, tensor<64x128xf16>, tensor<128x64xf32> -> tensor<128x64xf32>
 // CHECK: htile.reduce %{{.*}} axis 1 kind "max" : tensor<128x64xf32> -> tensor<128xf32>
 // CHECK: htile.broadcast %{{.*}} dimensions = [1] : tensor<128xf32> -> tensor<128x64xf32>
 // CHECK: math.exp2 %{{.*}} : tensor<128x64xf32>
-// CHECK: memref.subview %arg2
-// CHECK: bufferization.to_tensor
+// CHECK: htile.load %arg2
 // CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<128x64xf32>, tensor<64x128xf16>, tensor<128x128xf32> -> tensor<128x128xf32>
 // CHECK: htile.reduce %{{.*}} axis 1 kind "sum" : tensor<128x64xf32> -> tensor<128xf32>
 // CHECK: arith.divf %{{.*}}, %{{.*}} : tensor<128x128xf32>
 // CHECK: arith.truncf %{{.*}} : tensor<128x128xf32> to tensor<128x128xf16>
-// CHECK: memref.subview %arg3
-// CHECK: bufferization.materialize_in_destination
+// CHECK: htile.store %{{.*}}, %arg3
 // CHECK-NOT: tensor.parallel_insert_slice
 // CHECK: htile.return
