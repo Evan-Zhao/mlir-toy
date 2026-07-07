@@ -64,9 +64,6 @@ debug quickly and broad enough to prove the CPU+GPU split.
 - [x] Define `htile.kernel`, `htile.launch_func`, and `htile.return`.
 - [x] Add targeted bufferization across kernel (loop nest) boundaries.
 - [x] Add kernel outlining for selected top-level loop nests.
-- [ ] Rename/refactor `semantic_to_kernel_abi`; "kernel ABI" should mean the
-      `htile.kernel`/`htile.launch_func` boundary, while the existing transform mostly materializes
-      tile memory ops such as `htile.load` and `htile.store`.
 - [ ] Add per-temp `htile.runtime.alloc` / `htile.runtime.free`.
 - [ ] Add a verifier or late legality check that rejects inline executable HTile code before final
       runtime lowering.
@@ -154,10 +151,7 @@ The first runtime surface can be:
 No workspace allocation is required in this thrust. Allocation can be inefficient; the goal is to
 make the dataflow explicit and executable.
 
-### Per-Kernel ABI Lowering
-
-Teach `semantic_to_kernel_abi` to operate on each `htile.kernel` body rather than assuming the whole
-`func.func` is one kernel.
+### Host/Kernels After Outlining
 
 The host `func.func` should eventually contain only:
 

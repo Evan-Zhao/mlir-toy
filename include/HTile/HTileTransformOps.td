@@ -37,39 +37,6 @@ def HTileLinalgToSemanticOp : Op<Transform_Dialect, "htile.linalg_to_semantic",
   }];
 }
 
-def HTileSemanticToKernelAbiOp : Op<Transform_Dialect, "htile.semantic_to_kernel_abi",
-                                    [TransformOpInterface, TransformEachOpTrait,
-                                     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
-                                     ReportTrackingListenerFailuresOpTrait]> {
-  let summary = "Rewrite Semantic HTile function ABI toward Kernel HTile ABI";
-
-  let description = [{
-    Rewrites the targeted `func.func` boundary from tensor-return Semantic HTile
-    form toward the memref-facing Kernel HTile ABI.
-
-    This first step only rewrites the function ABI:
-
-    - ranked tensor function arguments become memref arguments,
-    - ranked tensor function results become trailing memref output arguments,
-    - tensor uses of converted input arguments are preserved through
-      `bufferization.to_tensor` bridge operations,
-    - `func.return` operations are rewritten to return no operands.
-  }];
-
-  let arguments = (ins TransformHandleTypeInterface:$target);
-  let results = (outs);
-
-  let assemblyFormat = "$target attr-dict `:` type($target)";
-
-  let extraClassDeclaration = [{
-    ::mlir::DiagnosedSilenceableFailure applyToOne(
-        ::mlir::transform::TransformRewriter &rewriter,
-        ::mlir::Operation *target,
-        ::mlir::transform::ApplyToEachResultList &results,
-        ::mlir::transform::TransformState &state);
-  }];
-}
-
 def HTileOutlineKernelsOp : Op<Transform_Dialect, "htile.outline_kernels",
                                [FunctionalStyleTransformOpTrait,
                                 DeclareOpInterfaceMethods<TransformOpInterface>,
