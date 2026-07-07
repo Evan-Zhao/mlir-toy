@@ -936,6 +936,7 @@ LogicalResult bufferizeForallResults(RewriterBase &rewriter, ArrayRef<scf::Foral
                                      TensorToBufferMap &map) {
   OpBuilder::InsertionGuard guard(rewriter);
   for (auto forall : forallOps) {
+    // Create a memref buffer for each result tensor and map it to the tensor.
     for (OpResult result : forall->getResults()) {
       auto tensorType = dyn_cast<RankedTensorType>(result.getType());
       if (!tensorType)
@@ -943,23 +944,29 @@ LogicalResult bufferizeForallResults(RewriterBase &rewriter, ArrayRef<scf::Foral
       if (!tensorType.hasStaticShape())
         return forall.emitError() << "result # " << result.getResultNumber()
                                   << " of this forall is a ranked tensor with dynamic shape";
-      // Make a memref buffer and put it before the forall loop.
+      // Allocate the buffer before the forall loop.
       rewriter.setInsertionPoint(forall);
       auto memrefType = MemRefType::get(tensorType.getShape(), tensorType.getElementType());
       auto buffer = memref::AllocOp::create(rewriter, forall.getLoc(), memrefType);
       map.mapTensorToMemref(result, buffer);
       map.mapTensorToMemref(forall.getTiedBlockArgument(result), buffer);
-      // We're expecting a parallel_insert_slice op in the forall loop that publishes this result.
-      // Replace it with a memref write op before the forall terminator.
-      auto maybeInsert = getParallelInsertSliceForLoopResult(forall, result);
-      if (failed(maybeInsert))
-        return forall.emitError()
-               << "expected result # " << result.getResultNumber()
-               << " of this forall to be published by tensor.parallel_insert_slice";
-      // Insert the memref write op before the forall terminator (i.e. not in in_parallel region).
-      rewriter.setInsertionPoint(forall.getTerminator());
-      materializeStoreForInsertSlice(rewriter, forall, *maybeInsert, buffer);
-      rewriter.eraseOp(*maybeInsert);
+    }
+
+    // Materialize each tensor.parallel_insert_slice op into a memref store.
+    // Insert the memref store ops before the forall terminator (i.e. not in in_parallel region).
+    rewriter.setInsertionPoint(forall.getTerminator());
+    for (Operation &combiningOp : llvm::make_early_inc_range(forall.getTerminator())) {
+      auto insert = dyn_cast<tensor::ParallelInsertSliceOp>(&combiningOp);
+      if (!insert)
+        return combiningOp.emitError() << "expected forall in_parallel region to only have "
+                                          "tensor.parallel_insert_slice ops";
+      auto dest = insert.getDest();
+      auto buffer = map.getTensorMemref(dest);
+      if (!buffer)
+        return insert.emitError()
+               << "this op doesn't publish to a tensor-typed block argument of the loop";
+      materializeStoreForInsertSlice(rewriter, forall, insert, buffer);
+      rewriter.eraseOp(insert);
     }
   }
   return success();
@@ -1182,6 +1189,22 @@ FailureOr<SmallVector<OutlinedKernel>> createKernelOps(RewriterBase &rewriter, O
   return kernels;
 }
 
+FailureOr<func::FuncOp> validateSameParentFunc(ArrayRef<scf::ForallOp> forallOps) {
+  func::FuncOp hostFunc;
+  for (scf::ForallOp forall : forallOps) {
+    auto parentFunc = dyn_cast<func::FuncOp>(forall->getParentOp());
+    if (!parentFunc)
+      return forall.emitError()
+             << "expected selected scf.forall to be a top-level op directly inside func.func";
+    if (!hostFunc)
+      hostFunc = parentFunc;
+    else if (parentFunc != hostFunc)
+      return forall.emitError()
+             << "expected all selected scf.forall ops to belong to the same func.func";
+  }
+  return hostFunc;
+}
+
 void createLaunchOpsAndEraseForalls(RewriterBase &rewriter,
                                     MutableArrayRef<OutlinedKernel> kernels) {
   for (OutlinedKernel &outlined : kernels) {
@@ -1280,7 +1303,10 @@ DiagnosedSilenceableFailure HTileOutlineKernelsOp::apply(TransformRewriter &rewr
   }
   if (forallOps.empty())
     BAIL("expected at least one scf.forall payload op");
-  Operation *hostOp = forallOps.front()->getParentOp();
+  FailureOr<func::FuncOp> hostFunc = validateSameParentFunc(forallOps);
+  if (failed(hostFunc))
+    BAIL("failed to validate selected scf.forall ops");
+  Operation *hostOp = hostFunc->getOperation();
 
   auto kernelNames = (*this)->getAttrOfType<ArrayAttr>("kernel_names");
   if (kernelNames && kernelNames.size() != forallOps.size())
