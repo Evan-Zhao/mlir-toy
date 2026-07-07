@@ -73,7 +73,7 @@ module attributes {transform.with_named_sequence} {
     transform.apply_cse to %func : !any
 
     transform.htile.linalg_to_semantic %func : !any
-    // transform.htile.semantic_to_kernel_abi %func : !any
+    transform.htile.semantic_to_kernel_abi %func : !any
     // transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     transform.yield
