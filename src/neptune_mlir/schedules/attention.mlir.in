@@ -120,8 +120,10 @@ module attributes {transform.with_named_sequence} {
     // --- HTile lowering begins ---
     // Use the translator to lower the tiled linalg program into HTile.
     transform.htile.linalg_to_semantic %func : !any
-    transform.htile.semantic_to_kernel_abi %func : !any
+    %launches, %kernels = transform.htile.outline_kernels %forall_loop
+        {kernel_names = ["attention_kernel"]} : (!any) -> (!any, !any)
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+    transform.verify %func : !any
 
     transform.yield
   }

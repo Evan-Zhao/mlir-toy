@@ -91,7 +91,8 @@ def test_export_attention_to_triton_input_mlir(variant, kwargs) -> None:
     )
 
     assert "func.func @attention" in lowered
-    assert "gpu.launch" in lowered
+    assert "htile.launch_func" in lowered
+    assert "htile.kernel" in lowered
     assert "htile.store" in lowered
     assert "transform.named_sequence" not in lowered
     assert "scf.forall" not in lowered

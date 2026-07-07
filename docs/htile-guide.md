@@ -90,83 +90,18 @@ The main ABI distinction is between Semantic HTile and Kernel HTile:
 
 The current Triton, TileLang, and cuTile translators are backend translators, not general
 tensor-return HTile interpreters. They should consume Kernel HTile.
-Therefore a semantic HTile program should run `transform.htile.semantic_to_kernel_abi`
+Therefore a semantic HTile program should use `transform.htile.outline_kernels`
 before invoking those translators.
 
-The `semantic_to_kernel_abi` transform currently implements:
+`transform.htile.outline_kernels` performs the minimal kernel-boundary conversion used by the
+current pipeline:
 
-1. ranked tensor function arguments are rewritten to memref arguments,
-1. ranked tensor function results are appended as trailing memref output arguments,
-1. converted input arguments get `bufferization.to_tensor` bridges so the existing tensor body
-   remains verifier-valid,
-1. direct `tensor.extract_slice` reads from converted function input arguments are rewritten to
-   `htile.load`,
-1. returned `scf.forall` tensor results are rewritten into side-effecting `htile.store` operations
-   by converting the corresponding `tensor.parallel_insert_slice` publications,
-1. returned `scf.forall` operations are rebuilt without `shared_outs` and without tensor results,
-1. `func.return` operations are rewritten to return no operands.
-
-### Emitting HTile Loads and Stores
-
-After function ABI rewriting inserts `bufferization.to_tensor` bridges,
-`semantic_to_kernel_abi` looks at each `extract_slice` and expects this pattern:
-
-```mlir
-%tensor = bufferization.to_tensor %q_memref restrict writable : memref<...> to tensor<...>
-%tile = tensor.extract_slice %tensor[...] [...] [1, 1, ...] : tensor<...> to tensor<128x64xf16>
-%use = htile.dot %tile, ...
-```
-
-and rewrites it into:
-
-```mlir
-%tile = htile.load %q_memref[...] : memref<...> -> tensor<128x64xf16>
-%use = htile.dot %tile, ...
-```
-
-Similarly, to produce stores, `semantic_to_kernel_abi` expects each return value
-of the function is produced by an `scf.forall`
-that publishes it with a `parallel_insert_slice`, like this:
-
-```mlir
-%result = scf.forall (...) shared_outs(%out = %init) -> (tensor<...>) {
-  ...
-  scf.forall.in_parallel {
-    tensor.parallel_insert_slice %tile into %out[...] [...] [1, 1, ...]
-      : tensor<...> into tensor<...>
-  }
-}
-return %result : tensor<...>
-```
-
-and rewrites it into a side-effecting loop with an explicit store:
-
-```mlir
-scf.forall (...) {
-  ...
-  htile.store %tile, %out_memref[...] : tensor<...>, memref<...>
-}
-return
-```
-
-This transform is complete for the current global, causal, and GQA attention pipelines:
-the output function has memref input/output arguments, direct `htile.load` / `htile.store`
-memory boundaries, and no tensor return.
-It intentionally leaves the outer `scf.forall` schedule in place and does not make placement,
-launch, or backend-specific layout decisions.
-
-Current ABI conversion assumptions:
-
-- the target is a non-external `func.func` with exactly one `func.return`,
-- tensor argument/result ABI types are ranked, unencoded tensors,
-- each input memory read is a unit-stride `tensor.extract_slice` directly from a
-  `bufferization.to_tensor` bridge over a function memref argument,
-- each converted `tensor.extract_slice` result feeds only HTile ops,
-- each returned tensor is produced by an `scf.forall`,
-- returned `scf.forall` results are published through unit-stride
-  `tensor.parallel_insert_slice` ops,
-- after those publications are converted, the `scf.forall` shared output block arguments and
-  tensor results have no remaining uses.
+1. selected top-level `scf.forall` loop nests become `htile.kernel` definitions,
+1. the host function gets result-free `htile.launch_func` operations,
+1. tensor values crossing selected loop boundaries are materialized as explicit memrefs,
+1. kernel-body tensor reads become `htile.load`,
+1. kernel-body result publications become `htile.store`,
+1. `htile.program_id` and `program_bounds` describe the logical launch domain.
 
 ## Placement Transforms
 

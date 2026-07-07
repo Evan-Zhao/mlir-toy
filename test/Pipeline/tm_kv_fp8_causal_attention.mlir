@@ -1,7 +1,22 @@
 // RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin --load-dialect-plugin=%neptune_ta_plugin --load-dialect-plugin=%neptune_htile_plugin --transform-interpreter %s 2>&1 | FileCheck %s
 
-// CHECK-LABEL: func.func @attention(%{{.*}}memref<1x4x1024x64xf16>, %{{.*}}memref<1x4x1024x64xf8E4M3FN>
-// CHECK: scf.forall (%{{.*}}, %{{.*}}) in (4, 8) {
+// CHECK-LABEL: func.func @attention(%arg0: tensor<1x4x1024x64xf16>, %arg1: tensor<1x4x1024x64xf8E4M3FN>, %arg2: tensor<1x4x1024x64xf8E4M3FN>, %arg3: tensor<1x4x1x1xf32>, %arg4: tensor<1x4x1x1xf32>) -> tensor<1x4x1024x64xf16>
+// CHECK: htile.launch_func @attention_kernel
+// CHECK-SAME: {program_bounds = array<i64: 4, 8>}
+// CHECK-NOT: scf.forall
+// CHECK: return
+
+// CHECK-LABEL: htile.kernel @attention_kernel
+// CHECK-SAME: memref<1x4x1024x64xf16>
+// CHECK-SAME: memref<1x4x1024x64xf8E4M3FN>
+// CHECK-SAME: memref<1x4x1x1xf32>
+// CHECK-SAME: memref<1x4x1024x64xf8E4M3FN>
+// CHECK-SAME: memref<1x4x1x1xf32>
+// CHECK-SAME: memref<1x4x1024x64xf16>
+// CHECK-SAME: attributes {program_bounds = array<i64: 4, 8>}
+// CHECK: htile.program_id 0
+// CHECK: htile.program_id 1
+// CHECK-NOT: scf.forall
 // CHECK: htile.full %{{.*}} : f32 -> tensor<128xf32>
 // CHECK: htile.full %{{.*}} : f32 -> tensor<128x64xf32>
 // CHECK: htile.full %{{.*}} : f32 -> tensor<128xf32>
@@ -14,6 +29,8 @@
 // CHECK: %[[DEAD_BOUND_MAX:.+]] = arith.maxsi %[[DEAD_BOUND_RAW]], %c0 : index
 // CHECK: %[[DEAD_BOUND:.+]] = arith.minsi %[[DEAD_BOUND_MAX]], %c16 : index
 // CHECK: %{{.*}}:3 = scf.for %{{.*}} = %[[LIVE_BOUND]] to %[[DEAD_BOUND]] step %c1 iter_args(%{{.*}} = %[[LIVE_LOOP]]#0, %{{.*}} = %[[LIVE_LOOP]]#1, %{{.*}} = %[[LIVE_LOOP]]#2)
+// CHECK: htile.store
+// CHECK: htile.return
 
 !any = !transform.any_op
 
@@ -98,9 +115,10 @@ module attributes {transform.with_named_sequence} {
 
     // --- HTile lowering begins ---
     transform.htile.linalg_to_semantic %func : !any
-    transform.htile.semantic_to_kernel_abi %func : !any
+    %launches, %kernels = transform.htile.outline_kernels %forall_loop
+        {kernel_names = ["attention_kernel"]} : (!any) -> (!any, !any)
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
-
+    transform.verify %func : !any
     transform.yield
   }
 

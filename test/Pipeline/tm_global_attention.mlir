@@ -127,8 +127,6 @@ module attributes {transform.with_named_sequence} {
         {kernel_names = ["attention_kernel"]} : (!any) -> (!any, !any)
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.verify %func : !any
-    // transform.htile.semantic_to_kernel_abi %func : !any
-
     transform.yield
   }
 
