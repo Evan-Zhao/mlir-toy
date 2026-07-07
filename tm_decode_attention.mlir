@@ -73,7 +73,12 @@ module attributes {transform.with_named_sequence} {
     transform.apply_cse to %func : !any
 
     transform.htile.linalg_to_semantic %func : !any
-    transform.htile.semantic_to_kernel_abi %func : !any
+    %kernel_loops = transform.merge_handles %forall_loop, %writeback_loop : !any
+    %launches, %kernels = transform.htile.outline_kernels %kernel_loops
+        {kernel_names = ["decode_partial", "decode_merge"]}
+        : (!any) -> (!any, !any)
+    transform.verify %func : !any
+    // transform.htile.semantic_to_kernel_abi %func : !any
     // transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     transform.yield

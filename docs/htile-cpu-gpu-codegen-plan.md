@@ -62,13 +62,14 @@ debug quickly and broad enough to prove the CPU+GPU split.
 ### Checklist
 
 - [x] Define `htile.kernel`, `htile.launch_func`, and `htile.return`.
-- [ ] Add transform-driven outlining for selected top-level `scf.forall` loop nests.
-- [ ] Allow mixed host functions with outlined kernels and remaining inline HTile code.
+- [x] Add targeted bufferization across kernel (loop nest) boundaries.
+- [ ] Add kernel outlining for selected top-level loop nests.
 - [ ] Add a verifier or late legality check that rejects inline executable HTile code before final
       runtime lowering.
-- [ ] Add targeted, stupid kernel-boundary bufferization for decode SplitK partial tensors.
 - [ ] Add per-temp `htile.runtime.alloc` / `htile.runtime.free`.
-- [ ] Teach `semantic_to_kernel_abi` to operate per `htile.kernel`.
+- [ ] Rename/refactor `semantic_to_kernel_abi`; "kernel ABI" should mean the
+      `htile.kernel`/`htile.launch_func` boundary, while the existing transform mostly materializes
+      tile memory ops such as `htile.load` and `htile.store`.
 
 ### Kernel Ops
 
@@ -190,52 +191,51 @@ packing, and async launch ordering. These are later-thrust problems.
 
 ### Transform-Driven Outlining
 
-Add an explicit transform op that outlines a selected payload loop nest into `htile.kernel` +
-`htile.launch_func`.
+Add `transform.htile.outline_kernels`, an explicit transform op that takes an ordered set of selected
+top-level `scf.forall` loop nests and turns them into result-free `htile.launch_func` operations plus
+`htile.kernel` definitions.
 
 Example shape:
 
 ```mlir
-%launch, %kernel = transform.htile.outline_kernel %forall
+%launches, %kernels = transform.htile.outline_kernels %foralls
+    {kernel_names = ["decode_partial", "decode_merge"]}
     : (!any) -> (!any, !any)
 ```
 
-The transform should:
+The transform first performs targeted kernel-boundary bufferization:
 
-1. compute live-ins with MLIR region utilities such as `getUsedValuesDefinedAbove`,
-1. reject unsupported captures initially, or clone simple constants and index computations,
-1. create a unique `htile.kernel @name`,
-1. clone or move the selected loop nest into the kernel body with `IRMapping`,
-1. replace the original loop nest with `htile.launch_func @name(...)`,
-1. return handles for both the launch and kernel.
+1. Validate that all selected loops are top-level `scf.forall` ops in the same host `func.func`;
+   use handle order as launch order and `kernel_names` or deterministic generated names.
+1. Allocate one explicit memref temporary for each ranked tensor result of each selected forall.
+1. Rewrite uses of those tensor results, and uses of their tied forall output block arguments, to
+   read through the corresponding memref. `tensor.extract_slice` users become `memref.subview`
+   followed by `bufferization.to_tensor`; other supported users may read the whole buffer through
+   `bufferization.to_tensor`.
+1. Rewrite each result publication `tensor.parallel_insert_slice` to `memref.subview` plus
+   `bufferization.materialize_in_destination`.
+1. Rebuild selected foralls without tensor `shared_outs` / tensor results, leaving their bodies
+   connected to explicit memrefs instead of result SSA.
+
+This is intentionally a local boundary rewrite, not general MLIR bufferization. It does not attempt
+alias analysis, copy minimization, workspace packing, complex control-flow handling, or async
+lifetime reasoning; those belong to later bufferization and allocation work.
+
+After boundary bufferization, the transform outlines kernels:
+
+1. Track the explicit read/write buffers for each selected forall; these become the basis for the
+   eventual kernel and launch operands.
+1. Compute remaining live-ins with `getUsedValuesDefinedAbove`, rejecting unsupported captures or
+   cloning simple constants/index computations.
+1. Create one `htile.kernel` per selected loop, move or clone the loop body into it with
+   `IRMapping`, and replace the original loop with result-free `htile.launch_func`.
+1. Fail if selected loops still have tensor results after boundary materialization; return handles
+   for the launches and kernels.
 
 This should be schedule-driven rather than automatic discovery. The decode attention schedule already
-knows which top-level loop nest should become each kernel.
-
-### Stupid Bufferization
-
-Add a targeted, manually implemented bufferization pass for the exact inter-kernel tensors produced
-by SplitK decode attention.
-
-The pass should:
-
-1. identify tensors produced by one top-level kernel and consumed by a later top-level kernel,
-1. allocate one device temp for each such tensor,
-1. rewrite the producing kernel to write into that temp,
-1. rewrite consuming kernels to read from that temp,
-1. remove the cross-kernel tensor SSA value.
-
-This pass can be conservative:
-
-- no alias analysis,
-- no copy minimization,
-- no in-place analysis beyond obvious destination-style outputs,
-- no support for complex control flow,
-- no workspace packing,
-- no async lifetime reasoning.
-
-It only needs to handle the decode attention pattern: split-local partial tensors produced by the
-first forall and consumed by the merge/post-processing forall.
+knows which top-level loop nests should become kernels. Because `htile.launch_func` has no data
+results, kernel-boundary buffer materialization is not optional: values that survive a selected loop
+boundary must be passed through explicit temporary buffers before the loop is replaced by a launch.
 
 ### Simple Runtime Allocation
 

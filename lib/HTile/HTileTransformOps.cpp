@@ -9,6 +9,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Transforms/Transforms.h"
@@ -24,6 +25,8 @@
 
 using namespace mlir;
 using bufferization::ToTensorOp;
+
+#define BAIL(message) return emitSilenceableFailure(transform, message)
 
 namespace mlir::transform {
 namespace {
@@ -785,7 +788,8 @@ LogicalResult materializeStoreForForallResult(RewriterBase &rewriter, OutputStor
   return success();
 }
 
-LogicalResult rebuildForallWithoutOutputs(RewriterBase &rewriter, scf::ForallOp forallOp) {
+FailureOr<scf::ForallOp> rebuildForallWithoutOutputs(RewriterBase &rewriter,
+                                                     scf::ForallOp forallOp) {
   for (BlockArgument outputArg : forallOp.getRegionOutArgs()) {
     if (!outputArg.use_empty())
       return forallOp.emitError() << "unsupported remaining use of scf.forall shared_out";
@@ -798,7 +802,7 @@ LogicalResult rebuildForallWithoutOutputs(RewriterBase &rewriter, scf::ForallOp 
 
   SmallVector<Value> oldOutputs = llvm::to_vector(forallOp.getOutputs());
   rewriter.setInsertionPoint(forallOp);
-  scf::ForallOp::create(
+  auto newForall = scf::ForallOp::create(
       rewriter, forallOp.getLoc(), forallOp.getMixedLowerBound(), forallOp.getMixedUpperBound(),
       forallOp.getMixedStep(), ValueRange{}, forallOp.getMapping(),
       [&](OpBuilder &nestedBuilder, Location, ValueRange bbArgs) {
@@ -813,7 +817,7 @@ LogicalResult rebuildForallWithoutOutputs(RewriterBase &rewriter, scf::ForallOp 
     if (def && def->use_empty())
       rewriter.eraseOp(def);
   }
-  return success();
+  return newForall;
 }
 
 LogicalResult rewriteOutputStores(RewriterBase &rewriter, KernelAbiRewriteInfo &info) {
@@ -869,6 +873,156 @@ LogicalResult rewriteExtractSlicesAsLoads(RewriterBase &rewriter, func::FuncOp f
   return success();
 }
 
+struct TensorToBufferMap {
+  void mapTensorToMemref(Value tensor, Value memref) { tensorToMemref[tensor] = memref; }
+
+  Value getTensorMemref(Value tensor) {
+    if (auto it = tensorToMemref.find(tensor); it != tensorToMemref.end()) {
+      return it->second;
+    }
+    return nullptr;
+  }
+
+  Value getOrCreateTensorMemrefForRead(RewriterBase &rewriter, scf::ForallOp forall, Value tensor) {
+    if (Value buffer = getTensorMemref(tensor)) {
+      return buffer;
+    }
+
+    auto tensorType = cast<RankedTensorType>(tensor.getType());
+    auto memrefType = MemRefType::get(tensorType.getShape(), tensorType.getElementType());
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(forall);
+    Value buffer = bufferization::ToBufferOp::create(rewriter, tensor.getLoc(), memrefType, tensor,
+                                                     /*readOnly=*/true);
+    mapTensorToMemref(tensor, buffer);
+    return buffer;
+  }
+
+  DenseMap<Value, Value> tensorToMemref;
+};
+
+void materializeStoreForInsertSlice(RewriterBase &rewriter, scf::ForallOp forall,
+                                    tensor::ParallelInsertSliceOp insert, Value buffer) {
+  using bufferization::MaterializeInDestinationOp;
+  auto sourceType = cast<RankedTensorType>(insert.getSourceType());
+  auto bufferType = cast<MemRefType>(buffer.getType());
+  auto subviewType = memref::SubViewOp::inferRankReducedResultType(
+      sourceType.getShape(), bufferType, insert.getMixedOffsets(), insert.getMixedSizes(),
+      insert.getMixedStrides());
+  Value subview = memref::SubViewOp::create(rewriter, insert.getLoc(), subviewType, buffer,
+                                            insert.getMixedOffsets(), insert.getMixedSizes(),
+                                            insert.getMixedStrides());
+  MaterializeInDestinationOp::create(rewriter, insert.getLoc(), TypeRange{}, insert.getSource(),
+                                     subview, rewriter.getUnitAttr(), rewriter.getUnitAttr());
+}
+
+Value materializeLoadForExtractSlice(OpBuilder &builder, tensor::ExtractSliceOp extract,
+                                     Value buffer) {
+  auto sourceMemrefType = cast<MemRefType>(buffer.getType());
+  auto resultType = cast<RankedTensorType>(extract.getResultType());
+  auto subviewType = memref::SubViewOp::inferRankReducedResultType(
+      resultType.getShape(), sourceMemrefType, extract.getMixedOffsets(), extract.getMixedSizes(),
+      extract.getMixedStrides());
+  Value subview = memref::SubViewOp::create(builder, extract.getLoc(), subviewType, buffer,
+                                            extract.getMixedOffsets(), extract.getMixedSizes(),
+                                            extract.getMixedStrides());
+  return ToTensorOp::create(builder, extract.getLoc(), resultType, subview, /*restrict=*/true,
+                            /*writable=*/true);
+}
+
+LogicalResult bufferizeForallResults(RewriterBase &rewriter, ArrayRef<scf::ForallOp> forallOps,
+                                     TensorToBufferMap &map) {
+  OpBuilder::InsertionGuard guard(rewriter);
+  for (auto forall : forallOps) {
+    for (OpResult result : forall->getResults()) {
+      auto tensorType = dyn_cast<RankedTensorType>(result.getType());
+      if (!tensorType)
+        continue;
+      if (!tensorType.hasStaticShape())
+        return forall.emitError() << "result # " << result.getResultNumber()
+                                  << " of this forall is a ranked tensor with dynamic shape";
+      // Make a memref buffer and put it before the forall loop.
+      rewriter.setInsertionPoint(forall);
+      auto memrefType = MemRefType::get(tensorType.getShape(), tensorType.getElementType());
+      auto buffer = memref::AllocOp::create(rewriter, forall.getLoc(), memrefType);
+      map.mapTensorToMemref(result, buffer);
+      map.mapTensorToMemref(forall.getTiedBlockArgument(result), buffer);
+      // We're expecting a parallel_insert_slice op in the forall loop that publishes this result.
+      // Replace it with a memref write op before the forall terminator.
+      auto maybeInsert = getParallelInsertSliceForLoopResult(forall, result);
+      if (failed(maybeInsert))
+        return forall.emitError()
+               << "expected result # " << result.getResultNumber()
+               << " of this forall to be published by tensor.parallel_insert_slice";
+      // Insert the memref write op before the forall terminator (i.e. not in in_parallel region).
+      rewriter.setInsertionPoint(forall.getTerminator());
+      materializeStoreForInsertSlice(rewriter, forall, *maybeInsert, buffer);
+      rewriter.eraseOp(*maybeInsert);
+    }
+  }
+  return success();
+}
+
+void materializeLoadsForTensorUsers(RewriterBase &rewriter, OpOperand *use,
+                                    RankedTensorType tensorType, Value buffer) {
+  Operation *owner = use->getOwner();
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(owner);
+  if (auto extract = dyn_cast<tensor::ExtractSliceOp>(owner)) {
+    // If the use is a tensor.extract_slice, we materialize a sliced load of the buffer.
+    Value sliced = materializeLoadForExtractSlice(rewriter, extract, buffer);
+    rewriter.replaceOp(extract, sliced);
+  } else {
+    // Otherwise, fall back to a full load of the buffer.
+    Value loaded =
+        ToTensorOp::create(rewriter, owner->getLoc(), tensorType, buffer, /*restrict=*/true,
+                           /*writable=*/true);
+    use->set(loaded);
+  }
+}
+
+LogicalResult bufferizeTensorReadInForalls(RewriterBase &rewriter,
+                                           ArrayRef<scf::ForallOp> forallOps,
+                                           TensorToBufferMap &map) {
+  for (auto forall : forallOps) {
+    SmallVector<OpOperand *> tensorUses;
+    forall.getBody()->walk([&](Operation *op) {
+      for (OpOperand &operand : op->getOpOperands()) {
+        // Skip non-tensors, and tensors defined inside the loop body (not block arguments).
+        Value tensor = operand.get();
+        if (!isa<RankedTensorType>(tensor.getType()))
+          continue;
+        auto defOp = tensor.getDefiningOp();
+        bool isInLoop = defOp && forall->isAncestor(defOp);
+        if (!isInLoop)
+          tensorUses.push_back(&operand);
+      }
+    });
+    for (OpOperand *use : tensorUses) {
+      Value tensor = use->get();
+      auto tensorType = cast<RankedTensorType>(tensor.getType());
+      Value buffer = map.getOrCreateTensorMemrefForRead(rewriter, forall, tensor);
+      materializeLoadsForTensorUsers(rewriter, use, tensorType, buffer);
+    }
+  }
+  return success();
+}
+
+LogicalResult bufferizeForallResultUses(RewriterBase &rewriter, ArrayRef<scf::ForallOp> forallOps,
+                                        TensorToBufferMap &map) {
+  for (auto forall : forallOps) {
+    for (OpOperand &use : llvm::make_early_inc_range(forall->getUses())) {
+      Value tensor = use.get();
+      Value buffer = map.getTensorMemref(tensor);
+      if (!buffer)
+        continue;
+      auto tensorType = cast<RankedTensorType>(tensor.getType());
+      materializeLoadsForTensorUsers(rewriter, &use, tensorType, buffer);
+    }
+  }
+  return success();
+}
+
 } // namespace
 
 void HTileLinalgToSemanticOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
@@ -888,9 +1042,8 @@ DiagnosedSilenceableFailure HTileLinalgToSemanticOp::applyToOne(TransformRewrite
   target->walk([&](linalg::LinalgOp op) { originalLinalgOps.push_back(op); });
 
   for (Operation *op : originalLinalgOps) {
-    if (succeeded(rewriteOriginalLinalgOp(rewriter, op)))
-      continue;
-    return emitSilenceableFailure(transform) << "failed to rewrite linalg op: " << *op;
+    if (failed(rewriteOriginalLinalgOp(rewriter, op)))
+      BAIL("failed to rewrite linalg op: ") << *op;
   }
 
   if (failed(applyRewritesGreedily(rewriter, target, [&](RewritePatternSet &patterns) {
@@ -901,7 +1054,7 @@ DiagnosedSilenceableFailure HTileLinalgToSemanticOp::applyToOne(TransformRewrite
         tensor::populateReassociativeReshapeFoldingPatterns(patterns);
         tensor::populateFoldTensorEmptyPatterns(patterns);
       })))
-    return emitSilenceableFailure(transform, "failed to apply tensor cleanup patterns");
+    BAIL("failed to apply tensor cleanup patterns");
 
   return DiagnosedSilenceableFailure::success();
 }
@@ -922,16 +1075,68 @@ DiagnosedSilenceableFailure HTileSemanticToKernelAbiOp::applyToOne(TransformRewr
 
   auto funcOp = dyn_cast<func::FuncOp>(target);
   if (!funcOp)
-    return emitSilenceableFailure(transform, "expected func.func target");
+    BAIL("expected func.func target");
 
   FailureOr<KernelAbiRewriteInfo> info = rewriteFunctionAbi(rewriter, funcOp);
   if (failed(info))
-    return emitSilenceableFailure(transform, "failed to rewrite function ABI");
+    BAIL("failed to rewrite function ABI");
   if (failed(rewriteOutputStores(rewriter, *info)))
-    return emitSilenceableFailure(transform, "failed to rewrite output stores");
+    BAIL("failed to rewrite output stores");
   if (failed(rewriteExtractSlicesAsLoads(rewriter, funcOp)))
-    return emitSilenceableFailure(transform, "failed to rewrite extract_slice ops as loads");
+    BAIL("failed to rewrite extract_slice ops as loads");
   return DiagnosedSilenceableFailure::success();
+}
+
+void HTileOutlineKernelsOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  consumesHandle(getForallsMutable(), effects);
+  producesHandle(getOperation()->getOpResults(), effects);
+  modifiesPayload(effects);
+}
+
+DiagnosedSilenceableFailure HTileOutlineKernelsOp::apply(TransformRewriter &rewriter,
+                                                         TransformResults &results,
+                                                         TransformState &state) {
+  (void)results;
+  auto transform = cast<TransformOpInterface>(getOperation());
+
+  SmallVector<scf::ForallOp> forallOps;
+  for (Operation *op : state.getPayloadOps(getForalls())) {
+    auto forall = dyn_cast<scf::ForallOp>(op);
+    if (!forall) {
+      op->emitError() << "expected scf.forall payload op";
+      BAIL("expected all payload ops to be scf.forall");
+    }
+    forallOps.push_back(forall);
+  }
+  if (forallOps.empty())
+    BAIL("expected at least one scf.forall payload op");
+  Operation *hostOp = forallOps.front()->getParentOp();
+
+  auto kernelNames = (*this)->getAttrOfType<ArrayAttr>("kernel_names");
+  if (kernelNames && kernelNames.size() != forallOps.size())
+    BAIL("expected kernel_names length to match payload op count");
+
+  TensorToBufferMap bufferMap;
+  // Convert forall tensor result to memrefs, and in-loop writes of results to memref writes.
+  if (failed(bufferizeForallResults(rewriter, forallOps, bufferMap)))
+    BAIL("failed to bufferize forall results");
+  // Convert reads of any tensor in foralls to memref reads: get a memref for the tensor being used,
+  // and read from the memref instead.
+  if (failed(bufferizeTensorReadInForalls(rewriter, forallOps, bufferMap)))
+    BAIL("failed to bufferize tensor reads in foralls");
+  // Convert any remaining uses of forall result tensors to memref reads, such as func.func return.
+  if (failed(bufferizeForallResultUses(rewriter, forallOps, bufferMap)))
+    BAIL("failed to bufferize forall result uses");
+  // Remove all results and shared out arguments from every forall op.
+  for (auto &forall : forallOps) {
+    auto newForall = rebuildForallWithoutOutputs(rewriter, forall);
+    if (failed(newForall))
+      BAIL("failed to rebuild forall without outputs");
+    forall = *newForall;
+  }
+  llvm::errs() << "Current module: " << *hostOp->getParentOp() << "\n";
+
+  BAIL("transform.htile.outline_kernels is not implemented yet");
 }
 
 } // namespace mlir::transform
@@ -940,13 +1145,15 @@ namespace htile {
 
 void registerHTileTransformExtension(mlir::DialectRegistry &registry) {
   registry.addExtension(+[](mlir::MLIRContext *ctx, mlir::transform::TransformDialect *dialect) {
-    ctx->loadDialect<htile::HTileDialect, mlir::bufferization::BufferizationDialect>();
+    ctx->loadDialect<htile::HTileDialect, mlir::bufferization::BufferizationDialect,
+                     mlir::memref::MemRefDialect>();
     struct TransformDialectAccess : public mlir::transform::TransformDialect {
       using mlir::Dialect::addOperations;
     };
     static_cast<TransformDialectAccess *>(dialect)
         ->addOperations<mlir::transform::HTileLinalgToSemanticOp,
-                        mlir::transform::HTileSemanticToKernelAbiOp>();
+                        mlir::transform::HTileSemanticToKernelAbiOp,
+                        mlir::transform::HTileOutlineKernelsOp>();
   });
 }
 
