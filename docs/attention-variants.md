@@ -1,110 +1,160 @@
-# Attention Variant Roadmap
+# Attention Operator Feature Roadmap
 
-This note records attention variants that are useful targets for the Neptune attention pipeline.
-The goal is to prioritize variants that are both common in modern models and interesting for a
-tiled compiler: masks that change tile liveness, layouts that change memory access, and score
-transforms that should fuse into the FlashAttention-like loop.
+This note records attention operator features that are useful targets for the Neptune attention
+pipeline. The goal is to organize the roadmap around operator behavior rather than kernel schedules.
+Scheduling techniques such as rolling update, SplitK, persistent decode, or work queues
+are tracked separately, even when a feature strongly motivates a particular schedule.
 
-## Current Coverage
+A concrete attention variant is usually a composition of several axes: for example,
+paged KV-cache decode with GQA, RoPE, causal masking, FP8 K/V, and cache append.
 
-The pipeline currently covers these variants:
+## Feature-Axis Model
 
-- **Global multi-head attention**: dense unmasked scaled dot-product attention.
-- **Causal multi-head attention**: triangular score masking with dead-tile specialization.
-- **Sliding-window causal attention**: causal score masking with a fixed-width local history
-  window, lowered through the masked-attention schedule.
-- **Global grouped-query attention (GQA)**: Q heads grouped over fewer K/V heads.
-- **Global multi-query attention (MQA)**: the GQA case where all Q heads share one K/V head.
-- **ALiBi-fused attention**: head-dependent linear score bias fused into the attention loop.
-- **KV-FP8 causal attention**: causal attention with FP16 Q, FP8 K/V inputs, and per-head K/V
-  dequantization scales fused into the tiled loop.
-- **Rectangular/cross-attention shape coverage**: Q and K/V sequence lengths may differ, with a
-  static masked-attention pipeline example that avoids square score-matrix assumptions.
+Attention variants should be described using the axes below. The checklist is ordered roughly by
+roadmap priority.
+Checked items have current Neptune pipeline coverage; unchecked items are useful targets.
 
-The static Transform-dialect examples live under [`test/Pipeline`](../test/Pipeline). The Python
-pipeline tests also exercise multiple shapes, including GQA with one K/V head, which is the MQA
-case.
+- [x] **Static sequence geometry**: full-sequence attention, rectangular Q-versus-K/V sequence shapes,
+      and decode-shaped inputs where Q has length 1 and K/V are long.
+- [x] **Head mapping**: MHA, GQA, and MQA. MQA is the special case of GQA with one K/V head.
+- [x] **Basic score domains**: dense global attention, triangular causal attention,
+      and contiguous sliding-window causal attention.
+- [x] **Basic score value modifiers**: ALiBi head-dependent additive bias.
+- [x] **Basic input numeric representation**: FP16 attention, plus causal attention with FP8 K/V inputs
+      and fused per-head K/V dequantization scales.
+- [ ] **Runtime sequence and segment bounds**: logical Q and K/V lengths should be carried by
+      runtime metadata for variable-length requests or packed document segments.
+- [ ] **KV-cache decode ABI**: K/V may come from persistent cache storage rather than freshly
+      materialized dense tensors, with explicit request slots, cache lengths, cache positions,
+      and batch indirection.
+- [ ] **Cache mutation semantics**: the operator may append or write new K/V into the cache,
+      or expose a paired cache-update operation with compatible metadata.
+- [ ] **K/V physical layout**: logical K/V token coordinates may map to head-major, token-major,
+      blocked, or other serving-oriented memory layouts.
+- [ ] **Page-table K/V indirection**: logical K/V positions may map through a block table
+      into paged cache storage.
+- [ ] **Quantized KV-cache representation**: persistent K/V may be stored in low-precision
+      formats such as FP8, with explicit scale metadata and scale granularity.
+- [ ] **Position-dependent Q/K transforms**: Q and/or K may be transformed before the QK dot,
+      usually using token position and channel index. RoPE is the primary target.
+- [ ] **Compressed or latent K/V representation**: the cache may store latent vectors or
+      compressed factors that must be reconstructed before attention consumes per-head K/V values.
 
-## Prioritized Variants
+For the features that Neptune already supports, the static Transform-dialect examples live under
+[`test/Pipeline`](../test/Pipeline).
+The Python pipeline tests also exercise multiple shapes, including GQA with one K/V head.
+Decode-input scheduling support is tracked in the [SplitK update design](split-k-update-design.md).
 
-### Variable-Length Packed Attention
+## Missing Feature Axes
 
-Packed attention handles batches where each sequence has a different length and padding should not
-consume tile work. This is important for real training and inference batches.
+### Runtime Sequence and Segment Bounds
 
-Compiler pressure points:
+Runtime sequence and segment bounds cover batches where each request, sequence, or packed document
+segment has different valid Q and K/V lengths. The operator should not infer validity only from
+static tensor extents or from a padded square score matrix. Instead, valid row and K/V ranges should
+come from metadata such as per-request lengths, cumulative sequence lengths, or segment boundaries.
 
-- Per-sequence metadata drives row and K/V bounds.
-- Tile liveness becomes data-dependent at the batch/sequence level.
-- The schedule needs clean handling for empty or partial tiles at sequence boundaries.
+The first target should be **variable-length packed prefill attention**. Q, K, and V are flattened
+across the batch, and `cu_seqlens`-style metadata maps each token range back to a request or
+document segment. This removes padding work and exercises nonuniform tile liveness without requiring
+KV-cache storage.
 
-### Decode Attention With KV Cache
+This axis composes with causal and document masking. Bounds say which tokens exist; the score domain
+says which valid Q/K pairs may interact. For packed causal training, the effective mask is usually
+“same document segment and not in the future.”
 
-Decode attention computes one or a few new query positions against a growing K/V cache. This is the
-inference-critical form for autoregressive serving, and MQA/GQA make it especially memory-layout
-sensitive.
+### KV-Cache Decode ABI
 
-This is a work in progresss. The split-k reduction schedule is tracked in the
-[SplitK update design](split-k-update-design.md).
+KV-cache decode distinguishes ordinary dense K/V tensors from persistent K/V storage owned by a
+serving runtime. A cache-ready operator should accept metadata for request slots, current cache
+lengths, logical cache positions, and optional batch indirection. It should not assume that K/V are
+freshly materialized dense tensors for exactly the current call.
 
-Compiler pressure points:
+The first target should be **contiguous KV-cache decode attention**. Q has length 1 or a small
+number of tokens, K/V are read from a persistent contiguous cache, and each request has a runtime
+cache length that bounds the valid K/V range. For GQA and MQA, Q-head-to-KV-head mapping should be
+explicit rather than implicit broadcasting.
 
-- Q has a very small sequence length while K/V can be long.
-- K/V cache layout dominates performance more than the QK and PV math shape.
-- The schedule should expose cache loads, head grouping, and cache position arithmetic explicitly.
+The ABI should also include position metadata before RoPE is implemented. Decode attention needs to
+know the absolute position of the new query token and the logical positions of cached K/V tokens.
 
-### PagedAttention-Style KV Cache
+### Cache Mutation Semantics
 
-PagedAttention is primarily a memory-layout variant: logical K/V positions are mapped through a
-block table into non-contiguous physical cache pages.
+Cache mutation covers attention calls that write newly computed K/V values into the cache, or a
+paired cache-update operation that uses the same metadata as attention. This is distinct from
+read-only cache attention because it introduces side effects, aliasing constraints, and ordering
+requirements.
 
-Compiler pressure points:
+The first target should be **decode with cache append**. The operator receives new K/V for the
+current token, writes them into cache at `cache_position`, and attends over the valid cache prefix.
+The roadmap should define whether attention reads the cache before or after the append; serving
+paths usually want “append then attend.”
 
-- K/V tile loads are indirect through a page table rather than simple affine slices.
-- The schedule needs to separate logical sequence coordinates from physical memory coordinates.
-- It is a good test for whether HTile can represent tile loads that are not simple strided slices.
+Even if the update lowers as a separate kernel, representing mutation at the operator level helps
+the compiler preserve correctness around cache slots, positions, and request isolation.
 
-### RoPE-Fused Attention
+### K/V Physical Layout
 
-Rotary position embedding applies a position-dependent rotation to Q and K before the QK dot. The
-useful compiler target is not a standalone RoPE kernel, but fusing those transforms into the
-attention loop without materializing rotated Q/K tensors.
+K/V physical layout is an operator feature when it changes how logical token coordinates map to
+memory coordinates. Ordinary dense tensors are only one layout. Serving-oriented kernels often use
+head-major, token-major, or blocked layouts chosen for vectorized cache loads.
 
-Compiler pressure points:
+The first target should be **blocked contiguous KV-cache decode**. Logical K/V positions are
+contiguous for each request, but the physical tensor groups token, head, and head-dimension
+coordinates into cache-load-friendly blocks. This exercises explicit layout indexing without adding
+page-table indirection.
 
-- Q and K elementwise transforms should be fused into their tile loads or immediately before dot.
-- The transform depends on token position and channel parity/pairing.
-- The Q-side and K-side transforms must remain structurally visible through TA/linalg matching.
+The operator should separate logical coordinates from physical layout: logical coordinates identify
+the request, token, and KV head; physical layout determines the address.
 
-### Block-Sparse Attention With Global Tokens
+### Page-Table K/V Indirection
 
-Longformer/BigBird-style attention combines local blocks with selected global or random blocks.
-This is more general than sliding-window attention because the active K/V tiles are no longer a
-single contiguous interval per query tile.
+Paged KV-cache support separates logical sequence coordinates from physical storage coordinates. K/V
+tile loads are indirect: a logical token range is mapped through a block table into one or more
+physical cache pages. This is K/V storage indirection, not score sparsity.
 
-Compiler pressure points:
+The first target should be **PagedAttention-style decode**. The operator takes a block table,
+per-request cache lengths, page size, and paged K/V tensors. For each request, logical K/V positions
+are translated through the block table before memory is loaded.
 
-- The K/V streaming loop may need sparse tile lists instead of affine lower/upper bounds.
-- Global tokens create non-local dependencies that should still share the online-softmax state.
-- A practical implementation needs a representation for sparse block patterns before lowering to
-  backend-specific launch code.
+The compiler representation should preserve logical attention positions, page-table lookup, and
+physical layout inside a page as separate concepts.
 
-### Multi-Head Latent Attention
+### Quantized K/V Representation
 
-Multi-head latent attention (MLA) compresses K/V cache state into latent vectors and reconstructs
-the per-head values needed by attention. This is a larger departure from ordinary GQA/MQA.
+Quantized K/V representation covers cases where K/V are stored in a lower-precision format and
+interpreted using scale metadata. This is broader than the current FP8 K/V input path because
+persistent KV caches need explicit scale layout and scale granularity.
 
-Compiler pressure points:
+The first target should be **FP8 KV-cache decode with explicit scales**. The operator should model
+cache storage dtype, compute dtype, and scale tensors. Scale granularity should be explicit:
+per-tensor, per-head, per-token, or layout-dependent scales imply different indexing and fusion choices.
 
-- The K/V cache representation is no longer plain per-token per-head K/V tensors.
-- Extra projection/reconstruction work must be placed relative to the attention loop.
-- It is a good long-term target after cache-layout and decode-attention support are stable.
+Quantized cache support should compose with both contiguous and paged cache addressing.
 
-## Suggested Order
+### Position-Dependent Q/K Transforms
 
-1. Variable-length packed attention.
-1. Decode attention with contiguous GQA/MQA KV cache.
-1. PagedAttention-style KV cache.
-1. RoPE Q/K fusion.
-1. Block-sparse attention with global tokens.
-1. Multi-head latent attention.
+Position-dependent Q/K transforms modify Q and K before the QK dot, usually based on token position
+and channel index. The compiler target is to fuse the transform into tile loads or immediately
+before the dot, without materializing transformed Q/K tensors.
+
+The first target should be **RoPE-fused attention**. RoPE rotates paired Q and K channels using
+position-dependent sin/cos values. In prefill, positions usually come from token indices within each
+sequence or segment. In decode, positions come from cache-position metadata.
+
+RoPE should be represented as a Q/K transform rather than a score modifier because it changes the
+vectors entering the dot product, not the score after the dot.
+
+### Compressed or Latent K/V Representation
+
+Compressed or latent K/V representations change the mathematical source of K/V, not only their
+layout or dtype. The cache may store latent vectors, compressed factors, or split positional /
+non-positional components that must be reconstructed before attention consumes per-head K/V values.
+
+The first target should be **multi-head latent attention (MLA)**. In MLA-style decode, the cache
+stores compressed latent state instead of ordinary per-head K/V tensors.
+The attention loop reconstructs the K/V values it needs and places that projection work
+relative to QK, softmax, and PV.
+
+This feature should remain separate from quantized KV cache. Quantization changes how values are
+stored numerically; MLA changes what the stored values mean mathematically.
