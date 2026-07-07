@@ -972,21 +972,23 @@ LogicalResult bufferizeForallResults(RewriterBase &rewriter, ArrayRef<scf::Foral
   return success();
 }
 
-void materializeLoadsForTensorUsers(RewriterBase &rewriter, OpOperand *use,
+bool materializeLoadsForTensorUsers(RewriterBase &rewriter, OpOperand &use,
                                     RankedTensorType tensorType, Value buffer) {
-  Operation *owner = use->getOwner();
+  Operation *owner = use.getOwner();
   OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPoint(owner);
   if (auto extract = dyn_cast<tensor::ExtractSliceOp>(owner)) {
     // If the use is a tensor.extract_slice, we materialize a sliced load of the buffer.
     Value sliced = materializeLoadForExtractSlice(rewriter, extract, buffer);
     rewriter.replaceOp(extract, sliced);
+    return true; // Op erased
   } else {
     // Otherwise, fall back to a full load of the buffer.
     Value loaded =
         ToTensorOp::create(rewriter, owner->getLoc(), tensorType, buffer, /*restrict=*/true,
                            /*writable=*/true);
-    use->set(loaded);
+    use.set(loaded);
+    return false; // Op not erased
   }
 }
 
@@ -994,25 +996,23 @@ LogicalResult bufferizeTensorReadInForalls(RewriterBase &rewriter,
                                            ArrayRef<scf::ForallOp> forallOps,
                                            TensorToBufferMap &map) {
   for (auto forall : forallOps) {
-    SmallVector<OpOperand *> tensorUses;
     forall.getBody()->walk([&](Operation *op) {
       for (OpOperand &operand : op->getOpOperands()) {
         // Skip non-tensors, and tensors defined inside the loop body (not block arguments).
         Value tensor = operand.get();
-        if (!isa<RankedTensorType>(tensor.getType()))
+        auto tensorType = dyn_cast<RankedTensorType>(tensor.getType());
+        if (!tensorType)
           continue;
-        auto defOp = tensor.getDefiningOp();
-        bool isInLoop = defOp && forall->isAncestor(defOp);
-        if (!isInLoop)
-          tensorUses.push_back(&operand);
+        bool isInLoop = forall.getRegion().isAncestor(tensor.getParentRegion());
+        if (isInLoop)
+          continue;
+        Value buffer = map.getOrCreateTensorMemrefForRead(rewriter, forall, tensor);
+        // If this op is an extract_slice, it may be entirely removed.
+        if (materializeLoadsForTensorUsers(rewriter, operand, tensorType, buffer))
+          return WalkResult::skip();
       }
+      return WalkResult::advance();
     });
-    for (OpOperand *use : tensorUses) {
-      Value tensor = use->get();
-      auto tensorType = cast<RankedTensorType>(tensor.getType());
-      Value buffer = map.getOrCreateTensorMemrefForRead(rewriter, forall, tensor);
-      materializeLoadsForTensorUsers(rewriter, use, tensorType, buffer);
-    }
   }
   return success();
 }
@@ -1026,7 +1026,7 @@ LogicalResult bufferizeForallResultUses(RewriterBase &rewriter, ArrayRef<scf::Fo
       if (!buffer)
         continue;
       auto tensorType = cast<RankedTensorType>(tensor.getType());
-      materializeLoadsForTensorUsers(rewriter, &use, tensorType, buffer);
+      materializeLoadsForTensorUsers(rewriter, use, tensorType, buffer);
     }
   }
   return success();
