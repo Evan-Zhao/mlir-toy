@@ -15,6 +15,7 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
+from jax import lax
 
 
 @partial(jax.jit, static_argnames=("max_doc_len"))
@@ -52,11 +53,19 @@ def doc_offset_attention(
     scale = jnp.asarray(1.0 / math.sqrt(D), dtype=jnp.float32)
 
     def load_doc(x, start):
-        # This is the JAX idiom closest to a masked vector load. Unlike
-        # dynamic_slice, gather/take with mode="fill" does not clamp the window
-        # start when start + L0 exceeds LT; out-of-bounds lanes are filled with 0.
+        # Invalid window lanes are masked out before they affect valid output.
+        # Use clipped gathers rather than masked-fill gathers to avoid generating
+        # separate OOB masks and zero-selects for every Q/K/V load.
         token_indices = start + token_offsets
-        return jnp.take(x, token_indices, axis=0, mode="fill", fill_value=0)
+        return lax.gather(
+            x,
+            token_indices[:, None],
+            dimension_numbers=lax.GatherDimensionNumbers(
+                offset_dims=(1, 2), collapsed_slice_dims=(0,), start_index_map=(0,)
+            ),
+            slice_sizes=(1, H, D),
+            mode=lax.GatherScatterMode.CLIP,
+        )
 
     def one_doc_attention(start, doc_len):
         """Dense masked attention for one logical document window."""
@@ -66,8 +75,9 @@ def doc_offset_attention(
         scores = scores * scale
         valid_tokens = token_offsets < doc_len
         key_valid = valid_tokens.reshape(1, 1, L0)
-        query_valid = valid_tokens.reshape(1, L0, 1)
-        scores = jnp.where(jnp.logical_and(query_valid, key_valid), scores, -jnp.inf)
+        # Padded query rows are scattered to out-of-bounds sink indices and
+        # dropped, so only key positions need to be masked for valid outputs.
+        scores = jnp.where(key_valid, scores, -jnp.inf)
         probs = jax.nn.softmax(scores, axis=-1)
         out_doc_f32 = jnp.einsum("hij,jhd->ihd", probs, v_doc, preferred_element_type=jnp.float32)
         return out_doc_f32.astype(q.dtype)
@@ -79,13 +89,24 @@ def doc_offset_attention(
     # Scatter valid document tokens back to packed layout. Invalid padded tokens
     # are sent to unique out-of-bounds sink positions so the scatter can be marked
     # unique and the OOB updates can be dropped instead of materializing sinks.
-    doc_token_indices = starts.reshape(N, 1) + token_offsets.reshape(1, L0)
-    valid_doc_tokens = token_offsets.reshape(1, L0) < lengths.reshape(N, 1)
-    sink_indices = LT + jnp.arange(N * L0, dtype=offsets.dtype).reshape(N, L0)
-    scatter_indices = jnp.where(valid_doc_tokens, doc_token_indices, sink_indices).reshape(N * L0)
-    scatter_updates = out_docs.reshape(N * L0, H, D)
-    out = jnp.zeros((LT, H, D), dtype=q.dtype)
-    return out.at[scatter_indices, :, :].set(scatter_updates, unique_indices=True, mode="drop")
+    doc_ids = jnp.arange(N, dtype=offsets.dtype)
+    doc_token_indices = starts[:, None] + token_offsets[None, :]
+    valid_doc_tokens = lengths[:, None] > token_offsets[None, :]
+    sink_indices = LT + doc_ids[:, None] * L0 + token_offsets[None, :]
+    scatter_indices = jnp.where(valid_doc_tokens, doc_token_indices, sink_indices)
+    return lax.scatter(
+        jnp.zeros((LT, H, D), dtype=q.dtype),
+        scatter_indices[..., None],  # [N, L0, 1]
+        out_docs,  # [N, L0, H, D]
+        dimension_numbers=lax.ScatterDimensionNumbers(
+            update_window_dims=(2, 3),
+            inserted_window_dims=(0,),
+            scatter_dims_to_operand_dims=(0,),
+        ),
+        indices_are_sorted=False,
+        unique_indices=True,
+        mode=lax.GatherScatterMode.FILL_OR_DROP,
+    )
 
 
 def parse_args() -> argparse.Namespace:
