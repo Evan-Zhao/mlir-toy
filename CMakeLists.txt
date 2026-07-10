@@ -96,75 +96,11 @@ if(BUILD_TESTING AND NOT LLVM_EXTERNAL_LIT)
   endif()
 endif()
 
-# These are used for tablegen. Mark LLVM/MLIR includes as system headers so
-# stricter warning profiles focus on this repo rather than upstream headers.
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
-include_directories(${CMAKE_CURRENT_BINARY_DIR})
-include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
-include_directories(SYSTEM ${MLIR_INCLUDE_DIRS})
-
-set(LLVM_TARGET_DEFINITIONS include/HTile/HTileOps.td)
-mlir_tablegen(HTileOps.h.inc -gen-op-decls)
-mlir_tablegen(HTileOps.cpp.inc -gen-op-defs)
-mlir_tablegen(HTileOpsDialect.h.inc -gen-dialect-decls -dialect=htile)
-mlir_tablegen(HTileOpsDialect.cpp.inc -gen-dialect-defs -dialect=htile)
-add_public_tablegen_target(HTileOpsIncGen)
-
-set(LLVM_TARGET_DEFINITIONS include/HTile/HTileAttrs.td)
-mlir_tablegen(HTileAttrs.h.inc -gen-attrdef-decls -attrdefs-dialect=htile)
-mlir_tablegen(HTileAttrs.cpp.inc -gen-attrdef-defs -attrdefs-dialect=htile)
-mlir_tablegen(HTileEnums.h.inc -gen-enum-decls)
-mlir_tablegen(HTileEnums.cpp.inc -gen-enum-defs)
-add_public_tablegen_target(HTileAttrsIncGen)
-
-set(LLVM_TARGET_DEFINITIONS include/HTile/HTileTransformOps.td)
-mlir_tablegen(HTileTransformOps.h.inc -gen-op-decls)
-mlir_tablegen(HTileTransformOps.cpp.inc -gen-op-defs)
-add_public_tablegen_target(HTileTransformOpsIncGen)
-
-set(LLVM_TARGET_DEFINITIONS include/LoopTr/LoopTransformOps.td)
-mlir_tablegen(LoopTransformOps.h.inc -gen-op-decls)
-mlir_tablegen(LoopTransformOps.cpp.inc -gen-op-defs)
-add_public_tablegen_target(LoopTransformOpsIncGen)
-
-set(LLVM_TARGET_DEFINITIONS include/TA/TAOps.td)
-mlir_tablegen(TAOps.h.inc -gen-op-decls)
-mlir_tablegen(TAOps.cpp.inc -gen-op-defs)
-mlir_tablegen(TAOpsDialect.h.inc -gen-dialect-decls -dialect=ta)
-mlir_tablegen(TAOpsDialect.cpp.inc -gen-dialect-defs -dialect=ta)
-add_public_tablegen_target(TAOpsIncGen)
-
-set(LLVM_TARGET_DEFINITIONS include/TA/TAAttrs.td)
-mlir_tablegen(TAAttrs.h.inc -gen-attrdef-decls -attrdefs-dialect=ta)
-mlir_tablegen(TAAttrs.cpp.inc -gen-attrdef-defs -attrdefs-dialect=ta)
-mlir_tablegen(TAEnums.h.inc -gen-enum-decls)
-mlir_tablegen(TAEnums.cpp.inc -gen-enum-defs)
-add_public_tablegen_target(TAAttrsIncGen)
-
-set(LLVM_TARGET_DEFINITIONS include/TA/TATypes.td)
-mlir_tablegen(TATypes.h.inc -gen-typedef-decls -typedefs-dialect=ta)
-mlir_tablegen(TATypes.cpp.inc -gen-typedef-defs -typedefs-dialect=ta)
-add_public_tablegen_target(TATypesIncGen)
-
-set(LLVM_TARGET_DEFINITIONS include/TA/TATransformOps.td)
-mlir_tablegen(TATransformOps.h.inc -gen-op-decls)
-mlir_tablegen(TATransformOps.cpp.inc -gen-op-defs)
-add_public_tablegen_target(TATransformOpsIncGen)
-
-add_mlir_pdll_library(TAMulScaleMotionPDLL
-  lib/TA/MulScaleMotion.pdll
-  MulScaleMotion.cpp.inc
-)
-
-add_mlir_pdll_library(TAExpToExp2PDLL
-  lib/TA/ExpToExp2.pdll
-  ExpToExp2.cpp.inc
-)
 
 function(setup_mlir_target TARGET)
   llvm_update_compile_flags(${TARGET})
   target_include_directories(${TARGET} PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}
+    ${PROJECT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}
   )
   target_include_directories(${TARGET} SYSTEM PUBLIC
     ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS}
@@ -199,6 +135,11 @@ function(make_mlir_opt_plugin)
   # Must NOT statically embed MLIR libs -- mlir-opt already provides them via
   # libMLIR.so, and duplicate TypeID registries cause a segfault on load.
   add_library(${ARG_TARGET} SHARED ${ARG_SOURCES})
+  # Keep plugin paths stable when their targets live in subdirectories.
+  set_target_properties(${ARG_TARGET} PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
+  )
   add_dependencies(${ARG_TARGET} ${ARG_DEPS})
   setup_mlir_target(${ARG_TARGET})
   if(APPLE)
@@ -210,96 +151,10 @@ function(make_mlir_opt_plugin)
   install(TARGETS ${ARG_TARGET} LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}")
 endfunction()
 
-function(make_mlir_python_extension)
-  cmake_parse_arguments(ARG "" "TARGET" "SOURCES;DEPS" ${ARGN})
-  Python3_add_library(${ARG_TARGET} MODULE WITH_SOABI ${ARG_SOURCES})
-
-  target_link_libraries(${ARG_TARGET} PRIVATE
-    "${MLIR_PYTHON_LIB_DIR}/libMLIRPythonCAPI${CMAKE_SHARED_LIBRARY_SUFFIX}"
-    "${MLIR_PYTHON_LIB_DIR}/libMLIRPythonSupport-mlir${CMAKE_SHARED_LIBRARY_SUFFIX}"
-  )
-  set_target_properties(${ARG_TARGET} PROPERTIES
-    BUILD_RPATH "${MLIR_PYTHON_LIB_DIR}"
-    INSTALL_RPATH "${MLIR_PYTHON_LIB_DIR}"
-  )
-  add_dependencies(${ARG_TARGET} ${ARG_DEPS})
-  setup_mlir_target(${ARG_TARGET})
-  set_target_properties(${ARG_TARGET} PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/neptune_mlir/_mlir_libs"
-  )
-  install(TARGETS _neptuneMlir LIBRARY DESTINATION "neptune_mlir/_mlir_libs")
-endfunction()
-
-if(NEPTUNE_MLIR_BUILD_PYTHON_EXTENSIONS)
-  make_mlir_python_extension(
-    TARGET _neptuneMlir
-    SOURCES
-      lib/Python/NeptuneMLIRModule.cpp
-      lib/HTile/HTileDialect.cpp
-      lib/HTile/HTilePasses.cpp
-      lib/HTile/HTileTransformOps.cpp
-      lib/LoopTr/Utils.cpp
-    DEPS
-      HTileOpsIncGen
-      HTileAttrsIncGen
-      HTileTransformOpsIncGen
-  )
-endif()
-
-make_mlir_opt_plugin(
-  TARGET HTileDialect
-  SOURCES
-    lib/HTile/HTileDialect.cpp
-    lib/HTile/HTilePasses.cpp
-    lib/HTile/HTileTransformOps.cpp
-    lib/LoopTr/Utils.cpp
-  DEPS
-    HTileOpsIncGen
-    HTileAttrsIncGen
-    HTileTransformOpsIncGen
-)
-make_mlir_opt_plugin(
-  TARGET TADialect
-  SOURCES
-    lib/TA/TADialect.cpp
-    lib/TA/LinalgToTA.cpp
-    lib/TA/TAToLinalg.cpp
-    lib/TA/TATransformOps.cpp
-    lib/TA/TAUtils.cpp
-  DEPS
-    TAOpsIncGen
-    TAAttrsIncGen
-    TATypesIncGen
-    TATransformOpsIncGen
-    TAMulScaleMotionPDLL
-    TAExpToExp2PDLL
-)
-make_mlir_opt_plugin(
-  TARGET LoopTransform
-  SOURCES
-    lib/LoopTr/FusionExprSolver.cpp
-    lib/LoopTr/FusionIntoProducer.cpp
-    lib/LoopTr/FusionSplitKUpdate.cpp
-    lib/LoopTr/FusionRollingUpdate.cpp
-    lib/LoopTr/LinalgTransformOps.cpp
-    lib/LoopTr/LoopSpecializeDeadTile.cpp
-    lib/LoopTr/LoopTransformPlugin.cpp
-    lib/LoopTr/ScfLocalizeScratchTensors.cpp
-    lib/LoopTr/ScfTransformOps.cpp
-    lib/LoopTr/Utils.cpp
-    DEPS LoopTransformOpsIncGen
-)
-
-# This is how we call the Python solver from C++.
-target_link_libraries(LoopTransform PRIVATE pybind11::embed)
-set_target_properties(LoopTransform PROPERTIES
-  BUILD_RPATH "${Python3_LIBRARY_DIRS}"
-  INSTALL_RPATH "${Python3_LIBRARY_DIRS}"
-)
-set_source_files_properties(
-  lib/LoopTr/FusionExprSolver.cpp
-  PROPERTIES COMPILE_OPTIONS "-frtti;-fexceptions"
-)
+add_subdirectory(lib/HTile)
+add_subdirectory(lib/TA)
+add_subdirectory(lib/LoopTr)
+add_subdirectory(lib/Python)
 
 if(BUILD_TESTING)
   add_subdirectory(test)
