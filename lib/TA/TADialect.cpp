@@ -779,6 +779,31 @@ struct FoldMulOfConstants : OpRewritePattern<MulOp> {
   }
 };
 
+template <typename OpTy, bool NegativeInfinity>
+struct FoldInfinityIdentity : OpRewritePattern<OpTy> {
+  using OpRewritePattern<OpTy>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(OpTy op, PatternRewriter &rewriter) const override {
+    auto matchIdentity = [&](Value candidate, Value other) -> Value {
+      auto constant = candidate.getDefiningOp<ConstantOp>();
+      auto value = constant ? dyn_cast<FloatAttr>(constant.getValue()) : FloatAttr();
+      if (!value || !value.getValue().isInfinity() ||
+          value.getValue().isNegative() != NegativeInfinity ||
+          other.getType() != op.getResult().getType())
+        return {};
+      return other;
+    };
+
+    Value replacement = matchIdentity(op.getLhs(), op.getRhs());
+    if (!replacement)
+      replacement = matchIdentity(op.getRhs(), op.getLhs());
+    if (!replacement)
+      return failure();
+    rewriter.replaceOp(op, replacement);
+    return success();
+  }
+};
+
 } // namespace
 
 void CastOp::getCanonicalizationPatterns(RewritePatternSet &patterns, MLIRContext *context) {
@@ -787,6 +812,14 @@ void CastOp::getCanonicalizationPatterns(RewritePatternSet &patterns, MLIRContex
 
 void MulOp::getCanonicalizationPatterns(RewritePatternSet &patterns, MLIRContext *context) {
   patterns.add<FoldMulOfConstants>(context);
+}
+
+void MaximumOp::getCanonicalizationPatterns(RewritePatternSet &patterns, MLIRContext *context) {
+  patterns.add<FoldInfinityIdentity<MaximumOp, /*NegativeInfinity=*/true>>(context);
+}
+
+void MinimumOp::getCanonicalizationPatterns(RewritePatternSet &patterns, MLIRContext *context) {
+  patterns.add<FoldInfinityIdentity<MinimumOp, /*NegativeInfinity=*/false>>(context);
 }
 
 LogicalResult CmpFOp::verify() {

@@ -40,4 +40,23 @@ module {
     } : () -> tensor<1xf32>
     return %0 : tensor<1xf32>
   }
+
+  // CHECK-LABEL: func.func @fold_float_infinity_identities
+  func.func @fold_float_infinity_identities(%arg: tensor<4xf32>) -> tensor<4xf32> {
+    %0 = ta.scope axes(%i "i" extent 4) {
+      // CHECK: %[[X:.+]] = ta.at
+      // CHECK-NOT: ta.maximum
+      // CHECK-NOT: ta.minimum
+      // CHECK: ta.yield %[[X]]
+      %x = ta.at %arg[%i] : tensor<4xf32> -> !ta.expr<f32, [i]>
+      %neg_inf = ta.constant 0xFF800000 : f32 : !ta.expr<f32, []>
+      %max = ta.maximum %neg_inf, %x
+          : (!ta.expr<f32, []>, !ta.expr<f32, [i]>) -> !ta.expr<f32, [i]>
+      %pos_inf = ta.constant 0x7F800000 : f32 : !ta.expr<f32, []>
+      %min = ta.minimum %max, %pos_inf
+          : (!ta.expr<f32, [i]>, !ta.expr<f32, []>) -> !ta.expr<f32, [i]>
+      ta.yield %min : !ta.expr<f32, [i]>
+    } : () -> tensor<4xf32>
+    return %0 : tensor<4xf32>
+  }
 }

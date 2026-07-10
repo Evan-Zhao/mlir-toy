@@ -327,6 +327,8 @@ void TAReassociateRightMulfPatternsOp::populatePatterns(RewritePatternSet &patte
 void TAExpToExp2PatternsOp::populatePatterns(RewritePatternSet &patterns) {
   ta_exp_to_exp2_pdl::populateGeneratedPDLLPatterns(patterns);
   ta::MulOp::getCanonicalizationPatterns(patterns, patterns.getContext());
+  ta::MaximumOp::getCanonicalizationPatterns(patterns, patterns.getContext());
+  ta::MinimumOp::getCanonicalizationPatterns(patterns, patterns.getContext());
 }
 
 void TARewriteExpToExp2Op::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
@@ -343,6 +345,8 @@ DiagnosedSilenceableFailure TARewriteExpToExp2Op::applyToOne(TransformRewriter &
   RewritePatternSet patterns(getContext());
   ta_exp_to_exp2_pdl::populateGeneratedPDLLPatterns(patterns);
   ta::MulOp::getCanonicalizationPatterns(patterns, getContext());
+  ta::MaximumOp::getCanonicalizationPatterns(patterns, getContext());
+  ta::MinimumOp::getCanonicalizationPatterns(patterns, getContext());
 
   if (failed(rewriteGreedily(rewriter, std::move(patterns), target))) {
     auto transform = cast<TransformOpInterface>(getOperation());

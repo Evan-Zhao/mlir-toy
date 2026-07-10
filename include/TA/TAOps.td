@@ -84,8 +84,12 @@ def TA_MulOp : TA_BinaryElementwiseOp<"mul", [Commutative]> {
   let hasCanonicalizer = 1;
 }
 def TA_DivOp : TA_BinaryElementwiseOp<"div">;
-def TA_MaximumOp : TA_BinaryElementwiseOp<"maximum", [Commutative]>;
-def TA_MinimumOp : TA_BinaryElementwiseOp<"minimum", [Commutative]>;
+def TA_MaximumOp : TA_BinaryElementwiseOp<"maximum", [Commutative]> {
+  let hasCanonicalizer = 1;
+}
+def TA_MinimumOp : TA_BinaryElementwiseOp<"minimum", [Commutative]> {
+  let hasCanonicalizer = 1;
+}
 def TA_MaxNumOp : TA_BinaryElementwiseOp<"maxnum", [Commutative]>;
 def TA_MinNumOp : TA_BinaryElementwiseOp<"minnum", [Commutative]>;
 
