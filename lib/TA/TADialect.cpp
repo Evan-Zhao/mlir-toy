@@ -10,6 +10,7 @@
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Tools/Plugins/DialectPlugin.h"
 #include "mlir/Tools/Plugins/PassPlugin.h"
+#include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/ADT/StringSet.h"
 
 #define GET_DIALECT_DEFS
@@ -717,9 +718,8 @@ struct FoldCastOfConstant : OpRewritePattern<CastOp> {
       if (status == APFloat::opInvalidOp)
         return failure();
     } else if (auto intValue = dyn_cast<IntegerAttr>(constant.getValue())) {
-      APFloat::opStatus status =
-          folded.convertFromAPInt(intValue.getValue(), /*IsSigned=*/true,
-                                  APFloat::rmNearestTiesToEven);
+      APFloat::opStatus status = folded.convertFromAPInt(intValue.getValue(), /*IsSigned=*/true,
+                                                         APFloat::rmNearestTiesToEven);
       if (status == APFloat::opInvalidOp)
         return failure();
     } else {
@@ -1130,8 +1130,10 @@ extern "C" LLVM_ATTRIBUTE_WEAK mlir::DialectPluginLibraryInfo mlirGetDialectPlug
   return {MLIR_PLUGIN_API_VERSION, "TADialectPlugin", LLVM_VERSION_STRING,
           [](mlir::DialectRegistry *registry) {
             registry->insert<ta::TADialect>();
+            registry->insert<mlir::stablehlo::StablehloDialect>();
             ta::registerTATransformExtension(*registry);
             ta::registerLinalgToTAPass();
+            ta::registerStableHLOToTAPass();
             ta::registerTAToLinalgPass();
           }};
 }
@@ -1139,6 +1141,7 @@ extern "C" LLVM_ATTRIBUTE_WEAK mlir::DialectPluginLibraryInfo mlirGetDialectPlug
 extern "C" LLVM_ATTRIBUTE_WEAK mlir::PassPluginLibraryInfo mlirGetPassPluginInfo() {
   return {MLIR_PLUGIN_API_VERSION, "TAPassPlugin", LLVM_VERSION_STRING, []() {
             ta::registerLinalgToTAPass();
+            ta::registerStableHLOToTAPass();
             ta::registerTAToLinalgPass();
           }};
 }

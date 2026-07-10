@@ -78,8 +78,8 @@ list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
 
 include(AddLLVM)
-include(TableGen)
 include(AddMLIR)
+include(TableGen)
 
 set(LLVM_LIT_ARGS "-sv" CACHE STRING "Default options for lit")
 
@@ -96,14 +96,13 @@ if(BUILD_TESTING AND NOT LLVM_EXTERNAL_LIT)
   endif()
 endif()
 
-
 function(setup_mlir_target TARGET)
   llvm_update_compile_flags(${TARGET})
   target_include_directories(${TARGET} PUBLIC
     ${PROJECT_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR}
   )
   target_include_directories(${TARGET} SYSTEM PUBLIC
-    ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS}
+    ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS} ${NEPTUNE_STABLEHLO_INCLUDE_DIRS}
   )
   target_compile_definitions(${TARGET} PRIVATE ${LLVM_DEFINITIONS})
 
@@ -153,6 +152,15 @@ function(make_mlir_opt_plugin)
   endif()
   install(TARGETS ${ARG_TARGET} LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}")
 endfunction()
+
+# Build StableHLO as a subproject.
+set(STABLEHLO_BUILD_EMBEDDED ON)
+set(STABLEHLO_ENABLE_BINDINGS_PYTHON OFF)
+add_subdirectory(
+  "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/stablehlo"
+  "${CMAKE_CURRENT_BINARY_DIR}/stablehlo"
+  EXCLUDE_FROM_ALL
+)
 
 add_subdirectory(lib/HTile)
 add_subdirectory(lib/TA)

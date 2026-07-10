@@ -16,6 +16,7 @@ mlir::LogicalResult lowerTAToLinalg(
         beforeErase = nullptr);
 
 void registerLinalgToTAPass();
+void registerStableHLOToTAPass();
 void registerTAToLinalgPass();
 
 } // namespace ta

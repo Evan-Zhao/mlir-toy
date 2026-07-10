@@ -43,6 +43,7 @@ make_mlir_opt_plugin(
   SOURCES
     TADialect.cpp
     LinalgToTA.cpp
+    StableHLOToTA.cpp
     TAToLinalg.cpp
     TATransformOps.cpp
     TAUtils.cpp
@@ -54,3 +55,7 @@ make_mlir_opt_plugin(
     TAMulScaleMotionPDLL
     TAExpToExp2PDLL
 )
+
+# StablehloOps provides both the StableHLO dialect implementation and its
+# generated-header include directories.
+target_link_libraries(TADialect PRIVATE StablehloOps)
