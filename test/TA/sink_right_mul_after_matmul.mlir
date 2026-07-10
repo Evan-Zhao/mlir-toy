@@ -24,18 +24,18 @@ module attributes {transform.with_named_sequence} {
       // CHECK: %[[VALUES:.+]] = ta.at %{{.+}}[%j, %d]
       %values_expr = ta.at %values[%j, %d]
           : tensor<3x4xf32> -> !ta.expr<f32, [j, d]>
-      %scaled_values = ta.mulf %values_expr, %scale_expr {ta.import_group = 5 : i64}
+      %scaled_values = ta.mul %values_expr, %scale_expr {ta.import_group = 5 : i64}
           : (!ta.expr<f32, [j, d]>, !ta.expr<f32, [i]>)
          -> !ta.expr<f32, [j, d, i]>
-      // CHECK: %[[PROD:.+]] = ta.mulf %[[SCORES]], %[[VALUES]]
-      %prod = ta.mulf %scores_expr, %scaled_values {ta.import_group = 11 : i64}
+      // CHECK: %[[PROD:.+]] = ta.mul %[[SCORES]], %[[VALUES]]
+      %prod = ta.mul %scores_expr, %scaled_values {ta.import_group = 11 : i64}
           : (!ta.expr<f32, [i, j]>, !ta.expr<f32, [j, d, i]>)
          -> !ta.expr<f32, [i, j, d]>
       // CHECK: %[[RED:.+]] = ta.reduce <add> %[[PROD]]
       // CHECK-SAME: axes = #ta.axes<j>
       %sum = ta.reduce #ta.reduce_kind<add> %prod {axes = #ta.axes<j>, ta.import_group = 11 : i64}
           : !ta.expr<f32, [i, j, d]> -> !ta.expr<f32, [i, d]>
-      // CHECK: %[[HOISTED:.+]] = ta.mulf %[[RED]], %[[SCALE]]
+      // CHECK: %[[HOISTED:.+]] = ta.mul %[[RED]], %[[SCALE]]
       // CHECK-SAME: -> !ta.expr<f32, [i, d]>
       // CHECK: ta.yield %[[HOISTED]]
       ta.yield %sum : !ta.expr<f32, [i, d]>
@@ -57,12 +57,12 @@ module attributes {transform.with_named_sequence} {
       // CHECK: %[[VALUES:.+]] = ta.at %{{.+}}[%j, %d]
       %values_expr = ta.at %values[%j, %d]
           : tensor<3x4xf32> -> !ta.expr<f32, [j, d]>
-      // CHECK: %[[SCALED:.+]] = ta.mulf %[[VALUES]], %[[SCALE]]
-      %scaled_values = ta.mulf %values_expr, %scale_expr {ta.import_group = 5 : i64}
+      // CHECK: %[[SCALED:.+]] = ta.mul %[[VALUES]], %[[SCALE]]
+      %scaled_values = ta.mul %values_expr, %scale_expr {ta.import_group = 5 : i64}
           : (!ta.expr<f32, [j, d]>, !ta.expr<f32, [j]>)
          -> !ta.expr<f32, [j, d]>
-      // CHECK: %[[PROD:.+]] = ta.mulf %[[SCORES]], %[[SCALED]]
-      %prod = ta.mulf %scores_expr, %scaled_values {ta.import_group = 11 : i64}
+      // CHECK: %[[PROD:.+]] = ta.mul %[[SCORES]], %[[SCALED]]
+      %prod = ta.mul %scores_expr, %scaled_values {ta.import_group = 11 : i64}
           : (!ta.expr<f32, [i, j]>, !ta.expr<f32, [j, d]>)
          -> !ta.expr<f32, [i, j, d]>
       // CHECK: ta.reduce <add> %[[PROD]]

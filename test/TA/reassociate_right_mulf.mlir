@@ -22,12 +22,12 @@ module attributes {transform.with_named_sequence} {
           : tensor<3xf32> -> !ta.expr<f32, [j]>
       // CHECK: %[[FACTOR:.+]] = ta.constant
       %factor_expr = ta.constant 2.000000e+00 : f32 : !ta.expr<f32, []>
-      // CHECK: %[[INNER:.+]] = ta.mulf %[[LHS]], %[[RHS]]
-      %inner = ta.mulf %lhs_expr, %rhs_expr {ta.import_group = 5 : i64}
+      // CHECK: %[[INNER:.+]] = ta.mul %[[LHS]], %[[RHS]]
+      %inner = ta.mul %lhs_expr, %rhs_expr {ta.import_group = 5 : i64}
           : (!ta.expr<f32, [i]>, !ta.expr<f32, [j]>)
          -> !ta.expr<f32, [i, j]>
-      // CHECK: %[[OUTER:.+]] = ta.mulf %[[FACTOR]], %[[INNER]]
-      %outer = ta.mulf %factor_expr, %inner {ta.import_group = 11 : i64}
+      // CHECK: %[[OUTER:.+]] = ta.mul %[[FACTOR]], %[[INNER]]
+      %outer = ta.mul %factor_expr, %inner {ta.import_group = 11 : i64}
           : (!ta.expr<f32, []>, !ta.expr<f32, [i, j]>)
          -> !ta.expr<f32, [i, j]>
       // CHECK: ta.reduce <add> %[[OUTER]]
@@ -51,15 +51,15 @@ module attributes {transform.with_named_sequence} {
           : tensor<2xf32> -> !ta.expr<f32, [i]>
       // CHECK: %[[FACTOR:.+]] = ta.constant
       %factor_expr = ta.constant 2.000000e+00 : f32 : !ta.expr<f32, []>
-      %inner = ta.mulf %lhs_expr, %rhs_expr {ta.import_group = 5 : i64}
+      %inner = ta.mul %lhs_expr, %rhs_expr {ta.import_group = 5 : i64}
           : (!ta.expr<f32, [j]>, !ta.expr<f32, [i]>)
          -> !ta.expr<f32, [j, i]>
-      // CHECK: %[[NEW_INNER:.+]] = ta.mulf %[[RHS]], %[[FACTOR]]
+      // CHECK: %[[NEW_INNER:.+]] = ta.mul %[[RHS]], %[[FACTOR]]
       // CHECK-SAME: -> !ta.expr<f32, [i]>
-      %outer = ta.mulf %factor_expr, %inner {ta.import_group = 11 : i64}
+      %outer = ta.mul %factor_expr, %inner {ta.import_group = 11 : i64}
           : (!ta.expr<f32, []>, !ta.expr<f32, [j, i]>)
          -> !ta.expr<f32, [j, i]>
-      // CHECK: %[[NEW_OUTER:.+]] = ta.mulf %[[LHS]], %[[NEW_INNER]]
+      // CHECK: %[[NEW_OUTER:.+]] = ta.mul %[[LHS]], %[[NEW_INNER]]
       // CHECK-SAME: -> !ta.expr<f32, [j, i]>
       // CHECK: ta.yield %[[NEW_OUTER]]
       ta.yield %outer : !ta.expr<f32, [j, i]>

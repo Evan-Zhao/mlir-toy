@@ -33,7 +33,7 @@ func.func @matmul_ta(%lhs: tensor<16x64xf32>, %rhs: tensor<64x32xf32>)
         : tensor<16x64xf32> -> !ta.expr<f32, [i, k]>
     %y = ta.at %rhs[%red, %col]
         : tensor<64x32xf32> -> !ta.expr<f32, [k, j]>
-    %xy = ta.mulf %x, %y
+    %xy = ta.mul %x, %y
         : (!ta.expr<f32, [i, k]>, !ta.expr<f32, [k, j]>)
        -> !ta.expr<f32, [i, k, j]>
     %dot = ta.reduce #ta.reduce_kind<add> %xy {axes = #ta.axes<k>}
@@ -51,11 +51,11 @@ func.func @elementwise_ta(%rows: tensor<16xf32>, %cols: tensor<32xf32>)
         : tensor<16xf32> -> !ta.expr<f32, [i]>
     %y = ta.at %cols[%col]
         : tensor<32xf32> -> !ta.expr<f32, [j]>
-    %sum = ta.addf %x, %y
+    %sum = ta.add %x, %y
         : (!ta.expr<f32, [i]>, !ta.expr<f32, [j]>)
        -> !ta.expr<f32, [i, j]>
     %scale = ta.constant 2.000000e+00 : f32 : !ta.expr<f32, []>
-    %scaled = ta.mulf %sum, %scale
+    %scaled = ta.mul %sum, %scale
         : (!ta.expr<f32, [i, j]>, !ta.expr<f32, []>)
        -> !ta.expr<f32, [i, j]>
     %limit = ta.exp2 %scaled
@@ -143,21 +143,21 @@ func.func @attention_ta(%Q: tensor<2x3x4x6xf32>,
         : tensor<2x3x4x6xf32> -> !ta.expr<f32, [b, h, i, d]>
     %k = ta.at %K[%b, %h, %j, %d]
         : tensor<2x3x5x6xf32> -> !ta.expr<f32, [b, h, j, d]>
-    %qk = ta.mulf %q, %k
+    %qk = ta.mul %q, %k
         : (!ta.expr<f32, [b, h, i, d]>, !ta.expr<f32, [b, h, j, d]>)
        -> !ta.expr<f32, [b, h, i, d, j]>
     %dot = ta.reduce #ta.reduce_kind<add> %qk {axes = #ta.axes<d>}
         : !ta.expr<f32, [b, h, i, d, j]> -> !ta.expr<f32, [b, h, i, j]>
 
     %scale = ta.constant 4.082482904638630e-01 : f32 : !ta.expr<f32, []>
-    %s = ta.mulf %scale, %dot
+    %s = ta.mul %scale, %dot
         : (!ta.expr<f32, []>, !ta.expr<f32, [b, h, i, j]>)
        -> !ta.expr<f32, [b, h, i, j]>
 
     %m = ta.reduce #ta.reduce_kind<max> %s {axes = #ta.axes<j>}
         : !ta.expr<f32, [b, h, i, j]> -> !ta.expr<f32, [b, h, i]>
 
-    %centered = ta.subf %s, %m
+    %centered = ta.sub %s, %m
         : (!ta.expr<f32, [b, h, i, j]>, !ta.expr<f32, [b, h, i]>)
        -> !ta.expr<f32, [b, h, i, j]>
     %p = ta.exp %centered
@@ -168,13 +168,13 @@ func.func @attention_ta(%Q: tensor<2x3x4x6xf32>,
 
     %v = ta.at %V[%b, %h, %j, %e]
         : tensor<2x3x5x7xf32> -> !ta.expr<f32, [b, h, j, e]>
-    %pv = ta.mulf %p, %v
+    %pv = ta.mul %p, %v
         : (!ta.expr<f32, [b, h, i, j]>, !ta.expr<f32, [b, h, j, e]>)
        -> !ta.expr<f32, [b, h, i, j, e]>
     %num = ta.reduce #ta.reduce_kind<add> %pv {axes = #ta.axes<j>}
         : !ta.expr<f32, [b, h, i, j, e]> -> !ta.expr<f32, [b, h, i, e]>
 
-    %o = ta.divf %num, %l
+    %o = ta.div %num, %l
         : (!ta.expr<f32, [b, h, i, e]>, !ta.expr<f32, [b, h, i]>)
        -> !ta.expr<f32, [b, h, i, e]>
     ta.yield %o : !ta.expr<f32, [b, h, i, e]>

@@ -30,7 +30,7 @@
 // CHECK-NEXT:   {{.*}} = ta.constant 0.000000e+00 : f32
 // CHECK-NEXT:   %[[LHS:.+]] = ta.at %{{.+}}[%i0, %j0] {{.*}} : tensor<4x8xf32> -> !ta.expr<f32, [i0, j0]>
 // CHECK-NEXT:   %[[RHS:.+]] = ta.at %{{.+}}[%j0, %i1] {{.*}} : tensor<8x16xf32> -> !ta.expr<f32, [j0, i1]>
-// CHECK-NEXT:   %[[MUL:.+]] = ta.mulf %[[LHS]], %[[RHS]] {{.*}} : (!ta.expr<f32, [i0, j0]>, !ta.expr<f32, [j0, i1]>) -> !ta.expr<f32, [i0, j0, i1]>
+// CHECK-NEXT:   %[[MUL:.+]] = ta.mul %[[LHS]], %[[RHS]] {{.*}} : (!ta.expr<f32, [i0, j0]>, !ta.expr<f32, [j0, i1]>) -> !ta.expr<f32, [i0, j0, i1]>
 // CHECK-NEXT:   %[[DOT:.+]] = ta.reduce <add> %[[MUL]] {axes = #ta.axes<j0>{{.*}} : !ta.expr<f32, [i0, j0, i1]> -> !ta.expr<f32, [i0, i1]>
 // CHECK-NEXT:   ta.yield %[[DOT]] : !ta.expr<f32, [i0, i1]>
 // CHECK-NEXT: } : () -> tensor<4x16xf32>
@@ -102,7 +102,7 @@ func.func @expand_arg(%arg0: tensor<4x8xf32>) -> tensor<2x2x8xf32> {
 // CHECK: ta.scope axes(%i0 "i0" extent 1, %i1 "i1" extent 4, %i2 "i2" extent 1, %i3 "i3" extent 4, %i4 "i4" extent 4, %j0 "j0" extent 3)
 // CHECK: ta.at %{{.+}}[%i0, %i1, %{{.+}}, %j0] : tensor<1x4x4x3xf32> -> !ta.expr<f32, [i0, i1, i2, i3, j0]>
 // CHECK: ta.at %{{.+}}[%i0, %i2, %i4, %j0] {{.*}} : tensor<1x1x4x3xf32> -> !ta.expr<f32, [i0, i2, i4, j0]>
-// CHECK: ta.mulf {{.*}} -> !ta.expr<f32, [i0, i1, i2, i3, j0, i4]>
+// CHECK: ta.mul {{.*}} -> !ta.expr<f32, [i0, i1, i2, i3, j0, i4]>
 // CHECK: ta.reduce <add> {{.*}} : !ta.expr<f32, [i0, i1, i2, i3, j0, i4]> -> !ta.expr<f32, [i0, i1, i2, i3, i4]>
 // CHECK: ta.yield {{.*}} : !ta.expr<f32, [i0, i1, i2, i3, i4]>
 // CHECK: return {{.*}} : tensor<1x4x1x4x4xf32>
@@ -145,11 +145,11 @@ func.func @mqa_unit_kv_head_reduce_order(%q: tensor<1x4x4x3xf32>,
 // CHECK-LABEL: func.func @alibi_expand_patterns
 // CHECK: ta.scope axes(%i0 "i0" extent 1, %i1 "i1" extent 2, %i2 "i2" extent 4, %i3 "i3" extent 4
 // CHECK: ta.index
-// CHECK: ta.subf {{.*}} -> !ta.expr<f32, [i3, i2]>
+// CHECK: ta.sub {{.*}} -> !ta.expr<f32, [i3, i2]>
 // CHECK: ta.at %{{.+}}[%i1] : tensor<2xf32> -> !ta.expr<f32, [i1]>
 // CHECK-NOT: ta.at %{{.+}}[%i0, %i1, %{{.+}}, %{{.+}}] : tensor<2xf32>
-// CHECK: ta.mulf {{.*}} -> !ta.expr<f32, [i3, i2, i1]>
-// CHECK: ta.addf
+// CHECK: ta.mul {{.*}} -> !ta.expr<f32, [i3, i2, i1]>
+// CHECK: ta.add
 // CHECK: ta.yield {{.*}} : !ta.expr<f32, [i0, i1, i2, i3]>
 // CHECK: return {{.*}} : tensor<1x2x4x4xf32>
 func.func @alibi_expand_patterns(%scores: tensor<1x2x4x4xf32>, %slopes: tensor<2xf32>)
@@ -218,18 +218,18 @@ func.func @alibi_expand_patterns(%scores: tensor<1x2x4x4xf32>, %slopes: tensor<2
 // CHECK: %[[Q:.+]] = ta.cast %[[Q16]] {{.*}} -> !ta.expr<f32, [i0, i1, i2, j0]>
 // CHECK: %[[K16:.+]] = ta.at %{{.+}}[%i0, %i1, %j1, %j0] {{.*}} : tensor<1x2x4x3xf16> -> !ta.expr<f16, [i0, i1, j1, j0]>
 // CHECK: %[[K:.+]] = ta.cast %[[K16]] {{.*}} -> !ta.expr<f32, [i0, i1, j1, j0]>
-// CHECK: %[[QK:.+]] = ta.mulf %[[Q]], %[[K]] {{.*}} -> !ta.expr<f32, [i0, i1, i2, j0, j1]>
+// CHECK: %[[QK:.+]] = ta.mul %[[Q]], %[[K]] {{.*}} -> !ta.expr<f32, [i0, i1, i2, j0, j1]>
 // CHECK: %[[DOT:.+]] = ta.reduce <add> %[[QK]] {axes = #ta.axes<j0>{{.*}} -> !ta.expr<f32, [i0, i1, i2, j1]>
 // CHECK: %[[SCALE:.+]] = ta.constant 0.577350259 : f32
-// CHECK: %[[SCORES:.+]] = ta.mulf %[[DOT]], %[[SCALE]] {{.*}} -> !ta.expr<f32, [i0, i1, i2, j1]>
+// CHECK: %[[SCORES:.+]] = ta.mul %[[DOT]], %[[SCALE]] {{.*}} -> !ta.expr<f32, [i0, i1, i2, j1]>
 // CHECK: %[[MAX:.+]] = ta.reduce <max> %[[SCORES]] {axes = #ta.axes<j1>{{.*}} -> !ta.expr<f32, [i0, i1, i2]>
-// CHECK: %[[CENTERED:.+]] = ta.subf %[[SCORES]], %[[MAX]] {{.*}} -> !ta.expr<f32, [i0, i1, i2, j1]>
+// CHECK: %[[CENTERED:.+]] = ta.sub %[[SCORES]], %[[MAX]] {{.*}} -> !ta.expr<f32, [i0, i1, i2, j1]>
 // CHECK: %[[EXP:.+]] = ta.exp %[[CENTERED]] {{.*}} -> !ta.expr<f32, [i0, i1, i2, j1]>
 // CHECK: %[[DEN:.+]] = ta.reduce <add> %[[EXP]] {axes = #ta.axes<j1>{{.*}} -> !ta.expr<f32, [i0, i1, i2]>
-// CHECK: %[[PROB:.+]] = ta.divf %[[EXP]], %[[DEN]] {{.*}} -> !ta.expr<f32, [i0, i1, i2, j1]>
+// CHECK: %[[PROB:.+]] = ta.div %[[EXP]], %[[DEN]] {{.*}} -> !ta.expr<f32, [i0, i1, i2, j1]>
 // CHECK: %[[V16:.+]] = ta.at %{{.+}}[%i0, %i1, %j1, %i3] {{.*}} : tensor<1x2x4x3xf16> -> !ta.expr<f16, [i0, i1, j1, i3]>
 // CHECK: %[[V:.+]] = ta.cast %[[V16]] {{.*}} -> !ta.expr<f32, [i0, i1, j1, i3]>
-// CHECK: %[[PV:.+]] = ta.mulf %[[PROB]], %[[V]] {{.*}} -> !ta.expr<f32, [i0, i1, i2, j1, i3]>
+// CHECK: %[[PV:.+]] = ta.mul %[[PROB]], %[[V]] {{.*}} -> !ta.expr<f32, [i0, i1, i2, j1, i3]>
 // CHECK: %[[NUM:.+]] = ta.reduce <add> %[[PV]] {axes = #ta.axes<j1>{{.*}} -> !ta.expr<f32, [i0, i1, i2, i3]>
 // CHECK: %[[OUT:.+]] = ta.cast %[[NUM]] {{.*}} -> !ta.expr<f16, [i0, i1, i2, i3]>
 // CHECK: ta.yield %[[OUT]] : !ta.expr<f16, [i0, i1, i2, i3]>

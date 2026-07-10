@@ -37,7 +37,7 @@ module attributes {transform.with_named_sequence} {
           : tensor<4x8xf32> -> !ta.expr<f32, [i, k]>
       %y = ta.at %rhs[%k, %j] {axes = #ta.axes<k, j>}
           : tensor<8x16xf32> -> !ta.expr<f32, [k, j]>
-      %xy = ta.mulf %x, %y
+      %xy = ta.mul %x, %y
           : (!ta.expr<f32, [i, k]>, !ta.expr<f32, [k, j]>) -> !ta.expr<f32, [i, k, j]>
       %dot = ta.reduce #ta.reduce_kind<add> %xy {axes = #ta.axes<k>}
           : !ta.expr<f32, [i, k, j]> -> !ta.expr<f32, [i, j]>
@@ -60,7 +60,7 @@ module attributes {transform.with_named_sequence} {
       %idx = ta.index %i : !ta.expr<i64, [i]>
       %idx_j = ta.subst %idx {from_axes = #ta.axes<i>, to_axes = #ta.axes<j>}
           : !ta.expr<i64, [i]> -> !ta.expr<i64, [j]>
-      %diff = ta.subi %idx_j, %idx
+      %diff = ta.sub %idx_j, %idx
           : (!ta.expr<i64, [j]>, !ta.expr<i64, [i]>) -> !ta.expr<i64, [j, i]>
       ta.yield %diff : !ta.expr<i64, [j, i]>
     } : () -> tensor<4x4xi64>
@@ -91,7 +91,7 @@ module attributes {transform.with_named_sequence} {
           : tensor<4xf32> -> !ta.expr<f32, [i]>
       %y = ta.subst %x {from_axes = #ta.axes<i>, to_axes = #ta.axes<j>}
           : !ta.expr<f32, [i]> -> !ta.expr<f32, [j]>
-      %sum = ta.addf %y, %x
+      %sum = ta.add %y, %x
           : (!ta.expr<f32, [j]>, !ta.expr<f32, [i]>) -> !ta.expr<f32, [j, i]>
       ta.yield %sum : !ta.expr<f32, [j, i]>
     } : () -> tensor<4x4xf32>

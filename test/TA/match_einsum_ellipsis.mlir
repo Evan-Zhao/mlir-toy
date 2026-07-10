@@ -28,7 +28,7 @@ module attributes {transform.with_named_sequence} {
           : tensor<2x3x4x6xf32> -> !ta.expr<f32, [b, h, i, d]>
       %k_expr = ta.at %k[%b, %h, %j, %d]
           : tensor<2x3x5x6xf32> -> !ta.expr<f32, [b, h, j, d]>
-      %prod = ta.mulf %q_expr, %k_expr
+      %prod = ta.mul %q_expr, %k_expr
           : (!ta.expr<f32, [b, h, i, d]>, !ta.expr<f32, [b, h, j, d]>)
          -> !ta.expr<f32, [b, h, i, d, j]>
       %dot = ta.reduce #ta.reduce_kind<add> %prod {axes = #ta.axes<d>}
@@ -49,7 +49,7 @@ module attributes {transform.with_named_sequence} {
           : tensor<2x7x3x4x6xf32> -> !ta.expr<f32, [b, g, h, i, d]>
       %k_expr = ta.at %k[%b, %h, %j, %d]
           : tensor<2x3x5x6xf32> -> !ta.expr<f32, [b, h, j, d]>
-      %prod = ta.mulf %q_expr, %k_expr
+      %prod = ta.mul %q_expr, %k_expr
           : (!ta.expr<f32, [b, g, h, i, d]>, !ta.expr<f32, [b, h, j, d]>)
          -> !ta.expr<f32, [b, g, h, i, d, j]>
       %dot = ta.reduce #ta.reduce_kind<add> %prod {axes = #ta.axes<d>}

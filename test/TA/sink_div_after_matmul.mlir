@@ -21,21 +21,21 @@ module attributes {transform.with_named_sequence} {
       // CHECK: %[[DEN:.+]] = ta.at %{{.+}}[%i]
       %den_expr = ta.at %den[%i]
           : tensor<2xf32> -> !ta.expr<f32, [i]>
-      %prob = ta.divf %num, %den_expr {ta.import_group = 9 : i64}
+      %prob = ta.div %num, %den_expr {ta.import_group = 9 : i64}
           : (!ta.expr<f32, [i, j]>, !ta.expr<f32, [i]>)
          -> !ta.expr<f32, [i, j]>
       // CHECK: %[[V:.+]] = ta.at %{{.+}}[%j, %d]
       %v = ta.at %values[%j, %d]
           : tensor<3x4xf32> -> !ta.expr<f32, [j, d]>
-      // CHECK: %[[PROD:.+]] = ta.mulf %[[NUM]], %[[V]]
+      // CHECK: %[[PROD:.+]] = ta.mul %[[NUM]], %[[V]]
       // CHECK: %[[RED:.+]] = ta.reduce <add> %[[PROD]]
       // CHECK-SAME: axes = #ta.axes<j>
-      %prod = ta.mulf %prob, %v {ta.import_group = 11 : i64}
+      %prod = ta.mul %prob, %v {ta.import_group = 11 : i64}
           : (!ta.expr<f32, [i, j]>, !ta.expr<f32, [j, d]>)
          -> !ta.expr<f32, [i, j, d]>
       %sum = ta.reduce #ta.reduce_kind<add> %prod {axes = #ta.axes<j>, ta.import_group = 11 : i64}
           : !ta.expr<f32, [i, j, d]> -> !ta.expr<f32, [i, d]>
-      // CHECK: %[[DIV:.+]] = ta.divf %[[RED]], %[[DEN]]
+      // CHECK: %[[DIV:.+]] = ta.div %[[RED]], %[[DEN]]
       // CHECK-SAME: -> !ta.expr<f32, [i, d]>
       // CHECK: ta.yield %[[DIV]]
       ta.yield %sum : !ta.expr<f32, [i, d]>
@@ -54,14 +54,14 @@ module attributes {transform.with_named_sequence} {
       // CHECK: %[[DEN:.+]] = ta.at %{{.+}}[%j]
       %den_expr = ta.at %den[%j]
           : tensor<3xf32> -> !ta.expr<f32, [j]>
-      // CHECK: %[[PROB:.+]] = ta.divf %[[NUM]], %[[DEN]]
-      %prob = ta.divf %num, %den_expr {ta.import_group = 9 : i64}
+      // CHECK: %[[PROB:.+]] = ta.div %[[NUM]], %[[DEN]]
+      %prob = ta.div %num, %den_expr {ta.import_group = 9 : i64}
           : (!ta.expr<f32, [i, j]>, !ta.expr<f32, [j]>)
          -> !ta.expr<f32, [i, j]>
       %v = ta.at %values[%j, %d]
           : tensor<3x4xf32> -> !ta.expr<f32, [j, d]>
-      // CHECK: %[[PROD:.+]] = ta.mulf %[[PROB]], %{{.+}}
-      %prod = ta.mulf %prob, %v {ta.import_group = 11 : i64}
+      // CHECK: %[[PROD:.+]] = ta.mul %[[PROB]], %{{.+}}
+      %prod = ta.mul %prob, %v {ta.import_group = 11 : i64}
           : (!ta.expr<f32, [i, j]>, !ta.expr<f32, [j, d]>)
          -> !ta.expr<f32, [i, j, d]>
       // CHECK: ta.reduce <add> %[[PROD]]
