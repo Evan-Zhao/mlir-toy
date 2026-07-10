@@ -2,11 +2,8 @@
 
 #include "TA/TAPasses.h"
 #include "mlir/Dialect/Transform/IR/TransformDialect.h"
-#include "mlir/IR/Dominance.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Parser/Parser.h"
-#include "mlir/Transforms/CSE.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/Twine.h"
@@ -182,39 +179,6 @@ SmallVector<std::string> reductionAxesForEquation(const ParsedEinsum &equation) 
   return axes;
 }
 
-LogicalResult rewriteGreedily(TransformRewriter &rewriter, RewritePatternSet patterns,
-                              Operation *target) {
-  GreedyRewriteConfig config;
-  config.setListener(static_cast<RewriterBase::Listener *>(rewriter.getListener()));
-  config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
-  FrozenRewritePatternSet frozenPatterns(std::move(patterns));
-
-  bool cseChanged = false;
-  constexpr int64_t maxIterations = 50;
-  int64_t iteration = 0;
-  do {
-    LogicalResult result = failure();
-    if (target->hasTrait<OpTrait::IsIsolatedFromAbove>()) {
-      result = applyPatternsGreedily(target, frozenPatterns, config);
-    } else {
-      SmallVector<Operation *> ops;
-      target->walk([&](Operation *nestedOp) {
-        if (target != nestedOp)
-          ops.push_back(nestedOp);
-      });
-      result = applyOpPatternsGreedily(ops, frozenPatterns, config);
-    }
-    if (failed(result))
-      return failure();
-
-    DominanceInfo domInfo;
-    cseChanged = false;
-    eliminateCommonSubExpressions(rewriter, domInfo, target, &cseChanged);
-  } while (cseChanged && ++iteration < maxIterations);
-
-  return success(iteration < maxIterations);
-}
-
 } // namespace
 
 DiagnosedSilenceableFailure TAMatchEinsumOp::matchOperation(Operation *target,
@@ -331,31 +295,6 @@ void TAExpToExp2PatternsOp::populatePatterns(RewritePatternSet &patterns) {
   ta::MinimumOp::getCanonicalizationPatterns(patterns, patterns.getContext());
 }
 
-void TARewriteExpToExp2Op::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  onlyReadsHandle(getTargetMutable(), effects);
-  modifiesPayload(effects);
-}
-
-DiagnosedSilenceableFailure TARewriteExpToExp2Op::applyToOne(TransformRewriter &rewriter,
-                                                             Operation *target,
-                                                             ApplyToEachResultList &results,
-                                                             TransformState &state) {
-  (void)results;
-  (void)state;
-  RewritePatternSet patterns(getContext());
-  ta_exp_to_exp2_pdl::populateGeneratedPDLLPatterns(patterns);
-  ta::MulOp::getCanonicalizationPatterns(patterns, getContext());
-  ta::MaximumOp::getCanonicalizationPatterns(patterns, getContext());
-  ta::MinimumOp::getCanonicalizationPatterns(patterns, getContext());
-
-  if (failed(rewriteGreedily(rewriter, std::move(patterns), target))) {
-    auto transform = cast<TransformOpInterface>(getOperation());
-    return emitSilenceableFailure(transform, "exp-to-exp2 rewrite did not converge");
-  }
-
-  return DiagnosedSilenceableFailure::success();
-}
-
 } // namespace mlir::transform
 
 namespace ta {
@@ -371,8 +310,7 @@ void registerTATransformExtension(mlir::DialectRegistry &registry) {
                         mlir::transform::TASinkDivAfterMatmulPatternsOp,
                         mlir::transform::TASinkRightMulAfterMatmulPatternsOp,
                         mlir::transform::TAReassociateRightMulfPatternsOp,
-                        mlir::transform::TAExpToExp2PatternsOp,
-                        mlir::transform::TARewriteExpToExp2Op>();
+                        mlir::transform::TAExpToExp2PatternsOp>();
   });
 }
 

@@ -55,7 +55,7 @@ Note: `ts` is short for `transform.structured`.
 | `rewrite_expr`                           | Use TA for rewrites: import linalg to TA, run TA expression rewrites, then lower back to linalg.                                    |
 
 1. The schedule generalizes named linalg ops, imports the computation into TA, and uses the TA
-   expression view for `transform.ta.rewrite_exp_to_exp2`,
+   expression view for `transform.apply_patterns.ta.exp_to_exp2`,
    `transform.apply_patterns.ta.sink_div_after_matmul`, and `transform.match.ta.einsum`.
    See the [TA dialect design](ta-dialect-design.md).
 2. See the [upward fusion design](upward-fusion-design.md).

@@ -25,10 +25,11 @@ module attributes {transform.with_named_sequence} {
     %func0 = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
     %func1 = transform.apply_registered_pass "linalg-generalize-named-ops" to %func0 : (!any) -> !any
     %func = transform.apply_registered_pass "linalg-to-ta" to %func1 : (!any) -> !any
-    transform.ta.rewrite_exp_to_exp2 %func : !any
     transform.apply_patterns to %func {
+      transform.apply_patterns.ta.exp_to_exp2
       transform.apply_patterns.ta.sink_div_after_matmul
     } : !any
+    transform.apply_cse to %func : !any
     %bmm0 = transform.collect_matching @match_4d_matmul_transb in %func : (!any) -> !any
     transform.ta.to_linalg %func : !any
 

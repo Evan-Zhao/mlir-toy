@@ -4,7 +4,11 @@ module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
     %func = transform.structured.match ops{["func.func"]} in %module
         : (!transform.any_op) -> !transform.any_op
-    transform.ta.rewrite_exp_to_exp2 %func : !transform.any_op
+    transform.apply_patterns to %func {
+      transform.apply_patterns.ta.exp_to_exp2
+      transform.apply_patterns.ta.sink_div_after_matmul
+    } : !transform.any_op
+    transform.apply_cse to %func : !transform.any_op
     transform.yield
   }
 

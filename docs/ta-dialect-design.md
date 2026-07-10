@@ -188,12 +188,7 @@ transform.apply_patterns to %target {
   transform.apply_patterns.ta.exp_to_exp2
   transform.apply_patterns.ta.sink_div_after_matmul
 } : !transform.any_op
-```
-
-There is also a greedy driver for the `exp` to `exp2` algebra rules:
-
-```mlir
-transform.ta.rewrite_exp_to_exp2 %target : !transform.any_op
+transform.apply_cse to %target : !transform.any_op
 ```
 
 ### `exp` To `exp2`
@@ -403,10 +398,11 @@ transform.named_sequence @__transform_main(%module: !transform.any_op) {
       : (!transform.any_op) -> !transform.any_op
   %ta_func = transform.apply_registered_pass "linalg-to-ta" to %func
       : (!transform.any_op) -> !transform.any_op
-  transform.ta.rewrite_exp_to_exp2 %ta_func : !transform.any_op
   transform.apply_patterns to %ta_func {
+    transform.apply_patterns.ta.exp_to_exp2
     transform.apply_patterns.ta.sink_div_after_matmul
   } : !transform.any_op
+  transform.apply_cse to %ta_func : !transform.any_op
   %linalg_func = transform.apply_registered_pass "ta-to-linalg" to %ta_func
       : (!transform.any_op) -> !transform.any_op
   transform.yield

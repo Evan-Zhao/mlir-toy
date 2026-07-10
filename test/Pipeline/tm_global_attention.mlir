@@ -21,16 +21,16 @@ module attributes {transform.with_named_sequence} {
     // more flexible expression rewrites.
     %func0 = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
     %func = transform.apply_registered_pass "stablehlo-to-ta" to %func0 : (!any) -> !any
-    // This canonicalization step folds trunc(const(f64), f32) into a constant in f32.
-    // This is only used in this test case, because only this test case has an f64 constant.
-    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
-    // Replace `exp(x)` with `exp2(x * log2(e))`, then push `log2(e)` constant around
-    // until it folds with other multiplicative constants.
-    transform.ta.rewrite_exp_to_exp2 %func : !any
-    // Replace `matmul(P_ij / s_i, V_jd)` with `matmul(P_ij, V_jd) / s_i`.
     transform.apply_patterns to %func {
+      // This canonicalization step folds trunc(const(f64), f32) into a constant in f32.
+      // This is only used in this test case, because only this test case has an f64 constant.
+      transform.apply_patterns.canonicalization
+      // Replace `exp(x)` with `exp2(x * log2(e))`, push `log2(e)` into scalar factors.
+      transform.apply_patterns.ta.exp_to_exp2
+      // Replace `matmul(P_ij / s_i, V_jd)` with `matmul(P_ij, V_jd) / s_i`.
       transform.apply_patterns.ta.sink_div_after_matmul
     } : !any
+    transform.apply_cse to %func : !any
     // This is a special idiom: use einsum to match matmuls in `ta` dialect is easy.
     // Then the `to_linalg` translator keeps these handles alive even after the translation,
     // so you get %bmm0 to point to the first matmul in linalg.
