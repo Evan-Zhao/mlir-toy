@@ -52,11 +52,11 @@ struct DiscoveredAxisInfo {
 // island may continue. Unsupported operations remain in the surrounding function as tensor
 // producers or consumers.
 static bool isSupportedStableHLOOp(Operation *op) {
-  return isa<arith::ConstantOp, stablehlo::ConstantOp, stablehlo::ConvertOp, stablehlo::ExpOp,
-             stablehlo::AddOp, stablehlo::SubtractOp, stablehlo::MulOp, stablehlo::DivOp,
-             stablehlo::MaxOp, stablehlo::MinOp, stablehlo::TransposeOp,
-             stablehlo::BroadcastInDimOp, stablehlo::ReshapeOp, stablehlo::ReduceOp,
-             stablehlo::DotGeneralOp>(op);
+  return isa<arith::ConstantOp, stablehlo::ConstantOp, stablehlo::IotaOp, stablehlo::ConvertOp,
+             stablehlo::ExpOp, stablehlo::AddOp, stablehlo::SubtractOp, stablehlo::MulOp,
+             stablehlo::DivOp, stablehlo::MaxOp, stablehlo::MinOp, stablehlo::CompareOp,
+             stablehlo::SelectOp, stablehlo::TransposeOp, stablehlo::BroadcastInDimOp,
+             stablehlo::ReshapeOp, stablehlo::ReduceOp, stablehlo::DotGeneralOp>(op);
 }
 
 /// Discover equal tensor dimensions before emitting TA.
@@ -79,8 +79,11 @@ public:
     for (Operation &op : func.front().without_terminator()) {
       LogicalResult result = success();
       if (isa<stablehlo::ConvertOp, stablehlo::ExpOp, stablehlo::AddOp, stablehlo::SubtractOp,
-              stablehlo::MulOp, stablehlo::DivOp, stablehlo::MaxOp, stablehlo::MinOp>(&op))
+              stablehlo::MulOp, stablehlo::DivOp, stablehlo::MaxOp, stablehlo::MinOp,
+              stablehlo::CompareOp>(&op))
         result = discoverSameShape(&op);
+      else if (auto select = dyn_cast<stablehlo::SelectOp>(&op))
+        result = discoverSelect(select);
       else if (auto transpose = dyn_cast<stablehlo::TransposeOp>(&op))
         result = discoverTranspose(transpose);
       else if (auto broadcast = dyn_cast<stablehlo::BroadcastInDimOp>(&op))
@@ -174,6 +177,26 @@ private:
         if (failed(unite(op, operandAxis, resultAxis)))
           return failure();
     }
+    return success();
+  }
+
+  LogicalResult discoverSelect(stablehlo::SelectOp op) {
+    auto result = getOrCreateValueAxes(op.getResult());
+    auto trueValue = getOrCreateValueAxes(op.getOnTrue());
+    auto falseValue = getOrCreateValueAxes(op.getOnFalse());
+    auto pred = getOrCreateValueAxes(op.getPred());
+    if (failed(result) || failed(trueValue) || failed(falseValue) || failed(pred) ||
+        trueValue->size() != result->size() || falseValue->size() != result->size() ||
+        (!pred->empty() && pred->size() != result->size()))
+      return op.emitOpError("expected scalar predicate or same-shape select operands");
+
+    for (auto [trueAxis, falseAxis, resultAxis] : llvm::zip_equal(*trueValue, *falseValue, *result))
+      if (failed(unite(op, trueAxis, resultAxis)) || failed(unite(op, falseAxis, resultAxis)))
+        return failure();
+    if (!pred->empty())
+      for (auto [predAxis, resultAxis] : llvm::zip_equal(*pred, *result))
+        if (failed(unite(op, predAxis, resultAxis)))
+          return failure();
     return success();
   }
 
@@ -440,6 +463,11 @@ public:
     return annotate(ConstantOp::create(builder, loc, getExprType(value.getType(), {}), value));
   }
 
+  Value index(const Axis &axis, Type elementType) {
+    return annotate(IndexOp::create(builder, loc, getExprType(elementType, {axis.name}),
+                                    materializeAxis(axis)));
+  }
+
   template <typename OpTy> Value unary(Type elementType, Value input) {
     return annotate(
         OpTy::create(builder, loc, getExprType(elementType, collectOperandAxes({input})), input));
@@ -448,6 +476,25 @@ public:
   template <typename OpTy> Value binary(Type elementType, Value lhs, Value rhs) {
     return annotate(OpTy::create(
         builder, loc, getExprType(elementType, collectOperandAxes({lhs, rhs})), lhs, rhs));
+  }
+
+  Value cmpf(arith::CmpFPredicate predicate, Value lhs, Value rhs) {
+    return annotate(CmpFOp::create(builder, loc,
+                                   getExprType(builder.getI1Type(), collectOperandAxes({lhs, rhs})),
+                                   predicate, lhs, rhs));
+  }
+
+  Value cmpi(arith::CmpIPredicate predicate, Value lhs, Value rhs) {
+    return annotate(CmpIOp::create(builder, loc,
+                                   getExprType(builder.getI1Type(), collectOperandAxes({lhs, rhs})),
+                                   predicate, lhs, rhs));
+  }
+
+  Value select(Type elementType, Value condition, Value trueValue, Value falseValue) {
+    return annotate(SelectOp::create(
+        builder, loc,
+        getExprType(elementType, collectOperandAxes({trueValue, falseValue, condition})), condition,
+        trueValue, falseValue));
   }
 
   // Reduction removes named axes from expression support. The StableHLO importer validates the
@@ -666,6 +713,8 @@ public:
     ScopedTABuilder::ImportGroupGuard guard(ta, nextImportGroup++, op->getLoc());
     if (auto constant = dyn_cast<stablehlo::ConstantOp>(op))
       return emitConstant(constant);
+    if (auto iota = dyn_cast<stablehlo::IotaOp>(op))
+      return emitIota(iota);
     if (auto convert = dyn_cast<stablehlo::ConvertOp>(op)) {
       auto inputType = cast<RankedTensorType>(convert.getOperand().getType());
       auto resultType = cast<RankedTensorType>(convert.getResult().getType());
@@ -687,6 +736,10 @@ public:
       return emitBinary<MaximumOp>(maximum);
     if (auto minimum = dyn_cast<stablehlo::MinOp>(op))
       return emitBinary<MinimumOp>(minimum);
+    if (auto compare = dyn_cast<stablehlo::CompareOp>(op))
+      return emitCompare(compare);
+    if (auto select = dyn_cast<stablehlo::SelectOp>(op))
+      return emitSelect(select);
     if (auto transpose = dyn_cast<stablehlo::TransposeOp>(op))
       return emitViewLike(transpose.getOperand(), transpose, transpose.getResult());
     if (auto broadcast = dyn_cast<stablehlo::BroadcastInDimOp>(op))
@@ -737,6 +790,29 @@ private:
     return success();
   }
 
+  LogicalResult emitIota(stablehlo::IotaOp op) {
+    auto resultAxes = lookupAxes(op.getResult());
+    if (failed(resultAxes))
+      return failure();
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+    uint64_t dimension = op.getIotaDimension();
+    if (dimension >= static_cast<uint64_t>(resultType.getRank()) || !(**resultAxes)[dimension])
+      return op.emitOpError("invalid iota dimension");
+
+    Type elementType = resultType.getElementType();
+    Value expr;
+    if (elementType.isSignlessInteger()) {
+      expr = ta.index(*(**resultAxes)[dimension], elementType);
+    } else if (isa<FloatType>(elementType)) {
+      Value index = ta.index(*(**resultAxes)[dimension], IntegerType::get(op.getContext(), 64));
+      expr = ta.unary<CastOp>(elementType, index);
+    } else {
+      return op.emitOpError("only signless integer and floating-point iotas are supported");
+    }
+    valueMap[op.getResult()] = {expr, getPresentTensorAxes(expr, **resultAxes)};
+    return success();
+  }
+
   template <typename TAOp, typename StableOp> LogicalResult emitUnary(StableOp op) {
     auto inputAxes = lookupAxes(op.getOperand());
     auto resultAxes = lookupAxes(op.getResult());
@@ -769,6 +845,88 @@ private:
     if (failed(lhs) || failed(rhs))
       return failure();
     Value expr = ta.binary<TAOp>(resultType.getElementType(), *lhs, *rhs);
+    valueMap[op.getResult()] = {expr, getPresentTensorAxes(expr, **resultAxes)};
+    return success();
+  }
+
+  LogicalResult emitCompare(stablehlo::CompareOp op) {
+    auto lhsAxes = lookupAxes(op.getLhs());
+    auto rhsAxes = lookupAxes(op.getRhs());
+    auto resultAxes = lookupAxes(op.getResult());
+    if (failed(lhsAxes) || failed(rhsAxes) || failed(resultAxes))
+      return failure();
+
+    auto lhsType = cast<RankedTensorType>(op.getLhs().getType());
+    auto rhsType = cast<RankedTensorType>(op.getRhs().getType());
+    Type elementType = lhsType.getElementType();
+    if (rhsType.getElementType() != elementType)
+      return op.emitOpError("comparison operands must have matching element types");
+    auto lhs = translateValue(op.getLhs(), **lhsAxes, elementType);
+    auto rhs = translateValue(op.getRhs(), **rhsAxes, elementType);
+    if (failed(lhs) || failed(rhs))
+      return failure();
+
+    static const arith::CmpFPredicate cmpFPreds[] = {
+        arith::CmpFPredicate::OEQ, arith::CmpFPredicate::UNE, arith::CmpFPredicate::OGE,
+        arith::CmpFPredicate::OGT, arith::CmpFPredicate::OLE, arith::CmpFPredicate::OLT};
+    static const arith::CmpIPredicate cmpISignedPreds[] = {
+        arith::CmpIPredicate::eq,  arith::CmpIPredicate::ne,  arith::CmpIPredicate::sge,
+        arith::CmpIPredicate::sgt, arith::CmpIPredicate::sle, arith::CmpIPredicate::slt};
+    static const arith::CmpIPredicate cmpIUnsignedPreds[] = {
+        arith::CmpIPredicate::eq,  arith::CmpIPredicate::ne,  arith::CmpIPredicate::uge,
+        arith::CmpIPredicate::ugt, arith::CmpIPredicate::ule, arith::CmpIPredicate::ult};
+    std::optional<stablehlo::ComparisonType> comparisonType = op.getCompareType();
+    if (!comparisonType)
+      return op.emitOpError("comparison type must be specified");
+    auto cmpDirection = static_cast<unsigned>(op.getComparisonDirection());
+    Value expr;
+    if (isa<FloatType>(elementType)) {
+      if (*comparisonType != stablehlo::ComparisonType::FLOAT)
+        return op.emitOpError("only FLOAT floating-point comparisons are supported");
+      arith::CmpFPredicate predicate = cmpFPreds[cmpDirection];
+      expr = ta.cmpf(predicate, *lhs, *rhs);
+    } else if (isa<IntegerType>(elementType)) {
+      arith::CmpIPredicate predicate;
+      if (*comparisonType == stablehlo::ComparisonType::SIGNED)
+        predicate = cmpISignedPreds[cmpDirection];
+      else if (*comparisonType == stablehlo::ComparisonType::UNSIGNED)
+        predicate = cmpIUnsignedPreds[cmpDirection];
+      else
+        return op.emitOpError("integer comparison must be SIGNED or UNSIGNED");
+      expr = ta.cmpi(predicate, *lhs, *rhs);
+    } else {
+      return op.emitOpError("only floating-point and integer comparisons are supported");
+    }
+
+    valueMap[op.getResult()] = {expr, getPresentTensorAxes(expr, **resultAxes)};
+    return success();
+  }
+
+  LogicalResult emitSelect(stablehlo::SelectOp op) {
+    auto predAxes = lookupAxes(op.getPred());
+    auto trueAxes = lookupAxes(op.getOnTrue());
+    auto falseAxes = lookupAxes(op.getOnFalse());
+    auto resultAxes = lookupAxes(op.getResult());
+    if (failed(predAxes) || failed(trueAxes) || failed(falseAxes) || failed(resultAxes))
+      return failure();
+
+    auto predType = cast<RankedTensorType>(op.getPred().getType());
+    auto trueType = cast<RankedTensorType>(op.getOnTrue().getType());
+    auto falseType = cast<RankedTensorType>(op.getOnFalse().getType());
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+    Type elementType = resultType.getElementType();
+    if (!predType.getElementType().isInteger(1))
+      return op.emitOpError("select predicate must have i1 element type");
+    if (trueType.getElementType() != elementType || falseType.getElementType() != elementType ||
+        !isa<FloatType, IntegerType>(elementType))
+      return op.emitOpError("only matching floating-point or integer select values are supported");
+
+    auto pred = translateValue(op.getPred(), **predAxes, predType.getElementType());
+    auto trueValue = translateValue(op.getOnTrue(), **trueAxes, elementType);
+    auto falseValue = translateValue(op.getOnFalse(), **falseAxes, elementType);
+    if (failed(pred) || failed(trueValue) || failed(falseValue))
+      return failure();
+    Value expr = ta.select(elementType, *pred, *trueValue, *falseValue);
     valueMap[op.getResult()] = {expr, getPresentTensorAxes(expr, **resultAxes)};
     return success();
   }

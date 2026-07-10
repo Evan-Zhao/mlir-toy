@@ -109,3 +109,67 @@ func.func @partition_permuted_dot(%q: tensor<2x3x4x5xf16>,
       : (tensor<2x4x3x3xf32>, tensor<2x4x3x3xf32>) -> tensor<2x4x6x3xf32>
   return %result : tensor<2x4x6x3xf32>
 }
+
+// CHECK-LABEL: func.func @select
+// CHECK: %[[SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 2, %i1 "i1" extent 3) {
+// CHECK: %[[PRED:.+]] = ta.at %{{.+}}[%i0, %i1]{{.*}}!ta.expr<i1, [i0, i1]>
+// CHECK: %[[TRUE:.+]] = ta.at %{{.+}}[%i0, %i1]{{.*}}!ta.expr<f32, [i0, i1]>
+// CHECK: %[[FALSE:.+]] = ta.at %{{.+}}[%i0, %i1]{{.*}}!ta.expr<f32, [i0, i1]>
+// CHECK: %[[SELECTED:.+]] = ta.select %[[PRED]], %[[TRUE]], %[[FALSE]]{{.*}}!ta.expr<f32, [i0, i1]>
+// CHECK: %[[SCALAR_PRED:.+]] = ta.at %{{.+}}[]{{.*}}!ta.expr<i1, []>
+// CHECK: %[[RESULT:.+]] = ta.select %[[SCALAR_PRED]], %[[SELECTED]], %{{.+}}{{.*}}!ta.expr<f32, [i0, i1]>
+// CHECK: ta.yield %[[RESULT]]
+// CHECK: return %[[SCOPE]] : tensor<2x3xf32>
+func.func @select(%pred: tensor<2x3xi1>, %scalar_pred: tensor<i1>,
+                  %on_true: tensor<2x3xf32>, %on_false: tensor<2x3xf32>)
+    -> tensor<2x3xf32> {
+  %selected = stablehlo.select %pred, %on_true, %on_false
+      : tensor<2x3xi1>, tensor<2x3xf32>
+  %result = stablehlo.select %scalar_pred, %selected, %on_false
+      : tensor<i1>, tensor<2x3xf32>
+  return %result : tensor<2x3xf32>
+}
+
+// CHECK-LABEL: func.func @compare
+// CHECK: ta.cmpf une,
+// CHECK: ta.cmpi slt,
+// CHECK: ta.cmpi uge,
+// CHECK: ta.select
+// CHECK: return %{{.+}} : tensor<2x3xf32>
+func.func @compare(%flhs: tensor<2x3xf32>, %frhs: tensor<2x3xf32>,
+                   %ilhs: tensor<2x3xi32>, %irhs: tensor<2x3xi32>)
+    -> tensor<2x3xf32> {
+  %float_pred = stablehlo.compare NE, %flhs, %frhs, FLOAT
+      : (tensor<2x3xf32>, tensor<2x3xf32>) -> tensor<2x3xi1>
+  %signed_pred = stablehlo.compare LT, %ilhs, %irhs, SIGNED
+      : (tensor<2x3xi32>, tensor<2x3xi32>) -> tensor<2x3xi1>
+  %unsigned_pred = stablehlo.compare GE, %ilhs, %irhs, UNSIGNED
+      : (tensor<2x3xi32>, tensor<2x3xi32>) -> tensor<2x3xi1>
+  %float_selected = stablehlo.select %float_pred, %flhs, %frhs
+      : tensor<2x3xi1>, tensor<2x3xf32>
+  %signed_selected = stablehlo.select %signed_pred, %float_selected, %frhs
+      : tensor<2x3xi1>, tensor<2x3xf32>
+  %result = stablehlo.select %unsigned_pred, %signed_selected, %frhs
+      : tensor<2x3xi1>, tensor<2x3xf32>
+  return %result : tensor<2x3xf32>
+}
+
+// CHECK-LABEL: func.func @integer_iota
+// CHECK: %[[SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 3) {
+// CHECK: %[[INDEX:.+]] = ta.index %i0{{.*}}!ta.expr<i32, [i0]>
+// CHECK: ta.yield %[[INDEX]]
+// CHECK: stablehlo.broadcast_in_dim %[[SCOPE]], dims = [1] : (tensor<3xi32>) -> tensor<2x3xi32>
+func.func @integer_iota() -> tensor<2x3xi32> {
+  %result = stablehlo.iota dim = 1 : tensor<2x3xi32>
+  return %result : tensor<2x3xi32>
+}
+
+// CHECK-LABEL: func.func @float_iota
+// CHECK: %[[SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 4) {
+// CHECK: %[[INDEX:.+]] = ta.index %i0{{.*}}!ta.expr<i64, [i0]>
+// CHECK: %[[CAST:.+]] = ta.cast %[[INDEX]]{{.*}}!ta.expr<f32, [i0]>
+// CHECK: ta.yield %[[CAST]]
+func.func @float_iota() -> tensor<4xf32> {
+  %result = stablehlo.iota dim = 0 : tensor<4xf32>
+  return %result : tensor<4xf32>
+}
