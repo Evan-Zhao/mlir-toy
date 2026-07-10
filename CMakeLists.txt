@@ -142,11 +142,14 @@ function(make_mlir_opt_plugin)
   )
   add_dependencies(${ARG_TARGET} ${ARG_DEPS})
   setup_mlir_target(${ARG_TARGET})
-  if(APPLE)
-    # Do not rely on late dynamic lookup for mlir-opt plugins. Link against the shared
-    # MLIR/LLVM dylibs so missing definitions in this target fail at link time without
-    # statically embedding MLIR/LLVM into the plugin.
-    target_link_libraries(${ARG_TARGET} PRIVATE MLIR LLVM)
+  # Do not rely on mlir-opt to provide plugin dependencies through late dynamic
+  # lookup. MLIR and LLVM are shared imported targets, so this does not embed
+  # duplicate TypeID registries in the plugin.
+  target_link_libraries(${ARG_TARGET} PRIVATE MLIR LLVM)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # ELF shared libraries otherwise permit unresolved symbols by default.
+    # Reject accidental dependencies on another plugin at link time instead.
+    target_link_options(${ARG_TARGET} PRIVATE "LINKER:-z,defs")
   endif()
   install(TARGETS ${ARG_TARGET} LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}")
 endfunction()
