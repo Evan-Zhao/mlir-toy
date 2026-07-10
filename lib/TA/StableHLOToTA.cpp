@@ -27,8 +27,8 @@ namespace {
 // important for dot_general: an axis may acquire its final identity only after several producers
 // and consumers have been visited.
 //
-// StableHLO values remain in place while the TA scope is built. Once the return value has been
-// translated, dead StableHLO operations are erased in reverse order.
+// StableHLO operations remain in place around the imported islands. Each supported value crossing
+// into unsupported IR or a function return becomes the root of a single-result TA scope.
 
 // An Axis is a logical iteration variable, not necessarily one physical tensor dimension. Names
 // are provisional during discovery and are normalized to output i* and internal j* names later.
@@ -47,6 +47,17 @@ using TensorAxes = SmallVector<std::optional<Axis>>;
 struct DiscoveredAxisInfo {
   DenseMap<Value, TensorAxes> valueAxes;
 };
+
+// Keep this predicate in one place so root selection and per-scope emission agree on where a TA
+// island may continue. Unsupported operations remain in the surrounding function as tensor
+// producers or consumers.
+static bool isSupportedStableHLOOp(Operation *op) {
+  return isa<arith::ConstantOp, stablehlo::ConstantOp, stablehlo::ConvertOp, stablehlo::ExpOp,
+             stablehlo::AddOp, stablehlo::SubtractOp, stablehlo::MulOp, stablehlo::DivOp,
+             stablehlo::MaxOp, stablehlo::MinOp, stablehlo::TransposeOp,
+             stablehlo::BroadcastInDimOp, stablehlo::ReshapeOp, stablehlo::ReduceOp,
+             stablehlo::DotGeneralOp>(op);
+}
 
 /// Discover equal tensor dimensions before emitting TA.
 ///
@@ -479,6 +490,53 @@ public:
 
   void yield(Value value) { YieldOp::create(builder, loc, value); }
 
+  // Materialize an expression in its natural TA axis order, then adapt that tensor back to the
+  // original StableHLO dimension order. broadcast_in_dim covers both permutation and dimensions
+  // omitted from expression support, so an island boundary does not constrain TA's internal order.
+  FailureOr<Value> materializeResult(Value output, const TensorAxes &targetAxes,
+                                     RankedTensorType targetType) {
+    auto exprType = cast<ExprType>(output.getType());
+    SmallVector<int64_t> exprShape;
+    SmallVector<int64_t> broadcastDimensions;
+    DenseSet<int64_t> usedTargetDims;
+    for (Attribute attr : exprType.getAxes().getAxes()) {
+      StringRef name = cast<AxisAttr>(attr).getName().getValue();
+      auto materialized = axes.find(name.str());
+      if (materialized == axes.end())
+        return emitError(output.getLoc(), "missing materialized extent for result axis");
+      exprShape.push_back(materialized->second.extent);
+
+      std::optional<int64_t> targetDim;
+      for (auto [dim, axis] : llvm::enumerate(targetAxes))
+        if (axis && axis->name == name) {
+          if (targetDim)
+            return emitError(output.getLoc(), "result axis maps to multiple tensor dimensions");
+          targetDim = static_cast<int64_t>(dim);
+        }
+      if (!targetDim || !usedTargetDims.insert(*targetDim).second)
+        return emitError(output.getLoc(), "expression axis is absent from result tensor axes");
+      broadcastDimensions.push_back(*targetDim);
+    }
+
+    auto exprTensorType = RankedTensorType::get(exprShape, exprType.getElementType());
+    scope.getResult().setType(exprTensorType);
+    yield(output);
+    relabelAxesForOutput(output);
+
+    bool identityLayout = exprTensorType == targetType;
+    for (auto [dim, targetDim] : llvm::enumerate(broadcastDimensions))
+      identityLayout &= targetDim == static_cast<int64_t>(dim);
+    if (identityLayout)
+      return scope.getResult();
+
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointAfter(scope);
+    return stablehlo::BroadcastInDimOp::create(builder, loc, targetType, scope.getResult(),
+                                               DenseI64ArrayAttr::get(context, broadcastDimensions))
+        .getResult();
+  }
+
+private:
   // Discovery names are deliberately unstable and verbose. Once the yielded expression is known,
   // assign i* names to its axes in result order and j* names to every remaining internal axis. This
   // convention makes imported TA deterministic and keeps output dimensions visually distinct from
@@ -539,7 +597,6 @@ public:
     });
   }
 
-private:
   template <typename OpTy> Value annotate(OpTy op) const {
     if (importGroup)
       op->setAttr("ta.import_group", IntegerAttr::get(IntegerType::get(context, 64), *importGroup));
@@ -592,22 +649,30 @@ struct TensorValueInfo {
 
 /// Replay supported StableHLO tensor dataflow as one scalar TA expression DAG.
 ///
-/// Values already emitted are reused through valueMap. Function arguments are observed lazily with
-/// ta.at, and splat constants become axis-free expressions. Unsupported defining operations are
-/// diagnosed only when their values are actually needed by supported output dataflow.
+/// Values already emitted are reused through valueMap. Function arguments and values defined
+/// outside the current supported component are observed lazily with ta.at, while splat constants
+/// become axis-free expressions.
 class FunctionEmitter {
 public:
-  FunctionEmitter(ScopedTABuilder &ta, const DiscoveredAxisInfo &axisInfo)
-      : ta(ta), axisInfo(axisInfo) {}
+  FunctionEmitter(ScopedTABuilder &ta, const DiscoveredAxisInfo &axisInfo,
+                  const DenseSet<Operation *> &component, int64_t &nextImportGroup)
+      : ta(ta), axisInfo(axisInfo), component(component), nextImportGroup(nextImportGroup) {}
 
   // Dispatch in source order so valueMap normally contains each producer before its consumers.
   // View-like operations only update tensor-axis metadata; arithmetic creates new TA operations.
-  LogicalResult emit(Operation *op, unsigned group) {
-    ScopedTABuilder::ImportGroupGuard guard(ta, group, op->getLoc());
+  LogicalResult emit(Operation *op) {
+    if (!component.contains(op))
+      return success();
+    ScopedTABuilder::ImportGroupGuard guard(ta, nextImportGroup++, op->getLoc());
     if (auto constant = dyn_cast<stablehlo::ConstantOp>(op))
       return emitConstant(constant);
-    if (auto convert = dyn_cast<stablehlo::ConvertOp>(op))
+    if (auto convert = dyn_cast<stablehlo::ConvertOp>(op)) {
+      auto inputType = cast<RankedTensorType>(convert.getOperand().getType());
+      auto resultType = cast<RankedTensorType>(convert.getResult().getType());
+      if (inputType.getElementType() == resultType.getElementType())
+        return emitViewLike(convert.getOperand(), convert, convert.getResult());
       return emitUnary<CastOp>(convert);
+    }
     if (auto exponential = dyn_cast<stablehlo::ExpOp>(op))
       return emitUnary<ExpOp>(exponential);
     if (auto add = dyn_cast<stablehlo::AddOp>(op))
@@ -635,10 +700,10 @@ public:
     return success();
   }
 
-  FailureOr<Value> translateFunctionResult(Value value) {
+  FailureOr<Value> translateRoot(Value value) {
     auto type = dyn_cast<RankedTensorType>(value.getType());
     if (!type)
-      return emitError(value.getLoc(), "ta importer expected a ranked tensor return value");
+      return emitError(value.getLoc(), "ta importer expected a ranked tensor root value");
     auto axes = lookupAxes(value);
     if (failed(axes))
       return failure();
@@ -862,12 +927,16 @@ private:
     auto resultType = cast<RankedTensorType>(op.getResult().getType());
     if (!isa<FloatType>(lhsType.getElementType()) ||
         lhsType.getElementType() != rhsType.getElementType() ||
-        lhsType.getElementType() != resultType.getElementType())
-      return op.emitOpError("only same-type floating-point dots are supported");
+        !isa<FloatType>(resultType.getElementType()))
+      return op.emitOpError("only floating-point dots with matching input types are supported");
     auto lhs = translateValue(op.getLhs(), **lhsAxes, lhsType.getElementType());
     auto rhs = translateValue(op.getRhs(), **rhsAxes, rhsType.getElementType());
     if (failed(lhs) || failed(rhs))
       return failure();
+    if (lhsType.getElementType() != resultType.getElementType()) {
+      lhs = ta.unary<CastOp>(resultType.getElementType(), *lhs);
+      rhs = ta.unary<CastOp>(resultType.getElementType(), *rhs);
+    }
     Value product = ta.binary<MulOp>(resultType.getElementType(), *lhs, *rhs);
     AxisNames reductionAxes;
     for (int64_t dim : op.getDotDimensionNumbers().getLhsContractingDimensions())
@@ -884,10 +953,9 @@ private:
   // expression participates in different broadcasts. Dropping an axis is valid only for extent
   // one; reducing a one-element domain is an identity and removes it from TA expression support.
   //
-  // Values without a valueMap entry must be external leaves. Splat constants are lifted directly;
-  // function arguments become ta.at observations. Any other defining operation indicates that live
-  // output dataflow crossed an unsupported StableHLO operation and is diagnosed rather than hidden
-  // behind a ta.at.
+  // Values without a valueMap entry are component leaves. Splat constants are lifted directly;
+  // function arguments, unsupported results, and earlier scope results become ta.at observations.
+  // A supported definition in the component without a map entry indicates an emitter bug.
   FailureOr<Value> translateValue(Value value, const TensorAxes &targetAxes, Type elementType) {
     auto it = valueMap.find(value);
     if (it != valueMap.end()) {
@@ -927,8 +995,9 @@ private:
       if (succeeded(splat))
         return ta.constant(*splat);
     }
-    if (Operation *def = value.getDefiningOp())
-      return def->emitOpError("unsupported operation for ta import: ") << def->getName();
+    if (Operation *def = value.getDefiningOp(); def && component.contains(def))
+      return def->emitOpError("supported operation was not emitted into its TA scope: ")
+             << def->getName();
     return ta.at(value, targetAxes, elementType);
   }
 
@@ -947,40 +1016,88 @@ private:
 
   ScopedTABuilder &ta;
   const DiscoveredAxisInfo &axisInfo;
+  const DenseSet<Operation *> &component;
+  int64_t &nextImportGroup;
   DenseMap<Value, TensorValueInfo> valueMap;
 };
 
-// Build the replacement scope before mutating the function return. Keeping old operations alive
-// lets ta.at reference function arguments and any supported external leaves during emission. After
-// the scope becomes the return value, reverse-order dead-code removal peels away the old StableHLO
-// graph without requiring a separate canonicalization pass.
-static LogicalResult importFunctionAsTA(func::FuncOp func, func::ReturnOp returnOp,
-                                        RankedTensorType resultType) {
+// Collect the maximal supported backward slice for one tensor root. Unsupported definitions and
+// values materialized by an earlier scope are leaves which will be observed with ta.at.
+static void collectSupportedComponent(Value value, Block *block, DenseSet<Operation *> &component) {
+  Operation *def = value.getDefiningOp();
+  if (!def || def->getBlock() != block || !isSupportedStableHLOOp(def) ||
+      !component.insert(def).second)
+    return;
+  for (Value operand : def->getOperands())
+    if (isa<RankedTensorType>(operand.getType()))
+      collectSupportedComponent(operand, block, component);
+}
+
+static LogicalResult importFunctionAsTA(func::FuncOp func) {
   ForwardAxisDiscovery discovery;
-  FailureOr<DiscoveredAxisInfo> axisInfo = discovery.run(func);
-  if (failed(axisInfo))
+  auto axisInfoR = discovery.run(func);
+  if (failed(axisInfoR))
     return failure();
+  DiscoveredAxisInfo &axisInfo = *axisInfoR;
 
-  SmallVector<Operation *> oldOps;
-  for (Operation &op : func.front().without_terminator())
-    oldOps.push_back(&op);
+  // A supported value becomes a scope root when it crosses back into unsupported IR or reaches the
+  // function terminator. Roots are collected before rewriting so newly inserted adapter operations
+  // do not themselves become candidates during this pass invocation.
+  auto hasUnsupportedUser = [](Value value) {
+    return llvm::any_of(value.getUses(),
+                        [](OpOperand &use) { return !isSupportedStableHLOOp(use.getOwner()); });
+  };
+  SmallVector<Value> roots;
+  for (Operation &op : func.front().without_terminator()) {
+    if (!isSupportedStableHLOOp(&op))
+      continue;
+    for (OpResult result : op.getResults())
+      if (isa<RankedTensorType>(result.getType()) && hasUnsupportedUser(result))
+        roots.push_back(result);
+  }
 
-  ScopedTABuilder ta(returnOp, returnOp.getLoc(), resultType);
-  FunctionEmitter emitter(ta, *axisInfo);
-  for (auto [group, op] : llvm::enumerate(oldOps))
-    if (failed(emitter.emit(op, group)))
+  // Process roots in producer order. If an early root also feeds supported operations, replacing
+  // all uses cuts that edge and later scopes observe the already materialized tensor instead of
+  // cloning the producer computation.
+  int64_t nextImportGroup = 0;
+  for (Value root : roots) {
+    Operation *rootDef = root.getDefiningOp();
+    auto resultType = dyn_cast<RankedTensorType>(root.getType());
+    if (!rootDef || !resultType)
       return failure();
 
-  FailureOr<Value> result = emitter.translateFunctionResult(returnOp.getOperand(0));
-  if (failed(result))
-    return failure();
-  ta.yield(*result);
-  ta.relabelAxesForOutput(*result);
-  returnOp.setOperand(0, ta.getScope().getResult());
+    DenseSet<Operation *> component;
+    collectSupportedComponent(root, rootDef->getBlock(), component);
+    if (component.empty())
+      return success();
 
-  for (Operation *op : llvm::reverse(oldOps))
-    if (op->use_empty())
-      op->erase();
+    ScopedTABuilder ta(rootDef, rootDef->getLoc(), resultType);
+    FunctionEmitter emitter(ta, axisInfo, component, nextImportGroup);
+    for (Operation &op : rootDef->getBlock()->without_terminator())
+      if (failed(emitter.emit(&op)))
+        return failure();
+
+    FailureOr<Value> expr = emitter.translateRoot(root);
+    auto axes = axisInfo.valueAxes.find(root);
+    if (failed(expr) || axes == axisInfo.valueAxes.end())
+      return failure();
+    FailureOr<Value> materialized = ta.materializeResult(*expr, axes->second, resultType);
+    if (failed(materialized))
+      return failure();
+
+    // Downstream components see the adapted tensor with exactly the original root's dimension axes.
+    // Recording the alias keeps the one global discovery result valid as scopes are introduced.
+    axisInfo.valueAxes[*materialized] = axes->second;
+    root.replaceAllUsesWith(*materialized);
+
+    SmallVector<Operation *> componentOps;
+    for (Operation &op : rootDef->getBlock()->without_terminator())
+      if (component.contains(&op))
+        componentOps.push_back(&op);
+    for (Operation *op : llvm::reverse(componentOps))
+      if (op->use_empty())
+        op->erase();
+  }
   return success();
 }
 
@@ -1016,7 +1133,7 @@ struct ImportStableHLOToTAPass
       func.emitOpError("ta importer currently expects static result shapes");
       return signalPassFailure();
     }
-    if (failed(importFunctionAsTA(func, returnOp, resultType)))
+    if (failed(importFunctionAsTA(func)))
       return signalPassFailure();
   }
 };

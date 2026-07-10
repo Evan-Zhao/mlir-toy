@@ -409,7 +409,7 @@ private:
     } else {
       loopAxes = axisNames(resultExpr);
       iterators.assign(loopAxes.size(), utils::IteratorType::parallel);
-      if (isa<SubstOp>(root)) {
+      if (isa<AtOp, SubstOp>(root)) {
         if (failed(collectInputs(root->getResult(0), root, loopAxes)))
           return failure();
       } else {

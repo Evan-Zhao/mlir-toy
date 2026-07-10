@@ -66,3 +66,46 @@ func.func @attention(%q: tensor<1x2x4x3xf16>, %k: tensor<1x2x4x3xf16>,
   %out = stablehlo.convert %pv : (tensor<1x2x4x3xf32>) -> tensor<1x2x4x3xf16>
   return %out : tensor<1x2x4x3xf16>
 }
+
+// CHECK-LABEL: func.func @partition_around_unsupported_ops
+// CHECK: %[[LHS:.+]] = stablehlo.slice
+// CHECK: %[[RHS:.+]] = stablehlo.slice
+// CHECK: %[[SUM:.+]] = ta.scope axes(%i0 "i0" extent 4, %i1 "i1" extent 3) {
+// CHECK:   %[[L:.+]] = ta.at %[[LHS]][%i0, %i1]
+// CHECK:   %[[R:.+]] = ta.at %[[RHS]][%i0, %i1]
+// CHECK:   %[[ADD:.+]] = ta.add %[[L]], %[[R]]
+// CHECK:   ta.yield %[[ADD]]
+// CHECK: stablehlo.concatenate %[[SUM]], %[[LHS]], dim = 0
+func.func @partition_around_unsupported_ops(%arg: tensor<5x3xf32>) -> tensor<8x3xf32> {
+  %lhs = stablehlo.slice %arg [0:4, 0:3]
+      : (tensor<5x3xf32>) -> tensor<4x3xf32>
+  %rhs = stablehlo.slice %arg [1:5, 0:3]
+      : (tensor<5x3xf32>) -> tensor<4x3xf32>
+  %sum = stablehlo.add %lhs, %rhs : tensor<4x3xf32>
+  %result = stablehlo.concatenate %sum, %lhs, dim = 0
+      : (tensor<4x3xf32>, tensor<4x3xf32>) -> tensor<8x3xf32>
+  return %result : tensor<8x3xf32>
+}
+
+// CHECK-LABEL: func.func @partition_permuted_dot
+// CHECK: %[[DOT:.+]] = ta.scope axes(%i0 "i0" extent 2, %i1 "i1" extent 3, %i2 "i2" extent 4, %i3 "i3" extent 3, %j0 "j0" extent 5)
+// CHECK: %[[ADAPTED:.+]] = stablehlo.broadcast_in_dim %[[DOT]], dims = [0, 2, 1, 3] : (tensor<2x3x4x3xf32>) -> tensor<2x4x3x3xf32>
+// CHECK: %[[SLICE:.+]] = stablehlo.slice %[[ADAPTED]]
+// CHECK: %[[EXP_SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 2, %i1 "i1" extent 3, %i2 "i2" extent 4, %i3 "i3" extent 3)
+// CHECK: ta.at %[[DOT]]{{.*}} {ta.import_group = 1 : i64}
+// CHECK: ta.exp {{.*}} {ta.import_group = 2 : i64}
+// CHECK: %[[EXP_ADAPTED:.+]] = stablehlo.broadcast_in_dim %[[EXP_SCOPE]], dims = [0, 2, 1, 3]
+// CHECK: stablehlo.concatenate %[[SLICE]], %[[EXP_ADAPTED]]
+func.func @partition_permuted_dot(%q: tensor<2x3x4x5xf16>,
+                                  %k: tensor<2x3x4x5xf16>)
+    -> tensor<2x4x6x3xf32> {
+  %dot = stablehlo.dot_general %q, %k,
+      batching_dims = [0, 2] x [0, 2], contracting_dims = [3] x [3]
+      : (tensor<2x3x4x5xf16>, tensor<2x3x4x5xf16>) -> tensor<2x4x3x3xf32>
+  %slice = stablehlo.slice %dot [0:2, 0:4, 0:3, 0:3]
+      : (tensor<2x4x3x3xf32>) -> tensor<2x4x3x3xf32>
+  %exp = stablehlo.exponential %dot : tensor<2x4x3x3xf32>
+  %result = stablehlo.concatenate %slice, %exp, dim = 2
+      : (tensor<2x4x3x3xf32>, tensor<2x4x3x3xf32>) -> tensor<2x4x6x3xf32>
+  return %result : tensor<2x4x6x3xf32>
+}
