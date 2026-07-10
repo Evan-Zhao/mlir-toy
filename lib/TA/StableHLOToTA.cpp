@@ -1,9 +1,17 @@
 #include "TA/TAOps.h"
 #include "TA/TAPasses.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
 #include "stablehlo/dialect/StablehloOps.h"
+#include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringMap.h"
+#include <llvm/ADT/SmallVector.h>
+#include <llvm/Support/LogicalResult.h>
 
 #define DEBUG_TYPE "stablehlo-to-ta"
 
@@ -12,6 +20,968 @@ namespace ta {
 using namespace mlir;
 
 namespace {
+
+// The importer runs in two phases. ForwardAxisDiscovery first assigns logical axes to every
+// tensor dimension and unifies dimensions related by StableHLO attributes. FunctionEmitter then
+// replays the dataflow as scalar TA expressions over those axes. Keeping discovery separate is
+// important for dot_general: an axis may acquire its final identity only after several producers
+// and consumers have been visited.
+//
+// StableHLO values remain in place while the TA scope is built. Once the return value has been
+// translated, dead StableHLO operations are erased in reverse order.
+
+// An Axis is a logical iteration variable, not necessarily one physical tensor dimension. Names
+// are provisional during discovery and are normalized to output i* and internal j* names later.
+struct Axis {
+  std::string name;
+  int64_t extent = ShapedType::kDynamic;
+};
+
+// Preserve tensor rank while allowing dimensions which do not occur in an expression's support.
+// A null entry means that the expression is constant along that tensor dimension. This is how a
+// scalar broadcast or an expanding size-one dimension is represented without a TA broadcast op.
+using TensorAxes = SmallVector<std::optional<Axis>>;
+
+// This is the stable, name-based form of discovery output consumed by FunctionEmitter. Discovery
+// itself uses compact union-find IDs because axis equivalences are still changing during the walk.
+struct DiscoveredAxisInfo {
+  DenseMap<Value, TensorAxes> valueAxes;
+};
+
+/// Discover equal tensor dimensions before emitting TA.
+///
+/// StableHLO makes most equalities explicit in operation dimension-number attributes, unlike
+/// linalg.generic where indexing maps and synthetic loop axes provide the connections. Every
+/// static tensor dimension starts in its own union-find set. Operation-specific visitors merge
+/// sets when two dimensions denote the same logical coordinate.
+///
+/// The walk is forward only. SSA producers have therefore been assigned axes before a consumer is
+/// inspected, while getOrCreateValueAxes also makes the code robust to constants and other values
+/// first encountered as operands.
+class ForwardAxisDiscovery {
+public:
+  FailureOr<DiscoveredAxisInfo> run(func::FuncOp func) {
+    for (BlockArgument argument : func.getArguments())
+      if (isa<RankedTensorType>(argument.getType()) && failed(getOrCreateValueAxes(argument)))
+        return failure();
+
+    for (Operation &op : func.front().without_terminator()) {
+      LogicalResult result = success();
+      if (isa<stablehlo::ConvertOp, stablehlo::ExpOp, stablehlo::AddOp, stablehlo::SubtractOp,
+              stablehlo::MulOp, stablehlo::DivOp, stablehlo::MaxOp, stablehlo::MinOp>(&op))
+        result = discoverSameShape(&op);
+      else if (auto transpose = dyn_cast<stablehlo::TransposeOp>(&op))
+        result = discoverTranspose(transpose);
+      else if (auto broadcast = dyn_cast<stablehlo::BroadcastInDimOp>(&op))
+        result = discoverBroadcast(broadcast);
+      else if (auto reshape = dyn_cast<stablehlo::ReshapeOp>(&op))
+        result = discoverReshape(reshape);
+      else if (auto reduce = dyn_cast<stablehlo::ReduceOp>(&op))
+        result = discoverReduce(reduce);
+      else if (auto dot = dyn_cast<stablehlo::DotGeneralOp>(&op))
+        result = discoverDot(dot);
+      else
+        for (Value value : llvm::concat<Value>(op.getOperands(), op.getResults()))
+          if (isa<RankedTensorType>(value.getType()) && failed(getOrCreateValueAxes(value)))
+            return op.emitOpError("axis discovery requires static ranked tensors");
+      if (failed(result))
+        return failure();
+    }
+
+    auto returnOp = cast<func::ReturnOp>(func.front().getTerminator());
+    for (Value value : returnOp.getOperands())
+      if (isa<RankedTensorType>(value.getType()) && failed(getOrCreateValueAxes(value)))
+        return returnOp.emitOpError("axis discovery requires static ranked tensors");
+
+    // Freeze union-find representatives into value-owned Axis records. From this point onward the
+    // emitter can compare and copy names without depending on mutable discovery storage.
+    DiscoveredAxisInfo info;
+    for (auto &[value, ids] : valueAxisIds)
+      info.valueAxes[value] = llvm::map_to_vector(
+          ids, [&](AxisId id) -> std::optional<Axis> { return axes[find(id)]; });
+    return info;
+  }
+
+private:
+  using AxisId = unsigned;
+  using AxisIds = SmallVector<AxisId, 4>;
+
+  // Return one union-find ID per tensor dimension. ArrayRef keeps call sites lightweight while the
+  // vectors remain owned by valueAxisIds for the lifetime of discovery. Dynamic shapes are
+  // rejected here so all later axis materialization can use compile-time extents.
+  FailureOr<ArrayRef<AxisId>> getOrCreateValueAxes(Value value) {
+    auto type = dyn_cast<RankedTensorType>(value.getType());
+    if (!type || !type.hasStaticShape())
+      return failure();
+    auto [it, inserted] = valueAxisIds.try_emplace(value);
+    if (!inserted)
+      return ArrayRef(it->second);
+    for (int64_t extent : type.getShape())
+      it->second.push_back(makeAxis(("v" + Twine(nextAxisName++)).str(), extent));
+    return ArrayRef(it->second);
+  }
+
+  AxisId makeAxis(std::string name, int64_t extent) {
+    AxisId id = parent.size();
+    parent.push_back(id);
+    axes.push_back(Axis{std::move(name), extent});
+    return id;
+  }
+
+  // Standard path-compressed union-find. The Axis stored at the representative supplies both the
+  // eventual name and the static extent for every member of the equivalence class.
+  AxisId find(AxisId id) {
+    if (parent[id] != id)
+      parent[id] = find(parent[id]);
+    return parent[id];
+  }
+
+  // Axis equality also implies extent equality. StableHLO verification normally guarantees this,
+  // but checking it here prevents malformed or partially transformed IR from producing invalid TA.
+  LogicalResult unite(Operation *op, AxisId lhs, AxisId rhs) {
+    lhs = find(lhs);
+    rhs = find(rhs);
+    if (lhs == rhs)
+      return success();
+    if (axes[lhs].extent != axes[rhs].extent)
+      return op->emitOpError("axis discovery found conflicting extents");
+    parent[rhs] = lhs;
+    return success();
+  }
+
+  LogicalResult discoverSameShape(Operation *op) {
+    if (op->getNumResults() != 1)
+      return op->emitOpError("expected one result");
+    auto result = getOrCreateValueAxes(op->getResult(0));
+    if (failed(result))
+      return op->emitOpError("axis discovery requires static ranked tensors");
+    for (Value operand : op->getOperands()) {
+      auto operandAxes = getOrCreateValueAxes(operand);
+      if (failed(operandAxes) || operandAxes->size() != result->size())
+        return op->emitOpError("expected same-rank tensor operands and result");
+      for (auto [operandAxis, resultAxis] : llvm::zip_equal(*operandAxes, *result))
+        if (failed(unite(op, operandAxis, resultAxis)))
+          return failure();
+    }
+    return success();
+  }
+
+  // StableHLO's permutation is result-dimension -> input-dimension. Unifying in that direction
+  // records the permutation in result metadata; no explicit transpose operation is needed in TA.
+  LogicalResult discoverTranspose(stablehlo::TransposeOp op) {
+    auto input = getOrCreateValueAxes(op.getOperand());
+    auto result = getOrCreateValueAxes(op.getResult());
+    ArrayRef<int64_t> permutation = op.getPermutation();
+    if (failed(input) || failed(result) || permutation.size() != result->size() ||
+        input->size() != result->size())
+      return op.emitOpError("invalid transpose axes");
+    for (auto [resultDim, inputDim] : llvm::enumerate(permutation)) {
+      if (inputDim < 0 || inputDim >= static_cast<int64_t>(input->size()) ||
+          failed(unite(op, (*input)[inputDim], (*result)[resultDim])))
+        return op.emitOpError("invalid transpose permutation");
+    }
+    return success();
+  }
+
+  LogicalResult discoverBroadcast(stablehlo::BroadcastInDimOp op) {
+    auto input = getOrCreateValueAxes(op.getOperand());
+    auto result = getOrCreateValueAxes(op.getResult());
+    ArrayRef<int64_t> dimensions = op.getBroadcastDimensions();
+    if (failed(input) || failed(result) || dimensions.size() != input->size())
+      return op.emitOpError("invalid broadcast axes");
+    auto inputType = cast<RankedTensorType>(op.getOperand().getType());
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+    for (auto [inputDim, resultDim] : llvm::enumerate(dimensions)) {
+      if (resultDim < 0 || resultDim >= resultType.getRank())
+        return op.emitOpError("invalid broadcast dimension");
+      int64_t inputExtent = inputType.getDimSize(inputDim);
+      int64_t resultExtent = resultType.getDimSize(resultDim);
+      // Equal extents mean the source coordinate survives the broadcast and can share the result
+      // axis. An expanding size-one dimension is indexed at zero instead and does not carry the
+      // destination axis into the source expression.
+      if (inputExtent == resultExtent &&
+          failed(unite(op, (*input)[inputDim], (*result)[resultDim])))
+        return failure();
+    }
+    return success();
+  }
+
+  // Initially support only insertion, removal, or movement of singleton dimensions. Removing all
+  // unit dimensions leaves a shape signature which must match exactly on both sides. This avoids
+  // pretending that a product reshape has a simple one-axis-to-one-axis interpretation.
+  LogicalResult discoverReshape(stablehlo::ReshapeOp op) {
+    auto input = getOrCreateValueAxes(op.getOperand());
+    auto result = getOrCreateValueAxes(op.getResult());
+    if (failed(input) || failed(result))
+      return op.emitOpError("axis discovery requires static ranked tensors");
+    auto inputType = cast<RankedTensorType>(op.getOperand().getType());
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+    SmallVector<int64_t> inputNonUnit, resultNonUnit, inputUnit, resultUnit;
+    for (int64_t i = 0; i < inputType.getRank(); ++i)
+      (inputType.getDimSize(i) == 1 ? inputUnit : inputNonUnit).push_back(i);
+    for (int64_t i = 0; i < resultType.getRank(); ++i)
+      (resultType.getDimSize(i) == 1 ? resultUnit : resultNonUnit).push_back(i);
+    if (inputNonUnit.size() != resultNonUnit.size())
+      return op.emitOpError("only singleton-dimension reshapes are supported");
+    for (auto [inputDim, resultDim] : llvm::zip_equal(inputNonUnit, resultNonUnit)) {
+      if (inputType.getDimSize(inputDim) != resultType.getDimSize(resultDim))
+        return op.emitOpError("only singleton-dimension reshapes are supported");
+      if (failed(unite(op, (*input)[inputDim], (*result)[resultDim])))
+        return failure();
+    }
+    // Preserve common singleton dimensions in order. Their coordinates are always zero, but
+    // retaining a shared axis where possible keeps leading batch dimensions visible. Extra unit
+    // dimensions on either side are semantically inserted or removed and remain unrelated.
+    for (auto [inputDim, resultDim] :
+         llvm::zip(inputUnit, ArrayRef<int64_t>(resultUnit)
+                                  .take_front(std::min(inputUnit.size(), resultUnit.size()))))
+      if (failed(unite(op, (*input)[inputDim], (*result)[resultDim])))
+        return failure();
+    return success();
+  }
+
+  // StableHLO reduction results list the unreduced input dimensions in input order. Walk the input
+  // once, skip dimensions named by the attribute, and merge each survivor with the next result
+  // dimension. Reduced axes intentionally remain available as internal TA axes.
+  LogicalResult discoverReduce(stablehlo::ReduceOp op) {
+    if (op.getInputs().size() != 1 || op.getNumResults() != 1)
+      return op.emitOpError("only single-input reductions are supported");
+    auto inputR = getOrCreateValueAxes(op.getInputs().front());
+    auto resultR = getOrCreateValueAxes(op.getResult(0));
+    if (failed(inputR) || failed(resultR))
+      return op.emitOpError("axis discovery requires static ranked tensors");
+    auto &result = *resultR;
+    DenseSet<int64_t> reduced(op.getDimensions().begin(), op.getDimensions().end());
+    unsigned resultDim = 0;
+    for (auto [inputDim, inputAxis] : llvm::enumerate(*inputR)) {
+      if (reduced.contains(static_cast<int64_t>(inputDim)))
+        continue;
+      if (resultDim >= result.size() || failed(unite(op, inputAxis, result[resultDim])))
+        return op.emitOpError("reduction dimensions do not match result rank");
+      resultDim++;
+    }
+    if (resultDim != result.size())
+      return op.emitOpError("reduction dimensions do not match result rank");
+    return success();
+  }
+
+  // A dot_general result is ordered as batching dimensions, lhs free dimensions, then rhs free
+  // dimensions. Contracting dimensions do not appear in the result, but lhs and rhs contracting
+  // pairs must be unified so the emitter can reduce their product over one shared axis.
+  LogicalResult discoverDot(stablehlo::DotGeneralOp op) {
+    auto lhsR = getOrCreateValueAxes(op.getLhs());
+    auto rhsR = getOrCreateValueAxes(op.getRhs());
+    auto resultR = getOrCreateValueAxes(op.getResult());
+    if (failed(lhsR) || failed(rhsR) || failed(resultR))
+      return op.emitOpError("axis discovery requires static ranked tensors");
+    auto &lhs = *lhsR, &rhs = *rhsR, &result = *resultR;
+
+    auto dims = op.getDotDimensionNumbers();
+    ArrayRef<int64_t> lhsBatch = dims.getLhsBatchingDimensions();
+    ArrayRef<int64_t> rhsBatch = dims.getRhsBatchingDimensions();
+    ArrayRef<int64_t> lhsContract = dims.getLhsContractingDimensions();
+    ArrayRef<int64_t> rhsContract = dims.getRhsContractingDimensions();
+    if (lhsBatch.size() != rhsBatch.size() || lhsContract.size() != rhsContract.size())
+      return op.emitOpError("mismatched dot dimension numbers");
+
+    auto validDim = [](int64_t dim, size_t rank) {
+      return dim >= 0 && dim < static_cast<int64_t>(rank);
+    };
+    // Batch pairs are visible in all three tensors. Process them first because StableHLO places
+    // them at the front of the result regardless of their positions in either operand.
+    unsigned resultDim = 0;
+    for (auto [lhsDim, rhsDim] : llvm::zip_equal(lhsBatch, rhsBatch)) {
+      if (!validDim(lhsDim, lhs.size()) || !validDim(rhsDim, rhs.size()) ||
+          resultDim >= result.size())
+        return op.emitOpError("invalid dot batching dimensions");
+      if (failed(unite(op, lhs[lhsDim], rhs[rhsDim])) ||
+          failed(unite(op, lhs[lhsDim], result[resultDim])))
+        return failure();
+      ++resultDim;
+    }
+
+    // Append one operand's free dimensions to the result. Batch and contracting dimensions are
+    // excluded; iterating the original operand order implements StableHLO's result layout rule.
+    auto uniteDotDims = [&](auto &batch, auto &contract, auto &axes) -> LogicalResult {
+      DenseSet<int64_t> skipped(batch.begin(), batch.end());
+      skipped.insert(contract.begin(), contract.end());
+      for (auto [dim, axis] : llvm::enumerate(axes)) {
+        if (skipped.contains(static_cast<int64_t>(dim)))
+          continue;
+        if (resultDim >= result.size())
+          return op.emitOpError("dot dimensions do not match result rank");
+        if (failed(unite(op, axis, result[resultDim])))
+          return failure();
+        ++resultDim;
+      }
+      return success();
+    };
+    if (failed(uniteDotDims(lhsBatch, lhsContract, lhs)) ||
+        failed(uniteDotDims(rhsBatch, rhsContract, rhs)))
+      return failure();
+    // Contracting pairs share an internal coordinate but have no corresponding result dimension.
+    // They are processed last because they do not advance resultDim.
+    for (auto [lhsDim, rhsDim] : llvm::zip_equal(lhsContract, rhsContract)) {
+      if (!validDim(lhsDim, lhs.size()) || !validDim(rhsDim, rhs.size()) ||
+          failed(unite(op, lhs[lhsDim], rhs[rhsDim])))
+        return op.emitOpError("invalid dot contracting dimensions");
+    }
+    if (resultDim != result.size())
+      return op.emitOpError("dot dimensions do not match result rank");
+    return success();
+  }
+
+  DenseMap<Value, AxisIds> valueAxisIds;
+  SmallVector<AxisId> parent;
+  SmallVector<Axis> axes;
+  unsigned nextAxisName = 0;
+};
+
+using AxisName = std::string;
+using AxisNames = SmallVector<AxisName>;
+using AxisNameMapVector = llvm::MapVector<AxisName, AxisName, llvm::StringMap<unsigned>>;
+
+// Kept intentionally parallel to ScopedTABuilder in LinalgToTA.cpp. The two importers should
+// produce the same TA vocabulary and axis naming.
+//
+// The builder owns one ta.scope and lazily adds its index block arguments as expressions begin to
+// use axes. StableHLO operation locations and import-group tags are applied through the guard
+// below, so all TA operations emitted for one source operation can later be materialized together.
+class ScopedTABuilder {
+public:
+  ScopedTABuilder(Operation *insertBefore, Location loc, RankedTensorType resultType)
+      : context(insertBefore->getContext()), loc(loc), builder(insertBefore) {
+    Block *body = new Block();
+    scope = ScopeOp::create(builder, loc, resultType, ValueRange{}, getAxesAttr({}),
+                            DenseI64ArrayAttr::get(context, {}));
+    scope.getBody().push_back(body);
+    builder.setInsertionPointToStart(body);
+  }
+
+  // Temporarily associate newly created TA operations with one StableHLO source operation. The
+  // ta-to-linalg lowering uses this grouping to choose useful materialization boundaries.
+  class ImportGroupGuard {
+  public:
+    ImportGroupGuard(ScopedTABuilder &ta, int64_t group, Location loc)
+        : ta(ta), oldGroup(ta.importGroup), oldLoc(ta.loc) {
+      ta.importGroup = group;
+      ta.loc = loc;
+    }
+    ~ImportGroupGuard() {
+      ta.importGroup = oldGroup;
+      ta.loc = oldLoc;
+    }
+
+  private:
+    ScopedTABuilder &ta;
+    std::optional<int64_t> oldGroup;
+    Location oldLoc;
+  };
+
+  ScopeOp getScope() const { return scope; }
+
+  AxesAttr getAxesAttr(ArrayRef<AxisName> names) const {
+    SmallVector<Attribute> result;
+    DenseSet<StringRef> seen;
+    for (StringRef name : names)
+      if (seen.insert(name).second)
+        result.push_back(AxisAttr::get(context, name));
+    return AxesAttr::get(context, ArrayAttr::get(context, result));
+  }
+
+  ExprType getExprType(Type elementType, ArrayRef<AxisName> axes) const {
+    return ExprType::get(context, elementType, getAxesAttr(axes));
+  }
+
+  // TA elementwise result axes are the ordered union of operand axes. Keep the first occurrence of
+  // each name so operand order remains visible and agrees with the TA verifier's inference rule.
+  AxisNames collectOperandAxes(ValueRange operands) const {
+    DenseSet<StringRef> seen;
+    AxisNames result;
+    for (Value operand : operands)
+      for (Attribute attr : cast<ExprType>(operand.getType()).getAxes().getAxes()) {
+        StringRef name = cast<AxisAttr>(attr).getName().getValue();
+        if (seen.insert(name).second)
+          result.push_back(name.str());
+      }
+    return result;
+  }
+
+  // Observe a tensor using one coordinate per physical dimension. Missing logical axes become a
+  // literal zero index, which implements scalar and singleton broadcasts without adding that axis
+  // to the resulting expression type.
+  Value at(Value source, const TensorAxes &dimAxes, Type elementType) {
+    SmallVector<Value> indices;
+    AxisNames resultAxes;
+    for (const std::optional<Axis> &axis : dimAxes) {
+      if (axis) {
+        indices.push_back(materializeAxis(*axis));
+        resultAxes.push_back(axis->name);
+      } else {
+        indices.push_back(indexZero());
+      }
+    }
+    return annotate(
+        AtOp::create(builder, loc, getExprType(elementType, resultAxes), source, indices));
+  }
+
+  Value constant(TypedAttr value) {
+    return annotate(ConstantOp::create(builder, loc, getExprType(value.getType(), {}), value));
+  }
+
+  template <typename OpTy> Value unary(Type elementType, Value input) {
+    return annotate(
+        OpTy::create(builder, loc, getExprType(elementType, collectOperandAxes({input})), input));
+  }
+
+  template <typename OpTy> Value binary(Type elementType, Value lhs, Value rhs) {
+    return annotate(OpTy::create(
+        builder, loc, getExprType(elementType, collectOperandAxes({lhs, rhs})), lhs, rhs));
+  }
+
+  // Reduction removes named axes from expression support. The StableHLO importer validates the
+  // identity separately, so the bodyless TA reduction does not carry an identity operand here.
+  Value reduce(ReduceKind kind, Value input, ArrayRef<AxisName> reductionAxes, Type elementType) {
+    DenseSet<StringRef> reduced(reductionAxes.begin(), reductionAxes.end());
+    AxisNames resultAxes;
+    for (Attribute attr : cast<ExprType>(input.getType()).getAxes().getAxes()) {
+      StringRef axis = cast<AxisAttr>(attr).getName().getValue();
+      if (!reduced.contains(axis))
+        resultAxes.push_back(axis.str());
+    }
+    return annotate(ReduceOp::create(builder, loc, getExprType(elementType, resultAxes), kind,
+                                     input, Value(), getAxesAttr(reductionAxes)));
+  }
+
+  // Relabel an already translated expression for a new consumer. Substitution changes logical
+  // coordinates without materializing a transpose or copying tensor data. Identity mappings are
+  // omitted to avoid creating no-op ta.subst operations.
+  Value subst(Value input, const AxisNameMapVector &replacements) {
+    auto inputType = cast<ExprType>(input.getType());
+    AxisNames resultAxes, fromAxes, toAxes;
+    for (Attribute attr : inputType.getAxes().getAxes()) {
+      StringRef axis = cast<AxisAttr>(attr).getName().getValue();
+      auto replacement = replacements.find(axis.str());
+      if (replacement == replacements.end() || replacement->second == axis) {
+        resultAxes.push_back(axis.str());
+      } else {
+        resultAxes.push_back(replacement->second);
+        fromAxes.push_back(axis.str());
+        toAxes.push_back(replacement->second);
+      }
+    }
+    if (fromAxes.empty())
+      return input;
+    return annotate(SubstOp::create(builder, loc,
+                                    getExprType(inputType.getElementType(), resultAxes), input,
+                                    getAxesAttr(fromAxes), getAxesAttr(toAxes)));
+  }
+
+  void yield(Value value) { YieldOp::create(builder, loc, value); }
+
+  // Discovery names are deliberately unstable and verbose. Once the yielded expression is known,
+  // assign i* names to its axes in result order and j* names to every remaining internal axis. This
+  // convention makes imported TA deterministic and keeps output dimensions visually distinct from
+  // reduction-only coordinates.
+  //
+  // Block arguments cannot be reordered in place. Add arguments in normalized order, replace uses
+  // of the old arguments, then erase the old prefix. Finally rewrite every AxesAttr and ExprType in
+  // the scope so names on operations, types, and block arguments remain consistent.
+  void relabelAxesForOutput(Value output) {
+    auto outputType = cast<ExprType>(output.getType());
+    AxisNameMapVector renames;
+    unsigned nextOutput = 0, nextInternal = 0;
+    for (Attribute attr : outputType.getAxes().getAxes()) {
+      AxisName oldName = cast<AxisAttr>(attr).getName().getValue().str();
+      if (axes.contains(oldName) && !renames.contains(oldName))
+        renames.insert({oldName, "i" + std::to_string(nextOutput++)});
+    }
+    for (auto &entry : axes)
+      if (!renames.contains(entry.first))
+        renames.insert({entry.first, "j" + std::to_string(nextInternal++)});
+
+    AxisNames scopeAxes;
+    SmallVector<int64_t> extents;
+    Block &body = scope.getBody().front();
+    unsigned oldNumAxes = body.getNumArguments();
+    for (auto &[oldName, newName] : renames) {
+      MaterializedAxis &axis = axes[oldName];
+      BlockArgument argument = body.addArgument(builder.getIndexType(), loc);
+      axis.value.replaceAllUsesWith(argument);
+      axis.value = argument;
+      scopeAxes.push_back(newName);
+      extents.push_back(axis.extent);
+    }
+    if (oldNumAxes)
+      body.eraseArguments(0, oldNumAxes);
+    scope.setAxesAttr(getAxesAttr(scopeAxes));
+    scope.setStaticExtentsAttr(DenseI64ArrayAttr::get(context, extents));
+
+    // Attribute and type rewriting is intentionally local to the new scope. StableHLO operations
+    // outside it still use ordinary tensor types and never refer to these provisional names.
+    auto renameAxes = [&](AxesAttr attr) {
+      SmallVector<Attribute> result;
+      for (Attribute axisAttr : attr.getAxes()) {
+        StringRef oldName = cast<AxisAttr>(axisAttr).getName().getValue();
+        auto it = renames.find(oldName.str());
+        result.push_back(AxisAttr::get(context, it == renames.end() ? oldName : it->second));
+      }
+      return AxesAttr::get(context, ArrayAttr::get(context, result));
+    };
+    scope.getBody().walk([&](Operation *op) {
+      for (NamedAttribute attr : llvm::to_vector(op->getAttrs()))
+        if (auto axesAttr = dyn_cast<AxesAttr>(attr.getValue()))
+          op->setAttr(attr.getName(), renameAxes(axesAttr));
+      for (OpResult result : op->getResults())
+        if (auto exprType = dyn_cast<ExprType>(result.getType()))
+          result.setType(
+              ExprType::get(context, exprType.getElementType(), renameAxes(exprType.getAxes())));
+    });
+  }
+
+private:
+  template <typename OpTy> Value annotate(OpTy op) const {
+    if (importGroup)
+      op->setAttr("ta.import_group", IntegerAttr::get(IntegerType::get(context, 64), *importGroup));
+    return op.getResult();
+  }
+
+  // All absent tensor dimensions can share one index constant. Insert it at scope entry so it
+  // dominates every ta.at regardless of the source operation currently being emitted.
+  Value indexZero() {
+    if (zero)
+      return zero;
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointToStart(&scope.getBody().front());
+    zero = arith::ConstantIndexOp::create(builder, loc, 0);
+    return zero;
+  }
+
+  // Materialize each logical axis exactly once as a scope block argument. MapVector preserves first
+  // use order until relabelAxesForOutput performs the final output-first ordering.
+  Value materializeAxis(const Axis &axis) {
+    auto it = axes.find(axis.name);
+    if (it != axes.end())
+      return it->second.value;
+    Value argument = scope.getBody().front().addArgument(builder.getIndexType(), loc);
+    axes.try_emplace(axis.name, MaterializedAxis{argument, axis.extent});
+    return argument;
+  }
+
+  struct MaterializedAxis {
+    Value value;
+    int64_t extent;
+  };
+
+  MLIRContext *context;
+  Location loc;
+  OpBuilder builder;
+  Value zero;
+  ScopeOp scope;
+  std::optional<int64_t> importGroup;
+  llvm::MapVector<AxisName, MaterializedAxis, llvm::StringMap<unsigned>> axes;
+};
+
+// Keep both the TA expression and its interpretation as tensor dimensions. The expression type
+// only stores present axes, while this rank-preserving vector is needed to translate later
+// broadcasts, reshapes, and consumers which request different logical names.
+struct TensorValueInfo {
+  Value expr;
+  TensorAxes axes;
+};
+
+/// Replay supported StableHLO tensor dataflow as one scalar TA expression DAG.
+///
+/// Values already emitted are reused through valueMap. Function arguments are observed lazily with
+/// ta.at, and splat constants become axis-free expressions. Unsupported defining operations are
+/// diagnosed only when their values are actually needed by supported output dataflow.
+class FunctionEmitter {
+public:
+  FunctionEmitter(ScopedTABuilder &ta, const DiscoveredAxisInfo &axisInfo)
+      : ta(ta), axisInfo(axisInfo) {}
+
+  // Dispatch in source order so valueMap normally contains each producer before its consumers.
+  // View-like operations only update tensor-axis metadata; arithmetic creates new TA operations.
+  LogicalResult emit(Operation *op, unsigned group) {
+    ScopedTABuilder::ImportGroupGuard guard(ta, group, op->getLoc());
+    if (auto constant = dyn_cast<stablehlo::ConstantOp>(op))
+      return emitConstant(constant);
+    if (auto convert = dyn_cast<stablehlo::ConvertOp>(op))
+      return emitUnary<CastOp>(convert);
+    if (auto exponential = dyn_cast<stablehlo::ExpOp>(op))
+      return emitUnary<ExpOp>(exponential);
+    if (auto add = dyn_cast<stablehlo::AddOp>(op))
+      return emitBinary<AddFOp>(add);
+    if (auto subtract = dyn_cast<stablehlo::SubtractOp>(op))
+      return emitBinary<SubFOp>(subtract);
+    if (auto multiply = dyn_cast<stablehlo::MulOp>(op))
+      return emitBinary<MulFOp>(multiply);
+    if (auto divide = dyn_cast<stablehlo::DivOp>(op))
+      return emitBinary<DivFOp>(divide);
+    if (auto maximum = dyn_cast<stablehlo::MaxOp>(op))
+      return emitBinary<MaximumFOp>(maximum);
+    if (auto minimum = dyn_cast<stablehlo::MinOp>(op))
+      return emitBinary<MinimumFOp>(minimum);
+    if (auto transpose = dyn_cast<stablehlo::TransposeOp>(op))
+      return emitViewLike(transpose.getOperand(), transpose, transpose.getResult());
+    if (auto broadcast = dyn_cast<stablehlo::BroadcastInDimOp>(op))
+      return emitBroadcast(broadcast);
+    if (auto reshape = dyn_cast<stablehlo::ReshapeOp>(op))
+      return emitReshape(reshape);
+    if (auto reduce = dyn_cast<stablehlo::ReduceOp>(op))
+      return emitReduce(reduce);
+    if (auto dot = dyn_cast<stablehlo::DotGeneralOp>(op))
+      return emitDot(dot);
+    return success();
+  }
+
+  FailureOr<Value> translateFunctionResult(Value value) {
+    auto type = dyn_cast<RankedTensorType>(value.getType());
+    if (!type)
+      return emitError(value.getLoc(), "ta importer expected a ranked tensor return value");
+    auto axes = lookupAxes(value);
+    if (failed(axes))
+      return failure();
+    return translateValue(value, **axes, type.getElementType());
+  }
+
+private:
+  FailureOr<const TensorAxes *> lookupAxes(Value value) const {
+    auto it = axisInfo.valueAxes.find(value);
+    if (it == axisInfo.valueAxes.end()) {
+      emitError(value.getLoc(), "missing discovered tensor axes");
+      return failure();
+    }
+    return &it->second;
+  }
+
+  static FailureOr<TypedAttr> getSplatValue(Attribute value) {
+    auto elements = dyn_cast<ElementsAttr>(value);
+    if (!elements || !elements.isSplat())
+      return failure();
+    return dyn_cast<TypedAttr>(elements.getSplatValue<Attribute>());
+  }
+
+  LogicalResult emitConstant(stablehlo::ConstantOp op) {
+    auto value = getSplatValue(op.getValue());
+    if (failed(value))
+      return op.emitOpError("only splat constants are supported");
+    auto type = cast<RankedTensorType>(op.getResult().getType());
+    valueMap[op.getResult()] =
+        TensorValueInfo{ta.constant(*value), TensorAxes(type.getRank(), std::nullopt)};
+    return success();
+  }
+
+  template <typename TAOp, typename StableOp> LogicalResult emitUnary(StableOp op) {
+    auto inputAxes = lookupAxes(op.getOperand());
+    auto resultAxes = lookupAxes(op.getResult());
+    if (failed(inputAxes) || failed(resultAxes))
+      return failure();
+    auto inputType = cast<RankedTensorType>(op.getOperand().getType());
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+    auto input = translateValue(op.getOperand(), **inputAxes, inputType.getElementType());
+    if (failed(input))
+      return failure();
+    Value expr = ta.unary<TAOp>(resultType.getElementType(), *input);
+    valueMap[op.getResult()] = {expr, getPresentTensorAxes(expr, **resultAxes)};
+    return success();
+  }
+
+  template <typename TAOp, typename StableOp> LogicalResult emitBinary(StableOp op) {
+    auto lhsAxes = lookupAxes(op.getLhs());
+    auto rhsAxes = lookupAxes(op.getRhs());
+    auto resultAxes = lookupAxes(op.getResult());
+    if (failed(lhsAxes) || failed(rhsAxes) || failed(resultAxes))
+      return failure();
+    auto lhsType = cast<RankedTensorType>(op.getLhs().getType());
+    auto rhsType = cast<RankedTensorType>(op.getRhs().getType());
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+    if (!isa<FloatType>(resultType.getElementType()))
+      return op.emitOpError("only floating-point elementwise arithmetic is supported");
+    auto lhs = translateValue(op.getLhs(), **lhsAxes, lhsType.getElementType());
+    auto rhs = translateValue(op.getRhs(), **rhsAxes, rhsType.getElementType());
+    if (failed(lhs) || failed(rhs))
+      return failure();
+    Value expr = ta.binary<TAOp>(resultType.getElementType(), *lhs, *rhs);
+    valueMap[op.getResult()] = {expr, getPresentTensorAxes(expr, **resultAxes)};
+    return success();
+  }
+
+  // Transpose has no scalar computation to emit. Discovery has already permuted the result's
+  // tensor-dimension metadata, while the underlying expression retains the source indexing order.
+  template <typename StableOp> LogicalResult emitViewLike(Value input, StableOp op, Value result) {
+    auto inputAxes = lookupAxes(input);
+    auto resultAxes = lookupAxes(result);
+    if (failed(inputAxes) || failed(resultAxes))
+      return failure();
+    auto inputType = cast<RankedTensorType>(input.getType());
+    auto expr = translateValue(input, **inputAxes, inputType.getElementType());
+    if (failed(expr))
+      return failure();
+    valueMap[result] = {*expr, getPresentTensorAxes(*expr, **resultAxes)};
+    return success();
+  }
+
+  // Project result axes back through broadcast_dimensions to obtain source tensor coordinates.
+  // Equal-size mapped dimensions retain the result axis. Expanded source dimensions remain null,
+  // causing translateValue or ta.at to treat them as constant-zero coordinates.
+  LogicalResult emitBroadcast(stablehlo::BroadcastInDimOp op) {
+    auto resultAxes = lookupAxes(op.getResult());
+    if (failed(resultAxes))
+      return failure();
+    TensorAxes projectedInputAxes(op.getBroadcastDimensions().size());
+    auto inputType = cast<RankedTensorType>(op.getOperand().getType());
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+    for (auto [inputDim, resultDim] : llvm::enumerate(op.getBroadcastDimensions()))
+      if (inputType.getDimSize(inputDim) == resultType.getDimSize(resultDim))
+        projectedInputAxes[inputDim] = (**resultAxes)[resultDim];
+    auto expr = translateValue(op.getOperand(), projectedInputAxes, inputType.getElementType());
+    if (failed(expr))
+      return failure();
+    valueMap[op.getResult()] = {*expr, getPresentTensorAxes(*expr, **resultAxes)};
+    return success();
+  }
+
+  // Singleton-only reshapes reuse their operand expression. A source unit axis absent from the
+  // result metadata must be forgotten; source axes still represented in the result are preserved.
+  // Non-unit dimensions were already proven one-to-one by discoverReshape.
+  LogicalResult emitReshape(stablehlo::ReshapeOp op) {
+    auto inputAxes = lookupAxes(op.getOperand());
+    auto resultAxes = lookupAxes(op.getResult());
+    if (failed(inputAxes) || failed(resultAxes))
+      return failure();
+    TensorAxes projectedInputAxes = **inputAxes;
+    DenseSet<StringRef> resultAxisNames;
+    for (const std::optional<Axis> &axis : **resultAxes)
+      if (axis)
+        resultAxisNames.insert(axis->name);
+    auto inputType = cast<RankedTensorType>(op.getOperand().getType());
+    for (int64_t dim = 0; dim < inputType.getRank(); ++dim)
+      if (inputType.getDimSize(dim) == 1 &&
+          !resultAxisNames.contains(projectedInputAxes[dim]->name))
+        projectedInputAxes[dim] = std::nullopt;
+    auto expr = translateValue(op.getOperand(), projectedInputAxes, inputType.getElementType());
+    if (failed(expr))
+      return failure();
+    valueMap[op.getResult()] = {*expr, getPresentTensorAxes(*expr, **resultAxes)};
+    return success();
+  }
+
+  // Match the canonical two-argument StableHLO reduction region. Requiring the returned combiner
+  // to consume both block arguments directly excludes maps, nested expressions, and reducers whose
+  // semantics cannot be represented by one bodyless ta.reduce.
+  FailureOr<ReduceKind> matchReductionKind(stablehlo::ReduceOp op) {
+    if (op.getInputs().size() != 1 || op.getInitValues().size() != 1 || op.getNumResults() != 1)
+      return op.emitOpError("only single-input reductions are supported");
+    Block &body = op.getBody().front();
+    auto terminator = dyn_cast<stablehlo::ReturnOp>(body.getTerminator());
+    if (body.getNumArguments() != 2 || !terminator || terminator.getNumOperands() != 1)
+      return op.emitOpError("expected a binary reduction body");
+    Operation *combiner = terminator.getOperand(0).getDefiningOp();
+    if (!combiner || combiner->getNumOperands() != 2 ||
+        !llvm::is_contained(combiner->getOperands(), body.getArgument(0)) ||
+        !llvm::is_contained(combiner->getOperands(), body.getArgument(1)))
+      return op.emitOpError("expected a direct binary reduction combiner");
+    if (isa<stablehlo::AddOp>(combiner))
+      return ReduceKind::Add;
+    if (isa<stablehlo::MaxOp>(combiner))
+      return ReduceKind::Max;
+    return op.emitOpError("only add and maximum reductions are supported");
+  }
+
+  // TA reductions encode mathematical reduction kind but not arbitrary StableHLO initialization.
+  // Accept only the identities whose omission is semantics-preserving: zero for add and negative
+  // infinity (or the minimum signed integer) for maximum.
+  LogicalResult verifyReductionIdentity(stablehlo::ReduceOp op, ReduceKind kind) {
+    Value init = op.getInitValues().front();
+    FailureOr<TypedAttr> value = failure();
+    if (auto constant = init.getDefiningOp<stablehlo::ConstantOp>())
+      value = getSplatValue(constant.getValue());
+    else if (auto constant = init.getDefiningOp<arith::ConstantOp>())
+      value = getSplatValue(constant.getValue());
+    if (failed(value))
+      return op.emitOpError("reduction init must be a splat identity constant");
+
+    bool isIdentity = false;
+    if (auto floatValue = dyn_cast<FloatAttr>(*value)) {
+      if (kind == ReduceKind::Add)
+        isIdentity = floatValue.getValue().isZero();
+      else
+        isIdentity = floatValue.getValue().isInfinity() && floatValue.getValue().isNegative();
+    } else if (auto integerValue = dyn_cast<IntegerAttr>(*value)) {
+      if (kind == ReduceKind::Add)
+        isIdentity = integerValue.getValue().isZero();
+      else
+        isIdentity = integerValue.getValue().isMinSignedValue();
+    }
+    if (!isIdentity)
+      return op.emitOpError("reduction init is not the canonical identity");
+    return success();
+  }
+
+  LogicalResult emitReduce(stablehlo::ReduceOp op) {
+    auto kind = matchReductionKind(op);
+    if (failed(kind) || failed(verifyReductionIdentity(op, *kind)))
+      return failure();
+    Value inputValue = op.getInputs().front();
+    Value resultValue = op.getResult(0);
+    auto inputAxes = lookupAxes(inputValue);
+    auto resultAxes = lookupAxes(resultValue);
+    if (failed(inputAxes) || failed(resultAxes))
+      return failure();
+    auto inputType = cast<RankedTensorType>(inputValue.getType());
+    auto resultType = cast<RankedTensorType>(resultValue.getType());
+    if (!isa<FloatType>(resultType.getElementType()))
+      return op.emitOpError("only floating-point reductions are supported");
+    auto input = translateValue(inputValue, **inputAxes, inputType.getElementType());
+    if (failed(input))
+      return failure();
+    AxisNames reductionAxes;
+    for (int64_t dim : op.getDimensions()) {
+      if (dim < 0 || dim >= static_cast<int64_t>((*inputAxes)->size()))
+        return op.emitOpError("invalid reduction dimension");
+      reductionAxes.push_back((**inputAxes)[dim]->name);
+    }
+    Value expr = ta.reduce(*kind, *input, reductionAxes, resultType.getElementType());
+    valueMap[resultValue] = {expr, getPresentTensorAxes(expr, **resultAxes)};
+    return success();
+  }
+
+  // Axis discovery makes each contracting pair share one name. A dot is therefore ordinary
+  // elementwise multiplication over the ordered union of operand axes followed by an add reduction
+  // over the lhs contracting axes. Batch and free axes survive automatically.
+  LogicalResult emitDot(stablehlo::DotGeneralOp op) {
+    auto lhsAxes = lookupAxes(op.getLhs());
+    auto rhsAxes = lookupAxes(op.getRhs());
+    auto resultAxes = lookupAxes(op.getResult());
+    if (failed(lhsAxes) || failed(rhsAxes) || failed(resultAxes))
+      return failure();
+    auto lhsType = cast<RankedTensorType>(op.getLhs().getType());
+    auto rhsType = cast<RankedTensorType>(op.getRhs().getType());
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+    if (!isa<FloatType>(lhsType.getElementType()) ||
+        lhsType.getElementType() != rhsType.getElementType() ||
+        lhsType.getElementType() != resultType.getElementType())
+      return op.emitOpError("only same-type floating-point dots are supported");
+    auto lhs = translateValue(op.getLhs(), **lhsAxes, lhsType.getElementType());
+    auto rhs = translateValue(op.getRhs(), **rhsAxes, rhsType.getElementType());
+    if (failed(lhs) || failed(rhs))
+      return failure();
+    Value product = ta.binary<MulFOp>(resultType.getElementType(), *lhs, *rhs);
+    AxisNames reductionAxes;
+    for (int64_t dim : op.getDotDimensionNumbers().getLhsContractingDimensions())
+      reductionAxes.push_back((**lhsAxes)[dim]->name);
+    Value expr = ta.reduce(ReduceKind::Add, product, reductionAxes, resultType.getElementType());
+    valueMap[op.getResult()] = {expr, getPresentTensorAxes(expr, **resultAxes)};
+    return success();
+  }
+
+  // Translate one tensor value as observed under targetAxes.
+  //
+  // For an emitted value, compare tensor dimensions positionally and build a simultaneous axis
+  // substitution. Consumers may legitimately request different names, for example when the same
+  // expression participates in different broadcasts. Dropping an axis is valid only for extent
+  // one; reducing a one-element domain is an identity and removes it from TA expression support.
+  //
+  // Values without a valueMap entry must be external leaves. Splat constants are lifted directly;
+  // function arguments become ta.at observations. Any other defining operation indicates that live
+  // output dataflow crossed an unsupported StableHLO operation and is diagnosed rather than hidden
+  // behind a ta.at.
+  FailureOr<Value> translateValue(Value value, const TensorAxes &targetAxes, Type elementType) {
+    auto it = valueMap.find(value);
+    if (it != valueMap.end()) {
+      if (it->second.axes.size() != targetAxes.size())
+        return emitError(value.getLoc(), "cannot relabel tensor with different rank");
+      AxisNameMapVector replacements;
+      AxisNames erasedUnitAxes;
+      for (auto [fromAxis, toAxis] : llvm::zip_equal(it->second.axes, targetAxes)) {
+        if (!fromAxis)
+          continue;
+        if (!toAxis) {
+          if (fromAxis->extent != 1)
+            return emitError(value.getLoc(), "cannot erase non-unit tensor axis during relabel");
+          erasedUnitAxes.push_back(fromAxis->name);
+          continue;
+        }
+        auto [replacement, inserted] = replacements.try_emplace(fromAxis->name, toAxis->name);
+        if (!inserted && replacement->second != toAxis->name)
+          return emitError(value.getLoc(), "cannot relabel tensor axis to multiple targets");
+      }
+      Value expr = ta.subst(it->second.expr, replacements);
+      // A reduction over a one-element axis is an identity and is the TA way
+      // to forget a singleton dimension already materialized by a producer.
+      if (!erasedUnitAxes.empty())
+        expr = ta.reduce(ReduceKind::Add, expr, erasedUnitAxes,
+                         cast<ExprType>(expr.getType()).getElementType());
+      return expr;
+    }
+
+    if (auto stableConstant = value.getDefiningOp<stablehlo::ConstantOp>()) {
+      auto splat = getSplatValue(stableConstant.getValue());
+      if (succeeded(splat))
+        return ta.constant(*splat);
+    }
+    if (auto constant = value.getDefiningOp<arith::ConstantOp>()) {
+      auto splat = getSplatValue(constant.getValue());
+      if (succeeded(splat))
+        return ta.constant(*splat);
+    }
+    if (Operation *def = value.getDefiningOp())
+      return def->emitOpError("unsupported operation for ta import: ") << def->getName();
+    return ta.at(value, targetAxes, elementType);
+  }
+
+  // Convert full discovery metadata into the rank-preserving metadata for one emitted expression.
+  // Dimensions whose axis is absent from the ExprType become null but retain their tensor position.
+  // This distinction is essential when a later broadcast maps tensor dimensions by number.
+  TensorAxes getPresentTensorAxes(Value expr, const TensorAxes &fullAxes) const {
+    DenseSet<StringRef> present;
+    for (Attribute attr : cast<ExprType>(expr.getType()).getAxes().getAxes())
+      present.insert(cast<AxisAttr>(attr).getName().getValue());
+    TensorAxes result;
+    for (const std::optional<Axis> &axis : fullAxes)
+      result.push_back(axis && present.contains(axis->name) ? axis : std::optional<Axis>{});
+    return result;
+  }
+
+  ScopedTABuilder &ta;
+  const DiscoveredAxisInfo &axisInfo;
+  DenseMap<Value, TensorValueInfo> valueMap;
+};
+
+// Build the replacement scope before mutating the function return. Keeping old operations alive
+// lets ta.at reference function arguments and any supported external leaves during emission. After
+// the scope becomes the return value, reverse-order dead-code removal peels away the old StableHLO
+// graph without requiring a separate canonicalization pass.
+static LogicalResult importFunctionAsTA(func::FuncOp func, func::ReturnOp returnOp,
+                                        RankedTensorType resultType) {
+  ForwardAxisDiscovery discovery;
+  FailureOr<DiscoveredAxisInfo> axisInfo = discovery.run(func);
+  if (failed(axisInfo))
+    return failure();
+
+  SmallVector<Operation *> oldOps;
+  for (Operation &op : func.front().without_terminator())
+    oldOps.push_back(&op);
+
+  ScopedTABuilder ta(returnOp, returnOp.getLoc(), resultType);
+  FunctionEmitter emitter(ta, *axisInfo);
+  for (auto [group, op] : llvm::enumerate(oldOps))
+    if (failed(emitter.emit(op, group)))
+      return failure();
+
+  FailureOr<Value> result = emitter.translateFunctionResult(returnOp.getOperand(0));
+  if (failed(result))
+    return failure();
+  ta.yield(*result);
+  ta.relabelAxesForOutput(*result);
+  returnOp.setOperand(0, ta.getScope().getResult());
+
+  for (Operation *op : llvm::reverse(oldOps))
+    if (op->use_empty())
+      op->erase();
+  return success();
+}
 
 struct ImportStableHLOToTAPass
     : public PassWrapper<ImportStableHLOToTAPass, OperationPass<func::FuncOp>> {
@@ -23,10 +993,31 @@ struct ImportStableHLOToTAPass
   }
 
   void getDependentDialects(DialectRegistry &registry) const final {
-    registry.insert<TADialect, func::FuncDialect, stablehlo::StablehloDialect>();
+    registry
+        .insert<TADialect, arith::ArithDialect, func::FuncDialect, stablehlo::StablehloDialect>();
   }
 
-  void runOnOperation() final {}
+  void runOnOperation() final {
+    func::FuncOp func = getOperation();
+    if (func.empty())
+      return;
+    auto returnOp = dyn_cast<func::ReturnOp>(func.front().getTerminator());
+    if (!returnOp || returnOp.getNumOperands() == 0)
+      return;
+    if (func.getNumResults() != 1 || returnOp.getNumOperands() != 1) {
+      func.emitOpError("ta importer currently expects one function result");
+      return signalPassFailure();
+    }
+    auto resultType = dyn_cast<RankedTensorType>(func.getResultTypes().front());
+    if (!resultType)
+      return;
+    if (!resultType.hasStaticShape()) {
+      func.emitOpError("ta importer currently expects static result shapes");
+      return signalPassFailure();
+    }
+    if (failed(importFunctionAsTA(func, returnOp, resultType)))
+      return signalPassFailure();
+  }
 };
 
 } // namespace
