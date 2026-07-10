@@ -52,46 +52,46 @@ Pattern ExpToExp2IntroduceLog2E {
 
   rewrite exp with {
     let log2e = MakeLog2EConstant(input);
-    let scaled = op<ta.mulf>(log2e, input) {"ta.import_group" = srcExp};
+    let scaled = op<ta.mul>(log2e, input) {"ta.import_group" = srcExp};
     replace exp with op<ta.exp2>(scaled) {"ta.import_group" = srcExp};
   };
 }
 
 // c * (x + y) => (c * x) + (c * y)
-Pattern DistributeConstantMulOverAddF {
-  let add = op<ta.addf>(lhs: Value, rhs: Value) {"ta.import_group" = srcAdd: Attr};
-  let mul = op<ta.mulf>(constant: Value, add) {"ta.import_group" = srcMul: Attr};
+Pattern DistributeConstantMulOverAdd {
+  let add = op<ta.add>(lhs: Value, rhs: Value) {"ta.import_group" = srcAdd: Attr};
+  let mul = op<ta.mul>(constant: Value, add) {"ta.import_group" = srcMul: Attr};
   AxislessConstant(constant);
 
   rewrite mul with {
-    let scaledLhs = op<ta.mulf>(constant, lhs) {"ta.import_group" = srcMul};
-    let scaledRhs = op<ta.mulf>(constant, rhs) {"ta.import_group" = srcMul};
-    replace mul with op<ta.addf>(scaledLhs, scaledRhs) {"ta.import_group" = srcAdd};
+    let scaledLhs = op<ta.mul>(constant, lhs) {"ta.import_group" = srcMul};
+    let scaledRhs = op<ta.mul>(constant, rhs) {"ta.import_group" = srcMul};
+    replace mul with op<ta.add>(scaledLhs, scaledRhs) {"ta.import_group" = srcAdd};
   };
 }
 
 // c * (x - y) => (c * x) - (c * y)
-Pattern DistributeConstantMulOverSubF {
-  let sub = op<ta.subf>(lhs: Value, rhs: Value) {"ta.import_group" = srcSub: Attr};
-  let mul = op<ta.mulf>(constant: Value, sub) {"ta.import_group" = srcMul: Attr};
+Pattern DistributeConstantMulOverSub {
+  let sub = op<ta.sub>(lhs: Value, rhs: Value) {"ta.import_group" = srcSub: Attr};
+  let mul = op<ta.mul>(constant: Value, sub) {"ta.import_group" = srcMul: Attr};
   AxislessConstant(constant);
 
   rewrite mul with {
-    let scaledLhs = op<ta.mulf>(constant, lhs) {"ta.import_group" = srcMul};
-    let scaledRhs = op<ta.mulf>(constant, rhs) {"ta.import_group" = srcMul};
-    replace mul with op<ta.subf>(scaledLhs, scaledRhs) {"ta.import_group" = srcSub};
+    let scaledLhs = op<ta.mul>(constant, lhs) {"ta.import_group" = srcMul};
+    let scaledRhs = op<ta.mul>(constant, rhs) {"ta.import_group" = srcMul};
+    replace mul with op<ta.sub>(scaledLhs, scaledRhs) {"ta.import_group" = srcSub};
   };
 }
 
 // c * select(p, x, y) => select(p, c * x, c * y)
 Pattern PushMulScaleThroughSelect {
   let select = op<ta.select>(condition: Value, trueValue: Value, falseValue: Value) {"ta.import_group" = srcSelect: Attr};
-  let mul = op<ta.mulf>(constant: Value, select) {"ta.import_group" = srcMul: Attr};
+  let mul = op<ta.mul>(constant: Value, select) {"ta.import_group" = srcMul: Attr};
   AxislessConstant(constant);
 
   rewrite mul with {
-    let scaledTrue = op<ta.mulf>(constant, trueValue) {"ta.import_group" = srcMul};
-    let scaledFalse = op<ta.mulf>(constant, falseValue) {"ta.import_group" = srcMul};
+    let scaledTrue = op<ta.mul>(constant, trueValue) {"ta.import_group" = srcMul};
+    let scaledFalse = op<ta.mul>(constant, falseValue) {"ta.import_group" = srcMul};
     replace mul with op<ta.select>(condition, scaledTrue, scaledFalse) {"ta.import_group" = srcSelect};
   };
 }
@@ -99,38 +99,38 @@ Pattern PushMulScaleThroughSelect {
 // c * max_axes(x) => max_axes(c * x), for finite c > 0
 Pattern PushPositiveScaleThroughMaxReduce {
   let reduce = op<ta.reduce>(input: Value) {kind = kind: Attr, axes = axes: Attr, "ta.import_group" = srcReduce: Attr};
-  let mul = op<ta.mulf>(constant: Value, reduce) {"ta.import_group" = srcMul: Attr} -> (resultType: Type);
+  let mul = op<ta.mul>(constant: Value, reduce) {"ta.import_group" = srcMul: Attr} -> (resultType: Type);
   PositiveAxislessConstant(constant);
   MaxReduceKind(kind);
 
   rewrite mul with {
-    let scaledInput = op<ta.mulf>(constant, input) {"ta.import_group" = srcMul};
+    let scaledInput = op<ta.mul>(constant, input) {"ta.import_group" = srcMul};
     replace mul with op<ta.reduce>(scaledInput) {kind = kind, axes = axes, "ta.import_group" = srcReduce} -> (resultType);
   };
 }
 
 // c0 * (c1 * x) => (c0 * c1) * x
-Pattern ReassociateLeftNestedConstantMulf {
-  let inner = op<ta.mulf>(innerConstant: Value, payload: Value) {"ta.import_group" = srcInner: Attr};
-  let outer = op<ta.mulf>(outerConstant: Value, inner) {"ta.import_group" = srcOuter: Attr};
+Pattern ReassociateLeftNestedConstantMul {
+  let inner = op<ta.mul>(innerConstant: Value, payload: Value) {"ta.import_group" = srcInner: Attr};
+  let outer = op<ta.mul>(outerConstant: Value, inner) {"ta.import_group" = srcOuter: Attr};
   AxislessConstant(innerConstant);
   AxislessConstant(outerConstant);
 
   rewrite outer with {
-    let combined = op<ta.mulf>(outerConstant, innerConstant) {"ta.import_group" = srcOuter};
-    replace outer with op<ta.mulf>(combined, payload) {"ta.import_group" = srcInner};
+    let combined = op<ta.mul>(outerConstant, innerConstant) {"ta.import_group" = srcOuter};
+    replace outer with op<ta.mul>(combined, payload) {"ta.import_group" = srcInner};
   };
 }
 
 // c0 * (x * c1) => (c0 * c1) * x
-Pattern ReassociateRightNestedConstantMulf {
-  let inner = op<ta.mulf>(payload: Value, innerConstant: Value) {"ta.import_group" = srcInner: Attr};
-  let outer = op<ta.mulf>(outerConstant: Value, inner) {"ta.import_group" = srcOuter: Attr};
+Pattern ReassociateRightNestedConstantMul {
+  let inner = op<ta.mul>(payload: Value, innerConstant: Value) {"ta.import_group" = srcInner: Attr};
+  let outer = op<ta.mul>(outerConstant: Value, inner) {"ta.import_group" = srcOuter: Attr};
   AxislessConstant(innerConstant);
   AxislessConstant(outerConstant);
 
   rewrite outer with {
-    let combined = op<ta.mulf>(outerConstant, innerConstant) {"ta.import_group" = srcOuter};
-    replace outer with op<ta.mulf>(combined, payload) {"ta.import_group" = srcInner};
+    let combined = op<ta.mul>(outerConstant, innerConstant) {"ta.import_group" = srcOuter};
+    replace outer with op<ta.mul>(combined, payload) {"ta.import_group" = srcInner};
   };
 }

@@ -233,7 +233,7 @@ DiagnosedSilenceableFailure TAMatchEinsumOp::matchOperation(Operation *target,
   if (reduce.getKind() != ta::ReduceKind::Add)
     return emitSilenceableFailure(transform, "expected ta.reduce <add>");
 
-  auto mul = reduce.getInput().getDefiningOp<ta::MulFOp>();
+  auto mul = reduce.getInput().getDefiningOp<ta::MulOp>();
   if (!mul)
     return emitSilenceableFailure(transform, "expected reduce payload to be ta.mulf");
 
@@ -321,12 +321,12 @@ void TASinkRightMulAfterMatmulPatternsOp::populatePatterns(RewritePatternSet &pa
 }
 
 void TAReassociateRightMulfPatternsOp::populatePatterns(RewritePatternSet &patterns) {
-  patterns.add<ta_mul_scale_motion_pdl::ReassociateRightMulfIfCheaper>(patterns.getContext());
+  patterns.add<ta_mul_scale_motion_pdl::ReassociateRightMulIfCheaper>(patterns.getContext());
 }
 
 void TAExpToExp2PatternsOp::populatePatterns(RewritePatternSet &patterns) {
   ta_exp_to_exp2_pdl::populateGeneratedPDLLPatterns(patterns);
-  ta::MulFOp::getCanonicalizationPatterns(patterns, patterns.getContext());
+  ta::MulOp::getCanonicalizationPatterns(patterns, patterns.getContext());
 }
 
 void TARewriteExpToExp2Op::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
@@ -342,7 +342,7 @@ DiagnosedSilenceableFailure TARewriteExpToExp2Op::applyToOne(TransformRewriter &
   (void)state;
   RewritePatternSet patterns(getContext());
   ta_exp_to_exp2_pdl::populateGeneratedPDLLPatterns(patterns);
-  ta::MulFOp::getCanonicalizationPatterns(patterns, getContext());
+  ta::MulOp::getCanonicalizationPatterns(patterns, getContext());
 
   if (failed(rewriteGreedily(rewriter, std::move(patterns), target))) {
     auto transform = cast<TransformOpInterface>(getOperation());

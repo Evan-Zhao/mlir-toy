@@ -611,17 +611,17 @@ public:
     if (auto exponential = dyn_cast<stablehlo::ExpOp>(op))
       return emitUnary<ExpOp>(exponential);
     if (auto add = dyn_cast<stablehlo::AddOp>(op))
-      return emitBinary<AddFOp>(add);
+      return emitBinary<AddOp>(add);
     if (auto subtract = dyn_cast<stablehlo::SubtractOp>(op))
-      return emitBinary<SubFOp>(subtract);
+      return emitBinary<SubOp>(subtract);
     if (auto multiply = dyn_cast<stablehlo::MulOp>(op))
-      return emitBinary<MulFOp>(multiply);
+      return emitBinary<MulOp>(multiply);
     if (auto divide = dyn_cast<stablehlo::DivOp>(op))
-      return emitBinary<DivFOp>(divide);
+      return emitBinary<DivOp>(divide);
     if (auto maximum = dyn_cast<stablehlo::MaxOp>(op))
-      return emitBinary<MaximumFOp>(maximum);
+      return emitBinary<MaximumOp>(maximum);
     if (auto minimum = dyn_cast<stablehlo::MinOp>(op))
-      return emitBinary<MinimumFOp>(minimum);
+      return emitBinary<MinimumOp>(minimum);
     if (auto transpose = dyn_cast<stablehlo::TransposeOp>(op))
       return emitViewLike(transpose.getOperand(), transpose, transpose.getResult());
     if (auto broadcast = dyn_cast<stablehlo::BroadcastInDimOp>(op))
@@ -696,8 +696,9 @@ private:
     auto lhsType = cast<RankedTensorType>(op.getLhs().getType());
     auto rhsType = cast<RankedTensorType>(op.getRhs().getType());
     auto resultType = cast<RankedTensorType>(op.getResult().getType());
-    if (!isa<FloatType>(resultType.getElementType()))
-      return op.emitOpError("only floating-point elementwise arithmetic is supported");
+    Type elementType = resultType.getElementType();
+    if (!isa<FloatType, IntegerType>(elementType) || elementType.isInteger(1))
+      return op.emitOpError("only floating-point and non-i1 integer arithmetic is supported");
     auto lhs = translateValue(op.getLhs(), **lhsAxes, lhsType.getElementType());
     auto rhs = translateValue(op.getRhs(), **rhsAxes, rhsType.getElementType());
     if (failed(lhs) || failed(rhs))
@@ -867,7 +868,7 @@ private:
     auto rhs = translateValue(op.getRhs(), **rhsAxes, rhsType.getElementType());
     if (failed(lhs) || failed(rhs))
       return failure();
-    Value product = ta.binary<MulFOp>(resultType.getElementType(), *lhs, *rhs);
+    Value product = ta.binary<MulOp>(resultType.getElementType(), *lhs, *rhs);
     AxisNames reductionAxes;
     for (int64_t dim : op.getDotDimensionNumbers().getLhsContractingDimensions())
       reductionAxes.push_back((**lhsAxes)[dim]->name);

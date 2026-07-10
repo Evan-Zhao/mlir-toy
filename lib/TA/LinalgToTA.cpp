@@ -784,10 +784,10 @@ private:
   if (failed(lhs) || failed(rhs))                                                                  \
     return failure();
 
-#define BINARY_OP(OpTy)                                                                            \
-  if (isa<arith::OpTy>(def)) {                                                                     \
+#define BINARY_OP(ArithOpTy, TAOpTy)                                                               \
+  if (isa<arith::ArithOpTy>(def)) {                                                                \
     TRANSLATE_BINARY_ARGS(def, lhs, rhs)                                                           \
-    return ta.binary<OpTy>(value.getType(), *lhs, *rhs);                                           \
+    return ta.binary<TAOpTy>(value.getType(), *lhs, *rhs);                                         \
   }
 
     if (auto it = env.find(value); it != env.end())
@@ -818,14 +818,16 @@ private:
       TRANSLATE_UNARY_ARG(def, input);
       return ta.unary<ExpOp>(value.getType(), *input);
     }
-    BINARY_OP(AddFOp);
-    BINARY_OP(SubFOp);
-    BINARY_OP(MulFOp);
-    BINARY_OP(DivFOp);
-    BINARY_OP(MaximumFOp);
-    BINARY_OP(MinimumFOp);
-    BINARY_OP(SubIOp);
-    BINARY_OP(AndIOp);
+    BINARY_OP(AddFOp, AddOp);
+    BINARY_OP(SubFOp, SubOp);
+    BINARY_OP(MulFOp, MulOp);
+    BINARY_OP(DivFOp, DivOp);
+    BINARY_OP(MaximumFOp, MaximumOp);
+    BINARY_OP(MinimumFOp, MinimumOp);
+    BINARY_OP(AddIOp, AddOp);
+    BINARY_OP(SubIOp, SubOp);
+    BINARY_OP(MulIOp, MulOp);
+    BINARY_OP(AndIOp, AndOp);
     if (auto cmpf = dyn_cast<arith::CmpFOp>(def)) {
       TRANSLATE_BINARY_ARGS(def, lhs, rhs);
       return ta.cmp<CmpFOp>(cmpf.getPredicate(), *lhs, *rhs);

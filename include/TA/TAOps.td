@@ -76,21 +76,20 @@ def TA_ConstantOp : TA_Op<"constant", [Pure, InferTypeOpAdaptor]> {
   let hasVerifier = 1;
 }
 
-def TA_NegFOp : TA_UnaryElementwiseOp<"negf">;
-def TA_AddFOp : TA_BinaryElementwiseOp<"addf", [Commutative]>;
-def TA_SubFOp : TA_BinaryElementwiseOp<"subf">;
-def TA_SubIOp : TA_BinaryElementwiseOp<"subi">;
-def TA_AndIOp : TA_BinaryElementwiseOp<"andi", [Commutative]>;
-def TA_MulFOp : TA_BinaryElementwiseOp<"mulf", [Commutative]> {
+def TA_NegOp : TA_UnaryElementwiseOp<"neg">;
+def TA_AddOp : TA_BinaryElementwiseOp<"add", [Commutative]>;
+def TA_SubOp : TA_BinaryElementwiseOp<"sub">;
+def TA_AndOp : TA_BinaryElementwiseOp<"and", [Commutative]>;
+def TA_MulOp : TA_BinaryElementwiseOp<"mul", [Commutative]> {
   let hasCanonicalizer = 1;
 }
-def TA_DivFOp : TA_BinaryElementwiseOp<"divf">;
-def TA_MaximumFOp : TA_BinaryElementwiseOp<"maximumf", [Commutative]>;
-def TA_MinimumFOp : TA_BinaryElementwiseOp<"minimumf", [Commutative]>;
-def TA_MaxNumFOp : TA_BinaryElementwiseOp<"maxnumf", [Commutative]>;
-def TA_MinNumFOp : TA_BinaryElementwiseOp<"minnumf", [Commutative]>;
+def TA_DivOp : TA_BinaryElementwiseOp<"div">;
+def TA_MaximumOp : TA_BinaryElementwiseOp<"maximum", [Commutative]>;
+def TA_MinimumOp : TA_BinaryElementwiseOp<"minimum", [Commutative]>;
+def TA_MaxNumOp : TA_BinaryElementwiseOp<"maxnum", [Commutative]>;
+def TA_MinNumOp : TA_BinaryElementwiseOp<"minnum", [Commutative]>;
 
-def TA_AbsFOp : TA_UnaryElementwiseOp<"absf">;
+def TA_AbsOp : TA_UnaryElementwiseOp<"abs">;
 def TA_CeilOp : TA_UnaryElementwiseOp<"ceil">;
 def TA_ExpOp : TA_UnaryElementwiseOp<"exp">;
 def TA_Exp2Op : TA_UnaryElementwiseOp<"exp2">;
@@ -108,7 +107,7 @@ def TA_CastOp : TA_ElementwiseOp<"cast"> {
   let assemblyFormat = "operands attr-dict `:` functional-type(operands, results)";
 }
 
-def TA_PowFOp : TA_BinaryElementwiseOp<"powf">;
+def TA_PowOp : TA_BinaryElementwiseOp<"pow">;
 def TA_FmaOp : TA_TernaryElementwiseOp<"fma">;
 
 def TA_CmpFOp : TA_ElementwiseOp<"cmpf", [InferTypeOpAdaptor]> {

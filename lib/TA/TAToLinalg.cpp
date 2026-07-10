@@ -61,6 +61,29 @@ static FailureOr<unsigned> findAxis(Operation *op, ArrayRef<StringRef> axes, Str
   return op->emitOpError("lowering could not find axis '") << axis << "' in loop axes";
 }
 
+static bool isUnsignedInteger(Type type) {
+  auto integerType = dyn_cast<IntegerType>(type);
+  return integerType && integerType.isUnsigned();
+}
+
+template <typename FOp, typename IOp>
+Value dispatchOp2Way(OpBuilder &builder, Location loc, Type elementType, Value lhs, Value rhs) {
+  if (isa<FloatType>(elementType))
+    return FOp::create(builder, loc, lhs, rhs);
+  else
+    return IOp::create(builder, loc, lhs, rhs);
+}
+
+template <typename FOp, typename UIOp, typename SIOp>
+Value dispatchOp3Way(OpBuilder &builder, Location loc, Type elementType, Value lhs, Value rhs) {
+  if (isa<FloatType>(elementType))
+    return FOp::create(builder, loc, lhs, rhs);
+  else if (isUnsignedInteger(elementType))
+    return UIOp::create(builder, loc, lhs, rhs);
+  else
+    return SIOp::create(builder, loc, lhs, rhs);
+}
+
 class ScopeLowering {
 public:
   ScopeLowering(ScopeOp scope, OpBuilder &builder,
@@ -437,24 +460,49 @@ private:
   }
 
   Value createIdentity(Location identityLoc, Type type, ReduceKind kind) {
-    auto floatType = cast<FloatType>(type);
-    const llvm::fltSemantics &semantics = floatType.getFloatSemantics();
-    APFloat value = APFloat::getZero(semantics);
+    if (auto floatType = dyn_cast<FloatType>(type)) {
+      const llvm::fltSemantics &semantics = floatType.getFloatSemantics();
+      APFloat value = APFloat::getZero(semantics);
+      switch (kind) {
+      case ReduceKind::Add:
+        value = APFloat::getZero(semantics);
+        break;
+      case ReduceKind::Mul:
+        value = APFloat(semantics, "1.0");
+        break;
+      case ReduceKind::Max:
+        value = APFloat::getInf(semantics, /*Negative=*/true);
+        break;
+      case ReduceKind::Min:
+        value = APFloat::getInf(semantics, /*Negative=*/false);
+        break;
+      }
+      return arith::ConstantOp::create(builder, identityLoc, FloatAttr::get(floatType, value));
+    }
+
+    if (type.isIndex()) {
+      assert((kind == ReduceKind::Add || kind == ReduceKind::Mul) &&
+             "index min/max reductions have no portable identity");
+      return arith::ConstantIndexOp::create(builder, identityLoc, kind == ReduceKind::Add ? 0 : 1);
+    }
+
+    auto integerType = cast<IntegerType>(type);
+    unsigned width = integerType.getWidth();
+    APInt value(width, 0);
     switch (kind) {
     case ReduceKind::Add:
-      value = APFloat::getZero(semantics);
       break;
     case ReduceKind::Mul:
-      value = APFloat(semantics, "1.0");
+      value = APInt(width, 1);
       break;
     case ReduceKind::Max:
-      value = APFloat::getInf(semantics, /*Negative=*/true);
+      value = isUnsignedInteger(type) ? APInt::getMinValue(width) : APInt::getSignedMinValue(width);
       break;
     case ReduceKind::Min:
-      value = APFloat::getInf(semantics, /*Negative=*/false);
+      value = isUnsignedInteger(type) ? APInt::getMaxValue(width) : APInt::getSignedMaxValue(width);
       break;
     }
-    return arith::ConstantOp::create(builder, identityLoc, FloatAttr::get(floatType, value));
+    return arith::ConstantOp::create(builder, identityLoc, IntegerAttr::get(integerType, value));
   }
 
   void buildLinalgBody(OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args,
@@ -520,6 +568,7 @@ private:
         operands.push_back(buildScalar(nestedBuilder, nestedLoc, operand, root, loopAxes));
     }
 
+    Type elementType = cast<ExprType>(value.getType()).getElementType();
     Value scalar;
     if (isa<CastOp>(def)) {
       Type operandType = cast<ExprType>(def->getOperand(0).getType()).getElementType();
@@ -534,8 +583,8 @@ private:
       } else if (operandType.isIndex() || operandType.isSignlessInteger()) {
         Value operand = operands[0];
         if (operandType.isIndex())
-          operand = arith::IndexCastOp::create(nestedBuilder, nestedLoc,
-                                               nestedBuilder.getI64Type(), operand);
+          operand = arith::IndexCastOp::create(nestedBuilder, nestedLoc, nestedBuilder.getI64Type(),
+                                               operand);
         scalar = arith::SIToFPOp::create(nestedBuilder, nestedLoc, resultType, operand);
       } else {
         llvm_unreachable("verified ta.cast has unsupported element types");
@@ -546,22 +595,26 @@ private:
     } else if (isa<SelectOp>(def)) {
       scalar =
           arith::SelectOp::create(nestedBuilder, nestedLoc, operands[0], operands[1], operands[2]);
-    } else if (isa<AddFOp>(def)) {
-      scalar = arith::AddFOp::create(nestedBuilder, nestedLoc, operands[0], operands[1]);
-    } else if (isa<SubFOp>(def)) {
-      scalar = arith::SubFOp::create(nestedBuilder, nestedLoc, operands[0], operands[1]);
-    } else if (isa<SubIOp>(def)) {
-      scalar = arith::SubIOp::create(nestedBuilder, nestedLoc, operands[0], operands[1]);
-    } else if (isa<AndIOp>(def)) {
+    } else if (isa<AddOp>(def)) {
+      scalar = dispatchOp2Way<arith::AddFOp, arith::AddIOp>(nestedBuilder, nestedLoc, elementType,
+                                                            operands[0], operands[1]);
+    } else if (isa<SubOp>(def)) {
+      scalar = dispatchOp2Way<arith::SubFOp, arith::SubIOp>(nestedBuilder, nestedLoc, elementType,
+                                                            operands[0], operands[1]);
+    } else if (isa<AndOp>(def)) {
       scalar = arith::AndIOp::create(nestedBuilder, nestedLoc, operands[0], operands[1]);
-    } else if (isa<MulFOp>(def)) {
-      scalar = arith::MulFOp::create(nestedBuilder, nestedLoc, operands[0], operands[1]);
-    } else if (isa<DivFOp>(def)) {
-      scalar = arith::DivFOp::create(nestedBuilder, nestedLoc, operands[0], operands[1]);
-    } else if (isa<MaximumFOp>(def)) {
-      scalar = arith::MaximumFOp::create(nestedBuilder, nestedLoc, operands[0], operands[1]);
-    } else if (isa<MinimumFOp>(def)) {
-      scalar = arith::MinimumFOp::create(nestedBuilder, nestedLoc, operands[0], operands[1]);
+    } else if (isa<MulOp>(def)) {
+      scalar = dispatchOp2Way<arith::MulFOp, arith::MulIOp>(nestedBuilder, nestedLoc, elementType,
+                                                            operands[0], operands[1]);
+    } else if (isa<DivOp>(def)) {
+      scalar = dispatchOp3Way<arith::DivFOp, arith::DivUIOp, arith::DivSIOp>(
+          nestedBuilder, nestedLoc, elementType, operands[0], operands[1]);
+    } else if (isa<MaximumOp>(def)) {
+      scalar = dispatchOp3Way<arith::MaximumFOp, arith::MaxUIOp, arith::MaxSIOp>(
+          nestedBuilder, nestedLoc, elementType, operands[0], operands[1]);
+    } else if (isa<MinimumOp>(def)) {
+      scalar = dispatchOp3Way<arith::MinimumFOp, arith::MinUIOp, arith::MinSIOp>(
+          nestedBuilder, nestedLoc, elementType, operands[0], operands[1]);
     } else if (isa<ExpOp>(def)) {
       scalar = math::ExpOp::create(nestedBuilder, nestedLoc, operands[0]);
     } else if (isa<Exp2Op>(def)) {
@@ -575,16 +628,20 @@ private:
 
   Value buildCombiner(OpBuilder &nestedBuilder, Location nestedLoc, ReduceKind kind, Value lhs,
                       Value rhs) {
+    Type type = lhs.getType();
     switch (kind) {
     case ReduceKind::Add:
-      return arith::AddFOp::create(nestedBuilder, nestedLoc, lhs, rhs);
+      return dispatchOp2Way<arith::AddFOp, arith::AddIOp>(nestedBuilder, nestedLoc, type, lhs, rhs);
     case ReduceKind::Mul:
-      return arith::MulFOp::create(nestedBuilder, nestedLoc, lhs, rhs);
+      return dispatchOp2Way<arith::MulFOp, arith::MulIOp>(nestedBuilder, nestedLoc, type, lhs, rhs);
     case ReduceKind::Max:
-      return arith::MaximumFOp::create(nestedBuilder, nestedLoc, lhs, rhs);
+      return dispatchOp3Way<arith::MaximumFOp, arith::MaxUIOp, arith::MaxSIOp>(
+          nestedBuilder, nestedLoc, type, lhs, rhs);
     case ReduceKind::Min:
-      return arith::MinimumFOp::create(nestedBuilder, nestedLoc, lhs, rhs);
+      return dispatchOp3Way<arith::MinimumFOp, arith::MinUIOp, arith::MinSIOp>(
+          nestedBuilder, nestedLoc, type, lhs, rhs);
     }
+
     llvm_unreachable("unknown reduce kind");
   }
 

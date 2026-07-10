@@ -366,14 +366,29 @@ template <size_t NArgs> static LogicalResult verifyNAryFloatElementwiseOp(Operat
   return success();
 }
 
+template <size_t NArgs> static LogicalResult verifyNAryNumericElementwiseOp(Operation *op) {
+  if (op->getNumOperands() != NArgs)
+    return op->emitOpError() << "expected " << NArgs << " operands";
+  auto elementType = verifyElementwiseOp(op);
+  if (failed(elementType))
+    return failure();
+  if (isa<FloatType>(*elementType) || elementType->isIndex())
+    return success();
+  auto integerType = dyn_cast<IntegerType>(*elementType);
+  if (!integerType || integerType.getWidth() == 1)
+    return op->emitOpError(
+        "requires floating-point, index, or non-i1 integer operand and result element types");
+  return success();
+}
+
 static LogicalResult verifyBinaryIntegerElementwiseOp(Operation *op) {
   if (op->getNumOperands() != 2)
     return op->emitOpError("expected two operands");
   auto elementType = verifyElementwiseOp(op);
   if (failed(elementType))
     return failure();
-  if (!(elementType->isIndex() || elementType->isSignlessInteger()))
-    return op->emitOpError("requires an index or signless integer expression result");
+  if (!(elementType->isIndex() || isa<IntegerType>(*elementType)))
+    return op->emitOpError("requires an index or integer expression result");
   return success();
 }
 
@@ -453,18 +468,17 @@ LogicalResult ConstantOp::inferReturnTypes(MLIRContext *context, std::optional<L
                                            inferredReturnTypes);                                   \
   }
 
-DEFINE_TA_SAME_ELEMENTWISE_INFER(NegFOp)
-DEFINE_TA_SAME_ELEMENTWISE_INFER(AddFOp)
-DEFINE_TA_SAME_ELEMENTWISE_INFER(SubFOp)
-DEFINE_TA_SAME_ELEMENTWISE_INFER(SubIOp)
-DEFINE_TA_SAME_ELEMENTWISE_INFER(AndIOp)
-DEFINE_TA_SAME_ELEMENTWISE_INFER(MulFOp)
-DEFINE_TA_SAME_ELEMENTWISE_INFER(DivFOp)
-DEFINE_TA_SAME_ELEMENTWISE_INFER(MaximumFOp)
-DEFINE_TA_SAME_ELEMENTWISE_INFER(MinimumFOp)
-DEFINE_TA_SAME_ELEMENTWISE_INFER(MaxNumFOp)
-DEFINE_TA_SAME_ELEMENTWISE_INFER(MinNumFOp)
-DEFINE_TA_SAME_ELEMENTWISE_INFER(AbsFOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(NegOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(AddOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(SubOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(AndOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(MulOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(DivOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(MaximumOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(MinimumOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(MaxNumOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(MinNumOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(AbsOp)
 DEFINE_TA_SAME_ELEMENTWISE_INFER(CeilOp)
 DEFINE_TA_SAME_ELEMENTWISE_INFER(ExpOp)
 DEFINE_TA_SAME_ELEMENTWISE_INFER(Exp2Op)
@@ -474,7 +488,7 @@ DEFINE_TA_SAME_ELEMENTWISE_INFER(Log2Op)
 DEFINE_TA_SAME_ELEMENTWISE_INFER(RsqrtOp)
 DEFINE_TA_SAME_ELEMENTWISE_INFER(SqrtOp)
 DEFINE_TA_SAME_ELEMENTWISE_INFER(TanhOp)
-DEFINE_TA_SAME_ELEMENTWISE_INFER(PowFOp)
+DEFINE_TA_SAME_ELEMENTWISE_INFER(PowOp)
 DEFINE_TA_SAME_ELEMENTWISE_INFER(FmaOp)
 
 #undef DEFINE_TA_SAME_ELEMENTWISE_INFER
@@ -660,22 +674,24 @@ LogicalResult ConstantOp::verify() {
   LogicalResult OP::verify() { return verifyNAryFloatElementwiseOp<2>(getOperation()); }
 #define DEFINE_TA_TERNARY_FLOAT_VERIFY(OP)                                                         \
   LogicalResult OP::verify() { return verifyNAryFloatElementwiseOp<3>(getOperation()); }
-
+#define DEFINE_TA_UNARY_NUMERIC_VERIFY(OP)                                                         \
+  LogicalResult OP::verify() { return verifyNAryNumericElementwiseOp<1>(getOperation()); }
+#define DEFINE_TA_BINARY_NUMERIC_VERIFY(OP)                                                        \
+  LogicalResult OP::verify() { return verifyNAryNumericElementwiseOp<2>(getOperation()); }
 #define DEFINE_TA_BINARY_INTEGER_VERIFY(OP)                                                        \
   LogicalResult OP::verify() { return verifyBinaryIntegerElementwiseOp(getOperation()); }
 
-DEFINE_TA_UNARY_FLOAT_VERIFY(NegFOp)
-DEFINE_TA_BINARY_FLOAT_VERIFY(AddFOp)
-DEFINE_TA_BINARY_FLOAT_VERIFY(SubFOp)
-DEFINE_TA_BINARY_INTEGER_VERIFY(SubIOp)
-DEFINE_TA_BINARY_INTEGER_VERIFY(AndIOp)
-DEFINE_TA_BINARY_FLOAT_VERIFY(MulFOp)
-DEFINE_TA_BINARY_FLOAT_VERIFY(DivFOp)
-DEFINE_TA_BINARY_FLOAT_VERIFY(MaximumFOp)
-DEFINE_TA_BINARY_FLOAT_VERIFY(MinimumFOp)
-DEFINE_TA_BINARY_FLOAT_VERIFY(MaxNumFOp)
-DEFINE_TA_BINARY_FLOAT_VERIFY(MinNumFOp)
-DEFINE_TA_UNARY_FLOAT_VERIFY(AbsFOp)
+DEFINE_TA_UNARY_NUMERIC_VERIFY(NegOp)
+DEFINE_TA_BINARY_NUMERIC_VERIFY(AddOp)
+DEFINE_TA_BINARY_NUMERIC_VERIFY(SubOp)
+DEFINE_TA_BINARY_INTEGER_VERIFY(AndOp)
+DEFINE_TA_BINARY_NUMERIC_VERIFY(MulOp)
+DEFINE_TA_BINARY_NUMERIC_VERIFY(DivOp)
+DEFINE_TA_BINARY_NUMERIC_VERIFY(MaximumOp)
+DEFINE_TA_BINARY_NUMERIC_VERIFY(MinimumOp)
+DEFINE_TA_BINARY_FLOAT_VERIFY(MaxNumOp)
+DEFINE_TA_BINARY_FLOAT_VERIFY(MinNumOp)
+DEFINE_TA_UNARY_NUMERIC_VERIFY(AbsOp)
 DEFINE_TA_UNARY_FLOAT_VERIFY(CeilOp)
 DEFINE_TA_UNARY_FLOAT_VERIFY(ExpOp)
 DEFINE_TA_UNARY_FLOAT_VERIFY(Exp2Op)
@@ -685,12 +701,15 @@ DEFINE_TA_UNARY_FLOAT_VERIFY(Log2Op)
 DEFINE_TA_UNARY_FLOAT_VERIFY(RsqrtOp)
 DEFINE_TA_UNARY_FLOAT_VERIFY(SqrtOp)
 DEFINE_TA_UNARY_FLOAT_VERIFY(TanhOp)
-DEFINE_TA_BINARY_FLOAT_VERIFY(PowFOp)
+DEFINE_TA_BINARY_NUMERIC_VERIFY(PowOp)
 DEFINE_TA_TERNARY_FLOAT_VERIFY(FmaOp)
 
 #undef DEFINE_TA_UNARY_FLOAT_VERIFY
 #undef DEFINE_TA_BINARY_FLOAT_VERIFY
 #undef DEFINE_TA_TERNARY_FLOAT_VERIFY
+#undef DEFINE_TA_UNARY_NUMERIC_VERIFY
+#undef DEFINE_TA_BINARY_NUMERIC_VERIFY
+#undef DEFINE_TA_BINARY_INTEGER_VERIFY
 
 LogicalResult CastOp::verify() { return verifyCastElementwiseOp(getOperation()); }
 
@@ -735,10 +754,10 @@ struct FoldCastOfConstant : OpRewritePattern<CastOp> {
   }
 };
 
-struct FoldMulfOfConstants : OpRewritePattern<MulFOp> {
+struct FoldMulOfConstants : OpRewritePattern<MulOp> {
   using OpRewritePattern::OpRewritePattern;
 
-  LogicalResult matchAndRewrite(MulFOp op, PatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(MulOp op, PatternRewriter &rewriter) const override {
     auto lhs = op.getLhs().getDefiningOp<ConstantOp>();
     auto rhs = op.getRhs().getDefiningOp<ConstantOp>();
     if (!lhs || !rhs)
@@ -766,8 +785,8 @@ void CastOp::getCanonicalizationPatterns(RewritePatternSet &patterns, MLIRContex
   patterns.add<FoldCastOfConstant>(context);
 }
 
-void MulFOp::getCanonicalizationPatterns(RewritePatternSet &patterns, MLIRContext *context) {
-  patterns.add<FoldMulfOfConstants>(context);
+void MulOp::getCanonicalizationPatterns(RewritePatternSet &patterns, MLIRContext *context) {
+  patterns.add<FoldMulOfConstants>(context);
 }
 
 LogicalResult CmpFOp::verify() {
