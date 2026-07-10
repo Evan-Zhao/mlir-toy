@@ -52,10 +52,26 @@ Constraint RightAssociatedMulIsCheaper(a: Value, b: Value, c: Value) [{
   return success(*rightElementCount < *leftElementCount);
 }];
 
-// sum((lhs / denom) * rhs) => sum(lhs * rhs) / den
-Pattern SinkDivAfterMatmul {
+// sum((lhs / denom) * rhs) => sum(lhs * rhs) / denom
+Pattern SinkLeftDivAfterMatmul {
   let div = op<ta.div>(lhs: Value, denom: Value) {"ta.import_group" = srcDiv: Attr};
   let mul = op<ta.mul>(div, rhs: Value) {"ta.import_group" = srcMul: Attr};
+  let reduce = op<ta.reduce>(mul) {kind = kind: Attr, axes = axes: Attr, "ta.import_group" = srcReduce: Attr} -> (resultType: Type);
+  FloatElementType(lhs);
+  ValueAxesDisjointFromReduction(denom, axes);
+  AddReduceKind(kind);
+
+  rewrite reduce with {
+    let newMul = op<ta.mul>(lhs, rhs) {"ta.import_group" = srcMul};
+    let newReduce = op<ta.reduce>(newMul) {kind = kind, axes = axes, "ta.import_group" = srcReduce} -> (resultType);
+    replace reduce with op<ta.div>(newReduce, denom) {"ta.import_group" = srcDiv};
+  };
+}
+
+// sum(lhs * (rhs / denom)) => sum(lhs * rhs) / denom
+Pattern SinkRightDivAfterMatmul {
+  let div = op<ta.div>(rhs: Value, denom: Value) {"ta.import_group" = srcDiv: Attr};
+  let mul = op<ta.mul>(lhs: Value, div) {"ta.import_group" = srcMul: Attr};
   let reduce = op<ta.reduce>(mul) {kind = kind: Attr, axes = axes: Attr, "ta.import_group" = srcReduce: Attr} -> (resultType: Type);
   FloatElementType(lhs);
   ValueAxesDisjointFromReduction(denom, axes);

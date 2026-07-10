@@ -277,7 +277,8 @@ DiagnosedSilenceableFailure TAToLinalgOp::apply(TransformRewriter &rewriter,
 }
 
 void TASinkDivAfterMatmulPatternsOp::populatePatterns(RewritePatternSet &patterns) {
-  patterns.add<ta_mul_scale_motion_pdl::SinkDivAfterMatmul>(patterns.getContext());
+  patterns.add<ta_mul_scale_motion_pdl::SinkLeftDivAfterMatmul>(patterns.getContext());
+  patterns.add<ta_mul_scale_motion_pdl::SinkRightDivAfterMatmul>(patterns.getContext());
 }
 
 void TASinkRightMulAfterMatmulPatternsOp::populatePatterns(RewritePatternSet &patterns) {
