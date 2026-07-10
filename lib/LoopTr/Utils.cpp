@@ -277,16 +277,6 @@ void pointBuilderToForallParallel(OpBuilder &builder, scf::ForallOp forall) {
 }
 
 SmallVector<std::pair<Operation *, Operation *>>
-cloneBlockWithoutTerminator(OpBuilder &builder, Block &block, IRMapping &mapping) {
-  SmallVector<std::pair<Operation *, Operation *>> clonedOps;
-  for (Operation &op : block.without_terminator()) {
-    Operation *cloned = builder.clone(op, mapping);
-    clonedOps.emplace_back(&op, cloned);
-  }
-  return clonedOps;
-}
-
-SmallVector<std::pair<Operation *, Operation *>>
 cloneForallLoopBody(scf::ForallOp fromLoop, OpBuilder &builder, scf::ForallOp intoLoop,
                     IRMapping &mapping) {
   builder.setInsertionPoint(intoLoop.getTerminator());
@@ -298,20 +288,6 @@ cloneForallLoopBody(scf::ForallOp fromLoop, OpBuilder &builder, scf::ForallOp in
     clonedOps.emplace_back(&combiningOp, cloned);
   }
   return clonedOps;
-}
-
-FailureOr<tensor::ParallelInsertSliceOp> getParallelInsertSliceForLoopResult(scf::ForallOp loop,
-                                                                             OpResult result) {
-  if (result.getOwner() != loop.getOperation())
-    return failure();
-  BlockArgument bbArg = loop.getTiedBlockArgument(result);
-  SmallVector<Operation *> combiningOps = loop.getCombiningOps(bbArg);
-  if (!llvm::hasSingleElement(combiningOps))
-    return failure();
-  auto insertSlice = dyn_cast<tensor::ParallelInsertSliceOp>(combiningOps.front());
-  if (!insertSlice)
-    return failure();
-  return insertSlice;
 }
 
 FailureOr<DenseMap<OpResult, LoopResultRelaysT>>

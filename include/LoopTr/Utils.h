@@ -51,8 +51,19 @@ FailureOr<uint64_t> getReductionIteratorIndex(linalg::GenericOp generic);
 FailureOr<uint64_t> matchOneDimReductionGeneric(linalg::GenericOp generic);
 
 /// Returns the unique tensor.parallel_insert_slice in `loop` that publishes `result`.
-FailureOr<tensor::ParallelInsertSliceOp> getParallelInsertSliceForLoopResult(scf::ForallOp loop,
-                                                                             OpResult result);
+inline FailureOr<tensor::ParallelInsertSliceOp>
+getParallelInsertSliceForLoopResult(scf::ForallOp loop, OpResult result) {
+  if (result.getOwner() != loop.getOperation())
+    return failure();
+  BlockArgument bbArg = loop.getTiedBlockArgument(result);
+  SmallVector<Operation *> combiningOps = loop.getCombiningOps(bbArg);
+  if (!llvm::hasSingleElement(combiningOps))
+    return failure();
+  auto insertSlice = dyn_cast<tensor::ParallelInsertSliceOp>(combiningOps.front());
+  if (!insertSlice)
+    return failure();
+  return insertSlice;
+}
 
 struct LoopResultRelay {
   OpResult inLoopResult;
@@ -142,17 +153,25 @@ void pointBuilderToForallParallel(OpBuilder &builder, scf::ForallOp forall);
 
 /// Clone the operations in `block` into the current insertion point of `builder`, except for the
 /// terminator. Returns a vector of pairs of the original and cloned operations.
-SmallVector<std::pair<Operation *, Operation *>>
-cloneBlockWithoutTerminator(OpBuilder &builder, Block &block, IRMapping &mapping);
+inline SmallVector<std::pair<Operation *, Operation *>>
+cloneBlockWithoutTerminator(OpBuilder &builder, Block &block, IRMapping &mapping) {
+  SmallVector<std::pair<Operation *, Operation *>> clonedOps;
+  for (Operation &op : block.without_terminator()) {
+    Operation *cloned = builder.clone(op, mapping);
+    clonedOps.emplace_back(&op, cloned);
+  }
+  return clonedOps;
+}
 
 /// Clone the operations in `fromLoop`, including body ops and combining ops
 /// (tensor.parallel_insert_slice ops), into `intoLoop`.
 /// It calls `cloneBlockWithoutTerminator` to clone the body ops, and then clones the combining ops.
-/// Returns a vector of pairs of the original and cloned operations, and updates `mapping` to map the
-/// original operations to the cloned ones.
-SmallVector<std::pair<Operation *, Operation *>>
-cloneForallLoopBody(scf::ForallOp fromLoop, OpBuilder &builder, scf::ForallOp intoLoop,
-                    IRMapping &mapping);
+/// Returns a vector of pairs of the original and cloned operations, and updates `mapping` to map
+/// the original operations to the cloned ones.
+SmallVector<std::pair<Operation *, Operation *>> cloneForallLoopBody(scf::ForallOp fromLoop,
+                                                                     OpBuilder &builder,
+                                                                     scf::ForallOp intoLoop,
+                                                                     IRMapping &mapping);
 
 FailureOr<Value> cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Value value,
                                                     IRMapping &mapping);

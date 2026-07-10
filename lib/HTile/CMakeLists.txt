@@ -29,7 +29,6 @@ make_mlir_opt_plugin(
     HTileDialect.cpp
     HTilePasses.cpp
     HTileTransformOps.cpp
-    ../LoopTr/Utils.cpp
   DEPS
     HTileOpsIncGen
     HTileAttrsIncGen
