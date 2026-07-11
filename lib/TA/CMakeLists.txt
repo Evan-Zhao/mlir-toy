@@ -56,6 +56,27 @@ make_mlir_opt_plugin(
     TAExpToExp2PDLL
 )
 
-# StablehloOps provides both the StableHLO dialect implementation and its
-# generated-header include directories.
-target_link_libraries(TADialect PRIVATE StablehloOps)
+# Create a wrapper library that takes StablehloOps but make it link to MLIR dynamically.
+# There is no StableHLO cmake option that does this.
+# This code depends on which targets exist in StableHLO, but it's arguably better than patching
+# StableHLO cmake, and we have control over StableHLO version, so all is well.
+add_library(NeptuneStablehlo INTERFACE)
+add_dependencies(NeptuneStablehlo
+  StablehloOps
+  StablehloTypeInference
+  StablehloAssemblyFormat
+  StablehloBase
+)
+target_include_directories(NeptuneStablehlo INTERFACE
+  "$<TARGET_PROPERTY:StablehloOps,INTERFACE_INCLUDE_DIRECTORIES>"
+)
+target_link_libraries(NeptuneStablehlo INTERFACE
+  "$<TARGET_FILE:StablehloOps>"
+  "$<TARGET_FILE:StablehloTypeInference>"
+  "$<TARGET_FILE:StablehloAssemblyFormat>"
+  "$<TARGET_FILE:StablehloBase>"
+  MLIR
+  LLVM
+)
+
+target_link_libraries(TADialect PRIVATE NeptuneStablehlo)

@@ -12,7 +12,8 @@ if(NEPTUNE_MLIR_BUILD_PYTHON_EXTENSIONS)
   )
   target_link_libraries(_neptuneMlir PRIVATE
     "${MLIR_PYTHON_LIB_DIR}/libMLIRPythonCAPI${CMAKE_SHARED_LIBRARY_SUFFIX}"
-    "${MLIR_PYTHON_LIB_DIR}/libMLIRPythonSupport-mlir${CMAKE_SHARED_LIBRARY_SUFFIX}"
+    MLIR
+    LLVM
   )
   set_target_properties(_neptuneMlir PROPERTIES
     BUILD_RPATH "${MLIR_PYTHON_LIB_DIR}"
