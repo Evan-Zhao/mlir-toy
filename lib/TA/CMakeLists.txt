@@ -62,19 +62,31 @@ make_mlir_opt_plugin(
 # StableHLO cmake, and we have control over StableHLO version, so all is well.
 add_library(NeptuneStablehlo INTERFACE)
 add_dependencies(NeptuneStablehlo
+  StablehloBase
   StablehloOps
   StablehloTypeInference
   StablehloAssemblyFormat
-  StablehloBase
+  StablehloLinalgTransforms
+  # Transitive dependencies of StablehloLinalgTransforms:
+  StablehloTypeConversion
+  StablehloBroadcastLowering
+  StablehloBroadcastUtils
+  ChloOps                                                                                                                             
 )
 target_include_directories(NeptuneStablehlo INTERFACE
   "$<TARGET_PROPERTY:StablehloOps,INTERFACE_INCLUDE_DIRECTORIES>"
 )
 target_link_libraries(NeptuneStablehlo INTERFACE
+  "$<TARGET_FILE:StablehloBase>"
   "$<TARGET_FILE:StablehloOps>"
   "$<TARGET_FILE:StablehloTypeInference>"
   "$<TARGET_FILE:StablehloAssemblyFormat>"
-  "$<TARGET_FILE:StablehloBase>"
+  "$<TARGET_FILE:StablehloLinalgTransforms>"
+  # Transitive dependencies of StablehloLinalgTransforms:
+  "$<TARGET_FILE:StablehloTypeConversion>"
+  "$<TARGET_FILE:StablehloBroadcastLowering>"
+  "$<TARGET_FILE:StablehloBroadcastUtils>"
+  "$<TARGET_FILE:ChloOps>"
   MLIR
   LLVM
 )

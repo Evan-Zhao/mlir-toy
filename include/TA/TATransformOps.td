@@ -41,6 +41,29 @@ def TAMatchEinsumOp
   let extraClassDeclaration = SingleOpMatcher.extraDeclaration;
 }
 
+def StablehloGatherToLinalgConversionPatternsOp
+    : Op<Transform_Dialect, "apply_conversion_patterns.stablehlo.gather_to_linalg",
+         [DeclareOpInterfaceMethods<ConversionPatternDescriptorOpInterface,
+                                    ["getTypeConverter"]>]> {
+  let summary = "Collect the StableHLO gather-to-Linalg conversion pattern";
+
+  let description = [{
+    Makes StableHLO's gather-to-Linalg conversion pattern available to
+    `transform.apply_conversion_patterns`. This permits gather conversion
+    without running the full StableHLO-to-Linalg pass or invalidating unrelated
+    handles:
+
+    ```
+    transform.apply_conversion_patterns to %func {
+      transform.apply_conversion_patterns.stablehlo.gather_to_linalg
+    } {illegal_ops = ["stablehlo.gather"], partial_conversion, preserve_handles}
+      : !transform.any_op
+    ```
+  }];
+
+  let assemblyFormat = "attr-dict";
+}
+
 def TAToLinalgOp : Op<Transform_Dialect, "ta.to_linalg",
                       [TransformOpInterface, DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
                        ReportTrackingListenerFailuresOpTrait]> {
