@@ -162,11 +162,9 @@ add_subdirectory(
   EXCLUDE_FROM_ALL
 )
 
-add_subdirectory(lib/HTile)
-add_subdirectory(lib/TA)
-add_subdirectory(lib/LoopTr)
-add_subdirectory(lib/Python)
+add_subdirectory(lib)
 add_subdirectory(plugins)
+add_subdirectory(tools/neptune-opt)
 
 if(BUILD_TESTING)
   add_subdirectory(test)
