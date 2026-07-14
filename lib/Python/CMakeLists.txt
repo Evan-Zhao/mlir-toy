@@ -19,7 +19,12 @@ if(NEPTUNE_MLIR_BUILD_PYTHON_EXTENSIONS)
     BUILD_RPATH "${MLIR_PYTHON_LIB_DIR}"
     INSTALL_RPATH "${MLIR_PYTHON_LIB_DIR}"
   )
-  add_dependencies(_neptuneMlir HTileOpsIncGen HTileAttrsIncGen HTileTransformOpsIncGen)
+  add_dependencies(_neptuneMlir
+    HTileOpsIncGen
+    HTileAttrsIncGen
+    HTilePassesIncGen
+    HTileTransformOpsIncGen
+  )
   setup_mlir_target(_neptuneMlir)
   set_target_properties(_neptuneMlir PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/neptune_mlir/_mlir_libs"

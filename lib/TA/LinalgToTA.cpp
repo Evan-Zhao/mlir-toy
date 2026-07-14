@@ -17,6 +17,8 @@
 #define DEBUG_TYPE "linalg-to-ta"
 
 namespace ta {
+#define GEN_PASS_DEF_LINALGTOTAPASS
+#include "TAPasses.h.inc"
 
 using namespace mlir;
 
@@ -32,20 +34,7 @@ static LogicalResult expandFullyWrappedGenericOps(func::FuncOp func);
 static LogicalResult importFunctionAsTA(func::FuncOp func, func::ReturnOp returnOp,
                                         RankedTensorType resultType);
 
-struct ImportLinalgToTAPass
-    : public PassWrapper<ImportLinalgToTAPass, OperationPass<func::FuncOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ImportLinalgToTAPass)
-
-  StringRef getArgument() const final { return "linalg-to-ta"; }
-  StringRef getDescription() const final {
-    return "Import supported linalg.generic tensor dataflow into the ta dialect";
-  }
-
-  void getDependentDialects(DialectRegistry &registry) const final {
-    registry.insert<TADialect, affine::AffineDialect, func::FuncDialect, linalg::LinalgDialect,
-                    tensor::TensorDialect>();
-  }
-
+struct ImportLinalgToTAPass : public impl::LinalgToTAPassBase<ImportLinalgToTAPass> {
   void runOnOperation() final {
     func::FuncOp func = getOperation();
     if (func.empty())
@@ -1238,8 +1227,6 @@ static LogicalResult expandFullyWrappedGenericOps(func::FuncOp func) {
 }
 
 } // namespace
-
-void registerLinalgToTAPass() { PassRegistration<ImportLinalgToTAPass>(); }
 
 } // namespace ta
 

@@ -321,25 +321,5 @@ void TAExpToExp2PatternsOp::populatePatterns(RewritePatternSet &patterns) {
 
 } // namespace mlir::transform
 
-namespace ta {
-
-void registerTATransformExtension(mlir::DialectRegistry &registry) {
-  registry.addExtension(+[](mlir::MLIRContext *ctx, mlir::transform::TransformDialect *dialect) {
-    ctx->loadDialect<ta::TADialect>();
-    struct TransformDialectAccess : public mlir::transform::TransformDialect {
-      using mlir::Dialect::addOperations;
-    };
-    static_cast<TransformDialectAccess *>(dialect)
-        ->addOperations<mlir::transform::StablehloGatherToLinalgConversionPatternsOp,
-                        mlir::transform::TAMatchEinsumOp, mlir::transform::TAToLinalgOp,
-                        mlir::transform::TASinkDivAfterMatmulPatternsOp,
-                        mlir::transform::TASinkRightMulAfterMatmulPatternsOp,
-                        mlir::transform::TAReassociateRightMulfPatternsOp,
-                        mlir::transform::TAExpToExp2PatternsOp>();
-  });
-}
-
-} // namespace ta
-
 #define GET_OP_CLASSES
 #include "TATransformOps.cpp.inc"

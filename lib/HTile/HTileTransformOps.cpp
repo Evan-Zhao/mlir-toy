@@ -1133,22 +1133,5 @@ DiagnosedSilenceableFailure HTileOutlineKernelsOp::apply(TransformRewriter &rewr
 
 } // namespace mlir::transform
 
-namespace htile {
-
-void registerHTileTransformExtension(mlir::DialectRegistry &registry) {
-  registry.addExtension(+[](mlir::MLIRContext *ctx, mlir::transform::TransformDialect *dialect) {
-    ctx->loadDialect<htile::HTileDialect, mlir::bufferization::BufferizationDialect,
-                     mlir::memref::MemRefDialect>();
-    struct TransformDialectAccess : public mlir::transform::TransformDialect {
-      using mlir::Dialect::addOperations;
-    };
-    static_cast<TransformDialectAccess *>(dialect)
-        ->addOperations<mlir::transform::HTileLinalgToSemanticOp,
-                        mlir::transform::HTileOutlineKernelsOp>();
-  });
-}
-
-} // namespace htile
-
 #define GET_OP_CLASSES
 #include "HTileTransformOps.cpp.inc"

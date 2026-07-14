@@ -23,14 +23,22 @@ mlir_tablegen(HTileTransformOps.h.inc -gen-op-decls)
 mlir_tablegen(HTileTransformOps.cpp.inc -gen-op-defs)
 add_public_tablegen_target(HTileTransformOpsIncGen)
 
-make_mlir_opt_plugin(
-  TARGET HTileDialect
-  SOURCES
-    HTileDialect.cpp
-    HTilePasses.cpp
-    HTileTransformOps.cpp
-  DEPS
-    HTileOpsIncGen
-    HTileAttrsIncGen
-    HTileTransformOpsIncGen
+set(LLVM_TARGET_DEFINITIONS "${PROJECT_SOURCE_DIR}/include/HTile/HTilePasses.td")
+mlir_tablegen(HTilePasses.h.inc -gen-pass-decls -name HTile)
+add_public_tablegen_target(HTilePassesIncGen)
+
+add_library(NeptuneHTile STATIC
+  HTileDialect.cpp
+  HTilePasses.cpp
+  HTileTransformExtension.cpp
+  HTileTransformOps.cpp
 )
+set_target_properties(NeptuneHTile PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_dependencies(NeptuneHTile
+  HTileOpsIncGen
+  HTileAttrsIncGen
+  HTilePassesIncGen
+  HTileTransformOpsIncGen
+)
+setup_mlir_target(NeptuneHTile)
+target_link_libraries(NeptuneHTile PUBLIC MLIR LLVM)

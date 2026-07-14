@@ -4,17 +4,16 @@
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Pass/PassRegistry.h"
-#include "mlir/Tools/Plugins/PassPlugin.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/Support/Compiler.h"
 
 using namespace mlir;
 
 namespace htile {
+#define GEN_PASS_DEF_DOTTRANSPOSETOLOADORDERPASS
+#include "HTilePasses.h.inc"
+
 namespace {
 
 constexpr StringLiteral kDimensionOrderAttrName = "dimension_order";
@@ -49,20 +48,7 @@ bool is2DRankedTensor(Value value) {
 }
 
 struct DotTransposeToLoadOrderPass
-    : public PassWrapper<DotTransposeToLoadOrderPass, OperationPass<>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DotTransposeToLoadOrderPass)
-
-  StringRef getArgument() const override { return "htile-dot-transpose-to-load-order"; }
-
-  StringRef getDescription() const override {
-    return "Fission htile.dot transpose attributes into htile.permute and "
-           "fold load-fed permutes into htile.load dimension_order attributes";
-  }
-
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<HTileDialect>();
-  }
-
+    : public impl::DotTransposeToLoadOrderPassBase<DotTransposeToLoadOrderPass> {
   void runOnOperation() override {
     Operation *root = getOperation();
 
@@ -134,22 +120,4 @@ struct DotTransposeToLoadOrderPass
 };
 
 } // namespace
-
-std::unique_ptr<Pass> createDotTransposeToLoadOrderPass() {
-  return std::make_unique<DotTransposeToLoadOrderPass>();
-}
-
-void registerHTilePasses() {
-  static bool registered = false;
-  if (registered)
-    return;
-  registered = true;
-  PassRegistration<DotTransposeToLoadOrderPass>();
-}
-
 } // namespace htile
-
-extern "C" LLVM_ATTRIBUTE_WEAK mlir::PassPluginLibraryInfo mlirGetPassPluginInfo() {
-  return {MLIR_PLUGIN_API_VERSION, "HTilePassPlugin", LLVM_VERSION_STRING,
-          []() { htile::registerHTilePasses(); }};
-}

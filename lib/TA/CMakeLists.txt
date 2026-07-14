@@ -28,6 +28,10 @@ mlir_tablegen(TATransformOps.h.inc -gen-op-decls)
 mlir_tablegen(TATransformOps.cpp.inc -gen-op-defs)
 add_public_tablegen_target(TATransformOpsIncGen)
 
+set(LLVM_TARGET_DEFINITIONS "${PROJECT_SOURCE_DIR}/include/TA/TAPasses.td")
+mlir_tablegen(TAPasses.h.inc -gen-pass-decls -name TA)
+add_public_tablegen_target(TAPassesIncGen)
+
 add_mlir_pdll_library(TAMulScaleMotionPDLL
   MulScaleMotion.pdll
   MulScaleMotion.cpp.inc
@@ -36,24 +40,6 @@ add_mlir_pdll_library(TAMulScaleMotionPDLL
 add_mlir_pdll_library(TAExpToExp2PDLL
   ExpToExp2.pdll
   ExpToExp2.cpp.inc
-)
-
-make_mlir_opt_plugin(
-  TARGET TADialect
-  SOURCES
-    TADialect.cpp
-    LinalgToTA.cpp
-    StableHLOToTA.cpp
-    TAToLinalg.cpp
-    TATransformOps.cpp
-    TAUtils.cpp
-  DEPS
-    TAOpsIncGen
-    TAAttrsIncGen
-    TATypesIncGen
-    TATransformOpsIncGen
-    TAMulScaleMotionPDLL
-    TAExpToExp2PDLL
 )
 
 # Create a wrapper library that takes StablehloOps but make it link to MLIR dynamically.
@@ -91,4 +77,24 @@ target_link_libraries(NeptuneStablehlo INTERFACE
   LLVM
 )
 
-target_link_libraries(TADialect PRIVATE NeptuneStablehlo)
+add_library(NeptuneTA STATIC
+  TADialect.cpp
+  LinalgToTA.cpp
+  StableHLOToTA.cpp
+  TAToLinalg.cpp
+  TATransformExtension.cpp
+  TATransformOps.cpp
+  TAUtils.cpp
+)
+set_target_properties(NeptuneTA PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_dependencies(NeptuneTA
+  TAOpsIncGen
+  TAAttrsIncGen
+  TATypesIncGen
+  TAPassesIncGen
+  TATransformOpsIncGen
+  TAMulScaleMotionPDLL
+  TAExpToExp2PDLL
+)
+setup_mlir_target(NeptuneTA)
+target_link_libraries(NeptuneTA PUBLIC NeptuneStablehlo MLIR LLVM)

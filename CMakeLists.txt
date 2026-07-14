@@ -166,6 +166,7 @@ add_subdirectory(lib/HTile)
 add_subdirectory(lib/TA)
 add_subdirectory(lib/LoopTr)
 add_subdirectory(lib/Python)
+add_subdirectory(plugins)
 
 if(BUILD_TESTING)
   add_subdirectory(test)

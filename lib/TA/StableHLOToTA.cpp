@@ -16,6 +16,8 @@
 #define DEBUG_TYPE "stablehlo-to-ta"
 
 namespace ta {
+#define GEN_PASS_DEF_STABLEHLOTOTAPASS
+#include "TAPasses.h.inc"
 
 using namespace mlir;
 
@@ -1259,20 +1261,7 @@ static LogicalResult importFunctionAsTA(func::FuncOp func) {
   return success();
 }
 
-struct ImportStableHLOToTAPass
-    : public PassWrapper<ImportStableHLOToTAPass, OperationPass<func::FuncOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ImportStableHLOToTAPass)
-
-  StringRef getArgument() const final { return "stablehlo-to-ta"; }
-  StringRef getDescription() const final {
-    return "Import supported StableHLO tensor dataflow into the ta dialect";
-  }
-
-  void getDependentDialects(DialectRegistry &registry) const final {
-    registry
-        .insert<TADialect, arith::ArithDialect, func::FuncDialect, stablehlo::StablehloDialect>();
-  }
-
+struct ImportStableHLOToTAPass : public impl::StableHLOToTAPassBase<ImportStableHLOToTAPass> {
   void runOnOperation() final {
     func::FuncOp func = getOperation();
     if (func.empty())
@@ -1297,8 +1286,6 @@ struct ImportStableHLOToTAPass
 };
 
 } // namespace
-
-void registerStableHLOToTAPass() { PassRegistration<ImportStableHLOToTAPass>(); }
 
 } // namespace ta
 

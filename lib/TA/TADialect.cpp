@@ -1,27 +1,12 @@
 #include "TA/TADialect.h"
 
-#include "stablehlo/conversions/linalg/transforms/Passes.h"
-
 #include "TA/TAAttrs.h"
 #include "TA/TAOps.h"
-#include "TA/TAPasses.h"
-#include "TA/TATransformOps.h"
 #include "TA/TATypes.h"
 #include "TA/TAUtils.h"
-#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
-#include "mlir/Dialect/Complex/IR/Complex.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/Math/IR/Math.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Shape/IR/Shape.h"
-#include "mlir/Dialect/SparseTensor/IR/SparseTensor.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LogicalResult.h"
-#include "mlir/Tools/Plugins/DialectPlugin.h"
-#include "mlir/Tools/Plugins/PassPlugin.h"
-#include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/ADT/StringSet.h"
 
 #define GET_DIALECT_DEFS
@@ -1188,40 +1173,6 @@ void ScopeOp::getAsmBlockArgumentNames(Region &region, OpAsmSetValueNameFn setNa
     setNameFn(arg, cast<AxisAttr>(axis).getName().getValue());
 }
 } // namespace ta
-
-extern "C" LLVM_ATTRIBUTE_WEAK mlir::DialectPluginLibraryInfo mlirGetDialectPluginInfo() {
-  return {MLIR_PLUGIN_API_VERSION, "TADialectPlugin", LLVM_VERSION_STRING,
-          [](mlir::DialectRegistry *registry) {
-            registry->insert<ta::TADialect>();
-            registry->insert<mlir::stablehlo::StablehloDialect>();
-            // transform.apply_registered_pass constructs its nested pass
-            // manager after execution has started, too late for that manager
-            // to load newly discovered dependent dialects safely. Preload the
-            // StableHLO-to-Linalg pass dependencies when StableHLO is loaded.
-            registry->addExtension(
-                +[](mlir::MLIRContext *context, mlir::stablehlo::StablehloDialect *) {
-                  context->loadDialect<mlir::bufferization::BufferizationDialect,
-                                       mlir::complex::ComplexDialect, mlir::linalg::LinalgDialect,
-                                       mlir::math::MathDialect, mlir::memref::MemRefDialect,
-                                       mlir::scf::SCFDialect, mlir::shape::ShapeDialect,
-                                       mlir::sparse_tensor::SparseTensorDialect>();
-                });
-            ta::registerTATransformExtension(*registry);
-            ta::registerLinalgToTAPass();
-            ta::registerStableHLOToTAPass();
-            ta::registerTAToLinalgPass();
-            mlir::stablehlo::registerStablehloLinalgTransformsPasses();
-          }};
-}
-
-extern "C" LLVM_ATTRIBUTE_WEAK mlir::PassPluginLibraryInfo mlirGetPassPluginInfo() {
-  return {MLIR_PLUGIN_API_VERSION, "TAPassPlugin", LLVM_VERSION_STRING, []() {
-            ta::registerLinalgToTAPass();
-            ta::registerStableHLOToTAPass();
-            ta::registerTAToLinalgPass();
-            mlir::stablehlo::registerStablehloLinalgTransformsPasses();
-          }};
-}
 
 #include "mlir/IR/DialectImplementation.h"
 #include "llvm/ADT/TypeSwitch.h"

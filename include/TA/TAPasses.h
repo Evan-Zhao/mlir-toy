@@ -3,6 +3,7 @@
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 
@@ -15,9 +16,11 @@ mlir::LogicalResult lowerTAToLinalg(
                             const llvm::DenseMap<mlir::Operation *, mlir::Operation *> &)>
         beforeErase = nullptr);
 
-void registerLinalgToTAPass();
-void registerStableHLOToTAPass();
-void registerTAToLinalgPass();
+#define GEN_PASS_DECL
+#include "TAPasses.h.inc"
+
+#define GEN_PASS_REGISTRATION
+#include "TAPasses.h.inc"
 
 } // namespace ta
 

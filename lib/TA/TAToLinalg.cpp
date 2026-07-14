@@ -22,6 +22,8 @@
 #include <optional>
 
 namespace ta {
+#define GEN_PASS_DEF_TATOLINALGPASS
+#include "TAPasses.h.inc"
 
 using namespace mlir;
 
@@ -659,19 +661,7 @@ private:
   llvm::function_ref<void(Operation *, const DenseMap<Operation *, Operation *> &)> beforeErase;
 };
 
-struct LowerTAToLinalgPass : public PassWrapper<LowerTAToLinalgPass, OperationPass<func::FuncOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerTAToLinalgPass)
-
-  StringRef getArgument() const final { return "ta-to-linalg"; }
-  StringRef getDescription() const final {
-    return "Lower supported ta.scope expression graphs to linalg.generic";
-  }
-
-  void getDependentDialects(DialectRegistry &registry) const final {
-    registry.insert<arith::ArithDialect, func::FuncDialect, linalg::LinalgDialect,
-                    math::MathDialect, tensor::TensorDialect>();
-  }
-
+struct LowerTAToLinalgPass : public impl::TAToLinalgPassBase<LowerTAToLinalgPass> {
   void runOnOperation() final {
     OpBuilder builder(getOperation());
     if (failed(lowerTAToLinalg(getOperation(), builder))) {
@@ -709,7 +699,5 @@ LogicalResult lowerTAToLinalg(
   }
   return success();
 }
-
-void registerTAToLinalgPass() { PassRegistration<LowerTAToLinalgPass>(); }
 
 } // namespace ta

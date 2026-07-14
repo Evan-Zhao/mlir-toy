@@ -9,26 +9,25 @@ mlir_tablegen(LoopTransformOps.h.inc -gen-op-decls)
 mlir_tablegen(LoopTransformOps.cpp.inc -gen-op-defs)
 add_public_tablegen_target(LoopTransformOpsIncGen)
 
-make_mlir_opt_plugin(
-  TARGET LoopTransform
-  SOURCES
-    FusionExprSolver.cpp
-    FusionIntoProducer.cpp
-    FusionSplitKUpdate.cpp
-    FusionRollingUpdate.cpp
-    LinalgTransformOps.cpp
-    LoopSpecializeDeadTile.cpp
-    LoopTransformPlugin.cpp
-    ScfLocalizeScratchTensors.cpp
-    ScfTransformOps.cpp
-    Utils.cpp
-  DEPS
-    LoopTransformOpsIncGen
+add_library(NeptuneLoopTransform STATIC
+  FusionExprSolver.cpp
+  FusionIntoProducer.cpp
+  FusionSplitKUpdate.cpp
+  FusionRollingUpdate.cpp
+  LinalgTransformOps.cpp
+  LoopSpecializeDeadTile.cpp
+  LoopTransformExtension.cpp
+  LoopTransformOps.cpp
+  ScfLocalizeScratchTensors.cpp
+  ScfTransformOps.cpp
+  Utils.cpp
 )
-
-# This is how we call the Python solver from C++.
-target_link_libraries(LoopTransform PRIVATE pybind11::embed)
-set_target_properties(LoopTransform PROPERTIES
+set_target_properties(NeptuneLoopTransform PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_dependencies(NeptuneLoopTransform LoopTransformOpsIncGen)
+setup_mlir_target(NeptuneLoopTransform)
+# This is how the rolling-update transform calls the Python solver from C++.
+target_link_libraries(NeptuneLoopTransform PUBLIC MLIR LLVM pybind11::embed)
+set_target_properties(NeptuneLoopTransform PROPERTIES
   BUILD_RPATH "${Python3_LIBRARY_DIRS}"
   INSTALL_RPATH "${Python3_LIBRARY_DIRS}"
 )

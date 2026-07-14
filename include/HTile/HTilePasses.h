@@ -3,12 +3,13 @@
 
 #include "mlir/Pass/Pass.h"
 
-#include <memory>
-
 namespace htile {
 
-std::unique_ptr<mlir::Pass> createDotTransposeToLoadOrderPass();
-void registerHTilePasses();
+#define GEN_PASS_DECL
+#include "HTilePasses.h.inc"
+
+#define GEN_PASS_REGISTRATION
+#include "HTilePasses.h.inc"
 
 } // namespace htile
 

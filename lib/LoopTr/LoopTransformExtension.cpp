@@ -1,11 +1,9 @@
+#include "LoopTr/LoopTransformExtension.h"
+
 #include "LoopTr/LoopTransformOps.h"
+#include "mlir/Dialect/Transform/IR/TransformDialect.h"
 
-#include "mlir/IR/DialectRegistry.h"
-#include "mlir/Tools/Plugins/DialectPlugin.h"
-
-namespace loop {
-
-void registerLoopTransformExtension(mlir::DialectRegistry &registry) {
+void loop::registerLoopTransformExtension(mlir::DialectRegistry &registry) {
   // MLIR 22.1.4 hangs in TransformDialectExtension::registerTransformOps for
   // this out-of-tree plugin. Register the op directly as a narrow workaround;
   // the ops are still constrained by their TableGen traits and verified when
@@ -21,14 +19,4 @@ void registerLoopTransformExtension(mlir::DialectRegistry &registry) {
 #undef GET_OP_LIST
             >();
   });
-}
-
-} // namespace loop
-
-#define GET_OP_CLASSES
-#include "LoopTransformOps.cpp.inc"
-
-extern "C" LLVM_ATTRIBUTE_WEAK mlir::DialectPluginLibraryInfo mlirGetDialectPluginInfo() {
-  return {MLIR_PLUGIN_API_VERSION, "LoopTransformPlugin", LLVM_VERSION_STRING,
-          [](mlir::DialectRegistry *registry) { loop::registerLoopTransformExtension(*registry); }};
 }
