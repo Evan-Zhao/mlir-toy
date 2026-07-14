@@ -8,23 +8,35 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FileUtilities.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/Program.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include <pybind11/embed.h>
-
+#include <array>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 
+#ifndef NEPTUNE_MLIR_PYTHON_EXECUTABLE
+#error "NEPTUNE_MLIR_PYTHON_EXECUTABLE must be provided by CMake"
+#endif
+
 namespace mlir {
 namespace json = llvm::json;
-namespace py = pybind11;
 
 namespace {
+
+llvm::cl::opt<std::string> neptunePythonExecutable(
+    "neptune-python-executable",
+    llvm::cl::desc("Python executable used by the Neptune rolling-solver worker"),
+    llvm::cl::value_desc("path"), llvm::cl::init(NEPTUNE_MLIR_PYTHON_EXECUTABLE));
 
 /* Serialization: MLIR program to JSON */
 
@@ -55,13 +67,6 @@ std::string stringifyFloat(const APFloat &value) {
   SmallString<32> storage;
   value.toString(storage);
   return std::string(storage);
-}
-
-std::string stringifyJSON(const json::Value &value) {
-  std::string storage;
-  llvm::raw_string_ostream os(storage);
-  os << value;
-  return storage;
 }
 
 FailureOr<json::Value> serializeMLIRExprValueToJSON(Value value, SerializationState &state);
@@ -448,49 +453,132 @@ FailureOr<DeserializedValueExpr> deserializeMLIRExprFromJSON(const json::Value &
 
 /* Solver logic begins */
 
-llvm::Expected<json::Value> solveRollingUpdaterWithPython(const json::Value &fExpr,
+llvm::Expected<std::string> readSolverFile(StringRef path, StringRef description) {
+  auto buffer = llvm::MemoryBuffer::getFile(path);
+  if (!buffer)
+    return llvm::make_error<llvm::StringError>(
+        "failed to read rolling-solver " + description.str() + ": " + buffer.getError().message(),
+        buffer.getError());
+  return buffer.get()->getBuffer().str();
+}
+
+llvm::Expected<json::Value> solveRollingUpdaterWithWorker(const json::Value &fExpr,
                                                           const json::Value &gExpr,
                                                           ArrayRef<std::string> rVariables,
                                                           StringRef accVar) {
-  static std::once_flag initOnce;
-  static py::object solverModule;
-  static py::object jsonModule;
-  static std::string initError;
+  llvm::SmallString<128> inputPath;
+  llvm::SmallString<128> outputPath;
+  llvm::SmallString<128> errorPath;
+  int inputFD;
+  int outputFD;
+  int errorFD;
 
-  std::call_once(initOnce, []() {
-    try {
-      // Intentionally leak the interpreter. If the d'tor of the interpreter throws an exception, it
-      // can cause a crash (likely during program shutdown, but still ugly).
-      auto interpreter = std::make_unique<py::scoped_interpreter>();
-      auto interpPtr = interpreter.release();
-      (void)interpPtr;
-      solverModule = py::module_::import("neptune_mlir.rolling_solver");
-      jsonModule = py::module_::import("json");
-    } catch (const py::error_already_set &e) {
-      initError = e.what();
-    }
-  });
-  if (!initError.empty()) {
-    return llvm::make_error<llvm::StringError>("failed to initialize embedded Python: " + initError,
-                                               llvm::inconvertibleErrorCode());
+  if (std::error_code error =
+          llvm::sys::fs::createTemporaryFile("neptune-rolling-solver", "json", inputFD, inputPath))
+    return llvm::make_error<llvm::StringError>(
+        "failed to create rolling-solver input: " + error.message(), error);
+  llvm::FileRemover inputRemover(inputPath);
+
+  if (std::error_code error = llvm::sys::fs::createTemporaryFile("neptune-rolling-solver-output",
+                                                                 "json", outputFD, outputPath))
+    return llvm::make_error<llvm::StringError>(
+        "failed to create rolling-solver output: " + error.message(), error);
+  llvm::FileRemover outputRemover(outputPath);
+
+  if (std::error_code error = llvm::sys::fs::createTemporaryFile("neptune-rolling-solver-error",
+                                                                 "txt", errorFD, errorPath))
+    return llvm::make_error<llvm::StringError>(
+        "failed to create rolling-solver error output: " + error.message(), error);
+  llvm::FileRemover errorRemover(errorPath);
+
+  {
+    llvm::raw_fd_ostream input(inputFD, /*shouldClose=*/true);
+    json::OStream request(input);
+    request.object([&] {
+      request.attribute("protocol_version", int64_t{1});
+      request.attribute("f_expr", fExpr);
+      request.attribute("g_expr", gExpr);
+      request.attributeArray("r_var_names", [&] {
+        for (const std::string &name : rVariables)
+          request.value(name);
+      });
+      request.attribute("acc_var_name", accVar);
+    });
+    input << '\n';
+    input.close();
+    if (input.has_error())
+      return llvm::make_error<llvm::StringError>("failed to write rolling-solver input",
+                                                 input.error());
+  }
+  {
+    llvm::raw_fd_ostream output(outputFD, /*shouldClose=*/true);
+    output.close();
+  }
+  {
+    llvm::raw_fd_ostream error(errorFD, /*shouldClose=*/true);
+    error.close();
   }
 
-  try {
-    py::gil_scoped_acquire gil;
-    py::object fExprPy = jsonModule.attr("loads")(stringifyJSON(fExpr));
-    py::object gExprPy = jsonModule.attr("loads")(stringifyJSON(gExpr));
-    py::list rVariablesPy;
-    for (const std::string &name : rVariables)
-      rVariablesPy.append(name);
-    py::object hExprPy = solverModule.attr("solve_rolling_updater_json")(
-        fExprPy, gExprPy, rVariablesPy, accVar.str());
-    std::string hExprText = py::str(jsonModule.attr("dumps")(hExprPy, py::arg("sort_keys") = true));
-    return json::parse(hExprText);
-  } catch (const py::error_already_set &e) {
-    return llvm::make_error<llvm::StringError>("embedded solver raised Python exception: " +
-                                                   std::string(e.what()),
+  auto pythonPath = llvm::sys::findProgramByName(neptunePythonExecutable);
+  if (!pythonPath)
+    return llvm::make_error<llvm::StringError>("unable to find Neptune Python executable '" +
+                                                   neptunePythonExecutable +
+                                                   "': " + pythonPath.getError().message(),
+                                               pythonPath.getError());
+
+  llvm::SmallVector<StringRef> arguments{*pythonPath, "-m", "neptune_mlir.rolling_solver"};
+  std::array<std::optional<StringRef>, 3> redirects = {StringRef(inputPath), StringRef(outputPath),
+                                                       StringRef(errorPath)};
+  std::string executionError;
+  int exitCode = llvm::sys::ExecuteAndWait(*pythonPath, arguments, /*Env=*/std::nullopt, redirects,
+                                           /*SecondsToWait=*/0, /*MemoryLimit=*/0, &executionError);
+
+  auto output = readSolverFile(outputPath, "output");
+  if (!output)
+    return output.takeError();
+  auto errorOutput = readSolverFile(errorPath, "stderr");
+  if (!errorOutput)
+    return errorOutput.takeError();
+
+  if (exitCode < 0)
+    return llvm::make_error<llvm::StringError>("failed to execute rolling-solver worker: " +
+                                                   executionError,
                                                llvm::inconvertibleErrorCode());
+
+  auto response = json::parse(*output);
+  if (!response) {
+    std::string message = "rolling-solver worker returned invalid JSON";
+    if (!errorOutput->empty())
+      message += ": " + *errorOutput;
+    return llvm::make_error<llvm::StringError>(message, llvm::inconvertibleErrorCode());
   }
+  auto *responseObject = response->getAsObject();
+  if (!responseObject)
+    return llvm::make_error<llvm::StringError>("rolling-solver response must be a JSON object",
+                                               llvm::inconvertibleErrorCode());
+
+  std::optional<int64_t> protocolVersion = responseObject->getInteger("protocol_version");
+  if (protocolVersion != 1)
+    return llvm::make_error<llvm::StringError>("rolling-solver response has unsupported protocol",
+                                               llvm::inconvertibleErrorCode());
+
+  if (std::optional<StringRef> error = responseObject->getString("error")) {
+    std::string message = "rolling-solver worker failed: " + error->str();
+    if (!errorOutput->empty())
+      message += "\n" + *errorOutput;
+    return llvm::make_error<llvm::StringError>(message, llvm::inconvertibleErrorCode());
+  }
+
+  if (exitCode != 0)
+    return llvm::make_error<llvm::StringError>("rolling-solver worker exited with code " +
+                                                   std::to_string(exitCode) + ": " + *errorOutput,
+                                               llvm::inconvertibleErrorCode());
+
+  json::Value *result = responseObject->get("result");
+  if (!result)
+    return llvm::make_error<llvm::StringError>("rolling-solver response is missing 'result'",
+                                               llvm::inconvertibleErrorCode());
+  return std::move(*result);
 }
 
 FailureOr<AffineMap> dropDomainDim(AffineMap map, unsigned droppedDim) {
@@ -612,8 +700,8 @@ FailureOr<FusionRepairTerm> solveFusionRepairExpr(RewriterBase &rewriter,
   if (failed(fExpr))
     return failure();
 
-  // Step 5. Call the Python solver to derive the repair term expression.
-  auto hExpr = solveRollingUpdaterWithPython(fExpr, gExpr, redVarNames, accVarName);
+  // Step 5. Call the Python worker to derive the repair term expression.
+  auto hExpr = solveRollingUpdaterWithWorker(fExpr, gExpr, redVarNames, accVarName);
   if (!hExpr)
     return thisRed.emitError("failed to solve for the rolling update expression: ")
            << llvm::toString(hExpr.takeError());

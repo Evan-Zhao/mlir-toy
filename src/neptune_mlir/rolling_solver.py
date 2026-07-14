@@ -1,3 +1,6 @@
+import json
+import sys
+import traceback
 from typing import Any, Iterable, Mapping, cast
 
 import sympy as sp
@@ -346,3 +349,56 @@ def _split_negative_term(expr: Expr) -> tuple[bool, Expr]:
     if coeff < 0:
         return True, sp.Mul(-coeff, *terms)
     return False, expr
+
+
+PROTOCOL_VERSION = 1
+
+
+def _require_request_field(request: dict[str, Any], name: str, expected_type: type) -> Any:
+    value = request.get(name)
+    if not isinstance(value, expected_type):
+        raise ValueError(f"request field {name!r} must be {expected_type.__name__}")
+    return value
+
+
+def process_request(request: dict[str, Any]) -> dict[str, Any]:
+    version = _require_request_field(request, "protocol_version", int)
+    if version != PROTOCOL_VERSION:
+        raise ValueError(
+            f"unsupported rolling-solver protocol version {version}; expected {PROTOCOL_VERSION}"
+        )
+
+    f_expr = _require_request_field(request, "f_expr", dict)
+    g_expr = _require_request_field(request, "g_expr", dict)
+    r_var_names = _require_request_field(request, "r_var_names", list)
+    if not all(isinstance(name, str) for name in r_var_names):
+        raise ValueError("request field 'r_var_names' must contain only strings")
+    acc_var_name = _require_request_field(request, "acc_var_name", str)
+
+    result = solve_rolling_updater_json(f_expr, g_expr, r_var_names, acc_var_name)
+    return {"protocol_version": PROTOCOL_VERSION, "result": result}
+
+
+def main() -> int:
+    try:
+        request = json.load(sys.stdin)
+        if not isinstance(request, dict):
+            raise ValueError("rolling-solver request must be a JSON object")
+        response = process_request(request)
+    except Exception as error:
+        traceback.print_exc(file=sys.stderr)
+        response = {
+            "protocol_version": PROTOCOL_VERSION,
+            "error": f"{type(error).__name__}: {error}",
+        }
+        json.dump(response, sys.stdout, sort_keys=True)
+        sys.stdout.write("\n")
+        return 1
+
+    json.dump(response, sys.stdout, sort_keys=True)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

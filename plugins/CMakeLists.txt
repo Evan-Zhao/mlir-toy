@@ -18,7 +18,3 @@ make_mlir_opt_plugin(
   DEPS NeptuneLoopTransform
 )
 target_link_libraries(LoopTransform PRIVATE NeptuneLoopTransform)
-set_target_properties(LoopTransform PROPERTIES
-  BUILD_RPATH "${Python3_LIBRARY_DIRS}"
-  INSTALL_RPATH "${Python3_LIBRARY_DIRS}"
-)

@@ -1,3 +1,7 @@
+import json
+import subprocess
+import sys
+
 import pytest
 import sympy as sp
 
@@ -9,6 +13,51 @@ FADD = T + sp.Symbol("x", real=True)
 
 def _assert_equiv(actual: sp.Expr, expected: sp.Expr) -> None:
     assert sp.simplify(actual - expected) == 0
+
+
+def test_worker_protocol() -> None:
+    f_expr = {
+        "op": "add",
+        "type": "f32",
+        "args": [
+            {"op": "var", "name": "t", "type": "f32"},
+            {"op": "var", "name": "x", "type": "f32"},
+        ],
+    }
+    g_expr = {
+        "op": "exp",
+        "type": "f32",
+        "args": [
+            {
+                "op": "sub",
+                "type": "f32",
+                "args": [
+                    {"op": "var", "name": "score", "type": "f32"},
+                    {"op": "var", "name": "row_max", "type": "f32"},
+                ],
+            }
+        ],
+    }
+    request = {
+        "protocol_version": 1,
+        "f_expr": f_expr,
+        "g_expr": g_expr,
+        "r_var_names": ["row_max"],
+        "acc_var_name": "t",
+    }
+
+    worker = subprocess.run(
+        [sys.executable, "-m", "neptune_mlir.rolling_solver"],
+        input=json.dumps(request),
+        capture_output=True,
+        text=True,
+    )
+
+    assert worker.returncode == 0, worker.stderr
+    response = json.loads(worker.stdout)
+    assert response["protocol_version"] == 1
+    assert "error" not in response
+    assert response["result"]["type"] == "f32"
 
 
 def test_attention_row_sum_repair() -> None:
