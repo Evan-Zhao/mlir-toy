@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin %s --transform-interpreter | FileCheck %s
+// RUN: neptune-opt %s --transform-interpreter | FileCheck %s
 //
 // Exercise the same broadcast access pattern from the attention softmax
 // pipeline: the forall loop produces two results (a 2D full tensor and a 1D

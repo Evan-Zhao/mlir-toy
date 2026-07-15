@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_ta_plugin %s --verify-diagnostics
+// RUN: neptune-opt %s --verify-diagnostics
 
 func.func @at_outside_scope(%tensor: tensor<16xf32>, %i: index) {
   // expected-error @+1 {{'ta.at' op must be nested inside a ta.scope}}

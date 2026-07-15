@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin %s --transform-interpreter | FileCheck %s
+// RUN: neptune-opt %s --transform-interpreter | FileCheck %s
 
 !any = !transform.any_op
 

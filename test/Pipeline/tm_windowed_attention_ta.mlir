@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin --load-dialect-plugin=%neptune_ta_plugin --load-dialect-plugin=%neptune_htile_plugin --load-pass-plugin=%neptune_ta_plugin %s --transform-interpreter 2>&1 | FileCheck %s
+// RUN: neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
 //
 // Transform-dialect schedule for the windowed-attention payload through HTile.
 

@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_ta_plugin --load-pass-plugin=%neptune_ta_plugin --pass-pipeline='builtin.module(func.func(linalg-to-ta))' %s --verify-diagnostics
+// RUN: neptune-opt --pass-pipeline='builtin.module(func.func(linalg-to-ta))' %s --verify-diagnostics
 
 #id1 = affine_map<(d0) -> (d0)>
 

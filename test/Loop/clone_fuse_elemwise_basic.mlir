@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin %s --transform-interpreter 2>&1 | FileCheck %s
+// RUN: neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
 
 // Minimal clone-fuse case: the forall/for loop nest produces a single tensor,
 // and one out-of-loop unary elementwise consumer is cloned and fused back into

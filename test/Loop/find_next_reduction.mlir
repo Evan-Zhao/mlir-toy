@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin %s --transform-interpreter | FileCheck %s
+// RUN: neptune-opt %s --transform-interpreter | FileCheck %s
 
 // Payload functions are structured to also serve as inputs for
 // rolling_update_elemwise_chain tests.

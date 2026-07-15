@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_ta_plugin --transform-interpreter %s | FileCheck %s
+// RUN: neptune-opt --transform-interpreter %s | FileCheck %s
 
 // Verify that the fine-grained conversion lowers only gather and updates its
 // pre-existing transform handle to the replacement linalg.generic.

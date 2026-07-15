@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin %s --transform-interpreter | FileCheck %s
+// RUN: neptune-opt %s --transform-interpreter | FileCheck %s
 
 // SplitK sidecar fusion case:
 //   - the forall publishes score tiles and split-local row-max partials,

@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin %s --transform-interpreter 2>&1 | FileCheck %s
+// RUN: neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
 
 // Two unary elemwise consumers where B consumes A. This exercises sidecar
 // chaining from one fused sidecar into the next.

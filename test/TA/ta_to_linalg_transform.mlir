@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_ta_plugin --load-pass-plugin=%neptune_ta_plugin %s --transform-interpreter 2>&1 | FileCheck %s
+// RUN: neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
 
 module attributes {transform.with_named_sequence} {
   transform.named_sequence @match_ta_matmul(%candidate: !transform.any_op {transform.readonly})

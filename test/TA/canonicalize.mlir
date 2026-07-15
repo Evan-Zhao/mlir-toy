@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_ta_plugin %s --canonicalize | FileCheck %s
+// RUN: neptune-opt %s --canonicalize | FileCheck %s
 
 module {
   // CHECK-LABEL: func.func @fold_cast_of_float_constant

@@ -27,37 +27,11 @@ if existing_python_path:
     python_paths.append(existing_python_path)
 config.environment["PYTHONPATH"] = os.pathsep.join(python_paths)
 
-config.substitutions.append(("%PATH%", config.environment["PATH"]))
-config.substitutions.append(("%shlibext", config.llvm_shlib_ext))
-config.substitutions.append(
-    (
-        "%neptune_loop_plugin",
-        os.path.join(
-            config.neptune_mlir_obj_root,
-            "libLoopTransform" + config.neptune_mlir_shared_library_suffix,
-        ),
-    )
-)
-config.substitutions.append(
-    (
-        "%neptune_htile_plugin",
-        os.path.join(
-            config.neptune_mlir_obj_root,
-            "libHTileDialect" + config.neptune_mlir_shared_library_suffix,
-        ),
-    )
-)
-config.substitutions.append(
-    (
-        "%neptune_ta_plugin",
-        os.path.join(
-            config.neptune_mlir_obj_root,
-            "libTADialect" + config.neptune_mlir_shared_library_suffix,
-        ),
-    )
-)
-
 llvm_config.add_tool_substitutions(
-    ["mlir-opt", "FileCheck", "not"],
+    ["neptune-opt"],
+    [config.neptune_mlir_obj_root],
+)
+llvm_config.add_tool_substitutions(
+    ["FileCheck", "not"],
     [config.llvm_tools_dir],
 )

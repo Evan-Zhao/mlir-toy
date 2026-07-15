@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_ta_plugin %s | FileCheck %s
+// RUN: neptune-opt %s | FileCheck %s
 
 // CHECK-LABEL: func.func @minimal_ta
 func.func @minimal_ta(%tensor: tensor<16xf32>) -> tensor<16xf32> {

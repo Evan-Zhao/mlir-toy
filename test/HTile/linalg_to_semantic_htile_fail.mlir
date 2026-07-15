@@ -1,4 +1,4 @@
-// RUN: not mlir-opt --load-dialect-plugin=%neptune_htile_plugin %s --transform-interpreter 2>&1 | FileCheck %s
+// RUN: not neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
 
 #id = affine_map<(d0) -> (d0)>
 

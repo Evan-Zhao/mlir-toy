@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_htile_plugin %s --transform-interpreter | FileCheck %s
+// RUN: neptune-opt %s --transform-interpreter | FileCheck %s
 
 #mat_lhs = affine_map<(m, n, k) -> (m, k)>
 #mat_rhs_t = affine_map<(m, n, k) -> (n, k)>

@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_htile_plugin %s --transform-interpreter --split-input-file --verify-diagnostics
+// RUN: neptune-opt %s --transform-interpreter --split-input-file --verify-diagnostics
 
 !any = !transform.any_op
 

@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_htile_plugin --load-pass-plugin=%neptune_htile_plugin --pass-pipeline='builtin.module(htile-dot-transpose-to-load-order,cse,canonicalize)' %s | FileCheck %s
+// RUN: neptune-opt --pass-pipeline='builtin.module(htile-dot-transpose-to-load-order,cse,canonicalize)' %s | FileCheck %s
 
 #shared = #htile.encoding<placement = shared>
 #local = #htile.encoding<placement = local>

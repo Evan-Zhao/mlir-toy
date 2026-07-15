@@ -1,4 +1,4 @@
-// RUN: mlir-opt --load-dialect-plugin=%neptune_loop_plugin %s --transform-interpreter | FileCheck %s
+// RUN: neptune-opt %s --transform-interpreter | FileCheck %s
 
 // CHECK-LABEL: func.func @localize_inner_scratch
 // CHECK: %[[ROW_INIT:.*]] = linalg.fill
