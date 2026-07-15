@@ -120,32 +120,6 @@ function(setup_mlir_target TARGET)
   endif()
 endfunction()
 
-function(make_mlir_opt_plugin)
-  cmake_parse_arguments(ARG "" "TARGET" "SOURCES;DEPS" ${ARGN})
-  # Shared plugin for `mlir-opt --load-dialect-plugin=<path>/libHTileDialect.so`
-  # (or `.dylib` for macOS).
-  # Must NOT statically embed MLIR libs -- mlir-opt already provides them via
-  # libMLIR.so, and duplicate TypeID registries cause a segfault on load.
-  add_library(${ARG_TARGET} SHARED ${ARG_SOURCES})
-  # Keep plugin paths stable when their targets live in subdirectories.
-  set_target_properties(${ARG_TARGET} PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
-    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
-  )
-  add_dependencies(${ARG_TARGET} ${ARG_DEPS})
-  setup_mlir_target(${ARG_TARGET})
-  # Do not rely on mlir-opt to provide plugin dependencies through late dynamic
-  # lookup. MLIR and LLVM are shared imported targets, so this does not embed
-  # duplicate TypeID registries in the plugin.
-  target_link_libraries(${ARG_TARGET} PRIVATE MLIR LLVM)
-  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    # ELF shared libraries otherwise permit unresolved symbols by default.
-    # Reject accidental dependencies on another plugin at link time instead.
-    target_link_options(${ARG_TARGET} PRIVATE "LINKER:-z,defs")
-  endif()
-  install(TARGETS ${ARG_TARGET} LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}")
-endfunction()
-
 # Build StableHLO as a subproject.
 set(STABLEHLO_BUILD_EMBEDDED ON)
 set(STABLEHLO_ENABLE_BINDINGS_PYTHON OFF)
@@ -156,7 +130,6 @@ add_subdirectory(
 )
 
 add_subdirectory(lib)
-add_subdirectory(plugins)
 add_subdirectory(tools/neptune-opt)
 add_subdirectory(tools/neptune-lsp-server)
 

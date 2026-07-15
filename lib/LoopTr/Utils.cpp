@@ -212,6 +212,48 @@ void TrackedOperationListener::notifyOperationErased(Operation *op) {
     trackedOp = nullptr;
 }
 
+FailureOr<BinaryReductionCombinerMatch> matchBinaryReductionCombiner(linalg::GenericOp generic,
+                                                                     unsigned resultNumber,
+                                                                     bool emitDiagnostics) {
+  auto fail = [&](const Twine &message) -> FailureOr<BinaryReductionCombinerMatch> {
+    if (emitDiagnostics)
+      generic.emitError() << message;
+    return failure();
+  };
+
+  if (resultNumber >= generic.getNumDpsInits())
+    return fail("reduction result number is out of bounds for linalg.generic outputs");
+
+  auto yield = cast<linalg::YieldOp>(generic.getBody()->getTerminator());
+  if (resultNumber >= yield.getNumOperands())
+    return fail("reduction result number is out of bounds for linalg.yield operands");
+
+  Value yieldedValue = yield.getOperand(resultNumber);
+  Operation *combiner = yieldedValue.getDefiningOp();
+  if (!combiner || combiner->getNumOperands() != 2 || combiner->getNumResults() != 1) {
+    if (emitDiagnostics) {
+      generic.emitError() << "expected the reduction combiner to have 2 operands and 1 result";
+      if (combiner)
+        combiner->emitRemark() << "this is the reduction combiner";
+    }
+    return failure();
+  }
+
+  BlockArgument accumulatorArg =
+      generic.getBody()->getArgument(generic.getNumDpsInputs() + resultNumber);
+  Value lhs = combiner->getOperand(0), rhs = combiner->getOperand(1);
+  bool lhsIsAcc = lhs == accumulatorArg, rhsIsAcc = rhs == accumulatorArg;
+  if (lhsIsAcc == rhsIsAcc)
+    return fail("expected exactly one reduction combiner operand to be the accumulator");
+
+  return BinaryReductionCombinerMatch{
+      .accumulatorArg = accumulatorArg,
+      .yieldedValue = yieldedValue,
+      .nonAccumulator = lhsIsAcc ? rhs : lhs,
+      .combiner = combiner,
+  };
+}
+
 LogicalResult isSingleOutputElemwiseLinalgOp(Operation *op) {
   auto generic = dyn_cast<linalg::GenericOp>(op);
   if (!generic)

@@ -1,7 +1,6 @@
 add_executable(neptune-opt neptune-opt.cpp)
 setup_mlir_target(neptune-opt)
 target_link_libraries(neptune-opt PRIVATE NeptuneInitAll MLIR LLVM)
-export_executable_symbols_for_plugins(neptune-opt)
 set(_NEPTUNE_OPT_INSTALL_RPATH "${LLVM_LIBRARY_DIRS}")
 if(APPLE)
   list(PREPEND _NEPTUNE_OPT_INSTALL_RPATH "@loader_path/../${CMAKE_INSTALL_LIBDIR}")

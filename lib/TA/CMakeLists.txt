@@ -86,7 +86,6 @@ add_library(NeptuneTA STATIC
   TATransformOps.cpp
   TAUtils.cpp
 )
-set_target_properties(NeptuneTA PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_dependencies(NeptuneTA
   TAOpsIncGen
   TAAttrsIncGen

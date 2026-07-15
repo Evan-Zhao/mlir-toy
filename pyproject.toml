@@ -5,7 +5,7 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "neptune-mlir"
 version = "0.1.0"
-description = "HTile MLIR dialect plugin and Python translators."
+description = "Neptune MLIR optimizer and Python translators."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["sympy>=1.14"]

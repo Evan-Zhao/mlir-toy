@@ -33,7 +33,6 @@ add_library(NeptuneHTile STATIC
   HTileTransformExtension.cpp
   HTileTransformOps.cpp
 )
-set_target_properties(NeptuneHTile PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_dependencies(NeptuneHTile
   HTileOpsIncGen
   HTileAttrsIncGen

@@ -22,7 +22,6 @@ add_library(NeptuneLoopTransform STATIC
   ScfTransformOps.cpp
   Utils.cpp
 )
-set_target_properties(NeptuneLoopTransform PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_dependencies(NeptuneLoopTransform LoopTransformOpsIncGen)
 setup_mlir_target(NeptuneLoopTransform)
 target_compile_definitions(NeptuneLoopTransform PRIVATE

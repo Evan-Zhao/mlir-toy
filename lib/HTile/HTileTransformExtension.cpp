@@ -6,15 +6,29 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Transform/IR/TransformDialect.h"
 
+namespace {
+
+class HTileTransformDialectExtension
+    : public mlir::transform::TransformDialectExtension<HTileTransformDialectExtension> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(HTileTransformDialectExtension)
+
+  using Base::Base;
+
+  void init() {
+    declareDependentDialect<htile::HTileDialect>();
+    declareGeneratedDialect<mlir::bufferization::BufferizationDialect>();
+    declareGeneratedDialect<mlir::memref::MemRefDialect>();
+    registerTransformOps<
+#define GET_OP_LIST
+#include "HTileTransformOps.cpp.inc"
+#undef GET_OP_LIST
+        >();
+  }
+};
+
+} // namespace
+
 void htile::registerHTileTransformExtension(mlir::DialectRegistry &registry) {
-  registry.addExtension(+[](mlir::MLIRContext *ctx, mlir::transform::TransformDialect *dialect) {
-    ctx->loadDialect<htile::HTileDialect, mlir::bufferization::BufferizationDialect,
-                     mlir::memref::MemRefDialect>();
-    struct TransformDialectAccess : public mlir::transform::TransformDialect {
-      using mlir::Dialect::addOperations;
-    };
-    static_cast<TransformDialectAccess *>(dialect)
-        ->addOperations<mlir::transform::HTileLinalgToSemanticOp,
-                        mlir::transform::HTileOutlineKernelsOp>();
-  });
+  registry.addExtensions<HTileTransformDialectExtension>();
 }

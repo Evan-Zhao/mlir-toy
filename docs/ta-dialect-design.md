@@ -181,7 +181,7 @@ different: selected value operands determine the result layout first, and the
 condition axes are appended if needed.
 `ta.map` remains available as an escape hatch for scalar code without a dedicated `ta` op.
 
-The current rewrite support is compiled into the plugin:
+The current rewrite support is compiled into `neptune-opt`:
 
 ```mlir
 transform.apply_patterns to %target {
@@ -234,9 +234,7 @@ The `linalg-to-ta` pass imports supported pure tensor dataflow rooted at a
 function return value and materializes it as one `ta.scope`.
 
 ```bash
-mlir-opt \
-  --load-dialect-plugin=libTADialect.so \
-  --load-pass-plugin=libTADialect.so \
+neptune-opt \
   --pass-pipeline='builtin.module(func.func(linalg-to-ta))' \
   input.mlir
 ```
@@ -328,9 +326,7 @@ The `ta-to-linalg` pass lowers a `ta.scope` back to `linalg.generic`
 materializations.
 
 ```bash
-mlir-opt \
-  --load-dialect-plugin=libTADialect.so \
-  --load-pass-plugin=libTADialect.so \
+neptune-opt \
   --pass-pipeline='builtin.module(func.func(ta-to-linalg))' \
   input.mlir
 ```
@@ -541,7 +537,7 @@ but several areas remain intentionally narrow:
 1. Floating-point legality is minimal. Rewrites such as `exp -> exp2` and
    moving positive factors through `max` need a fuller fastmath / NaN policy
    before they are generally legal.
-1. PDLL patterns are compiled into the plugin. Transform-interpreted rewrite
+1. PDLL patterns are compiled into `neptune-opt`. Transform-interpreted rewrite
    patterns would let users provide rules without rebuilding.
 1. A more compact custom rewrite syntax could sit above PDLL, for example:
 
