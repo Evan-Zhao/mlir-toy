@@ -158,6 +158,7 @@ add_subdirectory(
 add_subdirectory(lib)
 add_subdirectory(plugins)
 add_subdirectory(tools/neptune-opt)
+add_subdirectory(tools/neptune-lsp-server)
 
 if(BUILD_TESTING)
   add_subdirectory(test)

@@ -8,7 +8,7 @@ from lit.llvm import llvm_config
 
 config.name = "NEPTUNE_MLIR"
 config.test_format = lit.formats.ShTest(not llvm_config.use_lit_shell)
-config.suffixes = [".mlir"]
+config.suffixes = [".mlir", ".test"]
 
 config.test_source_root = os.path.dirname(__file__)
 config.test_exec_root = os.path.join(config.neptune_mlir_obj_root, "tests")
@@ -28,7 +28,7 @@ if existing_python_path:
 config.environment["PYTHONPATH"] = os.pathsep.join(python_paths)
 
 llvm_config.add_tool_substitutions(
-    ["neptune-opt"],
+    ["neptune-opt", "neptune-lsp-server"],
     [config.neptune_mlir_obj_root],
 )
 llvm_config.add_tool_substitutions(
