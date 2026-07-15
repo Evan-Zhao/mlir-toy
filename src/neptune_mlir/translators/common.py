@@ -180,18 +180,16 @@ def _reject_dot_transpose_attrs(op: ir.OpView, backend: str) -> None:
     )
 
 
-def parse_mlir_module(
-    path: str,
-    plugin: str | None = None,
-    pass_pipeline: str | None = None,
-    pass_plugin: str | None = None,
-) -> ir.Module:
-    """Run mlir-opt on *path* and parse the generic-form MLIR module."""
-    cmd = ["mlir-opt"]
-    if plugin:
-        cmd.append(f"--load-dialect-plugin={plugin}")
-    if pass_plugin:
-        cmd.append(f"--load-pass-plugin={pass_plugin}")
+def parse_mlir_module(path: str, pass_pipeline: str | None = None) -> ir.Module:
+    """Run neptune-opt on *path* and parse the generic-form MLIR module."""
+    from ..dist import find_neptune_opt
+
+    executable = find_neptune_opt()
+    if executable is None:
+        raise RuntimeError(
+            "failed to locate neptune-opt; set NEPTUNE_MLIR_OPT to the executable path"
+        )
+    cmd = [str(executable)]
     if pass_pipeline:
         cmd.append(f"--pass-pipeline={pass_pipeline}")
         cmd += ["--mlir-print-op-generic", path]
@@ -201,8 +199,8 @@ def parse_mlir_module(
     if result.returncode != 0:
         stderr = result.stderr.strip()
         stdout = result.stdout.strip()
-        details = stderr or stdout or "mlir-opt failed without output"
-        raise RuntimeError(f"mlir-opt failed with exit code {result.returncode}: {details}")
+        details = stderr or stdout or "neptune-opt failed without output"
+        raise RuntimeError(f"neptune-opt failed with exit code {result.returncode}: {details}")
 
     ctx = ir.Context()
     ctx.allow_unregistered_dialects = True
@@ -221,7 +219,7 @@ def parse_mlir_module_from_text(text: str) -> ir.Module:
 
 
 def _register_neptune_dialects(ctx: ir.Context) -> None:
-    from ..plugin import register_dialects
+    from ..dist import register_dialects
 
     register_dialects(ctx)
 
@@ -229,10 +227,8 @@ def _register_neptune_dialects(ctx: ir.Context) -> None:
 def translate_file_with(
     path: str,
     translator_cls: Type,
-    plugin: str | None = None,
     pass_pipeline: str | None = None,
-    pass_plugin: str | None = None,
 ) -> ast.Module:
-    module = parse_mlir_module(path, plugin, pass_pipeline, pass_plugin)
+    module = parse_mlir_module(path, pass_pipeline)
     translator = translator_cls()
     return translator.translate(module)

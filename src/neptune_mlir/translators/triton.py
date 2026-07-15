@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """HTile MLIR -> Triton Python translator using MLIR Python bindings.
 
-Usage:
-    python -m neptune_mlir.translators.triton <input.mlir> [--plugin <plugin.dylib>]
-
-mlir-opt is called as a subprocess to convert HTile dialect ops to generic form.
+neptune-opt is called as a subprocess to convert HTile dialect ops to generic form.
 """
 
 import ast

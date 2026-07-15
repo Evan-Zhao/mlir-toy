@@ -9,7 +9,6 @@ from neptune_mlir.pipeline import (
     attention_to_triton_input_pass_pipeline,
     export_attention_to_triton_input_mlir,
 )
-from neptune_mlir.plugin import find_neptune_plugins
 from neptune_mlir.schedules import AttentionTileConfig
 
 
@@ -43,24 +42,24 @@ ATTN_VARIANTS = (
     AttentionVariant.WINDOWED_CAUSAL_ATTN,  # Using default window size (128)
 )
 GQA_HEADS = ((4, 2), (4, 1))  # (4, 1) would be MQA
-TRANSLATOR_INPUT_CASES = [
-    make_attn_pytest_param(variant, batch, heads, heads, seq_len, hdim)
-    for variant, batch, heads, seq_len, hdim in product(
-        ATTN_VARIANTS, BATCHES, ATTN_HEADS, SEQ_LENS, HEAD_DIMS
-    )
-] + [
-    make_attn_pytest_param(AttentionVariant.ALIBI_CAUSAL_ATTN, batch, heads, heads, seq_len, 64)
-    for batch, heads, seq_len in product(BATCHES, ATTN_HEADS, SEQ_LENS)
-] + [
-    make_attn_pytest_param(AttentionVariant.GLOBAL_GQA, batch, q_heads, kv_heads, seq_len, hd)
-    for batch, (q_heads, kv_heads), seq_len, hd in product(BATCHES, GQA_HEADS, SEQ_LENS, HEAD_DIMS)
-]
-
-
-def require_plugins():
-    plugins = find_neptune_plugins()
-    assert plugins is not None, "Neptune failed to find its plugins (dynamic libs)"
-    return plugins
+TRANSLATOR_INPUT_CASES = (
+    [
+        make_attn_pytest_param(variant, batch, heads, heads, seq_len, hdim)
+        for variant, batch, heads, seq_len, hdim in product(
+            ATTN_VARIANTS, BATCHES, ATTN_HEADS, SEQ_LENS, HEAD_DIMS
+        )
+    ]
+    + [
+        make_attn_pytest_param(AttentionVariant.ALIBI_CAUSAL_ATTN, batch, heads, heads, seq_len, 64)
+        for batch, heads, seq_len in product(BATCHES, ATTN_HEADS, SEQ_LENS)
+    ]
+    + [
+        make_attn_pytest_param(AttentionVariant.GLOBAL_GQA, batch, q_heads, kv_heads, seq_len, hd)
+        for batch, (q_heads, kv_heads), seq_len, hd in product(
+            BATCHES, GQA_HEADS, SEQ_LENS, HEAD_DIMS
+        )
+    ]
+)
 
 
 def require_export_deps():
@@ -84,10 +83,9 @@ def require_export_deps():
 )
 def test_export_attention_to_triton_input_mlir(variant, kwargs) -> None:
     require_export_deps()
-    plugins = require_plugins()
 
     lowered = export_attention_to_triton_input_mlir(
-        variant=variant, seq_len=128, head_dim=64, plugins=plugins, **kwargs
+        variant=variant, seq_len=128, head_dim=64, **kwargs
     )
 
     assert "func.func @attention" in lowered
@@ -101,7 +99,6 @@ def test_export_attention_to_triton_input_mlir(variant, kwargs) -> None:
 
 def test_custom_tile_config_reaches_lowered_loop_bounds() -> None:
     require_export_deps()
-    plugins = require_plugins()
 
     lowered = export_attention_to_triton_input_mlir(
         variant=AttentionVariant.GLOBAL_ATTN,
@@ -109,7 +106,6 @@ def test_custom_tile_config_reaches_lowered_loop_bounds() -> None:
         seq_len=128,
         head_dim=64,
         tile_config=AttentionTileConfig(block_m=64, block_n=32),
-        plugins=plugins,
     )
 
     assert "arith.constant 64 : index" in lowered

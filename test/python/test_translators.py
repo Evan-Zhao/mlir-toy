@@ -2,25 +2,20 @@
 import ast
 import importlib.util
 import math
-import shutil
 import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 
-from neptune_mlir.plugin import find_neptune_plugins
 from neptune_mlir.translators.common import translate_file_with
 from neptune_mlir.translators.cutile import translate_mlir_text as translate_cutile
 from neptune_mlir.translators.tilelang import translate_mlir_text as translate_tilelang
 from neptune_mlir.translators.triton import Translator as TritonTranslator
 from neptune_mlir.translators.triton import translate_mlir_text as translate_triton
+from neptune_mlir.dist import find_neptune_opt
 
 PARENT_DIR = Path(__file__).resolve().parent
-plugin = find_neptune_plugins()
-if plugin is None:
-    pytest.exit("MLIR plugin path not found")
-PLUGIN = plugin.htile_dialect
 GOLDEN_DIR = PARENT_DIR / "golden"
 HTILE_LOAD_ORDER_INPUT = PARENT_DIR / "data" / "flash_attention_htile_load_order.mlir"
 HTILE_INPUT = PARENT_DIR / "data" / "flash_attention_htile.mlir"
@@ -30,10 +25,8 @@ FLASH_REF_BLOCK_ROWS = 128
 
 
 def require_translator_deps():
-    if shutil.which("mlir-opt") is None:
-        pytest.skip("mlir-opt is required for translator tests")
-    if PLUGIN is None or not PLUGIN.exists():
-        pytest.skip(f"HTile dialect plugin is missing: {PLUGIN}")
+    if find_neptune_opt() is None:
+        pytest.skip("neptune-opt is required for translator tests")
 
 
 def require_cuda_torch():
@@ -255,4 +248,4 @@ def test_tilelang_translator_functional():
 def test_triton_rejects_unfissioned_dot_transpose():
     require_translator_deps()
     with pytest.raises(NotImplementedError, match="htile-dot-transpose-to-load-order"):
-        translate_file_with(str(HTILE_INPUT), TritonTranslator, str(PLUGIN))
+        translate_file_with(str(HTILE_INPUT), TritonTranslator)

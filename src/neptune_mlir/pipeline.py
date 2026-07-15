@@ -8,8 +8,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from .dist import find_neptune_opt
 from .operator.variants import AttentionVariant
-from .plugin import NeptunePlugins, find_neptune_plugins
 from .schedules import (
     AttentionSchedule,
     AttentionTileConfig,
@@ -34,27 +34,14 @@ _VARIANT_TO_SCHEDULE = {
 }
 
 
-def _require_plugins(plugins: NeptunePlugins | None = None) -> NeptunePlugins:
-    if plugins is not None:
-        return plugins
-    resolved = find_neptune_plugins()
-    if resolved is None:
+def _run_neptune_opt_file(input_path: Path, pass_pipeline: str) -> str:
+    executable = find_neptune_opt()
+    if executable is None:
         raise RuntimeError(
-            "failed to locate Neptune MLIR native plugins; set NEPTUNE_MLIR_NATIVE_DIR "
-            "to a directory containing LoopTransform, TADialect, and HTileDialect"
+            "failed to locate neptune-opt; set NEPTUNE_MLIR_OPT to the executable path"
         )
-    return resolved
-
-
-def _run_mlir_opt_file(
-    input_path: Path,
-    pass_pipeline: str,
-    plugins: NeptunePlugins,
-) -> str:
     cmd = [
-        "mlir-opt",
-        *plugins.dialect_plugin_args(),
-        *plugins.htile_pass_plugin_args(),
+        str(executable),
         str(input_path),
         f"--pass-pipeline={pass_pipeline}",
     ]
@@ -62,8 +49,8 @@ def _run_mlir_opt_file(
     if result.returncode != 0:
         stderr = result.stderr.strip()
         stdout = result.stdout.strip()
-        details = stderr or stdout or "mlir-opt failed without output"
-        raise RuntimeError(f"mlir-opt failed with exit code {result.returncode}: {details}")
+        details = stderr or stdout or "neptune-opt failed without output"
+        raise RuntimeError(f"neptune-opt failed with exit code {result.returncode}: {details}")
     return result.stdout
 
 
@@ -98,16 +85,11 @@ def _export_attention_linalg_subprocess(
     return result.stdout
 
 
-def run_neptune_mlir_opt(
-    input_mlir: str,
-    pass_pipeline: str,
-    plugins: NeptunePlugins | None = None,
-) -> str:
-    plugins = _require_plugins(plugins)
+def run_neptune_mlir_opt(input_mlir: str, pass_pipeline: str) -> str:
     with tempfile.TemporaryDirectory(prefix="neptune_mlir_") as tmp_dir:
         input_path = Path(tmp_dir) / "input.mlir"
         input_path.write_text(input_mlir)
-        return _run_mlir_opt_file(input_path, pass_pipeline, plugins)
+        return _run_neptune_opt_file(input_path, pass_pipeline)
 
 
 def attention_to_triton_input_pass_pipeline(schedule_path: Path) -> str:
@@ -123,9 +105,7 @@ def lower_attention_linalg_to_triton_input_mlir(
     input_mlir: str,
     schedule: AttentionSchedule | str,
     tile_config: AttentionTileConfig | None = None,
-    plugins: NeptunePlugins | None = None,
 ) -> str:
-    plugins = _require_plugins(plugins)
     schedule_mlir = materialize_attention_schedule(schedule, tile_config)
     with tempfile.TemporaryDirectory(prefix="neptune_mlir_") as tmp_dir:
         tmp_path = Path(tmp_dir)
@@ -134,7 +114,7 @@ def lower_attention_linalg_to_triton_input_mlir(
         input_path.write_text(input_mlir)
         schedule_path.write_text(schedule_mlir)
         pass_pipeline = attention_to_triton_input_pass_pipeline(schedule_path)
-        return _run_mlir_opt_file(input_path, pass_pipeline, plugins)
+        return _run_neptune_opt_file(input_path, pass_pipeline)
 
 
 def export_attention_to_triton_input_mlir(
@@ -148,7 +128,6 @@ def export_attention_to_triton_input_mlir(
     window_size: int = 128,
     func_name: str = "attention",
     tile_config: AttentionTileConfig | None = None,
-    plugins: NeptunePlugins | None = None,
 ) -> str:
     variant = _coerce_attention_variant(variant)
     schedule = _VARIANT_TO_SCHEDULE.get(variant.value)
@@ -164,20 +143,17 @@ def export_attention_to_triton_input_mlir(
         window_size=window_size,
         func_name=func_name,
     )
-    return lower_attention_linalg_to_triton_input_mlir(input_mlir, schedule, tile_config, plugins)
+    return lower_attention_linalg_to_triton_input_mlir(input_mlir, schedule, tile_config)
 
 
 def lower_attention_linalg_to_triton_ast(
     input_mlir: str,
     schedule: AttentionSchedule | str,
     tile_config: AttentionTileConfig | None = None,
-    plugins: NeptunePlugins | None = None,
 ) -> "ast.Module":
     from .translators.triton import translate_mlir_text
 
-    lowered = lower_attention_linalg_to_triton_input_mlir(
-        input_mlir, schedule, tile_config, plugins
-    )
+    lowered = lower_attention_linalg_to_triton_input_mlir(input_mlir, schedule, tile_config)
     return translate_mlir_text(lowered)
 
 
