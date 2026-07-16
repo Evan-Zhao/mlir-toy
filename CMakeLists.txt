@@ -29,7 +29,6 @@ unset(SKBUILD CACHE)
 
 # Find Python3 if not defined. When building from pip, scikit-build will set this variable.
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
-
 set(
   NEPTUNE_MLIR_PYTHON_EXECUTABLE "${Python3_EXECUTABLE}"
   CACHE FILEPATH "Python executable used by the Neptune rolling-solver worker"
@@ -42,6 +41,11 @@ endif()
 
 find_package(LLVM REQUIRED CONFIG)
 find_package(MLIR REQUIRED CONFIG)
+if(LLVM_LINK_LLVM_DYLIB OR MLIR_LINK_MLIR_DYLIB)
+  message(FATAL_ERROR
+    "Neptune requires an LLVM/MLIR installation configured for static linking "
+    "(LLVM_LINK_LLVM_DYLIB=OFF and MLIR_LINK_MLIR_DYLIB=OFF).")
+endif()
 
 if(NEPTUNE_MLIR_BUILD_PYTHON_EXTENSIONS)
   execute_process(

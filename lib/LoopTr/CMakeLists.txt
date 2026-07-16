@@ -27,4 +27,27 @@ setup_mlir_target(NeptuneLoopTransform)
 target_compile_definitions(NeptuneLoopTransform PRIVATE
   "NEPTUNE_MLIR_PYTHON_EXECUTABLE=\"${NEPTUNE_MLIR_PYTHON_EXECUTABLE}\""
 )
-target_link_libraries(NeptuneLoopTransform PUBLIC MLIR LLVM)
+target_link_libraries(NeptuneLoopTransform PUBLIC
+  NeptuneMLIRCore
+  MLIRAffineAnalysis
+  MLIRAffineDialect
+  MLIRArithDialect
+  MLIRArithUtils
+  MLIRAsmParser
+  MLIRControlFlowInterfaces
+  MLIRDestinationStyleOpInterface
+  MLIRLinalgDialect
+  MLIRLinalgTransforms
+  MLIRLinalgUtils
+  MLIRLoopLikeInterface
+  MLIRMathDialect
+  MLIRSCFDialect
+  MLIRSCFTransforms
+  MLIRSCFUtils
+  MLIRSideEffectInterfaces
+  MLIRTensorDialect
+  MLIRTensorTransforms
+  MLIRTilingInterface
+  MLIRTransformDialectInterfaces
+  MLIRTransformUtils
+)

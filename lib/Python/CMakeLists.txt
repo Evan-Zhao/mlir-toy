@@ -10,10 +10,11 @@ if(NEPTUNE_MLIR_BUILD_PYTHON_EXTENSIONS)
     "${PROJECT_BINARY_DIR}/lib/HTile"
     "${PROJECT_BINARY_DIR}/lib/LoopTr"
   )
+  # All Python extension modules must use the single MLIR runtime embedded in
+  # libMLIRPythonCAPI. Linking MLIR component archives here would create a
+  # second set of MLIR contexts, TypeIDs, and registries in the Python process.
   target_link_libraries(_neptuneMlir PRIVATE
     "${MLIR_PYTHON_LIB_DIR}/libMLIRPythonCAPI${CMAKE_SHARED_LIBRARY_SUFFIX}"
-    MLIR
-    LLVM
   )
   set_target_properties(_neptuneMlir PROPERTIES
     BUILD_RPATH "${MLIR_PYTHON_LIB_DIR}"

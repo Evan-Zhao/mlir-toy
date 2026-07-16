@@ -1,17 +1,15 @@
 add_executable(neptune-opt neptune-opt.cpp)
 setup_mlir_target(neptune-opt)
-target_link_libraries(neptune-opt PRIVATE NeptuneInitAll MLIR LLVM)
-set(_NEPTUNE_OPT_INSTALL_RPATH "${LLVM_LIBRARY_DIRS}")
-if(APPLE)
-  list(PREPEND _NEPTUNE_OPT_INSTALL_RPATH "@loader_path/../${CMAKE_INSTALL_LIBDIR}")
-elseif(UNIX)
-  list(PREPEND _NEPTUNE_OPT_INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
-endif()
+target_link_libraries(neptune-opt PRIVATE
+  NeptuneInitAll
+  MLIROptLib
+  MLIRRegisterAllDialects
+  MLIRRegisterAllExtensions
+  MLIRRegisterAllPasses
+)
 set_target_properties(neptune-opt PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}"
-  INSTALL_RPATH "${_NEPTUNE_OPT_INSTALL_RPATH}"
 )
-unset(_NEPTUNE_OPT_INSTALL_RPATH)
 
 if(_NEPTUNE_MLIR_UNDER_SKBUILD)
   if(NOT SKBUILD_SCRIPTS_DIR)

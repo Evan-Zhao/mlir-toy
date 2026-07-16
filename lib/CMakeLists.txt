@@ -1,3 +1,12 @@
+add_library(NeptuneMLIRCore INTERFACE)
+target_link_libraries(NeptuneMLIRCore INTERFACE
+  MLIRIR
+  MLIRPass
+  MLIRTransformDialect
+  MLIRTransforms
+  LLVMSupport
+)
+
 add_subdirectory(HTile)
 add_subdirectory(TA)
 add_subdirectory(LoopTr)
@@ -9,6 +18,4 @@ target_link_libraries(NeptuneInitAll PUBLIC
   NeptuneHTile
   NeptuneTA
   NeptuneLoopTransform
-  MLIR
-  LLVM
 )

@@ -42,41 +42,6 @@ add_mlir_pdll_library(TAExpToExp2PDLL
   ExpToExp2.cpp.inc
 )
 
-# Create a wrapper library that takes StablehloOps but make it link to MLIR dynamically.
-# There is no StableHLO cmake option that does this.
-# This code depends on which targets exist in StableHLO, but it's arguably better than patching
-# StableHLO cmake, and we have control over StableHLO version, so all is well.
-add_library(NeptuneStablehlo INTERFACE)
-add_dependencies(NeptuneStablehlo
-  StablehloBase
-  StablehloOps
-  StablehloTypeInference
-  StablehloAssemblyFormat
-  StablehloLinalgTransforms
-  # Transitive dependencies of StablehloLinalgTransforms:
-  StablehloTypeConversion
-  StablehloBroadcastLowering
-  StablehloBroadcastUtils
-  ChloOps                                                                                                                             
-)
-target_include_directories(NeptuneStablehlo INTERFACE
-  "$<TARGET_PROPERTY:StablehloOps,INTERFACE_INCLUDE_DIRECTORIES>"
-)
-target_link_libraries(NeptuneStablehlo INTERFACE
-  "$<TARGET_FILE:StablehloBase>"
-  "$<TARGET_FILE:StablehloOps>"
-  "$<TARGET_FILE:StablehloTypeInference>"
-  "$<TARGET_FILE:StablehloAssemblyFormat>"
-  "$<TARGET_FILE:StablehloLinalgTransforms>"
-  # Transitive dependencies of StablehloLinalgTransforms:
-  "$<TARGET_FILE:StablehloTypeConversion>"
-  "$<TARGET_FILE:StablehloBroadcastLowering>"
-  "$<TARGET_FILE:StablehloBroadcastUtils>"
-  "$<TARGET_FILE:ChloOps>"
-  MLIR
-  LLVM
-)
-
 add_library(NeptuneTA STATIC
   TADialect.cpp
   LinalgToTA.cpp
@@ -96,4 +61,15 @@ add_dependencies(NeptuneTA
   TAExpToExp2PDLL
 )
 setup_mlir_target(NeptuneTA)
-target_link_libraries(NeptuneTA PUBLIC NeptuneStablehlo MLIR LLVM)
+target_link_libraries(NeptuneTA PUBLIC
+  NeptuneMLIRCore
+  StablehloOps
+  StablehloLinalgTransforms
+  MLIRAffineDialect
+  MLIRArithDialect
+  MLIRFuncDialect
+  MLIRLinalgDialect
+  MLIRMathDialect
+  MLIRParser
+  MLIRTensorDialect
+)

@@ -40,4 +40,19 @@ add_dependencies(NeptuneHTile
   HTileTransformOpsIncGen
 )
 setup_mlir_target(NeptuneHTile)
-target_link_libraries(NeptuneHTile PUBLIC MLIR LLVM)
+target_link_libraries(NeptuneHTile PUBLIC
+  NeptuneMLIRCore
+  MLIRAffineUtils
+  MLIRArithDialect
+  MLIRArithUtils
+  MLIRBufferizationDialect
+  MLIRFuncDialect
+  MLIRLinalgDialect
+  MLIRLinalgTransforms
+  MLIRMemRefDialect
+  MLIRSCFDialect
+  MLIRTensorDialect
+  MLIRTensorTransforms
+  MLIRTransformDialectInterfaces
+  MLIRTransformUtils
+)
