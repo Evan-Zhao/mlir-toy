@@ -4,6 +4,7 @@
 #include "HTile/HTilePasses.h"
 #include "HTile/HTileTransformExtension.h"
 #include "LoopTr/LoopTransformExtension.h"
+#include "StableHLO/StableHLOTilingInterfaceImpl.h"
 #include "TA/TADialect.h"
 #include "TA/TAPasses.h"
 #include "TA/TATransformExtension.h"
@@ -16,6 +17,7 @@ void neptune::registerAllDialects(mlir::DialectRegistry &registry) {
 
 void neptune::registerAllExtensions(mlir::DialectRegistry &registry) {
   htile::registerHTileTransformExtension(registry);
+  neptune::registerStableHLOTilingInterfaceExternalModels(registry);
   ta::registerTATransformExtension(registry);
   loop::registerLoopTransformExtension(registry);
 }
