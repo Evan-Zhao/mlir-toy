@@ -18,4 +18,5 @@ target_link_libraries(NeptuneInitAll PUBLIC
   NeptuneHTile
   NeptuneTA
   NeptuneLoopTransform
+  StablehloLinalgTransforms
 )

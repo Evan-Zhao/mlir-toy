@@ -63,7 +63,6 @@ setup_mlir_target(NeptuneTA)
 target_link_libraries(NeptuneTA PUBLIC
   NeptuneMLIRCore
   StablehloOps
-  StablehloLinalgTransforms
   MLIRAffineDialect
   MLIRArithDialect
   MLIRFuncDialect

@@ -1,12 +1,8 @@
 #include "TA/TATransformOps.h"
 
 #include "TA/TAPasses.h"
-#include "mlir/Dialect/Transform/IR/TransformDialect.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Parser/Parser.h"
-#include "stablehlo/conversions/linalg/transforms/Rewriters.h"
-#include "stablehlo/conversions/linalg/transforms/TypeConversion.h"
-#include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/Twine.h"
@@ -277,26 +273,6 @@ DiagnosedSilenceableFailure TAToLinalgOp::apply(TransformRewriter &rewriter,
   }
 
   return DiagnosedSilenceableFailure::success();
-}
-
-void StablehloGatherToLinalgConversionPatternsOp::populatePatterns(TypeConverter &typeConverter,
-                                                                   RewritePatternSet &patterns) {
-  // StableHLO does not expose GatherConversion separately. Populate its public
-  // conversion set, then retain only patterns rooted at stablehlo.gather.
-  RewritePatternSet stablehloPatterns(patterns.getContext());
-  stablehlo::populateStablehloToLinalgConversionPatterns(
-      patterns.getContext(), typeConverter, &stablehloPatterns,
-      /*enablePrimitiveOps=*/false, /*enableSparseOps=*/false,
-      /*captureScalarInputs=*/true);
-  for (std::unique_ptr<RewritePattern> &pattern : stablehloPatterns.getNativePatterns()) {
-    std::optional<OperationName> root = pattern->getRootKind();
-    if (root && root->getStringRef() == stablehlo::GatherOp::getOperationName())
-      patterns.getNativePatterns().push_back(std::move(pattern));
-  }
-}
-
-std::unique_ptr<TypeConverter> StablehloGatherToLinalgConversionPatternsOp::getTypeConverter() {
-  return std::make_unique<stablehlo::LinalgTypeConverter>();
 }
 
 void TASinkDivAfterMatmulPatternsOp::populatePatterns(RewritePatternSet &patterns) {
