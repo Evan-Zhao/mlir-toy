@@ -9,6 +9,7 @@ mlir_tablegen(StableHLOTransformOps.cpp.inc -gen-op-defs)
 add_public_tablegen_target(StableHLOTransformOpsIncGen)
 
 add_library(NeptuneStableHLO STATIC
+  StableHLOTilingInterfaceImpl.cpp
   StableHLOTransformExtension.cpp
   StableHLOTransformOps.cpp
 )
@@ -19,5 +20,6 @@ target_link_libraries(NeptuneStableHLO PUBLIC
   StablehloLinalgTransforms
   StablehloOps
   MLIRTensorDialect
+  MLIRTilingInterface
   MLIRTransformDialectInterfaces
 )

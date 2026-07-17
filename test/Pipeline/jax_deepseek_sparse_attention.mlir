@@ -3,12 +3,6 @@
 // Sparse-attention schedule for the default output of:
 //
 //   python examples/jax_deepseek_sparse_attention.py
-//
-// The payload is copied verbatim below, apart from adding the
-// `transform.with_named_sequence` module attribute. The schedule forms an
-// online-softmax HTile kernel over the selected-token dimension. The two
-// StableHLO gathers deliberately remain visible to document the next missing
-// fusion: tile-local indirect K/V loads from the original caches.
 
 !any = !transform.any_op
 
@@ -34,8 +28,6 @@ module @jit_deepseek_sparse_attention attributes {mhlo.num_partitions = 1 : i32,
     %bmm0 = transform.collect_matching @match_sparse_qk in %func : (!any) -> !any
     transform.ta.to_linalg %func : !any
 
-    // TODO: Fuse selected_indices and the two StableHLO gathers into the loop
-    // as tile-local indirect loads instead of materializing selected K/V.
     %_1, %forall_loop = transform.structured.tile_using_forall
         %bmm0 tile_sizes [1, 1, 16, 64, 0] : (!any) -> (!any, !any)
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
@@ -68,6 +60,13 @@ module @jit_deepseek_sparse_attention attributes {mhlo.num_partitions = 1 : i32,
 
     %ret = transform.structured.match ops{["func.return"]} in %func : (!any) -> !any
     transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %ret : (!any, !any) -> !any
+
+    // Pull both gathers and their shared selected-index producer into the
+    // streaming selected-token loop. Each gather is retiled from
+    // [1, 128, 2048, D] to [1, 1, 64, D].
+    %consumer_loops = transform.merge_handles %forall_loop, %t_loop : !any
+    %fused_producers, %_5 = transform.fusion.greedy_input_producers_into_consumer %consumer_loops
+        : (!any) -> (!any, !any)
 
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.scf.localize_scratch_tensors %func : !any
@@ -123,23 +122,36 @@ module @jit_deepseek_sparse_attention attributes {mhlo.num_partitions = 1 : i32,
 // CHECK-SAME: %arg1: tensor<1x16384x576xbf16>
 // CHECK-SAME: %arg2: tensor<1x16384x512xbf16>
 // CHECK-SAME: %arg3: tensor<1x128x2048xi32>
-// CHECK-COUNT-2: "stablehlo.gather"
+// CHECK-NOT: "stablehlo.gather"
 // CHECK: htile.launch_func @deepseek_sparse_attention_kernel
 // CHECK-SAME: {program_bounds = array<i64: 128, 8>}
+// CHECK-SAME: memref<1x128x128x576xbf16>, memref<1x16384x576xbf16>, memref<1x16384x512xbf16>, memref<1x128x2048xi32>, memref<1x128x128x512xbf16>
 // CHECK-LABEL: htile.kernel @deepseek_sparse_attention_kernel
+// CHECK-SAME: %arg0 : memref<1x128x128x576xbf16>, %arg1 : memref<1x16384x576xbf16>, %arg2 : memref<1x16384x512xbf16>, %arg3 : memref<1x128x2048xi32>
 // CHECK: %[[Q:.*]] = htile.load %arg0
 // CHECK-SAME: -> tensor<16x576xbf16>
 // CHECK: %[[STATE:.*]]:5 = scf.for
-// CHECK: %[[K:.*]] = htile.load %arg1
-// CHECK-SAME: -> tensor<64x576xbf16>
+// CHECK: %[[INDICES:.*]] = htile.load %arg3
+// CHECK-SAME: -> tensor<1x1x64xi32>
+// CHECK: %[[INDEX_VECTORS:.*]] = htile.broadcast %[[INDICES]] dimensions = [3]
+// CHECK: %[[K_CACHE:.*]] = htile.load %arg1
+// CHECK-SAME: -> tensor<1x16384x576xbf16>
+// CHECK: %[[K_GATHER:.*]] = "stablehlo.gather"(%[[K_CACHE]], %[[INDEX_VECTORS]])
+// CHECK-SAME: slice_sizes = array<i64: 1, 1, 576>
+// CHECK-SAME: -> tensor<1x1x64x576xbf16>
+// CHECK: %[[K:.*]] = htile.squeeze %[[K_GATHER]]
 // CHECK: %[[QK:.*]] = htile.dot %[[Q]], %[[K]] {transpose_b}
 // CHECK-SAME: -> tensor<16x64xf32>
 // CHECK: htile.reduce %[[QK]] axis 1 kind "max"
 // CHECK: math.exp2
 // CHECK: htile.reduce {{.*}} axis 1 kind "sum"
 // CHECK: %[[P:.*]] = arith.truncf {{.*}} : tensor<16x64xf32> to tensor<16x64xbf16>
-// CHECK: %[[V:.*]] = htile.load %arg2
-// CHECK-SAME: -> tensor<64x512xbf16>
+// CHECK: %[[V_CACHE:.*]] = htile.load %arg2
+// CHECK-SAME: -> tensor<1x16384x512xbf16>
+// CHECK: %[[V_GATHER:.*]] = "stablehlo.gather"(%[[V_CACHE]], %[[INDEX_VECTORS]])
+// CHECK-SAME: slice_sizes = array<i64: 1, 1, 512>
+// CHECK-SAME: -> tensor<1x1x64x512xbf16>
+// CHECK: %[[V:.*]] = htile.squeeze %[[V_GATHER]]
 // CHECK: htile.dot %[[P]], %[[V]], {{.*}} : tensor<16x64xbf16>, tensor<64x512xbf16>, tensor<16x512xf32> -> tensor<16x512xf32>
 // CHECK: arith.divf %[[STATE]]#4, {{.*}} : tensor<16x512xf32>
 // CHECK: arith.truncf {{.*}} : tensor<16x512xf32> to tensor<16x512xbf16>
