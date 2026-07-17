@@ -4,16 +4,17 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/Pass/Pass.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/ADT/MapVector.h"
-#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/LogicalResult.h"
 
 #define DEBUG_TYPE "stablehlo-to-ta"
@@ -87,12 +88,12 @@ inferReshapeReassociation(stablehlo::ReshapeOp op) {
 // island may continue. Unsupported operations remain in the surrounding function as tensor
 // producers or consumers.
 static bool isSupportedStableHLOOp(Operation *op) {
-  return isa<arith::ConstantOp, stablehlo::ConstantOp, stablehlo::IotaOp,
-             stablehlo::DynamicIotaOp, stablehlo::ConvertOp, stablehlo::ExpOp, stablehlo::AddOp,
-             stablehlo::SubtractOp, stablehlo::MulOp, stablehlo::DivOp, stablehlo::MaxOp,
-             stablehlo::MinOp, stablehlo::AndOp, stablehlo::CompareOp,
-             stablehlo::SelectOp, stablehlo::TransposeOp, stablehlo::BroadcastInDimOp,
-             stablehlo::ReshapeOp, stablehlo::ReduceOp, stablehlo::DotGeneralOp>(op);
+  return isa<arith::ConstantOp, stablehlo::ConstantOp, stablehlo::IotaOp, stablehlo::DynamicIotaOp,
+             stablehlo::ConvertOp, stablehlo::ExpOp, stablehlo::AddOp, stablehlo::SubtractOp,
+             stablehlo::MulOp, stablehlo::DivOp, stablehlo::MaxOp, stablehlo::MinOp,
+             stablehlo::AndOp, stablehlo::CompareOp, stablehlo::SelectOp, stablehlo::TransposeOp,
+             stablehlo::BroadcastInDimOp, stablehlo::ReshapeOp, stablehlo::ReduceOp,
+             stablehlo::DotGeneralOp>(op);
 }
 
 /// Discover tensor-axis equality and structural presence before emitting TA.
@@ -323,8 +324,7 @@ private:
     return success();
   }
 
-  LogicalResult processReassociation(Operation *op,
-                                     ArrayRef<ReassociationIndices> reassociation,
+  LogicalResult processReassociation(Operation *op, ArrayRef<ReassociationIndices> reassociation,
                                      ArrayRef<AxisId> collapsedAxes,
                                      ArrayRef<AxisId> expandedAxes) {
     if (reassociation.size() != collapsedAxes.size())
@@ -750,13 +750,14 @@ public:
   void yield(Value value) { YieldOp::create(builder, loc, value); }
 
   // Materialize an expression in its natural TA axis order, then adapt that tensor back to the
-  // original StableHLO dimension order. broadcast_in_dim covers both permutation and dimensions
-  // omitted from expression support, so an island boundary does not constrain TA's internal order.
+  // original StableHLO dimension order. A linalg.transpose restores axis order and a
+  // linalg.broadcast restores dimensions omitted from expression support, so an island boundary
+  // does not constrain TA's internal order and remains visible to Linalg producer fusion.
   FailureOr<Value> materializeResult(Value output, const TensorAxes &targetAxes,
                                      RankedTensorType targetType) {
     auto exprType = cast<ExprType>(output.getType());
     SmallVector<int64_t> exprShape;
-    SmallVector<int64_t> broadcastDimensions;
+    SmallVector<int64_t> broadcastDims;
     DenseSet<int64_t> usedTargetDims;
     for (Attribute attr : exprType.getAxes().getAxes()) {
       StringRef name = cast<AxisAttr>(attr).getName().getValue();
@@ -774,7 +775,7 @@ public:
         }
       if (!targetDim || !usedTargetDims.insert(*targetDim).second)
         return emitError(output.getLoc(), "expression axis is absent from result tensor axes");
-      broadcastDimensions.push_back(*targetDim);
+      broadcastDims.push_back(*targetDim);
     }
 
     auto exprTensorType = RankedTensorType::get(exprShape, exprType.getElementType());
@@ -783,16 +784,48 @@ public:
     relabelAxesForOutput(output);
 
     bool identityLayout = exprTensorType == targetType;
-    for (auto [dim, targetDim] : llvm::enumerate(broadcastDimensions))
+    for (auto [dim, targetDim] : llvm::enumerate(broadcastDims))
       identityLayout &= targetDim == static_cast<int64_t>(dim);
     if (identityLayout)
       return scope.getResult();
 
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointAfter(scope);
-    return stablehlo::BroadcastInDimOp::create(builder, loc, targetType, scope.getResult(),
-                                               DenseI64ArrayAttr::get(context, broadcastDimensions))
-        .getResult();
+
+    // linalg.transpose uses output-dimension -> input-dimension permutations.
+    // Order source dimensions by the target dimensions to which they map.
+    SmallVector<int64_t> permutation(exprTensorType.getRank());
+    std::iota(permutation.begin(), permutation.end(), 0);
+    llvm::sort(permutation,
+               [&](int64_t lhs, int64_t rhs) { return broadcastDims[lhs] < broadcastDims[rhs]; });
+
+    Value adapted = scope.getResult();
+    bool needsTranspose = llvm::any_of(llvm::enumerate(permutation), [](auto entry) {
+      return static_cast<int64_t>(entry.index()) != entry.value();
+    });
+    if (needsTranspose) {
+      SmallVector<int64_t> transposedShape;
+      for (int64_t inputDim : permutation)
+        transposedShape.push_back(exprTensorType.getDimSize(inputDim));
+      Value init =
+          tensor::EmptyOp::create(builder, loc, transposedShape, exprTensorType.getElementType());
+      adapted =
+          linalg::TransposeOp::create(builder, loc, adapted, init, permutation).getResult()[0];
+    }
+
+    DenseSet<int64_t> mappedTargetDims(broadcastDims.begin(), broadcastDims.end());
+    SmallVector<int64_t> addedDimensions;
+    for (int64_t dim = 0; dim < targetType.getRank(); ++dim)
+      if (!mappedTargetDims.contains(dim))
+        addedDimensions.push_back(dim);
+
+    if (!addedDimensions.empty()) {
+      Value init =
+          tensor::EmptyOp::create(builder, loc, targetType.getShape(), targetType.getElementType());
+      adapted =
+          linalg::BroadcastOp::create(builder, loc, adapted, init, addedDimensions).getResult()[0];
+    }
+    return adapted;
   }
 
 private:
@@ -1223,9 +1256,9 @@ private:
   // Collapsing singleton dimensions is the inverse projection needed by existing StableHLO
   // payloads. A true product collapse would require delinearizing one TA axis into several source
   // axes and remains unsupported.
-  FailureOr<TensorAxes> projectCollapsedSourceAxes(
-      stablehlo::ReshapeOp op, ArrayRef<ReassociationIndices> reassociation,
-      const TensorAxes &resultAxes) {
+  FailureOr<TensorAxes> projectCollapsedSourceAxes(stablehlo::ReshapeOp op,
+                                                   ArrayRef<ReassociationIndices> reassociation,
+                                                   const TensorAxes &resultAxes) {
     auto inputType = cast<RankedTensorType>(op.getOperand().getType());
     TensorAxes projected(inputType.getRank(), std::nullopt);
     if (reassociation.empty())

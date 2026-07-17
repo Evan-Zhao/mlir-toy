@@ -10,7 +10,9 @@ def StableHLOToTAPass : Pass<"stablehlo-to-ta", "mlir::func::FuncOp"> {
     "mlir::affine::AffineDialect",
     "mlir::arith::ArithDialect",
     "mlir::func::FuncDialect",
-    "mlir::stablehlo::StablehloDialect"
+    "mlir::linalg::LinalgDialect",
+    "mlir::stablehlo::StablehloDialect",
+    "mlir::tensor::TensorDialect"
   ];
 }
 

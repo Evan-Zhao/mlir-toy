@@ -89,13 +89,13 @@ func.func @partition_around_unsupported_ops(%arg: tensor<5x3xf32>) -> tensor<8x3
 
 // CHECK-LABEL: func.func @partition_permuted_dot
 // CHECK: %[[DOT:.+]] = ta.scope axes(%i0 "i0" extent 2, %i1 "i1" extent 3, %i2 "i2" extent 4, %i3 "i3" extent 3, %j0 "j0" extent 5)
-// CHECK: %[[ADAPTED:.+]] = stablehlo.broadcast_in_dim %[[DOT]], dims = [0, 2, 1, 3] : (tensor<2x3x4x3xf32>) -> tensor<2x4x3x3xf32>
+// CHECK: %[[TRANSPOSE_INIT:.+]] = tensor.empty() : tensor<2x4x3x3xf32>
+// CHECK: %[[ADAPTED:.+]] = linalg.transpose ins(%[[DOT]] : tensor<2x3x4x3xf32>) outs(%[[TRANSPOSE_INIT]] : tensor<2x4x3x3xf32>) permutation = [0, 2, 1, 3]
 // CHECK: %[[SLICE:.+]] = stablehlo.slice %[[ADAPTED]]
-// CHECK: %[[EXP_SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 2, %i1 "i1" extent 3, %i2 "i2" extent 4, %i3 "i3" extent 3)
-// CHECK: ta.at %[[DOT]]{{.*}} {ta.import_group = 1 : i64}
-// CHECK: ta.exp {{.*}} {ta.import_group = 2 : i64}
-// CHECK: %[[EXP_ADAPTED:.+]] = stablehlo.broadcast_in_dim %[[EXP_SCOPE]], dims = [0, 2, 1, 3]
-// CHECK: stablehlo.concatenate %[[SLICE]], %[[EXP_ADAPTED]]
+// CHECK: %[[EXP_SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 2, %i1 "i1" extent 4, %i2 "i2" extent 3, %i3 "i3" extent 3)
+// CHECK: ta.at %[[ADAPTED]]{{.*}} {ta.import_group = 1 : i64}
+// CHECK: ta.exp {{.*}} {ta.import_group = 1 : i64}
+// CHECK: stablehlo.concatenate %[[SLICE]], %[[EXP_SCOPE]]
 func.func @partition_permuted_dot(%q: tensor<2x3x4x5xf16>,
                                   %k: tensor<2x3x4x5xf16>)
     -> tensor<2x4x6x3xf32> {
@@ -108,6 +108,26 @@ func.func @partition_permuted_dot(%q: tensor<2x3x4x5xf16>,
   %result = stablehlo.concatenate %slice, %exp, dim = 2
       : (tensor<2x4x3x3xf32>, tensor<2x4x3x3xf32>) -> tensor<2x4x6x3xf32>
   return %result : tensor<2x4x6x3xf32>
+}
+
+// CHECK-LABEL: func.func @permuted_and_broadcast_adapter
+// CHECK: %[[DOT:.+]] = ta.scope axes(%{{.*}})
+// CHECK: %[[TRANSPOSE_INIT:.+]] = tensor.empty() : tensor<2x4x3x3xf32>
+// CHECK: %[[TRANSPOSED:.+]] = linalg.transpose ins(%[[DOT]] : tensor<2x3x4x3xf32>) outs(%[[TRANSPOSE_INIT]] : tensor<2x4x3x3xf32>) permutation = [0, 2, 1, 3]
+// CHECK: %[[BROADCAST_INIT:.+]] = tensor.empty() : tensor<2x1x4x3x3xf32>
+// CHECK: %[[ADAPTED:.+]] = linalg.broadcast ins(%[[TRANSPOSED]] : tensor<2x4x3x3xf32>) outs(%[[BROADCAST_INIT]] : tensor<2x1x4x3x3xf32>) dimensions = [1]
+// CHECK: stablehlo.slice %[[ADAPTED]]
+func.func @permuted_and_broadcast_adapter(%q: tensor<2x3x4x5xf16>,
+                                           %k: tensor<2x3x4x5xf16>)
+    -> tensor<2x1x4x3x3xf32> {
+  %dot = stablehlo.dot_general %q, %k,
+      batching_dims = [0, 2] x [0, 2], contracting_dims = [3] x [3]
+      : (tensor<2x3x4x5xf16>, tensor<2x3x4x5xf16>) -> tensor<2x4x3x3xf32>
+  %broadcast = stablehlo.broadcast_in_dim %dot, dims = [0, 2, 3, 4]
+      : (tensor<2x4x3x3xf32>) -> tensor<2x1x4x3x3xf32>
+  %slice = stablehlo.slice %broadcast [0:2, 0:1, 0:4, 0:3, 0:3]
+      : (tensor<2x1x4x3x3xf32>) -> tensor<2x1x4x3x3xf32>
+  return %slice : tensor<2x1x4x3x3xf32>
 }
 
 // CHECK-LABEL: func.func @select
@@ -158,7 +178,8 @@ func.func @compare(%flhs: tensor<2x3xf32>, %frhs: tensor<2x3xf32>,
 // CHECK: %[[SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 3) {
 // CHECK: %[[INDEX:.+]] = ta.index %i0{{.*}}!ta.expr<i32, [i0]>
 // CHECK: ta.yield %[[INDEX]]
-// CHECK: stablehlo.broadcast_in_dim %[[SCOPE]], dims = [1] : (tensor<3xi32>) -> tensor<2x3xi32>
+// CHECK: %[[BROADCAST_INIT:.+]] = tensor.empty() : tensor<2x3xi32>
+// CHECK: linalg.broadcast ins(%[[SCOPE]] : tensor<3xi32>) outs(%[[BROADCAST_INIT]] : tensor<2x3xi32>) dimensions = [0]
 func.func @integer_iota() -> tensor<2x3xi32> {
   %result = stablehlo.iota dim = 1 : tensor<2x3xi32>
   return %result : tensor<2x3xi32>
