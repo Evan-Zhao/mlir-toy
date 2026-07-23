@@ -144,23 +144,22 @@ FailureOr<scf::SCFFuseConsumerOfSliceResult>
 tileAndFuseConsumerWithDebug(RewriterBase &rewriter, Operation &consumer,
                              MutableArrayRef<LoopLikeOpInterface> loops);
 
-/// Listener that follows one operation across rewrite notifications.
+/// Listener that follows operations across rewrite notifications.
 ///
-/// The listener forwards all events to `previous` and updates the tracked
-/// operation when it sees the current operation replaced. If the current
-/// operation is erased or no unique same-kind replacement can be inferred,
-/// `getOperation()` returns nullptr.
-struct TrackedOperationListener : public RewriterBase::ForwardingListener {
-  TrackedOperationListener(Operation *trackedOp, OpBuilder::Listener *previous);
-
-  Operation *getOperation() const { return trackedOp; }
+/// The listener forwards all events to `previous` and updates `trackedOps`
+/// when a tracked operation is replaced. Erased operations, and operations for
+/// which no unique same-kind replacement can be inferred, are removed from the
+/// vector.
+struct TrackedOperationsListener : public RewriterBase::ForwardingListener {
+  TrackedOperationsListener(SmallVectorImpl<Operation *> &trackedOps,
+                            OpBuilder::Listener *previous);
 
   void notifyOperationReplaced(Operation *op, Operation *newOp) override;
   void notifyOperationReplaced(Operation *op, ValueRange replacement) override;
   void notifyOperationErased(Operation *op) override;
 
 private:
-  Operation *trackedOp;
+  SmallVectorImpl<Operation *> &trackedOps;
 };
 
 struct ElementwiseInlineResult {

@@ -185,31 +185,28 @@ Operation *getCommonDefiningOp(ValueRange values) {
 
 } // namespace
 
-TrackedOperationListener::TrackedOperationListener(Operation *trackedOp,
-                                                   OpBuilder::Listener *previous)
-    : RewriterBase::ForwardingListener(previous), trackedOp(trackedOp) {}
+TrackedOperationsListener::TrackedOperationsListener(
+    SmallVectorImpl<Operation *> &trackedOps, OpBuilder::Listener *previous)
+    : RewriterBase::ForwardingListener(previous), trackedOps(trackedOps) {}
 
-void TrackedOperationListener::notifyOperationReplaced(Operation *op, Operation *newOp) {
+void TrackedOperationsListener::notifyOperationReplaced(Operation *op, Operation *newOp) {
   RewriterBase::ForwardingListener::notifyOperationReplaced(op, newOp);
-  if (op == trackedOp)
-    trackedOp = newOp;
+  llvm::replace(trackedOps, op, newOp);
 }
 
-void TrackedOperationListener::notifyOperationReplaced(Operation *op, ValueRange replacement) {
+void TrackedOperationsListener::notifyOperationReplaced(Operation *op, ValueRange replacement) {
   RewriterBase::ForwardingListener::notifyOperationReplaced(op, replacement);
-  if (op == trackedOp) {
-    auto newOp = getCommonDefiningOp(replacement);
-    if (!newOp || newOp->getName() != op->getName())
-      trackedOp = nullptr;
-    else
-      trackedOp = newOp;
+  Operation *newOp = getCommonDefiningOp(replacement);
+  if (!newOp || newOp->getName() != op->getName()) {
+    llvm::erase(trackedOps, op);
+    return;
   }
+  llvm::replace(trackedOps, op, newOp);
 }
 
-void TrackedOperationListener::notifyOperationErased(Operation *op) {
+void TrackedOperationsListener::notifyOperationErased(Operation *op) {
   RewriterBase::ForwardingListener::notifyOperationErased(op);
-  if (op == trackedOp)
-    trackedOp = nullptr;
+  llvm::erase(trackedOps, op);
 }
 
 FailureOr<BinaryReductionCombinerMatch> matchBinaryReductionCombiner(linalg::GenericOp generic,

@@ -6,6 +6,7 @@
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/ScopeExit.h"
 
 namespace mlir::transform {
 
@@ -60,14 +61,17 @@ void FusionGreedyConsumersIntoProducerOp::getEffects(
 static FailureOr<scf::ForallOp> canonicalizeForLoop(RewriterBase &rewriter, scf::ForallOp loop) {
   RewritePatternSet patterns(rewriter.getContext());
   scf::ForallOp::getCanonicalizationPatterns(patterns, rewriter.getContext());
-  TrackedOperationListener listener(loop, rewriter.getListener());
+  SmallVector<Operation *> trackedLoops{loop};
+  TrackedOperationsListener listener(trackedLoops, rewriter.getListener());
   GreedyRewriteConfig config;
   config.setListener(&listener);
   config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
   if (failed(applyOpPatternsGreedily({loop}, FrozenRewritePatternSet(std::move(patterns)), config)))
     return failure();
 
-  auto rewrittenLoop = dyn_cast_if_present<scf::ForallOp>(listener.getOperation());
+  if (!llvm::hasSingleElement(trackedLoops))
+    return failure();
+  auto rewrittenLoop = dyn_cast<scf::ForallOp>(trackedLoops.front());
   if (!rewrittenLoop)
     return failure();
   return rewrittenLoop;
@@ -92,6 +96,11 @@ FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewrite
   const bool inlineElemwise = getInlineElementwise();
 
   SmallVector<Operation *> fusedOps;
+  OpBuilder::Listener *previousListener = rewriter.getListener();
+  TrackedOperationsListener fusedOpsListener(fusedOps, previousListener);
+  rewriter.setListener(&fusedOpsListener);
+  auto restoreListener = llvm::scope_exit([&]() { rewriter.setListener(previousListener); });
+
   while (true) {
     // Run CSE on the loop body because fusion may fail without it (fusion compares indices by
     // operation equality of affine ops, so we want to make sure that we don't have duplicate affine
