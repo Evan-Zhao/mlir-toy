@@ -2,17 +2,17 @@
 """Export attention-like PyTorch modules to linalg-on-tensors MLIR.
 
 Usage:
-  python export_attention_linalg.py --variant global-attn > attention.mlir
-  python export_attention_linalg.py --variant global-gqa > attention_gqa.mlir
-  python export_attention_linalg.py --variant alibi-causal-attn > attention_alibi.mlir
-  python export_attention_linalg.py --variant windowed-causal-attn > attention_sw.mlir
-  python export_attention_linalg.py --variant kv-only-quantized > attention_kv_quant.mlir
-  python export_attention_linalg.py --variant sparse-mm > sparse_probe.mlir
+  python export_attention.py --variant global-attn > attention.mlir
+  python export_attention.py --variant global-gqa > attention_gqa.mlir
+  python export_attention.py --variant alibi-causal-attn > attention_alibi.mlir
+  python export_attention.py --variant windowed-causal-attn > attention_sw.mlir
+  python export_attention.py --variant kv-only-quantized > attention_kv_quant.mlir
+  python export_attention.py --variant sparse-mm > sparse_probe.mlir
 """
 
 import argparse
 import math
-from typing import Callable
+from collections.abc import Callable
 
 import torch
 from torch_mlir import fx
@@ -250,7 +250,7 @@ def arange_default_iota_then_cast(
     return index
 
 
-def export_attention_linalg(
+def export_attention(
     *,
     variant: AttentionVariant,
     batch: int = 1,
@@ -275,7 +275,7 @@ def export_attention_linalg(
     exported_program = torch.export.export(model, example_args)
     module = fx.export_and_import(
         exported_program,
-        output_type="linalg-on-tensors",
+        output_type="stablehlo",
         func_name=func_name,
         import_symbolic_shape_expressions=True,
         decomposition_table=decomposition_table,
@@ -286,7 +286,7 @@ def export_attention_linalg(
 def main():
     args = parse_args()
     print(
-        export_attention_linalg(
+        export_attention(
             variant=args.variant,
             batch=args.batch,
             q_heads=args.q_heads,

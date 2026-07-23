@@ -54,7 +54,7 @@ def _run_neptune_opt_file(input_path: Path, pass_pipeline: str) -> str:
     return result.stdout
 
 
-def _export_attention_linalg_subprocess(
+def _export_attention_subprocess(
     *,
     variant: AttentionVariant,
     batch: int,
@@ -67,7 +67,7 @@ def _export_attention_linalg_subprocess(
 ) -> str:
     # Torch-MLIR and the standalone MLIR Python bindings ship separate native
     # runtimes that cannot be loaded into one Python process in arbitrary order.
-    cmd = [sys.executable, "-m", "neptune_mlir.operator.export_attention_linalg"]
+    cmd = [sys.executable, "-m", "neptune_mlir.operator.export_attention"]
     cmd += ["--variant", variant.value, "--batch", str(batch), "--q-heads", str(q_heads)]
     cmd += ["--seq-len", str(seq_len), "--head-dim", str(head_dim), "--func-name", func_name]
     if kv_heads is not None:
@@ -133,7 +133,7 @@ def export_attention_to_triton_input_mlir(
     schedule = _VARIANT_TO_SCHEDULE.get(variant.value)
     if schedule is None:
         raise ValueError(f"unsupported attention pipeline variant: {variant}")
-    input_mlir = _export_attention_linalg_subprocess(
+    input_mlir = _export_attention_subprocess(
         variant=variant,
         batch=batch,
         q_heads=q_heads,
@@ -150,7 +150,7 @@ def lower_attention_linalg_to_triton_ast(
     input_mlir: str,
     schedule: AttentionSchedule | str,
     tile_config: AttentionTileConfig | None = None,
-) -> "ast.Module":
+) -> ast.Module:
     from .translators.triton import translate_mlir_text
 
     lowered = lower_attention_linalg_to_triton_input_mlir(input_mlir, schedule, tile_config)
