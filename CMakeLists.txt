@@ -61,6 +61,63 @@ if(NEPTUNE_MLIR_BUILD_PYTHON_EXTENSIONS)
       "Failed to locate MLIR Python runtime using Python interpreter "
       "'${Python3_EXECUTABLE}': ${_NEPTUNE_MLIR_PYTHON_LIB_QUERY_ERROR}")
   endif()
+
+  # MLIR's fallback TypeIDs use C++ type names. Those names are not ABI-stable
+  # across compiler families, so an out-of-tree dialect extension must use a
+  # toolchain compatible with the one that built libMLIRPythonCAPI. Probe the
+  # actual runtime instead of relying on compiler-name heuristics.
+  set(_NEPTUNE_MLIR_TYPEID_CHECK_SOURCE
+      "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/NeptuneMLIRTypeIDCheck.cpp")
+  file(WRITE "${_NEPTUNE_MLIR_TYPEID_CHECK_SOURCE}" [=[
+#include "mlir-c/IR.h"
+#include "mlir/CAPI/IR.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/OperationSupport.h"
+
+int main() {
+  MlirContext context = mlirContextCreate();
+  mlir::MLIRContext *cppContext = unwrap(context);
+  auto moduleInfo = mlir::RegisteredOperationName::lookup(
+      mlir::ModuleOp::getOperationName(), cppContext);
+  bool compatible =
+      moduleInfo &&
+      moduleInfo->hasTrait<mlir::OpTrait::IsIsolatedFromAbove>() &&
+      moduleInfo->hasTrait<mlir::OpTrait::SymbolTable>() &&
+      moduleInfo->getInterface<mlir::SymbolOpInterface>();
+  mlirContextDestroy(context);
+  return compatible ? 0 : 1;
+}
+]=])
+  set(_NEPTUNE_MLIR_TYPEID_CHECK_INCLUDE_FLAGS)
+  foreach(_include_dir IN LISTS LLVM_INCLUDE_DIRS MLIR_INCLUDE_DIRS)
+    list(APPEND _NEPTUNE_MLIR_TYPEID_CHECK_INCLUDE_FLAGS "-I${_include_dir}")
+  endforeach()
+  try_run(
+    _NEPTUNE_MLIR_TYPEID_CHECK_RUN_RESULT
+    _NEPTUNE_MLIR_TYPEID_CHECK_COMPILE_RESULT
+    "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/NeptuneMLIRTypeIDCheck"
+    "${_NEPTUNE_MLIR_TYPEID_CHECK_SOURCE}"
+    CMAKE_FLAGS
+      "-DCMAKE_CXX_STANDARD:STRING=${CMAKE_CXX_STANDARD}"
+      "-DCMAKE_CXX_STANDARD_REQUIRED:BOOL=ON"
+    COMPILE_DEFINITIONS ${_NEPTUNE_MLIR_TYPEID_CHECK_INCLUDE_FLAGS}
+    LINK_LIBRARIES
+      "${MLIR_PYTHON_LIB_DIR}/libMLIRPythonCAPI${CMAKE_SHARED_LIBRARY_SUFFIX}"
+    COMPILE_OUTPUT_VARIABLE _NEPTUNE_MLIR_TYPEID_CHECK_COMPILE_OUTPUT
+    RUN_OUTPUT_VARIABLE _NEPTUNE_MLIR_TYPEID_CHECK_RUN_OUTPUT
+  )
+  if(NOT _NEPTUNE_MLIR_TYPEID_CHECK_COMPILE_RESULT)
+    message(FATAL_ERROR
+      "Failed to compile the MLIR TypeID compatibility probe:\n"
+      "${_NEPTUNE_MLIR_TYPEID_CHECK_COMPILE_OUTPUT}")
+  endif()
+  if(NOT _NEPTUNE_MLIR_TYPEID_CHECK_RUN_RESULT EQUAL 0)
+    message(FATAL_ERROR
+      "MLIR TypeID ABI mismatch between compiler '${CMAKE_CXX_COMPILER_ID} "
+      "${CMAKE_CXX_COMPILER_VERSION}' and the MLIR Python runtime in "
+      "'${MLIR_PYTHON_LIB_DIR}'. This is likely to cause trouble at runtime."
+      "Build Neptune with the same C++ toolchain as the one used for MLIR (likely `clang`).")
+  endif()
 endif()
 
 message(STATUS "Using Python3: ${Python3_EXECUTABLE}")

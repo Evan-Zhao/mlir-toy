@@ -62,6 +62,18 @@ TRANSLATOR_INPUT_CASES = (
 )
 
 
+def test_native_htile_dialect_typeids_match_mlir_runtime() -> None:
+    from neptune_mlir.dist import register_dialects
+    from neptune_mlir.mlir_bindings import ir
+
+    context = ir.Context()
+    register_dialects(context)
+    with context:
+        module = ir.Module.parse("module { htile.kernel @kernel() { htile.return } }")
+
+    assert str(module).count("htile.return") == 1
+
+
 def require_export_deps():
     import importlib.util
 

@@ -1,7 +1,10 @@
 #include "HTile/HTileDialect.h"
 
 #include "mlir-c/IR.h"
+#include "mlir/CAPI/IR.h"
 #include "mlir/CAPI/Registration.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/OperationSupport.h"
 #include <Python.h>
 
 #ifndef _PyCFunction_CAST
@@ -11,6 +14,16 @@
 MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(HTile, htile, htile::HTileDialect)
 
 namespace {
+
+bool hasCompatibleTypeIDs(MlirContext context) {
+  mlir::MLIRContext *cppContext = unwrap(context);
+  auto moduleInfo = mlir::RegisteredOperationName::lookup(
+      mlir::ModuleOp::getOperationName(), cppContext);
+  return moduleInfo &&
+         moduleInfo->hasTrait<mlir::OpTrait::IsIsolatedFromAbove>() &&
+         moduleInfo->hasTrait<mlir::OpTrait::SymbolTable>() &&
+         moduleInfo->getInterface<mlir::SymbolOpInterface>();
+}
 
 MlirContext contextFromPython(PyObject *context) {
   PyObject *capsule = PyObject_GetAttrString(context, "_CAPIPtr");
@@ -36,6 +49,14 @@ PyObject *registerHTileDialect(PyObject *, PyObject *args, PyObject *kwargs) {
   MlirContext mlirContext = contextFromPython(context);
   if (!mlirContext.ptr)
     return nullptr;
+
+  if (!hasCompatibleTypeIDs(mlirContext)) {
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "MLIR TypeID ABI mismatch: the Neptune native extension and the MLIR "
+        "Python runtime were built with incompatible C++ toolchains");
+    return nullptr;
+  }
 
   MlirDialectHandle handle = mlirGetDialectHandle__htile__();
   mlirDialectHandleRegisterDialect(handle, mlirContext);
