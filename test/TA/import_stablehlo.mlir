@@ -174,6 +174,18 @@ func.func @float_iota() -> tensor<4xf32> {
   return %result : tensor<4xf32>
 }
 
+// CHECK-LABEL: func.func @product_reshape
+// CHECK: %[[SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 1, %i1 "i1" extent 2, %i2 "i2" extent 2, %i3 "i3" extent 3)
+// CHECK: %[[HEAD:.+]] = affine.linearize_index disjoint [%i1, %i2] by (2, 2) : index
+// CHECK: %[[VALUE:.+]] = ta.at %arg0[%i0, %[[HEAD]], %i3]
+// CHECK: ta.yield %[[VALUE]]
+// CHECK: return %[[SCOPE]] : tensor<1x2x2x3xf32>
+func.func @product_reshape(%arg: tensor<1x4x3xf32>) -> tensor<1x2x2x3xf32> {
+  %result = stablehlo.reshape %arg
+      : (tensor<1x4x3xf32>) -> tensor<1x2x2x3xf32>
+  return %result : tensor<1x2x2x3xf32>
+}
+
 // Exported arange dataflow uses dynamic_iota even when its result type is static. The same
 // one-dimensional iota may then be reshaped independently into row and column coordinates.
 // CHECK-LABEL: func.func @dynamic_iota_and

@@ -18,6 +18,7 @@ def StableHLOToTAPass : Pass<"stablehlo-to-ta", "mlir::func::FuncOp"> {
   let summary = "Import supported StableHLO tensor dataflow into the ta dialect";
   let dependentDialects = [
     "ta::TADialect",
+    "mlir::affine::AffineDialect",
     "mlir::arith::ArithDialect",
     "mlir::func::FuncDialect",
     "mlir::stablehlo::StablehloDialect"

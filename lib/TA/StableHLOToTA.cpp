@@ -1,8 +1,10 @@
 #include "TA/TAOps.h"
 #include "TA/TAPasses.h"
 
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
@@ -49,6 +51,35 @@ using TensorAxes = SmallVector<std::optional<Axis>>;
 struct DiscoveredAxisInfo {
   DenseMap<Value, TensorAxes> valueAxes;
 };
+
+// StableHLO reshape carries source and result shapes but no tensor-dialect reassociation. Infer the
+// reassociation accepted by tensor.expand_shape/tensor.collapse_shape when possible. Equal-rank
+// reshapes are supported only when they are identity reshapes; rank-zero reshapes are the
+// singleton-only case which has no reassociation groups.
+static FailureOr<SmallVector<ReassociationIndices>>
+inferReshapeReassociation(stablehlo::ReshapeOp op) {
+  auto sourceType = cast<RankedTensorType>(op.getOperand().getType());
+  auto resultType = cast<RankedTensorType>(op.getResult().getType());
+  if (sourceType.getRank() == resultType.getRank()) {
+    if (sourceType.getShape() != resultType.getShape()) {
+      op.emitOpError("equal-rank non-identity reshapes are not reassociative");
+      return failure();
+    }
+    SmallVector<ReassociationIndices> identity;
+    for (int64_t dim = 0; dim < sourceType.getRank(); ++dim)
+      identity.push_back({dim});
+    return identity;
+  }
+  if (sourceType.getRank() == 0 || resultType.getRank() == 0)
+    return SmallVector<ReassociationIndices>{};
+  std::optional<SmallVector<ReassociationIndices>> reassociation =
+      getReassociationIndicesForReshape(sourceType, resultType);
+  if (!reassociation) {
+    op.emitOpError("reshape is not representable as a reassociative reshape");
+    return failure();
+  }
+  return std::move(*reassociation);
+}
 
 // Keep this predicate in one place so root selection and per-scope emission agree on where a TA
 // island may continue. Unsupported operations remain in the surrounding function as tensor
@@ -153,6 +184,42 @@ private:
     return parent[id];
   }
 
+  bool axesCompatible(AxisId lhs, AxisId rhs) const {
+    int64_t lhsExtent = axes[lhs].extent;
+    int64_t rhsExtent = axes[rhs].extent;
+    return lhsExtent == ShapedType::kDynamic || rhsExtent == ShapedType::kDynamic ||
+           lhsExtent == rhsExtent;
+  }
+
+  // Keep the relationship between a collapsed product axis and its expanded factor axes. This is
+  // intentionally parallel to LinalgToTA's reshape discovery: if another reshape exposes the same
+  // product with a compatible factorization, corresponding factors become the same logical axes.
+  LogicalResult mergeProductFactors(Operation *op, AxisId product,
+                                    ArrayRef<AxisId> incomingFactors_) {
+    product = find(product);
+    SmallVector<AxisId> incomingFactors =
+        llvm::map_to_vector(incomingFactors_, [&](AxisId factor) { return find(factor); });
+
+    auto it = productAxes.find(product);
+    if (it == productAxes.end()) {
+      productAxes[product] = std::move(incomingFactors);
+      return success();
+    }
+
+    SmallVector<AxisId> existingFactors = it->second;
+    for (AxisId &axis : existingFactors)
+      axis = find(axis);
+    if (existingFactors.size() != incomingFactors.size())
+      return success();
+    for (auto [lhs, rhs] : llvm::zip_equal(existingFactors, incomingFactors))
+      if (!axesCompatible(lhs, rhs))
+        return success();
+    for (auto [lhs, rhs] : llvm::zip_equal(existingFactors, incomingFactors))
+      if (failed(unite(op, lhs, rhs)))
+        return failure();
+    return success();
+  }
+
   // Axis equality also implies extent equality. StableHLO verification normally guarantees this,
   // but checking it here prevents malformed or partially transformed IR from producing invalid TA.
   LogicalResult unite(Operation *op, AxisId lhs, AxisId rhs) {
@@ -160,9 +227,43 @@ private:
     rhs = find(rhs);
     if (lhs == rhs)
       return success();
-    if (axes[lhs].extent != axes[rhs].extent)
+    if (!axesCompatible(lhs, rhs))
       return op->emitOpError("axis discovery found conflicting extents");
     parent[rhs] = lhs;
+
+    if (auto it = productAxes.find(rhs); it != productAxes.end()) {
+      SmallVector<AxisId> rhsFactors = std::move(it->second);
+      productAxes.erase(it);
+      return mergeProductFactors(op, lhs, rhsFactors);
+    }
+    return success();
+  }
+
+  LogicalResult processReassociation(Operation *op,
+                                     ArrayRef<ReassociationIndices> reassociation,
+                                     ArrayRef<AxisId> collapsedAxes,
+                                     ArrayRef<AxisId> expandedAxes) {
+    if (reassociation.size() != collapsedAxes.size())
+      return failure();
+    for (auto [collapsedDim, expandedDims] : llvm::enumerate(reassociation)) {
+      if (expandedDims.size() == 1) {
+        int64_t expandedDim = expandedDims.front();
+        if (expandedDim < 0 || expandedDim >= static_cast<int64_t>(expandedAxes.size()) ||
+            failed(unite(op, collapsedAxes[collapsedDim], expandedAxes[expandedDim])))
+          return failure();
+        continue;
+      }
+
+      SmallVector<AxisId> factors;
+      factors.reserve(expandedDims.size());
+      for (int64_t expandedDim : expandedDims) {
+        if (expandedDim < 0 || expandedDim >= static_cast<int64_t>(expandedAxes.size()))
+          return failure();
+        factors.push_back(find(expandedAxes[expandedDim]));
+      }
+      if (failed(mergeProductFactors(op, collapsedAxes[collapsedDim], factors)))
+        return failure();
+    }
     return success();
   }
 
@@ -243,33 +344,20 @@ private:
     return success();
   }
 
-  // Initially support only insertion, removal, or movement of singleton dimensions. Removing all
-  // unit dimensions leaves a shape signature which must match exactly on both sides. This avoids
-  // pretending that a product reshape has a simple one-axis-to-one-axis interpretation.
-  //
-  // Do not unify input and result axes here. The same value may be reshaped into row and column
-  // views, as happens in exporter-generated sliding-window masks. Those uses need independent
-  // result axes; emitReshape relabels the source expression separately for each use.
   LogicalResult discoverReshape(stablehlo::ReshapeOp op) {
     auto input = getOrCreateValueAxes(op.getOperand());
     auto result = getOrCreateValueAxes(op.getResult());
     if (failed(input) || failed(result))
       return op.emitOpError("axis discovery requires static ranked tensors");
+    auto reassociation = inferReshapeReassociation(op);
+    if (failed(reassociation))
+      return failure();
+
     auto inputType = cast<RankedTensorType>(op.getOperand().getType());
     auto resultType = cast<RankedTensorType>(op.getResult().getType());
-    SmallVector<int64_t> inputNonUnit, resultNonUnit;
-    for (int64_t i = 0; i < inputType.getRank(); ++i)
-      if (inputType.getDimSize(i) != 1)
-        inputNonUnit.push_back(i);
-    for (int64_t i = 0; i < resultType.getRank(); ++i)
-      if (resultType.getDimSize(i) != 1)
-        resultNonUnit.push_back(i);
-    if (inputNonUnit.size() != resultNonUnit.size())
-      return op.emitOpError("only singleton-dimension reshapes are supported");
-    for (auto [inputDim, resultDim] : llvm::zip_equal(inputNonUnit, resultNonUnit))
-      if (inputType.getDimSize(inputDim) != resultType.getDimSize(resultDim))
-        return op.emitOpError("only singleton-dimension reshapes are supported");
-    return success();
+    if (inputType.getRank() <= resultType.getRank())
+      return processReassociation(op, *reassociation, *input, *result);
+    return processReassociation(op, *reassociation, *result, *input);
   }
 
   // StableHLO reduction results list the unreduced input dimensions in input order. Walk the input
@@ -364,6 +452,7 @@ private:
   }
 
   DenseMap<Value, AxisIds> valueAxisIds;
+  DenseMap<AxisId, SmallVector<AxisId>> productAxes;
   SmallVector<AxisId> parent;
   SmallVector<Axis> axes;
   unsigned nextAxisName = 0;
@@ -453,6 +542,50 @@ public:
         indices.push_back(indexZero());
       }
     }
+    return annotate(
+        AtOp::create(builder, loc, getExprType(elementType, resultAxes), source, indices));
+  }
+
+  // Observe the lower-rank source of a reassociative expansion. Each expanded group is linearized
+  // into the corresponding source coordinate, exactly as in LinalgToTA's atExpandedSource.
+  FailureOr<Value> atExpandedSource(Value source, ArrayRef<ReassociationIndices> reassociation,
+                                    const TensorAxes &resultDimAxes, Type elementType) {
+    int64_t sourceRank = cast<RankedTensorType>(source.getType()).getRank();
+    if (static_cast<int64_t>(reassociation.size()) != sourceRank)
+      return emitError(source.getLoc(), "reshape reassociation does not match source rank");
+
+    SmallVector<Value> indices;
+    indices.reserve(reassociation.size());
+    AxisNames resultAxes;
+    resultAxes.reserve(resultDimAxes.size());
+    for (const ReassociationIndices &group : reassociation) {
+      SmallVector<Value> groupIndices;
+      SmallVector<int64_t> basis;
+      for (int64_t resultDim : group) {
+        if (resultDim < 0 || resultDim >= static_cast<int64_t>(resultDimAxes.size()))
+          return emitError(source.getLoc(), "reshape reassociation references invalid dimension");
+        const std::optional<Axis> &axis = resultDimAxes[resultDim];
+        // Size-one factors in a nontrivial expansion do not affect the linearized coordinate and
+        // are used only for broadcasting. StableHLO exporters commonly insert such factors before
+        // a broadcast (for example, the GQA group dimension).
+        if (!axis || (group.size() > 1 && axis->extent == 1))
+          continue;
+        if (axis->extent == ShapedType::kDynamic)
+          return emitError(source.getLoc(), "cannot linearize dynamic expanded axis");
+        groupIndices.push_back(materializeAxis(*axis));
+        basis.push_back(axis->extent);
+        resultAxes.push_back(axis->name);
+      }
+
+      if (groupIndices.empty())
+        indices.push_back(indexZero());
+      else if (groupIndices.size() == 1)
+        indices.push_back(groupIndices.front());
+      else
+        indices.push_back(affine::AffineLinearizeIndexOp::create(builder, loc, groupIndices, basis,
+                                                                 /*disjoint=*/true));
+    }
+
     return annotate(
         AtOp::create(builder, loc, getExprType(elementType, resultAxes), source, indices));
   }
@@ -966,32 +1099,107 @@ private:
     return success();
   }
 
-  // Relabel each surviving input dimension with the corresponding result dimension. Keeping this
-  // mapping local to the reshape allows one source value to produce independent row and column
-  // views. Common singleton dimensions are paired in order; extra source singleton dimensions are
-  // forgotten and extra result singleton dimensions remain absent from the scalar expression.
+  // Project an expanded result back to source axes so a previously translated source expression
+  // can be reused. This is the StableHLO counterpart of LinalgToTA's projectExpandSourceAxes.
+  FailureOr<TensorAxes> projectExpandSourceAxes(Value source,
+                                                ArrayRef<ReassociationIndices> reassociation,
+                                                const TensorAxes &targetAxes) {
+    auto sourceAxes = lookupAxes(source);
+    if (failed(sourceAxes) || (*sourceAxes)->size() != reassociation.size())
+      return failure();
+
+    TensorAxes projected;
+    projected.reserve((*sourceAxes)->size());
+    for (auto [sourceDim, group] : llvm::enumerate(reassociation)) {
+      const std::optional<Axis> &sourceAxis = (**sourceAxes)[sourceDim];
+      if (!sourceAxis) {
+        projected.push_back(std::nullopt);
+        continue;
+      }
+
+      std::optional<Axis> selected;
+      SmallVector<Axis> extentMatches;
+      for (int64_t dim : group) {
+        if (dim < 0 || dim >= static_cast<int64_t>(targetAxes.size()))
+          return failure();
+        const std::optional<Axis> &targetAxis = targetAxes[dim];
+        if (!targetAxis)
+          continue;
+        if (targetAxis->name == sourceAxis->name) {
+          selected = targetAxis;
+          break;
+        }
+        if (targetAxis->extent == sourceAxis->extent)
+          extentMatches.push_back(*targetAxis);
+      }
+      if (!selected && extentMatches.size() == 1)
+        selected = extentMatches.front();
+      projected.push_back(std::move(selected));
+    }
+    return projected;
+  }
+
+  // Collapsing singleton dimensions is the inverse projection needed by existing StableHLO
+  // payloads. A true product collapse would require delinearizing one TA axis into several source
+  // axes and remains unsupported, matching the scope of LinalgToTA's expression emitter.
+  FailureOr<TensorAxes> projectCollapsedSourceAxes(
+      stablehlo::ReshapeOp op, ArrayRef<ReassociationIndices> reassociation,
+      const TensorAxes &resultAxes) {
+    auto inputType = cast<RankedTensorType>(op.getOperand().getType());
+    TensorAxes projected(inputType.getRank(), std::nullopt);
+    if (reassociation.empty())
+      return projected;
+    if (reassociation.size() != resultAxes.size())
+      return failure();
+
+    for (auto [resultDim, group] : llvm::enumerate(reassociation)) {
+      const std::optional<Axis> &resultAxis = resultAxes[resultDim];
+      if (!resultAxis)
+        continue;
+      std::optional<int64_t> selected;
+      for (int64_t inputDim : group) {
+        if (inputDim < 0 || inputDim >= inputType.getRank())
+          return failure();
+        if (inputType.getDimSize(inputDim) == resultAxis->extent) {
+          if (selected)
+            return op.emitOpError("ambiguous collapsed reshape axis");
+          selected = inputDim;
+        }
+      }
+      if (!selected)
+        return op.emitOpError("product collapse of non-unit dimensions is not supported");
+      projected[*selected] = resultAxis;
+    }
+    return projected;
+  }
+
   LogicalResult emitReshape(stablehlo::ReshapeOp op) {
-    auto inputAxes = lookupAxes(op.getOperand());
     auto resultAxes = lookupAxes(op.getResult());
-    if (failed(inputAxes) || failed(resultAxes))
+    auto reassociation = inferReshapeReassociation(op);
+    if (failed(resultAxes) || failed(reassociation))
       return failure();
     auto inputType = cast<RankedTensorType>(op.getOperand().getType());
     auto resultType = cast<RankedTensorType>(op.getResult().getType());
-    SmallVector<int64_t> inputNonUnit, resultNonUnit, inputUnit, resultUnit;
-    for (int64_t i = 0; i < inputType.getRank(); ++i)
-      (inputType.getDimSize(i) == 1 ? inputUnit : inputNonUnit).push_back(i);
-    for (int64_t i = 0; i < resultType.getRank(); ++i)
-      (resultType.getDimSize(i) == 1 ? resultUnit : resultNonUnit).push_back(i);
 
-    TensorAxes projectedInputAxes(inputType.getRank(), std::nullopt);
-    for (auto [inputDim, resultDim] : llvm::zip_equal(inputNonUnit, resultNonUnit))
-      projectedInputAxes[inputDim] = (**resultAxes)[resultDim];
-    for (auto [inputDim, resultDim] :
-         llvm::zip(inputUnit, ArrayRef<int64_t>(resultUnit)
-                                  .take_front(std::min(inputUnit.size(), resultUnit.size()))))
-      projectedInputAxes[inputDim] = (**resultAxes)[resultDim];
-
-    auto expr = translateValue(op.getOperand(), projectedInputAxes, inputType.getElementType());
+    FailureOr<Value> expr;
+    if (inputType.getRank() < resultType.getRank()) {
+      if (valueMap.contains(op.getOperand())) {
+        auto sourceAxes = projectExpandSourceAxes(op.getOperand(), *reassociation, **resultAxes);
+        if (failed(sourceAxes))
+          return op.emitOpError("failed to project expanded source axes");
+        expr = translateValue(op.getOperand(), *sourceAxes, inputType.getElementType());
+      } else {
+        expr = ta.atExpandedSource(op.getOperand(), *reassociation, **resultAxes,
+                                   inputType.getElementType());
+      }
+    } else if (inputType.getRank() > resultType.getRank()) {
+      auto sourceAxes = projectCollapsedSourceAxes(op, *reassociation, **resultAxes);
+      if (failed(sourceAxes))
+        return failure();
+      expr = translateValue(op.getOperand(), *sourceAxes, inputType.getElementType());
+    } else {
+      expr = translateValue(op.getOperand(), **resultAxes, inputType.getElementType());
+    }
     if (failed(expr))
       return failure();
     valueMap[op.getResult()] = {*expr, getPresentTensorAxes(*expr, **resultAxes)};
