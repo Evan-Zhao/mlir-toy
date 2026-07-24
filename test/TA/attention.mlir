@@ -1,214 +1,72 @@
 // RUN: neptune-opt %s --transform-interpreter | FileCheck %s
 
-#map = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
-#map1 = affine_map<(d0, d1, d2, d3) -> (d0, d1, d3, d2)>
-#map2 = affine_map<(d0, d1, d2) -> ()>
-#map3 = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
-#map4 = affine_map<(d0, d1, d2, d3) -> (d0, d1, d3)>
-#map5 = affine_map<(d0, d1, d2, d3) -> (d0, d3, d2)>
-#map6 = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>
-#map7 = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, 0)>
-#map8 = affine_map<(d0, d1, d2, d3) -> ()>
-
+// Exercise the TA portion of the attention schedule on exact StableHLO exporter output: import the
+// scalar expression graph, rewrite exp to exp2, and sink softmax normalization after P @ V.
 module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
     %func = transform.structured.match ops{["func.func"]} in %module
         : (!transform.any_op) -> !transform.any_op
-    %ta_func = transform.apply_registered_pass "linalg-to-ta" to %func
+    %ta_func = transform.apply_registered_pass "stablehlo-to-ta" to %func
         : (!transform.any_op) -> !transform.any_op
     transform.apply_patterns to %ta_func {
+      transform.apply_patterns.canonicalization
       transform.apply_patterns.ta.exp_to_exp2
       transform.apply_patterns.ta.sink_div_after_matmul
     } : !transform.any_op
     transform.apply_cse to %ta_func : !transform.any_op
-    %linalg_func = transform.apply_registered_pass "ta-to-linalg" to %ta_func
-        : (!transform.any_op) -> !transform.any_op
     transform.yield
   }
 
   // CHECK-LABEL: func.func @attention(
-  // CHECK-NOT: ta.scope
-  // CHECK: linalg.generic
-  // CHECK-SAME: iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-  // CHECK: arith.extf
-  // CHECK: linalg.generic
-  // CHECK-SAME: iterator_types = ["parallel", "parallel", "parallel", "parallel"]
-  // CHECK: arith.extf
-  // CHECK: linalg.fill
-  // CHECK: linalg.generic
-  // CHECK-SAME: iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction"]
-  // CHECK: arith.mulf
-  // CHECK: arith.addf
-  // CHECK: arith.constant 0.83294034 : f32
-  // CHECK: arith.mulf
-  // CHECK: linalg.fill
-  // CHECK: linalg.generic
-  // CHECK-SAME: iterator_types = ["parallel", "parallel", "parallel", "reduction"]
-  // CHECK: arith.maximumf
-  // CHECK: arith.subf
-  // CHECK: math.exp2
-  // CHECK: linalg.fill
-  // CHECK: linalg.generic
-  // CHECK-SAME: iterator_types = ["parallel", "parallel", "parallel", "reduction"]
-  // CHECK: arith.addf
-  // CHECK: linalg.generic
-  // CHECK: arith.extf
-  // CHECK: linalg.fill
-  // CHECK: linalg.generic
-  // CHECK-SAME: iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction"]
-  // CHECK: arith.mulf
-  // CHECK: arith.addf
-  // CHECK: arith.divf
-  // CHECK: arith.truncf
-  // CHECK: return {{.*}} : tensor<1x2x4x3xf16>
-  func.func @attention(%arg0: tensor<1x2x4x3xf16>,
-                       %arg1: tensor<1x2x4x3xf16>,
+  // CHECK: %[[SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 1, %i1 "i1" extent 2, %i2 "i2" extent 4, %i3 "i3" extent 3, %j0 "j0" extent 3, %j1 "j1" extent 4) {
+  // CHECK: %[[Q:.+]] = ta.cast
+  // CHECK-SAME: -> !ta.expr<f32, [i0, i1, i2, j0]>
+  // CHECK: %[[K:.+]] = ta.cast
+  // CHECK-SAME: -> !ta.expr<f32, [i0, i1, j1, j0]>
+  // CHECK: %[[QK:.+]] = ta.mul %[[Q]], %[[K]]
+  // CHECK: %[[DOT:.+]] = ta.reduce <add> %[[QK]] {axes = #ta.axes<j0>
+  // CHECK: %[[LOG2_SCALE:.+]] = ta.constant 0.83294034 : f32
+  // CHECK: %[[SCORES:.+]] = ta.mul %[[LOG2_SCALE]], %[[DOT]]
+  // CHECK: %[[MAX:.+]] = ta.reduce <max> %[[SCORES]] {axes = #ta.axes<j1>
+  // CHECK: %[[CENTERED:.+]] = ta.sub %[[SCORES]], %[[MAX]]
+  // CHECK: %[[EXP:.+]] = ta.exp2 %[[CENTERED]]
+  // CHECK: %[[DEN:.+]] = ta.reduce <add> %[[EXP]] {axes = #ta.axes<j1>
+  // CHECK: %[[V:.+]] = ta.cast
+  // CHECK-SAME: -> !ta.expr<f32, [i0, i1, j1, i3]>
+  // CHECK: %[[PV:.+]] = ta.mul %[[EXP]], %[[V]]
+  // CHECK: %[[NUM:.+]] = ta.reduce <add> %[[PV]] {axes = #ta.axes<j1>
+  // CHECK: %[[NORMALIZED:.+]] = ta.div %[[NUM]], %[[DEN]]
+  // CHECK: %[[OUT:.+]] = ta.cast %[[NORMALIZED]]
+  // CHECK-SAME: -> !ta.expr<f16, [i0, i1, i2, i3]>
+  // CHECK: ta.yield %[[OUT]]
+  // CHECK: return %[[SCOPE]] : tensor<1x2x4x3xf16>
+  func.func @attention(%arg0: tensor<1x2x4x3xf16>, %arg1: tensor<1x2x4x3xf16>,
                        %arg2: tensor<1x2x4x3xf16>) -> tensor<1x2x4x3xf16> {
-    %cst = arith.constant 0.000000e+00 : f32
-    %cst_0 = arith.constant 0xFF800000 : f32
-    %cst_1 = arith.constant 5.773502691896258e-01 : f32
-    %0 = tensor.empty() : tensor<1x2x4x3xf32>
-    %1 = linalg.generic {indexing_maps = [#map, #map],
-        iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-        ins(%arg0 : tensor<1x2x4x3xf16>) outs(%0 : tensor<1x2x4x3xf32>) {
-    ^bb0(%in: f16, %out: f32):
-      %25 = arith.extf %in : f16 to f32
-      linalg.yield %25 : f32
-    } -> tensor<1x2x4x3xf32>
-    %2 = linalg.generic {indexing_maps = [#map, #map],
-        iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-        ins(%arg1 : tensor<1x2x4x3xf16>) outs(%0 : tensor<1x2x4x3xf32>) {
-    ^bb0(%in: f16, %out: f32):
-      %25 = arith.extf %in : f16 to f32
-      linalg.yield %25 : f32
-    } -> tensor<1x2x4x3xf32>
-    %3 = tensor.empty() : tensor<1x2x3x4xf32>
-    %4 = linalg.generic {indexing_maps = [#map1, #map],
-        iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-        ins(%2 : tensor<1x2x4x3xf32>) outs(%3 : tensor<1x2x3x4xf32>) {
-    ^bb0(%in: f32, %out: f32):
-      linalg.yield %in : f32
-    } -> tensor<1x2x3x4xf32>
-    %collapsed = tensor.collapse_shape %1 [[0, 1], [2], [3]]
-        : tensor<1x2x4x3xf32> into tensor<2x4x3xf32>
-    %collapsed_2 = tensor.collapse_shape %4 [[0, 1], [2], [3]]
-        : tensor<1x2x3x4xf32> into tensor<2x3x4xf32>
-    %5 = tensor.empty() : tensor<2x4x4xf32>
-    %6 = linalg.generic {indexing_maps = [#map2, #map3],
-        iterator_types = ["parallel", "parallel", "parallel"]}
-        ins(%cst : f32) outs(%5 : tensor<2x4x4xf32>) {
-    ^bb0(%in: f32, %out: f32):
-      linalg.yield %in : f32
-    } -> tensor<2x4x4xf32>
-    %7 = linalg.generic {indexing_maps = [#map4, #map5, #map6],
-        iterator_types = ["parallel", "parallel", "parallel", "reduction"]}
-        ins(%collapsed, %collapsed_2 : tensor<2x4x3xf32>, tensor<2x3x4xf32>)
-        outs(%6 : tensor<2x4x4xf32>) {
-    ^bb0(%in: f32, %in_7: f32, %out: f32):
-      %25 = arith.mulf %in, %in_7 : f32
-      %26 = arith.addf %out, %25 : f32
-      linalg.yield %26 : f32
-    } -> tensor<2x4x4xf32>
-    %expanded = tensor.expand_shape %7 [[0, 1], [2], [3]] output_shape [1, 2, 4, 4]
-        : tensor<2x4x4xf32> into tensor<1x2x4x4xf32>
-    %8 = tensor.empty() : tensor<1x2x4x4xf32>
-    %9 = linalg.generic {indexing_maps = [#map, #map],
-        iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-        ins(%expanded : tensor<1x2x4x4xf32>) outs(%8 : tensor<1x2x4x4xf32>) {
-    ^bb0(%in: f32, %out: f32):
-      %25 = arith.mulf %in, %cst_1 : f32
-      linalg.yield %25 : f32
-    } -> tensor<1x2x4x4xf32>
-    %10 = tensor.empty() : tensor<1x2x4xf32>
-    %11 = linalg.generic {indexing_maps = [#map2, #map3],
-        iterator_types = ["parallel", "parallel", "parallel"]}
-        ins(%cst_0 : f32) outs(%10 : tensor<1x2x4xf32>) {
-    ^bb0(%in: f32, %out: f32):
-      linalg.yield %in : f32
-    } -> tensor<1x2x4xf32>
-    %12 = linalg.generic {indexing_maps = [#map, #map6],
-        iterator_types = ["parallel", "parallel", "parallel", "reduction"]}
-        ins(%9 : tensor<1x2x4x4xf32>) outs(%11 : tensor<1x2x4xf32>) {
-    ^bb0(%in: f32, %out: f32):
-      %25 = arith.maximumf %in, %out : f32
-      linalg.yield %25 : f32
-    } -> tensor<1x2x4xf32>
-    %expanded_3 = tensor.expand_shape %12 [[0], [1], [2, 3]] output_shape [1, 2, 4, 1]
-        : tensor<1x2x4xf32> into tensor<1x2x4x1xf32>
-    %13 = linalg.generic {indexing_maps = [#map, #map7, #map],
-        iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-        ins(%9, %expanded_3 : tensor<1x2x4x4xf32>, tensor<1x2x4x1xf32>)
-        outs(%8 : tensor<1x2x4x4xf32>) {
-    ^bb0(%in: f32, %in_7: f32, %out: f32):
-      %25 = arith.subf %in, %in_7 : f32
-      linalg.yield %25 : f32
-    } -> tensor<1x2x4x4xf32>
-    %14 = linalg.generic {indexing_maps = [#map, #map],
-        iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-        ins(%13 : tensor<1x2x4x4xf32>) outs(%8 : tensor<1x2x4x4xf32>) {
-    ^bb0(%in: f32, %out: f32):
-      %25 = math.exp %in : f32
-      linalg.yield %25 : f32
-    } -> tensor<1x2x4x4xf32>
-    %15 = tensor.empty() : tensor<1x2x4x1xf32>
-    %16 = linalg.generic {indexing_maps = [#map8, #map],
-        iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-        ins(%cst : f32) outs(%15 : tensor<1x2x4x1xf32>) {
-    ^bb0(%in: f32, %out: f32):
-      linalg.yield %in : f32
-    } -> tensor<1x2x4x1xf32>
-    %17 = linalg.generic {indexing_maps = [#map, #map7],
-        iterator_types = ["parallel", "parallel", "parallel", "reduction"]}
-        ins(%14 : tensor<1x2x4x4xf32>) outs(%16 : tensor<1x2x4x1xf32>) {
-    ^bb0(%in: f32, %out: f32):
-      %25 = arith.addf %in, %out : f32
-      linalg.yield %25 : f32
-    } -> tensor<1x2x4x1xf32>
-    %18 = linalg.generic {indexing_maps = [#map, #map7, #map],
-        iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-        ins(%14, %17 : tensor<1x2x4x4xf32>, tensor<1x2x4x1xf32>)
-        outs(%8 : tensor<1x2x4x4xf32>) {
-    ^bb0(%in: f32, %in_7: f32, %out: f32):
-      %25 = arith.divf %in, %in_7 : f32
-      linalg.yield %25 : f32
-    } -> tensor<1x2x4x4xf32>
-    %19 = linalg.generic {indexing_maps = [#map, #map],
-        iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-        ins(%arg2 : tensor<1x2x4x3xf16>) outs(%0 : tensor<1x2x4x3xf32>) {
-    ^bb0(%in: f16, %out: f32):
-      %25 = arith.extf %in : f16 to f32
-      linalg.yield %25 : f32
-    } -> tensor<1x2x4x3xf32>
-    %collapsed_4 = tensor.collapse_shape %18 [[0, 1], [2], [3]]
-        : tensor<1x2x4x4xf32> into tensor<2x4x4xf32>
-    %collapsed_5 = tensor.collapse_shape %19 [[0, 1], [2], [3]]
-        : tensor<1x2x4x3xf32> into tensor<2x4x3xf32>
-    %20 = tensor.empty() : tensor<2x4x3xf32>
-    %21 = linalg.generic {indexing_maps = [#map2, #map3],
-        iterator_types = ["parallel", "parallel", "parallel"]}
-        ins(%cst : f32) outs(%20 : tensor<2x4x3xf32>) {
-    ^bb0(%in: f32, %out: f32):
-      linalg.yield %in : f32
-    } -> tensor<2x4x3xf32>
-    %22 = linalg.generic {indexing_maps = [#map4, #map5, #map6],
-        iterator_types = ["parallel", "parallel", "parallel", "reduction"]}
-        ins(%collapsed_4, %collapsed_5 : tensor<2x4x4xf32>, tensor<2x4x3xf32>)
-        outs(%21 : tensor<2x4x3xf32>) {
-    ^bb0(%in: f32, %in_7: f32, %out: f32):
-      %25 = arith.mulf %in, %in_7 : f32
-      %26 = arith.addf %out, %25 : f32
-      linalg.yield %26 : f32
-    } -> tensor<2x4x3xf32>
-    %expanded_6 = tensor.expand_shape %22 [[0, 1], [2], [3]] output_shape [1, 2, 4, 3]
-        : tensor<2x4x3xf32> into tensor<1x2x4x3xf32>
-    %23 = tensor.empty() : tensor<1x2x4x3xf16>
-    %24 = linalg.generic {indexing_maps = [#map, #map],
-        iterator_types = ["parallel", "parallel", "parallel", "parallel"]}
-        ins(%expanded_6 : tensor<1x2x4x3xf32>) outs(%23 : tensor<1x2x4x3xf16>) {
-    ^bb0(%in: f32, %out: f16):
-      %25 = arith.truncf %in : f32 to f16
-      linalg.yield %25 : f16
-    } -> tensor<1x2x4x3xf16>
-    return %24 : tensor<1x2x4x3xf16>
+    %cst = stablehlo.constant dense<0xFF800000> : tensor<f32>
+    %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+    %cst_1 = arith.constant dense<0.57735026918962584> : tensor<1xf64>
+    %0 = stablehlo.convert %arg0 : (tensor<1x2x4x3xf16>) -> tensor<1x2x4x3xf32>
+    %1 = stablehlo.convert %arg1 : (tensor<1x2x4x3xf16>) -> tensor<1x2x4x3xf32>
+    %2 = stablehlo.transpose %1, dims = [0, 1, 3, 2] : (tensor<1x2x4x3xf32>) -> tensor<1x2x3x4xf32>
+    %3 = stablehlo.broadcast_in_dim %2, dims = [0, 1, 2, 3] : (tensor<1x2x3x4xf32>) -> tensor<1x2x3x4xf32>
+    %4 = stablehlo.dot_general %0, %3, batching_dims = [0, 1] x [0, 1], contracting_dims = [3] x [2] : (tensor<1x2x4x3xf32>, tensor<1x2x3x4xf32>) -> tensor<1x2x4x4xf32>
+    %5 = stablehlo.convert %cst_1 : (tensor<1xf64>) -> tensor<1xf32>
+    %6 = stablehlo.reshape %5 : (tensor<1xf32>) -> tensor<f32>
+    %7 = stablehlo.broadcast_in_dim %6, dims = [] : (tensor<f32>) -> tensor<1x2x4x4xf32>
+    %8 = stablehlo.multiply %4, %7 : tensor<1x2x4x4xf32>
+    %9 = stablehlo.reduce(%8 init: %cst) applies stablehlo.maximum across dimensions = [3] : (tensor<1x2x4x4xf32>, tensor<f32>) -> tensor<1x2x4xf32>
+    %10 = stablehlo.reshape %9 : (tensor<1x2x4xf32>) -> tensor<1x2x4x1xf32>
+    %11 = stablehlo.broadcast_in_dim %10, dims = [0, 1, 2, 3] : (tensor<1x2x4x1xf32>) -> tensor<1x2x4x4xf32>
+    %12 = stablehlo.subtract %8, %11 : tensor<1x2x4x4xf32>
+    %13 = stablehlo.exponential %12 : tensor<1x2x4x4xf32>
+    %14 = stablehlo.reduce(%13 init: %cst_0) applies stablehlo.add across dimensions = [3] : (tensor<1x2x4x4xf32>, tensor<f32>) -> tensor<1x2x4xf32>
+    %15 = stablehlo.reshape %14 : (tensor<1x2x4xf32>) -> tensor<1x2x4x1xf32>
+    %16 = stablehlo.broadcast_in_dim %15, dims = [0, 1, 2, 3] : (tensor<1x2x4x1xf32>) -> tensor<1x2x4x4xf32>
+    %17 = stablehlo.divide %13, %16 : tensor<1x2x4x4xf32>
+    %18 = stablehlo.convert %arg2 : (tensor<1x2x4x3xf16>) -> tensor<1x2x4x3xf32>
+    %19 = stablehlo.broadcast_in_dim %18, dims = [0, 1, 2, 3] : (tensor<1x2x4x3xf32>) -> tensor<1x2x4x3xf32>
+    %20 = stablehlo.dot_general %17, %19, batching_dims = [0, 1] x [0, 1], contracting_dims = [3] x [2] : (tensor<1x2x4x4xf32>, tensor<1x2x4x3xf32>) -> tensor<1x2x4x3xf32>
+    %21 = stablehlo.convert %20 : (tensor<1x2x4x3xf32>) -> tensor<1x2x4x3xf16>
+    return %21 : tensor<1x2x4x3xf16>
   }
 }
