@@ -173,3 +173,44 @@ func.func @float_iota() -> tensor<4xf32> {
   %result = stablehlo.iota dim = 0 : tensor<4xf32>
   return %result : tensor<4xf32>
 }
+
+// Exported arange dataflow uses dynamic_iota even when its result type is static. The same
+// one-dimensional iota may then be reshaped independently into row and column coordinates.
+// CHECK-LABEL: func.func @dynamic_iota_and
+// CHECK: ta.scope axes(%i0 "i0" extent 4, %i1 "i1" extent 4, %j0 "j0" extent 4)
+// CHECK: %[[DYNAMIC_INDEX:.+]] = ta.index %j0
+// CHECK: ta.subst %{{.+}} {from_axes = #ta.axes<j0>{{.*}}to_axes = #ta.axes<i1>}
+// CHECK: ta.subst %{{.+}} {from_axes = #ta.axes<j0>{{.*}}to_axes = #ta.axes<i0>}
+// CHECK: ta.and %{{.+}}, %{{.+}}
+// CHECK: return %{{.+}} : tensor<4x4xi1>
+func.func @dynamic_iota_and() -> tensor<4x4xi1> {
+  %window = stablehlo.constant dense<-1> : tensor<4x4xi64>
+  %zero_vec = stablehlo.constant dense<0> : tensor<4xi64>
+  %one_vec = stablehlo.constant dense<1> : tensor<4xi64>
+  %four = stablehlo.constant dense<4> : tensor<i64>
+  %one = stablehlo.constant dense<1> : tensor<i64>
+  %one_f = stablehlo.convert %one : (tensor<i64>) -> tensor<f64>
+  %four_f = stablehlo.convert %four : (tensor<i64>) -> tensor<f64>
+  %extent_f = stablehlo.divide %four_f, %one_f : tensor<f64>
+  %extent_ceil = stablehlo.ceil %extent_f : tensor<f64>
+  %extent = stablehlo.convert %extent_ceil : (tensor<f64>) -> tensor<i64>
+  %shape = stablehlo.reshape %extent : (tensor<i64>) -> tensor<1xi64>
+  %iota = stablehlo.dynamic_iota %shape, dim = 0 : (tensor<1xi64>) -> tensor<4xi64>
+  %scaled = stablehlo.multiply %iota, %one_vec : tensor<4xi64>
+  %index = stablehlo.add %scaled, %zero_vec : tensor<4xi64>
+  %row = stablehlo.reshape %index : (tensor<4xi64>) -> tensor<4x1xi64>
+  %col = stablehlo.reshape %index : (tensor<4xi64>) -> tensor<1x4xi64>
+  %rows = stablehlo.broadcast_in_dim %row, dims = [0, 1]
+      : (tensor<4x1xi64>) -> tensor<4x4xi64>
+  %cols = stablehlo.broadcast_in_dim %col, dims = [0, 1]
+      : (tensor<1x4xi64>) -> tensor<4x4xi64>
+  %distance = stablehlo.subtract %cols, %rows : tensor<4x4xi64>
+  %in_window = stablehlo.compare GE, %distance, %window, SIGNED
+      : (tensor<4x4xi64>, tensor<4x4xi64>) -> tensor<4x4xi1>
+  %col_iota = stablehlo.iota dim = 1 : tensor<4x4xi64>
+  %row_iota = stablehlo.iota dim = 0 : tensor<4x4xi64>
+  %causal = stablehlo.compare LE, %col_iota, %row_iota, SIGNED
+      : (tensor<4x4xi64>, tensor<4x4xi64>) -> tensor<4x4xi1>
+  %result = stablehlo.and %in_window, %causal : tensor<4x4xi1>
+  return %result : tensor<4x4xi1>
+}

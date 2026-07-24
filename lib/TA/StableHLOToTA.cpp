@@ -54,9 +54,10 @@ struct DiscoveredAxisInfo {
 // island may continue. Unsupported operations remain in the surrounding function as tensor
 // producers or consumers.
 static bool isSupportedStableHLOOp(Operation *op) {
-  return isa<arith::ConstantOp, stablehlo::ConstantOp, stablehlo::IotaOp, stablehlo::ConvertOp,
-             stablehlo::ExpOp, stablehlo::AddOp, stablehlo::SubtractOp, stablehlo::MulOp,
-             stablehlo::DivOp, stablehlo::MaxOp, stablehlo::MinOp, stablehlo::CompareOp,
+  return isa<arith::ConstantOp, stablehlo::ConstantOp, stablehlo::IotaOp,
+             stablehlo::DynamicIotaOp, stablehlo::ConvertOp, stablehlo::ExpOp, stablehlo::AddOp,
+             stablehlo::SubtractOp, stablehlo::MulOp, stablehlo::DivOp, stablehlo::MaxOp,
+             stablehlo::MinOp, stablehlo::AndOp, stablehlo::CompareOp,
              stablehlo::SelectOp, stablehlo::TransposeOp, stablehlo::BroadcastInDimOp,
              stablehlo::ReshapeOp, stablehlo::ReduceOp, stablehlo::DotGeneralOp>(op);
 }
@@ -82,7 +83,7 @@ public:
       LogicalResult result = success();
       if (isa<stablehlo::ConvertOp, stablehlo::ExpOp, stablehlo::AddOp, stablehlo::SubtractOp,
               stablehlo::MulOp, stablehlo::DivOp, stablehlo::MaxOp, stablehlo::MinOp,
-              stablehlo::CompareOp>(&op))
+              stablehlo::AndOp, stablehlo::CompareOp>(&op))
         result = discoverSameShape(&op);
       else if (auto select = dyn_cast<stablehlo::SelectOp>(&op))
         result = discoverSelect(select);
@@ -245,6 +246,10 @@ private:
   // Initially support only insertion, removal, or movement of singleton dimensions. Removing all
   // unit dimensions leaves a shape signature which must match exactly on both sides. This avoids
   // pretending that a product reshape has a simple one-axis-to-one-axis interpretation.
+  //
+  // Do not unify input and result axes here. The same value may be reshaped into row and column
+  // views, as happens in exporter-generated sliding-window masks. Those uses need independent
+  // result axes; emitReshape relabels the source expression separately for each use.
   LogicalResult discoverReshape(stablehlo::ReshapeOp op) {
     auto input = getOrCreateValueAxes(op.getOperand());
     auto result = getOrCreateValueAxes(op.getResult());
@@ -252,27 +257,18 @@ private:
       return op.emitOpError("axis discovery requires static ranked tensors");
     auto inputType = cast<RankedTensorType>(op.getOperand().getType());
     auto resultType = cast<RankedTensorType>(op.getResult().getType());
-    SmallVector<int64_t> inputNonUnit, resultNonUnit, inputUnit, resultUnit;
+    SmallVector<int64_t> inputNonUnit, resultNonUnit;
     for (int64_t i = 0; i < inputType.getRank(); ++i)
-      (inputType.getDimSize(i) == 1 ? inputUnit : inputNonUnit).push_back(i);
+      if (inputType.getDimSize(i) != 1)
+        inputNonUnit.push_back(i);
     for (int64_t i = 0; i < resultType.getRank(); ++i)
-      (resultType.getDimSize(i) == 1 ? resultUnit : resultNonUnit).push_back(i);
+      if (resultType.getDimSize(i) != 1)
+        resultNonUnit.push_back(i);
     if (inputNonUnit.size() != resultNonUnit.size())
       return op.emitOpError("only singleton-dimension reshapes are supported");
-    for (auto [inputDim, resultDim] : llvm::zip_equal(inputNonUnit, resultNonUnit)) {
+    for (auto [inputDim, resultDim] : llvm::zip_equal(inputNonUnit, resultNonUnit))
       if (inputType.getDimSize(inputDim) != resultType.getDimSize(resultDim))
         return op.emitOpError("only singleton-dimension reshapes are supported");
-      if (failed(unite(op, (*input)[inputDim], (*result)[resultDim])))
-        return failure();
-    }
-    // Preserve common singleton dimensions in order. Their coordinates are always zero, but
-    // retaining a shared axis where possible keeps leading batch dimensions visible. Extra unit
-    // dimensions on either side are semantically inserted or removed and remain unrelated.
-    for (auto [inputDim, resultDim] :
-         llvm::zip(inputUnit, ArrayRef<int64_t>(resultUnit)
-                                  .take_front(std::min(inputUnit.size(), resultUnit.size()))))
-      if (failed(unite(op, (*input)[inputDim], (*result)[resultDim])))
-        return failure();
     return success();
   }
 
@@ -717,6 +713,8 @@ public:
       return emitConstant(constant);
     if (auto iota = dyn_cast<stablehlo::IotaOp>(op))
       return emitIota(iota);
+    if (auto iota = dyn_cast<stablehlo::DynamicIotaOp>(op))
+      return emitIota(iota);
     if (auto convert = dyn_cast<stablehlo::ConvertOp>(op)) {
       auto inputType = cast<RankedTensorType>(convert.getOperand().getType());
       auto resultType = cast<RankedTensorType>(convert.getResult().getType());
@@ -738,6 +736,8 @@ public:
       return emitBinary<MaximumOp>(maximum);
     if (auto minimum = dyn_cast<stablehlo::MinOp>(op))
       return emitBinary<MinimumOp>(minimum);
+    if (auto andOp = dyn_cast<stablehlo::AndOp>(op))
+      return emitBinary<AndOp>(andOp);
     if (auto compare = dyn_cast<stablehlo::CompareOp>(op))
       return emitCompare(compare);
     if (auto select = dyn_cast<stablehlo::SelectOp>(op))
@@ -792,7 +792,7 @@ private:
     return success();
   }
 
-  LogicalResult emitIota(stablehlo::IotaOp op) {
+  template <typename IotaOp> LogicalResult emitIota(IotaOp op) {
     auto resultAxes = lookupAxes(op.getResult());
     if (failed(resultAxes))
       return failure();
@@ -840,8 +840,6 @@ private:
     auto rhsType = cast<RankedTensorType>(op.getRhs().getType());
     auto resultType = cast<RankedTensorType>(op.getResult().getType());
     Type elementType = resultType.getElementType();
-    if (!isa<FloatType, IntegerType>(elementType) || elementType.isInteger(1))
-      return op.emitOpError("only floating-point and non-i1 integer arithmetic is supported");
     auto lhs = translateValue(op.getLhs(), **lhsAxes, lhsType.getElementType());
     auto rhs = translateValue(op.getRhs(), **rhsAxes, rhsType.getElementType());
     if (failed(lhs) || failed(rhs))
@@ -968,24 +966,31 @@ private:
     return success();
   }
 
-  // Singleton-only reshapes reuse their operand expression. A source unit axis absent from the
-  // result metadata must be forgotten; source axes still represented in the result are preserved.
-  // Non-unit dimensions were already proven one-to-one by discoverReshape.
+  // Relabel each surviving input dimension with the corresponding result dimension. Keeping this
+  // mapping local to the reshape allows one source value to produce independent row and column
+  // views. Common singleton dimensions are paired in order; extra source singleton dimensions are
+  // forgotten and extra result singleton dimensions remain absent from the scalar expression.
   LogicalResult emitReshape(stablehlo::ReshapeOp op) {
     auto inputAxes = lookupAxes(op.getOperand());
     auto resultAxes = lookupAxes(op.getResult());
     if (failed(inputAxes) || failed(resultAxes))
       return failure();
-    TensorAxes projectedInputAxes = **inputAxes;
-    DenseSet<StringRef> resultAxisNames;
-    for (const std::optional<Axis> &axis : **resultAxes)
-      if (axis)
-        resultAxisNames.insert(axis->name);
     auto inputType = cast<RankedTensorType>(op.getOperand().getType());
-    for (int64_t dim = 0; dim < inputType.getRank(); ++dim)
-      if (inputType.getDimSize(dim) == 1 &&
-          !resultAxisNames.contains(projectedInputAxes[dim]->name))
-        projectedInputAxes[dim] = std::nullopt;
+    auto resultType = cast<RankedTensorType>(op.getResult().getType());
+    SmallVector<int64_t> inputNonUnit, resultNonUnit, inputUnit, resultUnit;
+    for (int64_t i = 0; i < inputType.getRank(); ++i)
+      (inputType.getDimSize(i) == 1 ? inputUnit : inputNonUnit).push_back(i);
+    for (int64_t i = 0; i < resultType.getRank(); ++i)
+      (resultType.getDimSize(i) == 1 ? resultUnit : resultNonUnit).push_back(i);
+
+    TensorAxes projectedInputAxes(inputType.getRank(), std::nullopt);
+    for (auto [inputDim, resultDim] : llvm::zip_equal(inputNonUnit, resultNonUnit))
+      projectedInputAxes[inputDim] = (**resultAxes)[resultDim];
+    for (auto [inputDim, resultDim] :
+         llvm::zip(inputUnit, ArrayRef<int64_t>(resultUnit)
+                                  .take_front(std::min(inputUnit.size(), resultUnit.size()))))
+      projectedInputAxes[inputDim] = (**resultAxes)[resultDim];
+
     auto expr = translateValue(op.getOperand(), projectedInputAxes, inputType.getElementType());
     if (failed(expr))
       return failure();
@@ -1187,6 +1192,11 @@ static void collectSupportedComponent(Value value, Block *block, DenseSet<Operat
   Operation *def = value.getDefiningOp();
   if (!def || def->getBlock() != block || !isSupportedStableHLOOp(def) ||
       !component.insert(def).second)
+    return;
+  // A statically shaped dynamic_iota is determined by its result type. Its shape operand is
+  // control metadata, not tensor dataflow, and exporter-generated shape arithmetic may use ops
+  // outside the TA expression subset.
+  if (isa<stablehlo::DynamicIotaOp>(def))
     return;
   for (Value operand : def->getOperands())
     if (isa<RankedTensorType>(operand.getType()))
