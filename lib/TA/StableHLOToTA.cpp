@@ -275,9 +275,9 @@ private:
            lhsExtent == rhsExtent;
   }
 
-  // Keep the relationship between a collapsed product axis and its expanded factor axes. This is
-  // intentionally parallel to LinalgToTA's reshape discovery: if another reshape exposes the same
-  // product with a compatible factorization, corresponding factors become the same logical axes.
+  // Keep the relationship between a collapsed product axis and its expanded factor axes. If
+  // another reshape exposes the same product with a compatible factorization, corresponding
+  // factors become the same logical axes.
   LogicalResult mergeProductFactors(Operation *op, AxisId product,
                                     ArrayRef<AxisId> incomingFactors_) {
     product = find(product);
@@ -547,9 +547,6 @@ using AxisName = std::string;
 using AxisNames = SmallVector<AxisName>;
 using AxisNameMapVector = llvm::MapVector<AxisName, AxisName, llvm::StringMap<unsigned>>;
 
-// Kept intentionally parallel to ScopedTABuilder in LinalgToTA.cpp. The two importers should
-// produce the same TA vocabulary and axis naming.
-//
 // The builder owns one ta.scope and lazily adds its index block arguments as expressions begin to
 // use axes. StableHLO operation locations and import-group tags are applied through the guard
 // below, so all TA operations emitted for one source operation can later be materialized together.
@@ -632,7 +629,7 @@ public:
   }
 
   // Observe the lower-rank source of a reassociative expansion. Each expanded group is linearized
-  // into the corresponding source coordinate, exactly as in LinalgToTA's atExpandedSource.
+  // into the corresponding source coordinate.
   FailureOr<Value> atExpandedSource(Value source, ArrayRef<ReassociationIndices> reassociation,
                                     const TensorAxes &resultDimAxes, Type elementType) {
     int64_t sourceRank = cast<RankedTensorType>(source.getType()).getRank();
@@ -1184,7 +1181,7 @@ private:
   }
 
   // Project an expanded result back to source axes so a previously translated source expression
-  // can be reused. This is the StableHLO counterpart of LinalgToTA's projectExpandSourceAxes.
+  // can be reused.
   FailureOr<TensorAxes> projectExpandSourceAxes(Value source,
                                                 ArrayRef<ReassociationIndices> reassociation,
                                                 const TensorAxes &targetAxes) {
@@ -1225,7 +1222,7 @@ private:
 
   // Collapsing singleton dimensions is the inverse projection needed by existing StableHLO
   // payloads. A true product collapse would require delinearizing one TA axis into several source
-  // axes and remains unsupported, matching the scope of LinalgToTA's expression emitter.
+  // axes and remains unsupported.
   FailureOr<TensorAxes> projectCollapsedSourceAxes(
       stablehlo::ReshapeOp op, ArrayRef<ReassociationIndices> reassociation,
       const TensorAxes &resultAxes) {

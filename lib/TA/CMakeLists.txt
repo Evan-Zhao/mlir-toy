@@ -44,7 +44,6 @@ add_mlir_pdll_library(TAExpToExp2PDLL
 
 add_library(NeptuneTA STATIC
   TADialect.cpp
-  LinalgToTA.cpp
   StableHLOToTA.cpp
   TAToLinalg.cpp
   TATransformExtension.cpp
