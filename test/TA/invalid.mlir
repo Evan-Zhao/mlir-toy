@@ -37,7 +37,7 @@ func.func @bad_elementwise_result_axes(%rows: tensor<16xf32>, %cols: tensor<32xf
 func.func @bad_at_result_axes(%tensor: tensor<16x32xf32>)
     -> tensor<32x16xf32> {
   %0 = ta.scope axes(%row "i" extent 16, %col "j" extent 32) {
-    // expected-error @+1 {{'ta.at' op result axes must match scope-axis indices; expected #ta.axes<i, j>}}
+    // expected-error @+1 {{'ta.at' op result axes must match scope-axis indices, except for structural unit axes; expected #ta.axes<i, j>}}
     %x = ta.at %tensor[%row, %col]
         : tensor<16x32xf32> -> !ta.expr<f32, [j, i]>
     ta.yield %x : !ta.expr<f32, [j, i]>

@@ -59,6 +59,21 @@ module {
     return %0 : tensor<4xi64>
   }
 
+  // A structural unit axis may remain in expression support after affine canonicalization removes
+  // it from a linearized physical index.
+  // CHECK-LABEL: func.func @preserve_structural_unit_axis
+  func.func @preserve_structural_unit_axis(%arg: tensor<4xf32>) -> tensor<1x4xf32> {
+    %0 = ta.scope axes(%h "h" extent 1, %i "i" extent 4) {
+      // CHECK-NOT: affine.linearize_index
+      // CHECK: %[[VALUE:.+]] = ta.at %{{.*}}[%i] : tensor<4xf32> -> !ta.expr<f32, [h, i]>
+      // CHECK: ta.yield %[[VALUE]]
+      %index = affine.linearize_index disjoint [%h, %i] by (1, 4) : index
+      %value = ta.at %arg[%index] : tensor<4xf32> -> !ta.expr<f32, [h, i]>
+      ta.yield %value : !ta.expr<f32, [h, i]>
+    } : () -> tensor<1x4xf32>
+    return %0 : tensor<1x4xf32>
+  }
+
   // CHECK-LABEL: func.func @fold_float_infinity_identities
   func.func @fold_float_infinity_identities(%arg: tensor<4xf32>) -> tensor<4xf32> {
     %0 = ta.scope axes(%i "i" extent 4) {

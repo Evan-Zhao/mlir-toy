@@ -186,6 +186,33 @@ func.func @product_reshape(%arg: tensor<1x4x3xf32>) -> tensor<1x2x2x3xf32> {
   return %result : tensor<1x2x2x3xf32>
 }
 
+// MQA keeps its structural h=1 batching axis while dropping the inserted group dimension from
+// K's expanding broadcast. This preserves the same einsum rank as non-degenerate GQA.
+// CHECK-LABEL: func.func @mqa_qk
+// CHECK: %[[SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 1, %i1 "i1" extent 4, %i2 "i2" extent 1, %i3 "i3" extent 8, %i4 "i4" extent 8, %j0 "j0" extent 4)
+// CHECK: %[[Q:.+]] = ta.at %arg0{{.*}} -> !ta.expr<f32, [i0, i1, i2, i3, j0]>
+// CHECK: %[[K:.+]] = ta.at %arg1{{.*}} -> !ta.expr<f32, [i0, i2, i4, j0]>
+// CHECK: %[[PRODUCT:.+]] = ta.mul %[[Q]], %[[K]]
+// CHECK: %[[DOT:.+]] = ta.reduce <add> %[[PRODUCT]] {{.*}} -> !ta.expr<f32, [i0, i1, i2, i3, i4]>
+// CHECK: return %[[SCOPE]] : tensor<1x4x1x8x8xf32>
+func.func @mqa_qk(%q: tensor<1x4x8x4xf32>,
+                  %k: tensor<1x1x8x4xf32>) -> tensor<1x4x1x8x8xf32> {
+  %q5 = stablehlo.reshape %q
+      : (tensor<1x4x8x4xf32>) -> tensor<1x4x1x8x4xf32>
+  %k5_seed = stablehlo.reshape %k
+      : (tensor<1x1x8x4xf32>) -> tensor<1x1x1x8x4xf32>
+  %k5 = stablehlo.broadcast_in_dim %k5_seed, dims = [0, 1, 2, 3, 4]
+      : (tensor<1x1x1x8x4xf32>) -> tensor<1x4x1x8x4xf32>
+  %kt = stablehlo.transpose %k5, dims = [0, 1, 2, 4, 3]
+      : (tensor<1x4x1x8x4xf32>) -> tensor<1x4x1x4x8xf32>
+  %out = stablehlo.dot_general %q5, %kt,
+      batching_dims = [0, 1, 2] x [0, 1, 2],
+      contracting_dims = [4] x [3]
+      : (tensor<1x4x1x8x4xf32>, tensor<1x4x1x4x8xf32>)
+        -> tensor<1x4x1x8x8xf32>
+  return %out : tensor<1x4x1x8x8xf32>
+}
+
 // Exported arange dataflow uses dynamic_iota even when its result type is static. The same
 // one-dimensional iota may then be reshaped independently into row and column coordinates.
 // CHECK-LABEL: func.func @dynamic_iota_and

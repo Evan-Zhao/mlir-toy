@@ -10,10 +10,11 @@
 #include "mlir/Pass/Pass.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
-#include <llvm/ADT/SmallVector.h>
-#include <llvm/Support/LogicalResult.h>
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/LogicalResult.h"
 
 #define DEBUG_TYPE "stablehlo-to-ta"
 
@@ -25,11 +26,11 @@ using namespace mlir;
 
 namespace {
 
-// The importer runs in two phases. ForwardAxisDiscovery first assigns logical axes to every
-// tensor dimension and unifies dimensions related by StableHLO attributes. FunctionEmitter then
-// replays the dataflow as scalar TA expressions over those axes. Keeping discovery separate is
-// important for dot_general: an axis may acquire its final identity only after several producers
-// and consumers have been visited.
+// The importer runs in two phases. AxisDiscovery first assigns logical axes to every tensor
+// dimension, unifies dimensions related by StableHLO attributes, and determines which unit axes
+// remain structurally present. FunctionEmitter then replays the dataflow as scalar TA expressions
+// over those axes. Keeping discovery separate is important for dot_general: an axis may acquire its
+// final identity only after several producers and consumers have been visited.
 //
 // StableHLO operations remain in place around the imported islands. Each supported value crossing
 // into unsupported IR or a function return becomes the root of a single-result TA scope.
@@ -50,6 +51,7 @@ using TensorAxes = SmallVector<std::optional<Axis>>;
 // itself uses compact union-find IDs because axis equivalences are still changing during the walk.
 struct DiscoveredAxisInfo {
   DenseMap<Value, TensorAxes> valueAxes;
+  SmallVector<Value> roots;
 };
 
 // StableHLO reshape carries source and result shapes but no tensor-dialect reassociation. Infer the
@@ -93,17 +95,14 @@ static bool isSupportedStableHLOOp(Operation *op) {
              stablehlo::ReshapeOp, stablehlo::ReduceOp, stablehlo::DotGeneralOp>(op);
 }
 
-/// Discover equal tensor dimensions before emitting TA.
+/// Discover tensor-axis equality and structural presence before emitting TA.
 ///
 /// StableHLO makes most equalities explicit in operation dimension-number attributes, unlike
 /// linalg.generic where indexing maps and synthetic loop axes provide the connections. Every
-/// static tensor dimension starts in its own union-find set. Operation-specific visitors merge
-/// sets when two dimensions denote the same logical coordinate.
-///
-/// The walk is forward only. SSA producers have therefore been assigned axes before a consumer is
-/// inspected, while getOrCreateValueAxes also makes the code robust to constants and other values
-/// first encountered as operands.
-class ForwardAxisDiscovery {
+/// static tensor dimension starts in its own union-find set. A forward walk merges sets when two
+/// dimensions denote the same logical coordinate. Once all unions are complete, presence analysis
+/// retains structural unit axes while omitting unit factors used only for expanding broadcasts.
+class AxisDiscovery {
 public:
   FailureOr<DiscoveredAxisInfo> run(func::FuncOp func) {
     for (BlockArgument argument : func.getArguments())
@@ -141,12 +140,20 @@ public:
       if (isa<RankedTensorType>(value.getType()) && failed(getOrCreateValueAxes(value)))
         return returnOp.emitOpError("axis discovery requires static ranked tensors");
 
-    // Freeze union-find representatives into value-owned Axis records. From this point onward the
-    // emitter can compare and copy names without depending on mutable discovery storage.
+    SmallVector<Value> roots = collectRoots(func);
+    discoverPresentAxes(func, roots);
+
+    // Freeze union-find representatives into value-owned Axis records. Unit dimensions omitted by
+    // presence analysis become null tensor axes; all non-unit dimensions remain present.
     DiscoveredAxisInfo info;
+    info.roots = std::move(roots);
     for (auto &[value, ids] : valueAxisIds)
-      info.valueAxes[value] = llvm::map_to_vector(
-          ids, [&](AxisId id) -> std::optional<Axis> { return axes[find(id)]; });
+      info.valueAxes[value] = llvm::map_to_vector(ids, [&](AxisId id) -> std::optional<Axis> {
+        id = find(id);
+        if (axes[id].extent == 1 && !presentAxes.test(id))
+          return std::nullopt;
+        return axes[id];
+      });
     return info;
   }
 
@@ -182,6 +189,83 @@ private:
     if (parent[id] != id)
       parent[id] = find(parent[id]);
     return parent[id];
+  }
+
+  SmallVector<Value> collectRoots(func::FuncOp func) {
+    auto hasUnsupportedUser = [](Value value) {
+      return llvm::any_of(value.getUses(),
+                          [](OpOperand &use) { return !isSupportedStableHLOOp(use.getOwner()); });
+    };
+
+    SmallVector<Value> roots;
+    for (Operation &op : func.front().without_terminator()) {
+      if (!isSupportedStableHLOOp(&op))
+        continue;
+      for (OpResult result : op.getResults())
+        if (isa<RankedTensorType>(result.getType()) && hasUnsupportedUser(result))
+          roots.push_back(result);
+    }
+    return roots;
+  }
+
+  void markPresent(AxisId id) { presentAxes.set(find(id)); }
+
+  void markValueDimPresent(Value value, int64_t dim) {
+    auto it = valueAxisIds.find(value);
+    if (it == valueAxisIds.end() || dim < 0 || dim >= static_cast<int64_t>(it->second.size()))
+      return;
+    markPresent(it->second[dim]);
+  }
+
+  // Equality discovery already propagates presence through elementwise operations, transposes,
+  // equal-size broadcasts, and visible dot/reduction dimensions. Seed external boundaries and
+  // internal iteration-only dimensions, then carry factor demand back to collapsed products.
+  void discoverPresentAxes(func::FuncOp func, ArrayRef<Value> roots) {
+    presentAxes.resize(parent.size());
+
+    // Presence analysis only decides the fate of unit axes. Non-unit coordinates always affect
+    // indexing and remain part of expression support.
+    for (AxisId id = 0; id < axes.size(); ++id)
+      if (axes[find(id)].extent != 1)
+        markPresent(id);
+
+    for (Value root : roots) {
+      auto it = valueAxisIds.find(root);
+      if (it != valueAxisIds.end())
+        for (AxisId id : it->second)
+          markPresent(id);
+    }
+
+    for (Operation &operation : func.front().without_terminator()) {
+      if (auto iota = dyn_cast<stablehlo::IotaOp>(&operation))
+        markValueDimPresent(iota.getResult(), iota.getIotaDimension());
+      else if (auto iota = dyn_cast<stablehlo::DynamicIotaOp>(&operation))
+        markValueDimPresent(iota.getResult(), iota.getIotaDimension());
+      else if (auto reduce = dyn_cast<stablehlo::ReduceOp>(&operation))
+        for (int64_t dim : reduce.getDimensions())
+          markValueDimPresent(reduce.getInputs().front(), dim);
+      else if (auto dot = dyn_cast<stablehlo::DotGeneralOp>(&operation)) {
+        auto dims = dot.getDotDimensionNumbers();
+        for (int64_t dim : dims.getLhsContractingDimensions())
+          markValueDimPresent(dot.getLhs(), dim);
+        for (int64_t dim : dims.getRhsContractingDimensions())
+          markValueDimPresent(dot.getRhs(), dim);
+      }
+    }
+
+    bool changed;
+    do {
+      changed = false;
+      for (auto &[product_, factors] : productAxes) {
+        AxisId product = find(product_);
+        if (presentAxes.test(product))
+          continue;
+        if (llvm::any_of(factors, [&](AxisId factor) { return presentAxes.test(find(factor)); })) {
+          presentAxes.set(product);
+          changed = true;
+        }
+      }
+    } while (changed);
   }
 
   bool axesCompatible(AxisId lhs, AxisId rhs) const {
@@ -455,6 +539,7 @@ private:
   DenseMap<AxisId, SmallVector<AxisId>> productAxes;
   SmallVector<AxisId> parent;
   SmallVector<Axis> axes;
+  llvm::SmallBitVector presentAxes;
   unsigned nextAxisName = 0;
 };
 
@@ -565,10 +650,9 @@ public:
         if (resultDim < 0 || resultDim >= static_cast<int64_t>(resultDimAxes.size()))
           return emitError(source.getLoc(), "reshape reassociation references invalid dimension");
         const std::optional<Axis> &axis = resultDimAxes[resultDim];
-        // Size-one factors in a nontrivial expansion do not affect the linearized coordinate and
-        // are used only for broadcasting. StableHLO exporters commonly insert such factors before
-        // a broadcast (for example, the GQA group dimension).
-        if (!axis || (group.size() > 1 && axis->extent == 1))
+        // Presence analysis has already omitted factors used only for expanding broadcasts.
+        // Retain every remaining factor, including structural unit axes such as MQA's KV head.
+        if (!axis)
           continue;
         if (axis->extent == ShapedType::kDynamic)
           return emitError(source.getLoc(), "cannot linearize dynamic expanded axis");
@@ -1412,33 +1496,17 @@ static void collectSupportedComponent(Value value, Block *block, DenseSet<Operat
 }
 
 static LogicalResult importFunctionAsTA(func::FuncOp func) {
-  ForwardAxisDiscovery discovery;
+  AxisDiscovery discovery;
   auto axisInfoR = discovery.run(func);
   if (failed(axisInfoR))
     return failure();
   DiscoveredAxisInfo &axisInfo = *axisInfoR;
 
-  // A supported value becomes a scope root when it crosses back into unsupported IR or reaches the
-  // function terminator. Roots are collected before rewriting so newly inserted adapter operations
-  // do not themselves become candidates during this pass invocation.
-  auto hasUnsupportedUser = [](Value value) {
-    return llvm::any_of(value.getUses(),
-                        [](OpOperand &use) { return !isSupportedStableHLOOp(use.getOwner()); });
-  };
-  SmallVector<Value> roots;
-  for (Operation &op : func.front().without_terminator()) {
-    if (!isSupportedStableHLOOp(&op))
-      continue;
-    for (OpResult result : op.getResults())
-      if (isa<RankedTensorType>(result.getType()) && hasUnsupportedUser(result))
-        roots.push_back(result);
-  }
-
   // Process roots in producer order. If an early root also feeds supported operations, replacing
   // all uses cuts that edge and later scopes observe the already materialized tensor instead of
   // cloning the producer computation.
   int64_t nextImportGroup = 0;
-  for (Value root : roots) {
+  for (Value root : axisInfo.roots) {
     Operation *rootDef = root.getDefiningOp();
     auto resultType = dyn_cast<RankedTensorType>(root.getType());
     if (!rootDef || !resultType)

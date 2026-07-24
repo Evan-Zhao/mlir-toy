@@ -175,6 +175,34 @@ static bool sameAxes(AxesAttr lhs, AxesAttr rhs) {
   return true;
 }
 
+// A tensor observation may retain structural unit axes which do not affect any physical source
+// index. This happens when affine canonicalization removes a size-one factor from a linearized
+// index, for example MQA's h=1 batching axis. The index-derived axes must remain an ordered
+// subsequence, and every additional result axis must have extent one.
+static bool sameAxesAllowingUnitExtras(ScopeOp scope, AxesAttr result, AxesAttr expected) {
+  ArrayAttr expectedAxes = expected.getAxes();
+  size_t nextExpected = 0;
+  for (Attribute resultAttr : result.getAxes()) {
+    AxisAttr resultAxis = cast<AxisAttr>(resultAttr);
+    if (nextExpected < expectedAxes.size() &&
+        resultAxis.getName() == cast<AxisAttr>(expectedAxes[nextExpected]).getName()) {
+      ++nextExpected;
+      continue;
+    }
+
+    bool isUnit = false;
+    for (auto [scopeAttr, extent] :
+         llvm::zip_equal(scope.getAxes().getAxes(), scope.getStaticExtents()))
+      if (cast<AxisAttr>(scopeAttr).getName() == resultAxis.getName()) {
+        isUnit = extent == 1;
+        break;
+      }
+    if (!isUnit)
+      return false;
+  }
+  return nextExpected == expectedAxes.size();
+}
+
 static AxesAttr inferOrderedUnionAxes(MLIRContext *context, ValueRange operands) {
   llvm::StringSet<> seen;
   SmallVector<Attribute> inferred;
@@ -611,8 +639,10 @@ LogicalResult AtOp::verify() {
       inferAxesFromScopeIndexOperands(getOperation(), scope, getIndices());
   if (failed(expected))
     return failure();
-  if (!sameAxes(result.getAxes(), *expected))
-    return emitOpError() << "result axes must match scope-axis indices; expected " << *expected;
+  if (!sameAxesAllowingUnitExtras(scope, result.getAxes(), *expected))
+    return emitOpError() << "result axes must match scope-axis indices, except for structural "
+                            "unit axes; expected "
+                         << *expected;
 
   return success();
 }
