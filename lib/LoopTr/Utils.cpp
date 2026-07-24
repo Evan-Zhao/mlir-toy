@@ -258,8 +258,11 @@ LogicalResult isSingleOutputElemwiseLinalgOp(Operation *op) {
   if (generic->getNumResults() != 1 || !generic.isAllParallelLoops() ||
       !generic.hasPureTensorSemantics())
     return failure();
+  // Constant-zero results index singleton dimensions and are ordinary broadcast accesses.
   if (!llvm::all_of(generic.getIndexingMapsArray(),
-                    [](AffineMap map) { return map.isProjectedPermutation(); }))
+                    [](AffineMap map) {
+                      return map.isProjectedPermutation(/*allowZeroInResults=*/true);
+                    }))
     return failure();
   if (!generic.getIndexingMapsArray().back().isIdentity())
     return failure();

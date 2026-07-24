@@ -45,6 +45,16 @@
 // CHECK: IR printer
 // CHECK: iterator_types = ["parallel", "reduction"]
 // CHECK: arith.maxnumf
+
+// @zero_index_broadcast: loop -> broadcasted scale -> sum. Constant-zero indexing-map results
+// are singleton broadcasts and remain valid elementwise operations on the path to the reduction.
+// CHECK: IR printer
+// CHECK: iterator_types = ["parallel", "reduction"]
+// CHECK: arith.addf
+// CHECK: IR printer
+// CHECK: affine_map<(d0, d1) -> (d0, 0)>
+// CHECK: iterator_types = ["parallel", "parallel"]
+// CHECK: arith.mulf
 // CHECK: module attributes {transform.with_named_sequence} {
 
 module attributes {transform.with_named_sequence} {
@@ -99,6 +109,16 @@ transform.named_sequence @__transform_main(%module: !transform.any_op) {
       : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
   transform.print %r5 : !transform.any_op
   transform.print %e5 : !transform.any_op
+
+  %f6 = transform.structured.match ops{["func.func"]}
+      attributes {sym_name = "zero_index_broadcast"} in %module
+      : (!transform.any_op) -> !transform.any_op
+  %loop6 = transform.structured.match ops{["scf.for"]} in %f6
+      : (!transform.any_op) -> !transform.any_op
+  %r6, %e6 = transform.fusion.find_next_reduction %loop6
+      : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+  transform.print %r6 : !transform.any_op
+  transform.print %e6 : !transform.any_op
 
   transform.yield
 }
@@ -399,6 +419,52 @@ func.func @attention_like(%arg0: tensor<4x4xf32>) -> tensor<4xf32> {
       linalg.yield %v : f32
   } -> tensor<4xf32>
   return %weighted_sum : tensor<4xf32>
+}
+
+// loop -> broadcasted scale with a constant-zero indexing result -> sum
+func.func @zero_index_broadcast(%arg0: tensor<4x4xf32>,
+                                %scale: tensor<4x1xf32>) -> tensor<4xf32> {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c2 = arith.constant 2 : index
+
+  %empty = tensor.empty() : tensor<4x4xf32>
+  %scores = scf.for %iv = %c0 to %c2 step %c1
+      iter_args(%acc = %empty) -> (tensor<4x4xf32>) {
+    %j = affine.apply affine_map<(d0) -> (d0 * 2)>(%iv)
+    %tile = tensor.extract_slice %arg0[0, %j] [4, 2] [1, 1]
+        : tensor<4x4xf32> to tensor<4x2xf32>
+    %inserted = tensor.insert_slice %tile into %acc[0, %j] [4, 2] [1, 1]
+        : tensor<4x2xf32> into tensor<4x4xf32>
+    scf.yield %inserted : tensor<4x4xf32>
+  }
+
+  %scaled_empty = tensor.empty() : tensor<4x4xf32>
+  %scaled = linalg.generic {
+      indexing_maps = [affine_map<(i, j) -> (i, j)>,
+                       affine_map<(i, j) -> (i, 0)>,
+                       affine_map<(i, j) -> (i, j)>],
+      iterator_types = ["parallel", "parallel"]}
+      ins(%scores, %scale : tensor<4x4xf32>, tensor<4x1xf32>)
+      outs(%scaled_empty : tensor<4x4xf32>) {
+    ^bb0(%score: f32, %factor: f32, %out: f32):
+      %value = arith.mulf %score, %factor : f32
+      linalg.yield %value : f32
+  } -> tensor<4x4xf32>
+
+  %zero = arith.constant 0.0 : f32
+  %sum_empty = tensor.empty() : tensor<4xf32>
+  %sum_init = linalg.fill ins(%zero : f32) outs(%sum_empty : tensor<4xf32>) -> tensor<4xf32>
+  %sum = linalg.generic {
+      indexing_maps = [affine_map<(i, j) -> (i, j)>,
+                       affine_map<(i, j) -> (i)>],
+      iterator_types = ["parallel", "reduction"]}
+      ins(%scaled : tensor<4x4xf32>) outs(%sum_init : tensor<4xf32>) {
+    ^bb0(%value: f32, %acc: f32):
+      %next = arith.addf %value, %acc : f32
+      linalg.yield %next : f32
+  } -> tensor<4xf32>
+  return %sum : tensor<4xf32>
 }
 
 } // module
