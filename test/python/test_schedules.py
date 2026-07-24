@@ -11,6 +11,8 @@ from neptune_mlir.schedules import (
 def test_default_attention_schedule_tile_sizes() -> None:
     text = materialize_attention_schedule(AttentionSchedule.GLOBAL_ATTN)
     assert "tile_sizes [1, 1, 128, 64, 0]" in text
+    assert 'transform.apply_registered_pass "stablehlo-to-ta"' in text
+    assert 'transform.apply_registered_pass "linalg-to-ta"' not in text
     assert "${block_m}" not in text
     assert "${block_n}" not in text
 

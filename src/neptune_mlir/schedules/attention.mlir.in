@@ -11,11 +11,10 @@ module attributes {transform.with_named_sequence} {
   }
 
   transform.named_sequence @__transform_main(%module: !any) {
-    // Prepass. Translate the input function from linalg to `ta` dialect, which enables
-    // more flexible expression rewrites. Apply rewrites, then translate back to linalg.
+    // Prepass. Translate the StableHLO input function to `ta`, which enables more flexible
+    // expression rewrites. Apply rewrites, then translate to linalg for scheduling.
     %func0 = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
-    %func1 = transform.apply_registered_pass "linalg-generalize-named-ops" to %func0 : (!any) -> !any
-    %func = transform.apply_registered_pass "linalg-to-ta" to %func1 : (!any) -> !any
+    %func = transform.apply_registered_pass "stablehlo-to-ta" to %func0 : (!any) -> !any
     transform.apply_patterns to %func {
       // This canonicalization step folds trunc(const(f64), f32) into a constant in f32.
       transform.apply_patterns.canonicalization
