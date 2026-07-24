@@ -2,14 +2,14 @@
 
 `ta` represents pure tensor computations as scalar indexed expressions over
 named axes. It is meant to be a temporary compiler view of a tensor dataflow
-graph: import from `linalg`, expose algebra and reductions across original
-operation boundaries, rewrite, then lower back to structured tensor code.
+graph: import from StableHLO, expose algebra and reductions across original
+operation boundaries, rewrite, then lower to structured tensor code.
 
 The core shape is:
 
 ```text
-linalg tensor dataflow
-  -> one ta.scope over named axes with extents
+StableHLO tensor dataflow
+  -> ta.scope regions over named axes with extents
   -> scope-local ta.expr values
   -> elementwise scalar ops plus bodyless reductions
   -> rewritten ta
@@ -228,55 +228,46 @@ intended TA rewrite style: match a small expression DAG, query axis
 side-conditions, create new ordinary `ta` ops, and let later lowering decide
 materialization boundaries.
 
-## Importing From Linalg
+## Importing From StableHLO
 
-The `linalg-to-ta` pass imports supported pure tensor dataflow rooted at a
-function return value and materializes it as one `ta.scope`.
+The `stablehlo-to-ta` pass imports supported, statically shaped StableHLO tensor
+islands and materializes each island as a `ta.scope`. An island ends when a
+supported value reaches a function return or an unsupported operation. The
+containing function currently must have one static ranked tensor result.
 
 ```bash
 neptune-opt \
-  --pass-pipeline='builtin.module(func.func(linalg-to-ta))' \
+  --pass-pipeline='builtin.module(func.func(stablehlo-to-ta))' \
   input.mlir
 ```
 
-The importer walks the tensor dataflow graph, assigns canonical axes to tensor
-dimensions and `linalg.generic` loops, then emits each source operation once in
-dominance order using a value-to-value map. Shared producers stay shared in the
-TA program.
+The importer first discovers logical axes for every tensor dimension, then
+replays the dataflow as scalar TA expressions. Each source operation is emitted
+once per scope using a value-to-value map, so shared producers remain shared in
+the TA program.
 
-Supported producer forms:
-
-```text
-function tensor arguments
-arith constants
-tensor.collapse_shape
-tensor.expand_shape
-linalg.generic with projected-permutation and broadcast indexing maps
-```
-
-Recognized scalar body ops:
+Supported inputs and operations include:
 
 ```text
-arith.extf
-arith.truncf
-arith.addf
-arith.subf
-arith.mulf
-arith.divf
-arith.maximumf
-arith.minimumf
-arith.cmpi
-arith.select
-linalg.index
-arith.index_cast of linalg.index
-math.exp
+static ranked tensor arguments
+arith.constant and stablehlo.constant
+stablehlo.iota and stablehlo.dynamic_iota with static result shapes
+stablehlo.convert
+stablehlo.exponential
+stablehlo.add, subtract, multiply, divide, maximum, minimum, and and
+stablehlo.compare and stablehlo.select
+stablehlo.transpose
+stablehlo.broadcast_in_dim
+reassociative stablehlo.reshape
+stablehlo.reduce
+stablehlo.dot_general
 ```
 
-Recognized reduction combiners are add, multiply, maximum, and minimum.
-Reduction bodies with those accumulator forms are imported as elementwise
-payload ops followed by `ta.reduce`.
+Reductions must have one input and a direct binary `add` or `maximum` combiner.
+Their initial value must be the corresponding identity: zero for addition and
+negative infinity (or the minimum signed integer) for maximum.
 
-The importer annotates ops created from each source `linalg.generic` with:
+The importer annotates TA operations created from each StableHLO operation with:
 
 ```mlir
 {ta.import_group = N : i64}
@@ -287,38 +278,45 @@ not part of the mathematical semantics.
 
 ### Axis Discovery
 
-Result tensor dimensions receive axes first. The importer then propagates those
-axes backward through output indexing maps to loop dimensions, and through input
-indexing maps to operand tensor dimensions. If a tensor value is reached from
-multiple users, equivalent dimensions are unified so the producer is not
-re-imported with fresh axes.
+Every static tensor dimension initially receives its own union-find axis.
+Operation dimension attributes then unify dimensions that denote the same
+logical coordinate: same-shaped elementwise operations align dimensions by
+position, transposes apply their permutation, and `dot_general` uses its
+batching and contracting dimensions. Equal-size broadcast dimensions remain
+the same axis, while a unit dimension expanded to a larger extent is not
+unified with the result dimension.
 
-For a dot product with local loops:
+Reshapes are accepted when their source and result shapes admit tensor-style
+reassociation. The importer records collapsed product axes and their expanded
+factors, and emission uses `affine.linearize_index` when an expanded expression
+observes a lower-rank source tensor. True product collapses that require
+recovering several source coordinates from one TA axis remain unsupported.
+
+After equality discovery, a presence phase decides which extent-one axes remain
+in expression support. Non-unit axes are always present. Unit axes are retained
+when required by scope results, iotas, reduction dimensions, dot contractions,
+or reshape-product dependencies. Unit axes used only to introduce an expanding
+broadcast are omitted.
+
+This distinction is important for grouped-query attention. MQA keeps its
+structural KV-head axis `h=1`, so its QK contraction still matches:
 
 ```text
-(b, h, i, j, d)
+b ... h i d, b h j d -> b ... h i j
 ```
 
-and maps:
+The separate unit group dimension on K and V is omitted because it exists only
+to broadcast from one KV head group to multiple query-head groups.
 
-```text
-Q   : (b,h,i,j,d) -> (b,h,i,d)
-K   : (b,h,i,j,d) -> (b,h,j,d)
-Dot : (b,h,i,j,d) -> (b,h,i,j)
-```
-
-the output map assigns axes to `b`, `h`, `i`, and `j`; the missing reduction
-loop gets a fresh axis `d`; input maps project those loop axes onto `Q` and
-`K`.
-
-Broadcasts appear as missing axes or constant affine-map results. For:
+Broadcasts in elementwise expressions are represented by missing operand axes.
+For:
 
 ```text
 P[b,h,i,j] = exp(S[b,h,i,j] - M[b,h,i])
 ```
 
 `M` imports as an expression over `[b, h, i]`; combining it with `S` broadcasts
-it by unioning axis sets.
+it by taking the ordered union of their axis sets.
 
 ## Lowering Back To Linalg
 
@@ -348,10 +346,10 @@ ta.at accesses   -> affine indexing maps
 scalar TA ops     -> linalg region scalar ops
 ```
 
-The current lowering is conservative. It handles the attention demo after
-`linalg-to-ta`, `exp` to `exp2`, and division/matmul exchange, but more complex
-partitions may need to be split or lowered through a more general path such as
-`scf`.
+The current lowering is conservative. It handles attention imported with
+`stablehlo-to-ta` after the `exp` to `exp2` and division/matmul rewrites, but
+more complex partitions may need to be split or lowered through a more general
+path such as `scf`.
 
 Transform schedules that need to keep handles across the TA-to-linalg boundary
 can use a TA-side einsum matcher and the transform lowering op:
@@ -392,7 +390,7 @@ linalg-region scalar ops may be dropped.
 transform.named_sequence @__transform_main(%module: !transform.any_op) {
   %func = transform.structured.match ops{["func.func"]} in %module
       : (!transform.any_op) -> !transform.any_op
-  %ta_func = transform.apply_registered_pass "linalg-to-ta" to %func
+  %ta_func = transform.apply_registered_pass "stablehlo-to-ta" to %func
       : (!transform.any_op) -> !transform.any_op
   transform.apply_patterns to %ta_func {
     transform.apply_patterns.ta.exp_to_exp2

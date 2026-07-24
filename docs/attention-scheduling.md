@@ -14,15 +14,15 @@ The test contains a payload module in algorithmic form and a `transform` region 
 
 ## Scheduling Model
 
-The source program describes attention in simple math terms, with matmuls and softmax modeled
-in the MLIR `linalg` dialect.
+The source program is exact exporter-generated StableHLO describing attention in simple math
+terms. TA lowering later produces the MLIR `linalg` operations used by loop scheduling.
 After transformation, the scheduled L1 program exposes a structure similar to FlashAttention,
 with online-softmax recurrence and block tiling.
 
 The key techniques we use in scheduling are:
 
-1. _Expression rewrites in TA dialect_: translate the linalg program into the _tensor algebra_
-   (TA) dialect, to enable for rewrites like `exp -> exp2`, then translate back to linalg.
+1. _Expression rewrites in TA dialect_: translate the StableHLO program into the _tensor algebra_
+   (TA) dialect for rewrites like `exp -> exp2`, then lower TA to linalg.
 1. _Structural matching over names_: match ops by linalg structure and use-def navigation,
    instead of operation names or custom tags (which is typical in other compilers like TVM).
 1. _Upward fusion into tiled loops_: tile the QK producer, then fuse consumers upwards into
@@ -52,9 +52,9 @@ Note: `ts` is short for `transform.structured`.
 | `set_scope`, `cache_read`, `cache_write` | Not represented in L1. Defer memory placement to later HTile placement and kernel lowering.                                         |
 | `to_tile_expr_form`, `mem2reg`           | L1 is already value-based over tile tensors.                                                                                        |
 | `cse`                                    | Use MLIR canonicalization and CSE, including `transform.apply_patterns ... canonicalization` and `transform.apply_cse`.             |
-| `rewrite_expr`                           | Use TA for rewrites: import linalg to TA, run TA expression rewrites, then lower back to linalg.                                    |
+| `rewrite_expr`                           | Use TA for rewrites: import StableHLO to TA, run TA expression rewrites, then lower TA to linalg.                                  |
 
-1. The schedule generalizes named linalg ops, imports the computation into TA, and uses the TA
+1. The schedule imports StableHLO into TA and uses the TA
    expression view for `transform.apply_patterns.ta.exp_to_exp2`,
    `transform.apply_patterns.ta.sink_div_after_matmul`, and `transform.match.ta.einsum`.
    See the [TA dialect design](ta-dialect-design.md).
@@ -89,8 +89,7 @@ the structural matching strategy used here.
 
 The current integrated schedule proceeds as follows:
 
-1. Generalize named linalg ops.
-1. Translate linalg to TA for expression-level rewrites.
+1. Translate StableHLO to TA for expression-level rewrites.
 1. Rewrite `exp(x)` to `exp2(x * log2(e))`.
 1. Sink division past the final matmul where possible.
 1. Match the QK contraction with `transform.match.ta.einsum`, then lower TA back to linalg while preserving that handle.
@@ -124,7 +123,7 @@ transformations. See [the rolling update design](rolling-update-design.md) for d
 
 The L0-to-L1 schedule is implemented for the current global attention shape.
 
-- [x] TA prepass imports linalg attention into expression form, rewrites `exp` to `exp2`,
+- [x] TA prepass imports StableHLO attention into expression form, rewrites `exp` to `exp2`,
       exchanges division and matmul where needed, and lowers back to linalg.
 - [x] TA einsum matching identifies the two attention contractions across TA-to-linalg lowering.
 - [x] QK is tiled with `transform.structured.tile_using_forall` to produce `scf.forall`.
