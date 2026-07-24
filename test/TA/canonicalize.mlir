@@ -41,6 +41,24 @@ module {
     return %0 : tensor<1xf32>
   }
 
+  // CHECK-LABEL: func.func @fold_integer_add_zero
+  func.func @fold_integer_add_zero() -> tensor<4xi64> {
+    %0 = ta.scope axes(%i "i" extent 4) {
+      // CHECK: %[[INDEX:.+]] = ta.index
+      // CHECK-NOT: ta.constant
+      // CHECK-NOT: ta.add
+      // CHECK: ta.yield %[[INDEX]]
+      %index = ta.index %i : !ta.expr<i64, [i]>
+      %zero = ta.constant 0 : i64 : !ta.expr<i64, []>
+      %left = ta.add %zero, %index
+          : (!ta.expr<i64, []>, !ta.expr<i64, [i]>) -> !ta.expr<i64, [i]>
+      %right = ta.add %left, %zero
+          : (!ta.expr<i64, [i]>, !ta.expr<i64, []>) -> !ta.expr<i64, [i]>
+      ta.yield %right : !ta.expr<i64, [i]>
+    } : () -> tensor<4xi64>
+    return %0 : tensor<4xi64>
+  }
+
   // CHECK-LABEL: func.func @fold_float_infinity_identities
   func.func @fold_float_infinity_identities(%arg: tensor<4xf32>) -> tensor<4xf32> {
     %0 = ta.scope axes(%i "i" extent 4) {

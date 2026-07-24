@@ -750,6 +750,28 @@ struct FoldCastOfConstant : OpRewritePattern<CastOp> {
   }
 };
 
+struct FoldAddIntegerZero : OpRewritePattern<AddOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(AddOp op, PatternRewriter &rewriter) const override {
+    auto isIntegerZero = [](Value value) {
+      auto constant = value.getDefiningOp<ConstantOp>();
+      auto integer = constant ? dyn_cast<IntegerAttr>(constant.getValue()) : IntegerAttr();
+      return integer && integer.getValue().isZero();
+    };
+
+    Value replacement;
+    if (isIntegerZero(op.getLhs()))
+      replacement = op.getRhs();
+    else if (isIntegerZero(op.getRhs()))
+      replacement = op.getLhs();
+    if (!replacement || replacement.getType() != op.getResult().getType())
+      return failure();
+    rewriter.replaceOp(op, replacement);
+    return success();
+  }
+};
+
 struct FoldMulOfConstants : OpRewritePattern<MulOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -804,6 +826,10 @@ struct FoldInfinityIdentity : OpRewritePattern<OpTy> {
 
 void CastOp::getCanonicalizationPatterns(RewritePatternSet &patterns, MLIRContext *context) {
   patterns.add<FoldCastOfConstant>(context);
+}
+
+void AddOp::getCanonicalizationPatterns(RewritePatternSet &patterns, MLIRContext *context) {
+  patterns.add<FoldAddIntegerZero>(context);
 }
 
 void MulOp::getCanonicalizationPatterns(RewritePatternSet &patterns, MLIRContext *context) {

@@ -77,7 +77,9 @@ def TA_ConstantOp : TA_Op<"constant", [Pure, InferTypeOpAdaptor]> {
 }
 
 def TA_NegOp : TA_UnaryElementwiseOp<"neg">;
-def TA_AddOp : TA_BinaryElementwiseOp<"add", [Commutative]>;
+def TA_AddOp : TA_BinaryElementwiseOp<"add", [Commutative]> {
+  let hasCanonicalizer = 1;
+}
 def TA_SubOp : TA_BinaryElementwiseOp<"sub">;
 def TA_AndOp : TA_BinaryElementwiseOp<"and", [Commutative]>;
 def TA_MulOp : TA_BinaryElementwiseOp<"mul", [Commutative]> {
