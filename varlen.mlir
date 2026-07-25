@@ -13,18 +13,15 @@ module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo
     // and transform ops cannot update the module itself.
     %func0 = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
     %func = transform.apply_registered_pass "stablehlo-to-ta" to %func0 : (!any) -> !any
-    // Replace `exp(x)` with `exp2(x * log2(e))`, then push `log2(e)` constant around
-    // until it folds with other multiplicative constants.
     transform.apply_patterns to %func {
-      // Replace `exp(x)` with `exp2(x * log2(e))`, push `log2(e)` into scalar factors.
       transform.apply_patterns.ta.exp_to_exp2
-      // Replace `matmul(P_ij / s_i, V_jd)` with `matmul(P_ij, V_jd) / s_i`.
       transform.apply_patterns.ta.sink_div_after_matmul
     } : !any
     transform.apply_cse to %func : !any
     %bmm0 = transform.collect_matching @match_4d_matmul_transb in %func : (!any) -> !any
     transform.ta.to_linalg %func : !any
 
+    // Nothing out of ordinary here: a regular schedule for dense attention.
     %_1, %forall_loop = transform.structured.tile_using_forall
         %bmm0 tile_sizes [1, 128, 1, 64, 0] : (!any) -> (!any, !any)
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
@@ -59,10 +56,21 @@ module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo
         : (!any, !any, !any, !any, !any, !any) -> !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
-    // This differs from the global attention schedule. We have trailing stablehlo.broadcast_in_dim
-    // and stablehlo.scatter that we don't know how to fuse. TODO
-    %scatter = transform.structured.match ops{["stablehlo.broadcast_in_dim"]} in %func : (!any) -> !any
-    transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %scatter : (!any, !any) -> !any
+    // Difference from dense attention (1): fuse gathers, tensor slices, etc. downwards into the loop nest.
+    // Only do this after we've scheduled the dense attention itself
+    // (specifically after the PV matmul is in the loop).
+    // This step will fail to fuse the stablehlo.slice ops themselves, and that is fine.
+    %slices = transform.structured.match ops{["stablehlo.slice"]} in %func : (!any) -> !any
+    %consumer_loops = transform.merge_handles %forall_loop, %j0_loop : !any
+    transform.fusion.greedy_producers_into_consumer %slices into %consumer_loops : (!any, !any) -> (!any, !any)
+
+    // Instead of fusing stablehlo.slice, convert them to tensor.extract_slice, and merge with existing extract_slice ops in the loop.
+    transform.apply_conversion_patterns to %func {
+      transform.apply_conversion_patterns.stablehlo.slice_to_tensor
+    } {illegal_ops = ["stablehlo.slice"], legal_dialects = ["tensor"], partial_conversion, preserve_handles} : !any
+    transform.apply_patterns to %func {
+      transform.apply_patterns.tensor.merge_consecutive_insert_extract_slice
+    } : !any
 
     // Post-pass: pushes lingering init tensor (see destination-passing style)
     // before and outside the loops into the loop body.

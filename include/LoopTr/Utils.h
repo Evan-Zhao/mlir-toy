@@ -8,6 +8,8 @@
 #include "mlir/Dialect/Transform/Utils/DiagnosedSilenceableFailure.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/SetVector.h"
 #include <optional>
 
 namespace mlir {
@@ -37,6 +39,24 @@ class TransformRewriter;
   (varName) = dyn_cast<Type>(varName##1);                                                          \
   if (!(varName))                                                                                  \
     return emitSilenceableFailure(transform, "expected " nameStr " to be a " #Type);
+
+struct DefUsePathCollection {
+  llvm::SetVector<Operation *> operations;
+  SmallVector<Operation *> descendants;
+};
+
+/// Find descendant operations by forward BFS from `ancestorValues`, then
+/// collect the operations on paths between the ancestors and those descendants.
+///
+/// Forward traversal stops at every operation accepted by `isDescendant`. If
+/// `stopAfterFirstDescendant` is true, the first accepted operation in BFS
+/// order is the only descendant. The returned operations are the intersection
+/// of the forward and backward slices, in producer-to-consumer topological
+/// order. They include defining operations of ancestor values and accepted
+/// descendants. Paths through block arguments are not followed.
+DefUsePathCollection collectOpsOnDefUsePaths(ValueRange ancestorValues,
+                                             llvm::function_ref<bool(Operation *)> isDescendant,
+                                             bool stopAfterFirstDescendant = false);
 
 /// Verifies that `op` is an elementwise linalg.generic operation with a single output.
 LogicalResult isSingleOutputElemwiseLinalgOp(Operation *op);
