@@ -9,6 +9,18 @@ def HTile_Placement
   let cppNamespace = "::htile";
 }
 
+def HTile_ScatterOutOfBounds
+    : I32EnumAttr<"ScatterOutOfBounds", "parallel scatter out-of-bounds behavior",
+                  [I32EnumAttrCase<"Discard", 0, "discard">]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::htile";
+}
+
+def HTile_ScatterOutOfBoundsAttr
+    : EnumAttr<HTile_Dialect, HTile_ScatterOutOfBounds, "scatter_out_of_bounds"> {
+  let assemblyFormat = "`<` $value `>`";
+}
+
 def HTile_EncodingAttr : AttrDef<HTile_Dialect, "Encoding"> {
   let mnemonic = "encoding";
   let summary = "HTile tensor encoding";
