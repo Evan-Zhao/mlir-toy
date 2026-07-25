@@ -91,10 +91,10 @@ module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo
     %1 = stablehlo.slice %arg3 [1:9] : (tensor<9xi32>) -> tensor<8xi32>
     %2 = stablehlo.subtract %1, %0 : tensor<8xi32>
     %3 = stablehlo.iota dim = 0 : tensor<128xi32>
-    %4 = stablehlo.broadcast_in_dim %3, dims = [1] : (tensor<128xi32>) -> tensor<1x128xi32>
-    %5 = stablehlo.broadcast_in_dim %0, dims = [0] : (tensor<8xi32>) -> tensor<8x1xi32>
-    %6 = stablehlo.broadcast_in_dim %5, dims = [0, 1] : (tensor<8x1xi32>) -> tensor<8x128xi32>
-    %7 = stablehlo.broadcast_in_dim %4, dims = [0, 1] : (tensor<1x128xi32>) -> tensor<8x128xi32>
+    %4 = stablehlo.broadcast_in_dim %0, dims = [0] : (tensor<8xi32>) -> tensor<8x1xi32>
+    %5 = stablehlo.broadcast_in_dim %3, dims = [1] : (tensor<128xi32>) -> tensor<1x128xi32>
+    %6 = stablehlo.broadcast_in_dim %4, dims = [0, 1] : (tensor<8x1xi32>) -> tensor<8x128xi32>
+    %7 = stablehlo.broadcast_in_dim %5, dims = [0, 1] : (tensor<1x128xi32>) -> tensor<8x128xi32>
     %8 = stablehlo.add %6, %7 : tensor<8x128xi32>
     %9 = stablehlo.broadcast_in_dim %8, dims = [0, 1] : (tensor<8x128xi32>) -> tensor<8x128x1xi32>
     %10 = "stablehlo.gather"(%arg0, %9) <{dimension_numbers = #stablehlo.gather<offset_dims = [2, 3], collapsed_slice_dims = [0], start_index_map = [0], index_vector_dim = 2>, indices_are_sorted = false, slice_sizes = array<i64: 1, 4, 64>}> : (tensor<1024x4x64xf16>, tensor<8x128x1xi32>) -> tensor<8x128x4x64xf16>

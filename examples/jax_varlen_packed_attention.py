@@ -1,12 +1,11 @@
 """Print a JAX packed variable-length attention program as StableHLO MLIR.
 
 This variant expresses documents as a parallel batch using ``vmap`` instead of a
-sequential ``fori_loop``. It gathers fixed-size, padded document windows from
-packed Q/K/V, applies regular masked attention over the dense
-``[num_docs, max_doc_tokens, heads, head_dim]`` view, and scatters valid document
-results back to packed output. Runtime document lengths come from
-``cu_seqlens``; the maximum document length must be provided statically via
-``--max-doc-tokens``.
+sequential ``fori_loop``. It loads fixed-size document windows with per-token gathers,
+applies regular masked attention over the dense ``[num_docs, max_doc_tokens, heads, head_dim]`` view,
+and scatters valid document results back to packed output.
+Runtime document lengths come from ``offsets``;
+the maximum document length must be provided statically via ``--max-doc-tokens``.
 """
 
 import argparse
@@ -51,26 +50,28 @@ def doc_offset_attention(
     lengths = offsets[1:] - starts
     token_offsets = jnp.arange(L0, dtype=offsets.dtype)
     scale = jnp.asarray(1.0 / math.sqrt(D), dtype=jnp.float32)
+    token_indices = starts[:, None] + token_offsets[None, :]
 
-    def load_doc(x, start):
-        # Invalid window lanes are masked out before they affect valid output.
-        # Use clipped gathers rather than masked-fill gathers to avoid generating
-        # separate OOB masks and zero-selects for every Q/K/V load.
-        token_indices = start + token_offsets
+    # StableHLO has no masked slicing operation. A ranged load `[start, end)` in StableHLO
+    # clamps start to make the whole window in bound, which is surprising and not what we intend.
+    # Instead, use `lax.gather` in clip mode, which translate to a StableHLO gather (that we can
+    # lower to a masked load later).
+    # N.B. Use CLIP mode so the StableHLO IR is kept simple, and we can add on our own masking semantics later.
+    # FILL_OR_DROP would be more proper, but JAX would produce masking logic in the IR.
+    def masked_load_docs(x):
         return lax.gather(
             x,
-            token_indices[:, None],
+            token_indices[..., None],
             dimension_numbers=lax.GatherDimensionNumbers(
-                offset_dims=(1, 2), collapsed_slice_dims=(0,), start_index_map=(0,)
+                offset_dims=(2, 3), collapsed_slice_dims=(0,), start_index_map=(0,)
             ),
             slice_sizes=(1, H, D),
             mode=lax.GatherScatterMode.CLIP,
         )
 
-    def one_doc_attention(start, doc_len):
+    def one_doc_attention(q_doc, k_doc, v_doc, doc_len):
         """Dense masked attention for one logical document window."""
 
-        q_doc, k_doc, v_doc = [load_doc(x, start) for x in (q, k, v)]
         scores = jnp.einsum("ihd,jhd->hij", q_doc, k_doc, preferred_element_type=jnp.float32)
         scores = scores * scale
         valid_tokens = token_offsets < doc_len
@@ -82,18 +83,19 @@ def doc_offset_attention(
         out_doc_f32 = jnp.einsum("hij,jhd->ihd", probs, v_doc, preferred_element_type=jnp.float32)
         return out_doc_f32.astype(q.dtype)
 
+    q_docs, k_docs, v_docs = [masked_load_docs(x) for x in (q, k, v)]
+
     # [N, M, H, D]. `vmap` makes the whole per-document attention computation a
     # batched, document-parallel map rather than a loop-carried sequential loop.
-    out_docs = jax.vmap(one_doc_attention)(starts, lengths)
+    out_docs = jax.vmap(one_doc_attention)(q_docs, k_docs, v_docs, lengths)
 
     # Scatter valid document tokens back to packed layout. Invalid padded tokens
     # are sent to unique out-of-bounds sink positions so the scatter can be marked
     # unique and the OOB updates can be dropped instead of materializing sinks.
     doc_ids = jnp.arange(N, dtype=offsets.dtype)
-    doc_token_indices = starts[:, None] + token_offsets[None, :]
     valid_doc_tokens = lengths[:, None] > token_offsets[None, :]
     sink_indices = LT + doc_ids[:, None] * L0 + token_offsets[None, :]
-    scatter_indices = jnp.where(valid_doc_tokens, doc_token_indices, sink_indices)
+    scatter_indices = jnp.where(valid_doc_tokens, token_indices, sink_indices)
     return lax.scatter(
         jnp.zeros((LT, H, D), dtype=q.dtype),
         scatter_indices[..., None],  # [N, L0, 1]
