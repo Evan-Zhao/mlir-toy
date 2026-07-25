@@ -287,6 +287,44 @@ def FusionGreedyConsumersIntoProducerOp
                        "attr-dict `:` functional-type(operands, results)";
 }
 
+def FusionGreedyProducersIntoConsumerOp
+    : Op<Transform_Dialect, "fusion.greedy_producers_into_consumer",
+         [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+          ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Greedily fuse producers into a consumer loop";
+
+  let description = [{
+    Greedily fuse producers into `consumer_op` along def-use paths that start
+    at one of the operations in the required `producer_ops` handle and end at
+    a tensor.extract_slice nested in the consumer loop.
+    Producers outside these paths are not fused.
+
+    `consumer_op` may identify either one loop or multiple strictly nested
+    loops. The outermost loop must be an `scf.forall`. When multiple loops are
+    provided, producers are fused into the innermost loop. Loop nesting, rather
+    than handle order, determines the outer-to-inner order passed to MLIR's
+    producer fusion utility.
+
+    Producers are processed in a topological order whenever possible, so a
+    producer exposed by fusing another producer can be fused in a later step.
+    Function arguments and non-tileable operations are not fused.
+
+    The `producer_ops` and `consumer_op` handles are read-only. The
+    `new_consumer` result contains the updated loop nest in outer-to-inner
+    order. The `fused_ops` result contains the producer operations fused in
+    fusion order.
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$producer_ops,
+      TransformHandleTypeInterface:$consumer_op);
+  let results = (outs TransformHandleTypeInterface:$fused_ops,
+      TransformHandleTypeInterface:$new_consumer);
+
+  let assemblyFormat = "$producer_ops `into` $consumer_op attr-dict "
+                       " `:` functional-type(operands, results)";
+}
+
 def FusionFindNextReductionOp
     : Op<Transform_Dialect, "fusion.find_next_reduction",
          [NavigationTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,

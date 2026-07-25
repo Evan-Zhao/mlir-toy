@@ -149,54 +149,28 @@ DiagnosedSilenceableFailure FusionFindNextReductionOp::apply(transform::Transfor
   if (resultNumber && *resultNumber >= producer->getNumResults())
     BAIL("result number is out of range for producer op");
 
-  // Forward BFS: find the nearest reduction.
-  SmallPtrSet<Operation *, 16> visited({producer});
-  std::deque<Operation *> queue({producer});
-  Operation *reduce = nullptr;
-  while (!queue.empty()) {
-    Operation *current = queue.front();
-    queue.pop_front();
-    if (current != producer && isReductionLike(current)) {
-      reduce = current;
-      break;
-    }
-    SmallVector<Value> results;
-    if (current == producer && resultNumber)
-      results.push_back(producer->getResult(*resultNumber));
-    else
-      llvm::append_range(results, current->getOpResults());
-    for (Value result : results)
-      for (Operation *user : result.getUsers())
-        if (visited.insert(user).second)
-          queue.push_back(user);
-  }
-  if (!reduce)
-    BAIL("no reduction reachable from producer op");
+  SmallVector<Value> sourceValues;
+  if (resultNumber)
+    sourceValues.push_back(producer->getResult(*resultNumber));
+  else
+    llvm::append_range(sourceValues, producer->getResults());
 
-  // Backward walk from `reduce`, bounded by `visited`.
+  DefUsePathCollection path = collectOpsOnDefUsePaths(sourceValues, isReductionLike,
+                                                      /*stopAfterFirstDescendant=*/true);
+  if (path.descendants.empty())
+    BAIL("no reduction reachable from producer op");
+  Operation *reduce = path.descendants.front();
+
   SmallVector<Operation *> elemwiseOps;
-  {
-    SmallPtrSet<Operation *, 16> bvisited({reduce});
-    std::deque<Operation *> bqueue({reduce});
-    while (!bqueue.empty()) {
-      Operation *current = bqueue.front();
-      bqueue.pop_front();
-      if (current != reduce) {
-        if (failed(isSingleOutputElemwiseLinalgOp(current))) {
-          current->emitRemark("this op is not a single-output elementwise linalg op");
-          BAIL("expected all ops between producer_op and reduce_op to be elementwise");
-        }
-        elemwiseOps.push_back(current);
-      }
-      for (Value operand : current->getOperands()) {
-        Operation *defOp = operand.getDefiningOp();
-        if (defOp && defOp != producer && visited.contains(defOp))
-          if (bvisited.insert(defOp).second)
-            bqueue.push_back(defOp);
-      }
+  for (Operation *current : path.operations) {
+    if (current == producer || current == reduce)
+      continue;
+    if (failed(isSingleOutputElemwiseLinalgOp(current))) {
+      current->emitRemark("this op is not a single-output elementwise linalg op");
+      BAIL("expected all ops between producer_op and reduce_op to be elementwise");
     }
+    elemwiseOps.push_back(current);
   }
-  llvm::sort(elemwiseOps, [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
 
   transformResults.set(getOperation()->getResult(0), {reduce});
   transformResults.set(getOperation()->getResult(1), elemwiseOps);

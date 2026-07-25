@@ -1,4 +1,5 @@
 #include "LoopTr/Utils.h"
+#include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
@@ -7,6 +8,7 @@
 #include "mlir/Transforms/CSE.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/Twine.h"
+#include <deque>
 
 namespace mlir {
 
@@ -185,8 +187,63 @@ Operation *getCommonDefiningOp(ValueRange values) {
 
 } // namespace
 
-TrackedOperationsListener::TrackedOperationsListener(
-    SmallVectorImpl<Operation *> &trackedOps, OpBuilder::Listener *previous)
+DefUsePathCollection collectOpsOnDefUsePaths(ValueRange ancestorValues,
+                                             llvm::function_ref<bool(Operation *)> isDescendant,
+                                             bool stopAfterFirstDescendant) {
+  // Compute the forward slice. Seed users from the exact ancestor values so a
+  // caller can select one result of a multi-result operation without making
+  // paths through its other results reachable.
+  SmallPtrSet<Operation *, 32> forwardReachable;
+  std::deque<Operation *> forwardQueue;
+  auto enqueue = [&](Operation *operation) {
+    if (forwardReachable.insert(operation).second)
+      forwardQueue.push_back(operation);
+  };
+  for (Value ancestor : ancestorValues) {
+    if (Operation *def = ancestor.getDefiningOp())
+      forwardReachable.insert(def);
+    for (Operation *user : ancestor.getUsers())
+      enqueue(user);
+  }
+
+  SmallVector<Operation *> descendants;
+  while (!forwardQueue.empty()) {
+    Operation *current = forwardQueue.front();
+    forwardQueue.pop_front();
+    if (isDescendant(current)) {
+      descendants.push_back(current);
+      if (stopAfterFirstDescendant)
+        break;
+      continue;
+    }
+    for (Value result : current->getResults())
+      for (Operation *user : result.getUsers())
+        enqueue(user);
+  }
+
+  // Compute the backward slice, pruning every definition that is not in the
+  // forward slice. The intersection contains exactly operations on a path
+  // between the requested endpoints.
+  llvm::SetVector<Operation *> onPaths;
+  std::deque<Operation *> backwardQueue(descendants.begin(), descendants.end());
+  while (!backwardQueue.empty()) {
+    Operation *current = backwardQueue.front();
+    backwardQueue.pop_front();
+    if (!onPaths.insert(current))
+      continue;
+    for (Value operand : current->getOperands()) {
+      Operation *def = operand.getDefiningOp();
+      if (def && forwardReachable.contains(def))
+        backwardQueue.push_back(def);
+    }
+  }
+
+  return DefUsePathCollection{.operations = mlir::topologicalSort(onPaths),
+                              .descendants = std::move(descendants)};
+}
+
+TrackedOperationsListener::TrackedOperationsListener(SmallVectorImpl<Operation *> &trackedOps,
+                                                     OpBuilder::Listener *previous)
     : RewriterBase::ForwardingListener(previous), trackedOps(trackedOps) {}
 
 void TrackedOperationsListener::notifyOperationReplaced(Operation *op, Operation *newOp) {
@@ -259,10 +316,9 @@ LogicalResult isSingleOutputElemwiseLinalgOp(Operation *op) {
       !generic.hasPureTensorSemantics())
     return failure();
   // Constant-zero results index singleton dimensions and are ordinary broadcast accesses.
-  if (!llvm::all_of(generic.getIndexingMapsArray(),
-                    [](AffineMap map) {
-                      return map.isProjectedPermutation(/*allowZeroInResults=*/true);
-                    }))
+  if (!llvm::all_of(generic.getIndexingMapsArray(), [](AffineMap map) {
+        return map.isProjectedPermutation(/*allowZeroInResults=*/true);
+      }))
     return failure();
   if (!generic.getIndexingMapsArray().back().isIdentity())
     return failure();
@@ -318,9 +374,10 @@ void pointBuilderToForallParallel(OpBuilder &builder, scf::ForallOp forall) {
   builder.setInsertionPointToEnd(&forall.getTerminator().getRegion().front());
 }
 
-SmallVector<std::pair<Operation *, Operation *>>
-cloneForallLoopBody(scf::ForallOp fromLoop, OpBuilder &builder, scf::ForallOp intoLoop,
-                    IRMapping &mapping) {
+SmallVector<std::pair<Operation *, Operation *>> cloneForallLoopBody(scf::ForallOp fromLoop,
+                                                                     OpBuilder &builder,
+                                                                     scf::ForallOp intoLoop,
+                                                                     IRMapping &mapping) {
   builder.setInsertionPoint(intoLoop.getTerminator());
   SmallVector<std::pair<Operation *, Operation *>> clonedOps =
       cloneBlockWithoutTerminator(builder, *fromLoop.getBody(), mapping);

@@ -59,6 +59,13 @@ module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo
         : (!any, !any, !any, !any, !any, !any) -> !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
+    // Fuse operations before the loop downwards into the loop, including slices, gathers, etc.
+    // Only do this after we've scheduled the dense attention itself
+    // (specifically after the PV matmul is in the loop).
+    %slices = transform.structured.match ops{["linalg.generic"]} in %func : (!any) -> !any
+    %consumer_loops = transform.merge_handles %forall_loop, %j0_loop : !any
+    transform.fusion.greedy_producers_into_consumer %slices into %consumer_loops : (!any, !any) -> (!any, !any)
+
     // This differs from the global attention schedule. We have trailing stablehlo.broadcast_in_dim
     // and stablehlo.scatter that we don't know how to fuse. TODO
     %scatter = transform.structured.match ops{["stablehlo.broadcast_in_dim"]} in %func : (!any) -> !any

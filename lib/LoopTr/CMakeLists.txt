@@ -11,7 +11,7 @@ add_public_tablegen_target(LoopTransformOpsIncGen)
 
 add_library(NeptuneLoopTransform STATIC
   FusionExprSolver.cpp
-  FusionIntoProducer.cpp
+  FusionIntoLoop.cpp
   FusionSplitKUpdate.cpp
   FusionRollingUpdate.cpp
   LinalgTransformOps.cpp
