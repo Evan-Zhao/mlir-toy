@@ -272,6 +272,9 @@ def FusionGreedyConsumersIntoProducerOp
     consumer with no eligible elementwise producers should still be considered
     for loop fusion.
 
+    Consumers that cannot be fused are skipped and receive a diagnostic remark,
+    allowing fusion to continue with other consumers.
+
     The `producer_loop` handle is preserved and remapped to the rewritten loop.
     The optional `stop_op` handle is read-only. The result handle contains the
     fused consumer operations in fusion order.

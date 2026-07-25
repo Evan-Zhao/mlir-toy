@@ -83,7 +83,7 @@ DiagnosedSilenceableFailure
 FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewriter,
                                            TransformResults &transformResults,
                                            TransformState &state) {
-  const auto transform = cast<TransformOpInterface>(getOperation());
+  auto transform = cast<TransformOpInterface>(getOperation());
   scf::ForallOp loop;
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getProducerLoop, "producer loop", loop,
                                scf::ForallOp);
@@ -98,6 +98,7 @@ FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewrite
   const bool inlineElemwise = getInlineElementwise();
 
   SmallVector<Operation *> fusedOps;
+  DenseSet<Operation *> failedConsumers;
   OpBuilder::Listener *previousListener = rewriter.getListener();
   TrackedOperationsListener fusedOpsListener(fusedOps, previousListener);
   rewriter.setListener(&fusedOpsListener);
@@ -111,9 +112,13 @@ FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewrite
 
     SmallVector<Operation *> consumers;
     for (Operation *consumer : loop->getResult(resultNumber).getUsers()) {
+      if (failedConsumers.contains(consumer))
+        continue;
       if (stopOps.contains(consumer)) {
         // Stop all fusing when we reach the stop op.
         transformResults.set(getOperation()->getResult(0), fusedOps);
+        if (!failedConsumers.empty())
+          transform.emitRemark("did not fuse all discovered consumers into the producer loop");
         return DiagnosedSilenceableFailure::success();
       }
       consumers.push_back(consumer);
@@ -121,6 +126,8 @@ FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewrite
     if (consumers.empty()) {
       // No consumer found -- we are done.
       transformResults.set(getOperation()->getResult(0), fusedOps);
+      if (!failedConsumers.empty())
+        transform.emitRemark("did not fuse all discovered consumers into the producer loop");
       return DiagnosedSilenceableFailure::success();
     }
     // Sort by their position in the block so that we fuse consumers in program order.
@@ -141,10 +148,11 @@ FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewrite
       SmallVector<LoopLikeOpInterface> loops{loop};
       FailureOr<scf::SCFFuseConsumerOfSliceResult> fuseResult =
           tileAndFuseConsumerWithDebug(rewriter, *consumer, loops);
-      if (failed(fuseResult))
-        BAIL("failed to tile and fuse elementwise consumer into loop");
-      if (fuseResult->tiledOps.empty())
-        BAIL("consumer had no operands defined by the containing loop");
+      if (failed(fuseResult) || fuseResult->tiledOps.empty()) {
+        consumer->emitRemark("failed to fuse this consumer into the producer loop");
+        failedConsumers.insert(consumer);
+        continue;
+      }
       loop = cast<scf::ForallOp>(loops.front());
       fusedOps.append(fuseResult->tiledOps);
       if (isOpTriviallyDead(consumer))
@@ -241,6 +249,7 @@ FusionGreedyProducersIntoConsumerOp::apply(transform::TransformRewriter &rewrite
     enqueue(cast<tensor::ExtractSliceOp>(descendant));
 
   SmallVector<Operation *> fusedOps;
+  bool hasFailure = false;
   while (!worklist.empty()) {
     tensor::ExtractSliceOp slice = worklist.front();
     worklist.pop_front();
@@ -248,9 +257,11 @@ FusionGreedyProducersIntoConsumerOp::apply(transform::TransformRewriter &rewrite
     std::optional<scf::SCFFuseProducerOfSliceResult> fused =
         scf::tileAndFuseProducerOfSlice(rewriter, slice, loops);
     if (!fused) {
-      slice.emitRemark("failed to fuse the producer of this slice");
       if (Operation *source = slice.getSource().getDefiningOp())
-        source->emitRemark("...which is this op");
+        source->emitRemark("failed to fuse this op into the consumer loop nest");
+      else
+        slice.emitRemark("failed to fuse the producer of this slice into the consumer loop nest");
+      hasFailure = true;
       continue;
     }
     fusedOps.append(fused->tiledOps);
@@ -270,6 +281,8 @@ FusionGreedyProducersIntoConsumerOp::apply(transform::TransformRewriter &rewrite
       llvm::map_to_vector(loops, [](LoopLikeOpInterface loop) { return loop.getOperation(); });
   transformResults.set(getOperation()->getResult(0), fusedOps);
   transformResults.set(getOperation()->getResult(1), updatedLoops);
+  if (hasFailure)
+    transform.emitRemark("failed to fuse some producers into the consumer loop nest");
   return DiagnosedSilenceableFailure::success();
 }
 
