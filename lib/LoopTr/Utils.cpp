@@ -117,22 +117,6 @@ getNestedLoopResultRelays(ArrayRef<Operation *> loops) {
   return relaysByLoop;
 }
 
-void cloneSingleRegionBody(OpBuilder &builder, Location nestedLoc, Block &oldBlock,
-                           ValueRange newArgs) {
-  IRMapping mapping;
-  for (auto [oldArg, newArg] : llvm::zip_equal(oldBlock.getArguments(), newArgs))
-    mapping.map(oldArg, newArg);
-
-  cloneBlockWithoutTerminator(builder, oldBlock, mapping);
-
-  auto oldYield = cast<linalg::YieldOp>(oldBlock.getTerminator());
-  SmallVector<Value> yielded;
-  yielded.reserve(oldYield.getValues().size());
-  for (Value value : oldYield.getValues())
-    yielded.push_back(mapping.lookup(value));
-  linalg::YieldOp::create(builder, nestedLoc, yielded);
-}
-
 struct MatchFailureCaptureListener : public RewriterBase::ForwardingListener {
   using Base = RewriterBase::ForwardingListener;
 
@@ -374,21 +358,6 @@ void pointBuilderToForallParallel(OpBuilder &builder, scf::ForallOp forall) {
   builder.setInsertionPointToEnd(&forall.getTerminator().getRegion().front());
 }
 
-SmallVector<std::pair<Operation *, Operation *>> cloneForallLoopBody(scf::ForallOp fromLoop,
-                                                                     OpBuilder &builder,
-                                                                     scf::ForallOp intoLoop,
-                                                                     IRMapping &mapping) {
-  builder.setInsertionPoint(intoLoop.getTerminator());
-  SmallVector<std::pair<Operation *, Operation *>> clonedOps =
-      cloneBlockWithoutTerminator(builder, *fromLoop.getBody(), mapping);
-  pointBuilderToForallParallel(builder, intoLoop);
-  for (Operation &combiningOp : fromLoop.getTerminator()) {
-    Operation *cloned = builder.clone(combiningOp, mapping);
-    clonedOps.emplace_back(&combiningOp, cloned);
-  }
-  return clonedOps;
-}
-
 ForallOutputExtension cloneForallWithAppendedOutputs(RewriterBase &rewriter, scf::ForallOp forall,
                                                      ValueRange appendedOutputs) {
   unsigned oldOutputCount = forall.getNumResults();
@@ -402,8 +371,14 @@ ForallOutputExtension cloneForallWithAppendedOutputs(RewriterBase &rewriter, scf
   IRMapping mapping;
   mapping.map(forall.getInductionVars(), newForall.getInductionVars());
   mapping.map(forall.getRegionOutArgs(), newForall.getRegionOutArgs().take_front(oldOutputCount));
-  rewriter.setInsertionPointToStart(newForall.getBody());
-  auto clonedOps = cloneForallLoopBody(forall, rewriter, newForall, mapping);
+
+  rewriter.setInsertionPoint(newForall.getTerminator());
+  auto clonedOps = cloneBlockWithoutTerminator(rewriter, *forall.getBody(), mapping);
+  pointBuilderToForallParallel(rewriter, newForall);
+  for (Operation &combiningOp : forall.getTerminator()) {
+    Operation *cloned = rewriter.clone(combiningOp, mapping);
+    clonedOps.emplace_back(&combiningOp, cloned);
+  }
 
   return ForallOutputExtension{.forall = newForall,
                                .mapping = std::move(mapping),
@@ -445,10 +420,6 @@ getChainedLoopResultMap(ArrayRef<Operation *> loops) {
     chainedMap = std::move(nextMap);
   }
   return chainedMap;
-}
-
-SmallVector<OpFoldResult> getUnitStrides(RewriterBase &rewriter, size_t rank) {
-  return SmallVector<OpFoldResult>(rank, rewriter.getIndexAttr(1));
 }
 
 SmallVector<OpFoldResult> getMixedTensorSizes(RewriterBase &rewriter, Location loc, Value tensor) {
@@ -635,16 +606,6 @@ Value createExtractSliceFromState(RewriterBase &rewriter, Location loc, Value fu
   auto tileType = RankedTensorType::get(shape, tensorType.getElementType());
   return tensor::ExtractSliceOp::create(rewriter, loc, tileType, fullTensor, offsets, sizes,
                                         strides);
-}
-
-linalg::GenericOp cloneGenericOnTile(RewriterBase &rewriter, linalg::GenericOp sourceGeneric,
-                                     Value inputTile, Value initTile, Location loc) {
-  return linalg::GenericOp::create(
-      rewriter, loc, TypeRange{initTile.getType()}, ValueRange{inputTile}, ValueRange{initTile},
-      sourceGeneric.getIndexingMapsArray(), sourceGeneric.getIteratorTypesArray(),
-      [&](OpBuilder &builder, Location nestedLoc, ValueRange newArgs) {
-        cloneSingleRegionBody(builder, nestedLoc, sourceGeneric->getRegion(0).front(), newArgs);
-      });
 }
 
 } // namespace mlir

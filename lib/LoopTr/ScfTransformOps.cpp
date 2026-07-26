@@ -693,17 +693,33 @@ DiagnosedSilenceableFailure ScfFuseReductionIntoForallOp::apply(TransformRewrite
   }
 
   rewriter.setInsertionPointToEnd(split.innerFor.getBody());
-  auto fusedReduction =
-      cloneGenericOnTile(rewriter, consumer, split.outerTile, split.innerFor.getRegionIterArgs()[1],
-                         consumer.getLoc());
+  Value reductionInit = split.innerFor.getRegionIterArgs()[1];
+  auto fusedReduction = linalg::GenericOp::create(
+      rewriter, consumer.getLoc(), TypeRange{reductionInit.getType()},
+      ValueRange{split.outerTile}, ValueRange{reductionInit}, consumer.getIndexingMapsArray(),
+      consumer.getIteratorTypesArray(),
+      [&](OpBuilder &builder, Location nestedLoc, ValueRange newArgs) {
+        Block &oldBlock = consumer.getRegion().front();
+        IRMapping bodyMapping;
+        bodyMapping.map(oldBlock.getArguments(), newArgs);
+        cloneBlockWithoutTerminator(builder, oldBlock, bodyMapping);
+
+        auto oldYield = cast<linalg::YieldOp>(oldBlock.getTerminator());
+        SmallVector<Value> yieldedValues;
+        for (Value value : oldYield.getValues())
+          yieldedValues.push_back(bodyMapping.lookup(value));
+        linalg::YieldOp::create(builder, nestedLoc, yieldedValues);
+      });
   Value reductionTile = fusedReduction.getResult(0);
   auto reductionTileType = cast<RankedTensorType>(reductionTile.getType());
   SmallVector<OpFoldResult> reductionOffsets(reductionTileType.getRank(), rewriter.getIndexAttr(0));
   SmallVector<OpFoldResult> reductionSizes =
       getMixedTensorSizes(rewriter, loop.getLoc(), reductionTile);
+  SmallVector<OpFoldResult> reductionStrides(reductionTileType.getRank(),
+                                             rewriter.getIndexAttr(1));
   auto insertedReduction = tensor::InsertSliceOp::create(
       rewriter, loop.getLoc(), reductionTile, split.innerFor.getRegionIterArgs()[1],
-      reductionOffsets, reductionSizes, getUnitStrides(rewriter, reductionTileType.getRank()));
+      reductionOffsets, reductionSizes, reductionStrides);
   scf::YieldOp::create(rewriter, loop.getLoc(),
                        ValueRange{split.innerTile, insertedReduction.getResult()});
 

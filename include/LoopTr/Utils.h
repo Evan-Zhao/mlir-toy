@@ -118,8 +118,6 @@ FailureOr<BinaryReductionCombinerMatch> matchBinaryReductionCombiner(linalg::Gen
                                                                      unsigned resultNumber,
                                                                      bool emitDiagnostics = false);
 
-SmallVector<OpFoldResult> getUnitStrides(RewriterBase &rewriter, size_t rank);
-
 /// Returns the sizes of each dimension of `tensor` as a vector of `OpFoldResult`.
 /// For dynamic dimensions, creates a `tensor.dim` op to query the size at runtime;
 /// for static dimensions, returns the constant integer attribute directly.
@@ -140,16 +138,6 @@ cloneBlockWithoutTerminator(OpBuilder &builder, Block &block, IRMapping &mapping
   }
   return clonedOps;
 }
-
-/// Clone the operations in `fromLoop`, including body ops and combining ops
-/// (tensor.parallel_insert_slice ops), into `intoLoop`.
-/// It calls `cloneBlockWithoutTerminator` to clone the body ops, and then clones the combining ops.
-/// Returns a vector of pairs of the original and cloned operations, and updates `mapping` to map
-/// the original operations to the cloned ones.
-SmallVector<std::pair<Operation *, Operation *>> cloneForallLoopBody(scf::ForallOp fromLoop,
-                                                                     OpBuilder &builder,
-                                                                     scf::ForallOp intoLoop,
-                                                                     IRMapping &mapping);
 
 struct ForallOutputExtension {
   scf::ForallOp forall;
@@ -240,9 +228,6 @@ void eliminateLocalCommonSubexpressions(RewriterBase &rewriter, Operation *op);
 Value createExtractSliceFromState(RewriterBase &rewriter, Location loc, Value fullTensor,
                                   ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes,
                                   ArrayRef<OpFoldResult> strides);
-
-linalg::GenericOp cloneGenericOnTile(RewriterBase &rewriter, linalg::GenericOp sourceGeneric,
-                                     Value inputTile, Value initTile, Location loc);
 
 } // namespace mlir
 
