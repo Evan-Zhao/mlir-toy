@@ -40,8 +40,12 @@ add_dependencies(NeptuneHTile
   HTileTransformOpsIncGen
 )
 setup_mlir_target(NeptuneHTile)
-target_link_libraries(NeptuneHTile PUBLIC
+target_link_libraries(NeptuneHTile
+  PRIVATE
+  NeptuneLoopTransform
+  PUBLIC
   NeptuneMLIRCore
+  StablehloOps
   MLIRAffineUtils
   MLIRArithDialect
   MLIRArithUtils
@@ -50,6 +54,7 @@ target_link_libraries(NeptuneHTile PUBLIC
   MLIRLinalgDialect
   MLIRLinalgTransforms
   MLIRMemRefDialect
+  MLIRParallelCombiningOpInterface
   MLIRSCFDialect
   MLIRTensorDialect
   MLIRTensorTransforms

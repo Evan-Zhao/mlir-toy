@@ -56,15 +56,22 @@ module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo
         : (!any, !any, !any, !any, !any, !any) -> !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
-    // Difference from dense attention (1): fuse gathers, tensor slices, etc. downwards into the loop nest.
-    // Only do this after we've scheduled the dense attention itself
-    // (specifically after the PV matmul is in the loop).
-    // This step will fail to fuse the stablehlo.slice ops themselves, and that is fine.
-    %slices = transform.structured.match ops{["stablehlo.slice"]} in %func : (!any) -> !any
-    %consumer_loops = transform.merge_handles %forall_loop, %j0_loop : !any
-    transform.fusion.greedy_producers_into_consumer %slices into %consumer_loops : (!any, !any) -> (!any, !any)
+    // Difference from dense attention (1): fuse linalg ops post-loop upwards into the loop,
+    // then fuse stablehlo.scatter into the loop nest and transform it.
+    // This special fusion for scatter does not preserve the scatter op -- it creates a htile.parallel_scatter,
+    // placed in the parallel region of the forall loop.
+    %scatter = transform.structured.match ops{["stablehlo.scatter"]} in %func : (!any) -> !any
+    transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %scatter : (!any, !any) -> !any
+    %parallel_scatter =
+        transform.htile.fuse_scatter_into_forall %scatter into %forall_loop : (!any, !any) -> !any
 
-    // Instead of fusing stablehlo.slice, convert them to tensor.extract_slice, and merge with existing extract_slice ops in the loop.
+    // Difference from dense attention (2): fuse data producers pre-loop downwards into the
+    // deepest loop that contains each use. Do this after scatter fusion, which brings the
+    // scatter-index producers to the outer forall boundary.
+    %consumer_loops = transform.merge_handles %forall_loop, %j0_loop : !any
+    transform.fusion.greedy_input_producers_into_consumer %consumer_loops : (!any) -> (!any, !any)
+    // StableHLO slices were not fused because they are not fusable. However, we can convert them to
+    // tensor.extract_slice ops, then combine them with existing tensor.extract_slice ops in the loop.
     transform.apply_conversion_patterns to %func {
       transform.apply_conversion_patterns.stablehlo.slice_to_tensor
     } {illegal_ops = ["stablehlo.slice"], legal_dialects = ["tensor"], partial_conversion, preserve_handles} : !any

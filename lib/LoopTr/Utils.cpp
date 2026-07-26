@@ -117,22 +117,6 @@ getNestedLoopResultRelays(ArrayRef<Operation *> loops) {
   return relaysByLoop;
 }
 
-void cloneSingleRegionBody(OpBuilder &builder, Location nestedLoc, Block &oldBlock,
-                           ValueRange newArgs) {
-  IRMapping mapping;
-  for (auto [oldArg, newArg] : llvm::zip_equal(oldBlock.getArguments(), newArgs))
-    mapping.map(oldArg, newArg);
-
-  cloneBlockWithoutTerminator(builder, oldBlock, mapping);
-
-  auto oldYield = cast<linalg::YieldOp>(oldBlock.getTerminator());
-  SmallVector<Value> yielded;
-  yielded.reserve(oldYield.getValues().size());
-  for (Value value : oldYield.getValues())
-    yielded.push_back(mapping.lookup(value));
-  linalg::YieldOp::create(builder, nestedLoc, yielded);
-}
-
 struct MatchFailureCaptureListener : public RewriterBase::ForwardingListener {
   using Base = RewriterBase::ForwardingListener;
 
@@ -374,19 +358,32 @@ void pointBuilderToForallParallel(OpBuilder &builder, scf::ForallOp forall) {
   builder.setInsertionPointToEnd(&forall.getTerminator().getRegion().front());
 }
 
-SmallVector<std::pair<Operation *, Operation *>> cloneForallLoopBody(scf::ForallOp fromLoop,
-                                                                     OpBuilder &builder,
-                                                                     scf::ForallOp intoLoop,
-                                                                     IRMapping &mapping) {
-  builder.setInsertionPoint(intoLoop.getTerminator());
-  SmallVector<std::pair<Operation *, Operation *>> clonedOps =
-      cloneBlockWithoutTerminator(builder, *fromLoop.getBody(), mapping);
-  pointBuilderToForallParallel(builder, intoLoop);
-  for (Operation &combiningOp : fromLoop.getTerminator()) {
-    Operation *cloned = builder.clone(combiningOp, mapping);
+ForallOutputExtension cloneForallWithAppendedOutputs(RewriterBase &rewriter, scf::ForallOp forall,
+                                                     ValueRange appendedOutputs) {
+  unsigned oldOutputCount = forall.getNumResults();
+  SmallVector<Value> outputs = llvm::to_vector(forall.getOutputs());
+  llvm::append_range(outputs, appendedOutputs);
+
+  auto newForall = scf::ForallOp::create(rewriter, forall.getLoc(), forall.getMixedLowerBound(),
+                                         forall.getMixedUpperBound(), forall.getMixedStep(),
+                                         outputs, forall.getMapping());
+
+  IRMapping mapping;
+  mapping.map(forall.getInductionVars(), newForall.getInductionVars());
+  mapping.map(forall.getRegionOutArgs(), newForall.getRegionOutArgs().take_front(oldOutputCount));
+
+  rewriter.setInsertionPoint(newForall.getTerminator());
+  auto clonedOps = cloneBlockWithoutTerminator(rewriter, *forall.getBody(), mapping);
+  pointBuilderToForallParallel(rewriter, newForall);
+  for (Operation &combiningOp : forall.getTerminator()) {
+    Operation *cloned = rewriter.clone(combiningOp, mapping);
     clonedOps.emplace_back(&combiningOp, cloned);
   }
-  return clonedOps;
+
+  return ForallOutputExtension{.forall = newForall,
+                               .mapping = std::move(mapping),
+                               .oldOutputCount = oldOutputCount,
+                               .clonedOps = std::move(clonedOps)};
 }
 
 FailureOr<DenseMap<OpResult, LoopResultRelaysT>>
@@ -425,10 +422,6 @@ getChainedLoopResultMap(ArrayRef<Operation *> loops) {
   return chainedMap;
 }
 
-SmallVector<OpFoldResult> getUnitStrides(RewriterBase &rewriter, size_t rank) {
-  return SmallVector<OpFoldResult>(rank, rewriter.getIndexAttr(1));
-}
-
 SmallVector<OpFoldResult> getMixedTensorSizes(RewriterBase &rewriter, Location loc, Value tensor) {
   auto tensorType = cast<RankedTensorType>(tensor.getType());
   SmallVector<OpFoldResult> sizes;
@@ -444,8 +437,11 @@ SmallVector<OpFoldResult> getMixedTensorSizes(RewriterBase &rewriter, Location l
   return sizes;
 }
 
-FailureOr<Value> cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Value value,
-                                                    IRMapping &mapping) {
+using ClonedOperation = std::pair<Operation *, Operation *>;
+
+static FailureOr<Value>
+cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Value value, IRMapping &mapping,
+                                   SmallVectorImpl<ClonedOperation> *clonedOps) {
   if (Value mapped = mapping.lookupOrNull(value))
     return mapped;
 
@@ -462,7 +458,7 @@ FailureOr<Value> cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Valu
   IRMapping localMapping = mapping;
   for (Value operand : def->getOperands()) {
     FailureOr<Value> remappedOperand =
-        cloneValueDefChainAtInsertionPoint(rewriter, operand, mapping);
+        cloneValueDefChainAtInsertionPoint(rewriter, operand, mapping, clonedOps);
     if (failed(remappedOperand))
       return failure();
     localMapping.map(operand, *remappedOperand);
@@ -470,29 +466,43 @@ FailureOr<Value> cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Valu
 
   Operation *cloned = rewriter.clone(*def, localMapping);
   mapping.map(def->getResults(), cloned->getResults());
+  if (clonedOps)
+    clonedOps->emplace_back(def, cloned);
   return mapping.lookup(value);
+}
+
+FailureOr<SmallVector<Value>> makeValuesAvailableAtInsertionPoint(RewriterBase &rewriter,
+                                                                  ValueRange values,
+                                                                  IRMapping &mapping,
+                                                                  DefChainAction action) {
+  SmallVector<ClonedOperation> clonedOps;
+  SmallVector<Value> availableValues;
+  availableValues.reserve(values.size());
+  for (Value value : values) {
+    FailureOr<Value> available =
+        cloneValueDefChainAtInsertionPoint(rewriter, value, mapping, &clonedOps);
+    if (failed(available)) {
+      for (auto &[original, cloned] : llvm::reverse(clonedOps))
+        rewriter.eraseOp(cloned);
+      return failure();
+    }
+    availableValues.push_back(*available);
+  }
+
+  if (action == DefChainAction::Move)
+    for (auto &[original, cloned] : llvm::reverse(clonedOps))
+      rewriter.replaceOp(original, cloned->getResults());
+  return availableValues;
 }
 
 LogicalResult recursiveMoveOperandsBeforeOp(Operation &toMoveOperands, RewriterBase &rewriter,
                                             Operation &moveBefore) {
   IRMapping mapping;
   rewriter.setInsertionPoint(&moveBefore);
-  for (auto value : toMoveOperands.getOperands()) {
-    auto result = dyn_cast<OpResult>(value);
-    if (!result)
-      continue;
-    // This function does not clone if the value is already defined before the insertion point of
-    // the rewriter.
-    auto newValue = cloneValueDefChainAtInsertionPoint(rewriter, result, mapping);
-    if (failed(newValue)) {
-      result.getDefiningOp()->emitRemark("when cloning this operation");
-      return failure();
-    }
-    if (*newValue == value)
-      continue;
-    mapping.map(result, *newValue);
-    rewriter.replaceAllUsesWith(result, *newValue);
-    rewriter.eraseOp(result.getDefiningOp());
+  if (failed(makeValuesAvailableAtInsertionPoint(rewriter, toMoveOperands.getOperands(), mapping,
+                                                 DefChainAction::Move))) {
+    toMoveOperands.emitRemark("when moving operand definition chains");
+    return failure();
   }
   return success();
 }
@@ -596,16 +606,6 @@ Value createExtractSliceFromState(RewriterBase &rewriter, Location loc, Value fu
   auto tileType = RankedTensorType::get(shape, tensorType.getElementType());
   return tensor::ExtractSliceOp::create(rewriter, loc, tileType, fullTensor, offsets, sizes,
                                         strides);
-}
-
-linalg::GenericOp cloneGenericOnTile(RewriterBase &rewriter, linalg::GenericOp sourceGeneric,
-                                     Value inputTile, Value initTile, Location loc) {
-  return linalg::GenericOp::create(
-      rewriter, loc, TypeRange{initTile.getType()}, ValueRange{inputTile}, ValueRange{initTile},
-      sourceGeneric.getIndexingMapsArray(), sourceGeneric.getIteratorTypesArray(),
-      [&](OpBuilder &builder, Location nestedLoc, ValueRange newArgs) {
-        cloneSingleRegionBody(builder, nestedLoc, sourceGeneric->getRegion(0).front(), newArgs);
-      });
 }
 
 } // namespace mlir

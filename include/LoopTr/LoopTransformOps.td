@@ -272,6 +272,9 @@ def FusionGreedyConsumersIntoProducerOp
     consumer with no eligible elementwise producers should still be considered
     for loop fusion.
 
+    Consumers that cannot be fused are skipped and receive a diagnostic remark,
+    allowing fusion to continue with other consumers.
+
     The `producer_loop` handle is preserved and remapped to the rewritten loop.
     The optional `stop_op` handle is read-only. The result handle contains the
     fused consumer operations in fusion order.
@@ -287,42 +290,39 @@ def FusionGreedyConsumersIntoProducerOp
                        "attr-dict `:` functional-type(operands, results)";
 }
 
-def FusionGreedyProducersIntoConsumerOp
-    : Op<Transform_Dialect, "fusion.greedy_producers_into_consumer",
+def FusionGreedyInputProducersIntoConsumerOp
+    : Op<Transform_Dialect, "fusion.greedy_input_producers_into_consumer",
          [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
           ReportTrackingListenerFailuresOpTrait]> {
-  let summary = "Greedily fuse producers into a consumer loop";
+  let summary = "Greedily fuse input producers into a consumer loop nest";
 
   let description = [{
-    Greedily fuse producers into `consumer_op` along def-use paths that start
-    at one of the operations in the required `producer_ops` handle and end at
-    a tensor.extract_slice nested in the consumer loop.
-    Producers outside these paths are not fused.
+    Starting from tensor.extract_slice operations that read values defined
+    outside `consumer_op`, greedily fuse their tileable producer chains into
+    the loop nest. Destination-style init operands and loop iter-arg init
+    operands are not followed.
 
     `consumer_op` may identify either one loop or multiple strictly nested
-    loops. The outermost loop must be an `scf.forall`. When multiple loops are
-    provided, producers are fused into the innermost loop. Loop nesting, rather
-    than handle order, determines the outer-to-inner order passed to MLIR's
-    producer fusion utility.
+    loops. The outermost loop must be an `scf.forall`. Each producer chain is
+    fused into the deepest selected loop containing its boundary slice. Loop
+    nesting, rather than handle order, determines the outer-to-inner order
+    passed to MLIR's producer fusion utility.
 
-    Producers are processed in a topological order whenever possible, so a
-    producer exposed by fusing another producer can be fused in a later step.
-    Function arguments and non-tileable operations are not fused.
+    Producers exposed by fusing another producer are processed recursively.
+    Function arguments, producers already inside the selected placement loop,
+    init-only chains, and non-tileable operations are not fused.
 
-    The `producer_ops` and `consumer_op` handles are read-only. The
-    `new_consumer` result contains the updated loop nest in outer-to-inner
-    order. The `fused_ops` result contains the producer operations fused in
-    fusion order.
+    The `consumer_op` handle is read-only. The `new_consumer` result contains
+    the updated loop nest in outer-to-inner order. The `fused_ops` result
+    contains the producer operations in fusion order.
   }];
 
-  let arguments = (ins TransformHandleTypeInterface:$producer_ops,
-      TransformHandleTypeInterface:$consumer_op);
+  let arguments = (ins TransformHandleTypeInterface:$consumer_op);
   let results = (outs TransformHandleTypeInterface:$fused_ops,
       TransformHandleTypeInterface:$new_consumer);
 
-  let assemblyFormat = "$producer_ops `into` $consumer_op attr-dict "
-                       " `:` functional-type(operands, results)";
+  let assemblyFormat = "$consumer_op attr-dict `:` functional-type(operands, results)";
 }
 
 def FusionFindNextReductionOp

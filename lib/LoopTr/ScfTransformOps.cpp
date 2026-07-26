@@ -578,16 +578,11 @@ rFactorReductionUnderForall(TransformOpInterface transform, TransformRewriter &r
     return consumer.emitError() << "failed to create partial reduction init tensor";
 
   // Create a new forall loop that has the RF init tensor as an additional output.
-  SmallVector<Value> newOutputs = llvm::to_vector(forall.getOutputs());
-  newOutputs.push_back(rfInits->front());
-  auto newForall =
-      scf::ForallOp::create(rewriter, loc, forall.getMixedLowerBound(), forall.getMixedUpperBound(),
-                            forall.getMixedStep(), newOutputs, forall.getMapping());
-  IRMapping mapping;
-  mapping.map(forall.getInductionVars(), newForall.getInductionVars());
-  mapping.map(forall.getRegionIterArgs(), newForall.getRegionIterArgs());
-  rewriter.setInsertionPointToStart(newForall.getBody());
-  auto clonedOps = cloneForallLoopBody(forall, rewriter, newForall, mapping);
+  ForallOutputExtension extension =
+      cloneForallWithAppendedOutputs(rewriter, forall, ValueRange{rfInits->front()});
+  scf::ForallOp newForall = extension.forall;
+  IRMapping mapping = std::move(extension.mapping);
+  auto clonedOps = std::move(extension.clonedOps);
 
   // Get the under-loop tile of the reduction input, and use tiling interface method to map this
   // input tile to a tile of the reduction's iter domain.
@@ -698,17 +693,33 @@ DiagnosedSilenceableFailure ScfFuseReductionIntoForallOp::apply(TransformRewrite
   }
 
   rewriter.setInsertionPointToEnd(split.innerFor.getBody());
-  auto fusedReduction =
-      cloneGenericOnTile(rewriter, consumer, split.outerTile, split.innerFor.getRegionIterArgs()[1],
-                         consumer.getLoc());
+  Value reductionInit = split.innerFor.getRegionIterArgs()[1];
+  auto fusedReduction = linalg::GenericOp::create(
+      rewriter, consumer.getLoc(), TypeRange{reductionInit.getType()},
+      ValueRange{split.outerTile}, ValueRange{reductionInit}, consumer.getIndexingMapsArray(),
+      consumer.getIteratorTypesArray(),
+      [&](OpBuilder &builder, Location nestedLoc, ValueRange newArgs) {
+        Block &oldBlock = consumer.getRegion().front();
+        IRMapping bodyMapping;
+        bodyMapping.map(oldBlock.getArguments(), newArgs);
+        cloneBlockWithoutTerminator(builder, oldBlock, bodyMapping);
+
+        auto oldYield = cast<linalg::YieldOp>(oldBlock.getTerminator());
+        SmallVector<Value> yieldedValues;
+        for (Value value : oldYield.getValues())
+          yieldedValues.push_back(bodyMapping.lookup(value));
+        linalg::YieldOp::create(builder, nestedLoc, yieldedValues);
+      });
   Value reductionTile = fusedReduction.getResult(0);
   auto reductionTileType = cast<RankedTensorType>(reductionTile.getType());
   SmallVector<OpFoldResult> reductionOffsets(reductionTileType.getRank(), rewriter.getIndexAttr(0));
   SmallVector<OpFoldResult> reductionSizes =
       getMixedTensorSizes(rewriter, loop.getLoc(), reductionTile);
+  SmallVector<OpFoldResult> reductionStrides(reductionTileType.getRank(),
+                                             rewriter.getIndexAttr(1));
   auto insertedReduction = tensor::InsertSliceOp::create(
       rewriter, loop.getLoc(), reductionTile, split.innerFor.getRegionIterArgs()[1],
-      reductionOffsets, reductionSizes, getUnitStrides(rewriter, reductionTileType.getRank()));
+      reductionOffsets, reductionSizes, reductionStrides);
   scf::YieldOp::create(rewriter, loop.getLoc(),
                        ValueRange{split.innerTile, insertedReduction.getResult()});
 

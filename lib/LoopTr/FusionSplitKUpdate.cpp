@@ -269,23 +269,20 @@ FusionCloneFuseRfactorElemwiseOp::apply(transform::TransformRewriter &rewriter,
     IRMapping localMapping;
     for (auto elemwiseOp : elemwiseOps) {
       for (auto initVal : elemwiseOp.getDpsInits()) {
-        auto newInitVal = cloneValueDefChainAtInsertionPoint(rewriter, initVal, localMapping);
-        if (failed(newInitVal)) {
+        auto movedValues = makeValuesAvailableAtInsertionPoint(rewriter, {initVal}, localMapping,
+                                                               DefChainAction::Move);
+        if (failed(movedValues)) {
           ::emitRemark(initVal.getLoc()) << "when cloning this value and its use-def chain up";
           BAIL("failed to move the DPS init operand of an elementwise op before the forall loop");
         }
-        if (*newInitVal != initVal) {
-          rewriter.replaceAllUsesWith(initVal, *newInitVal);
-          rewriter.eraseOp(initVal.getDefiningOp());
-        }
-        newOutArgs.push_back(*newInitVal);
+        newOutArgs.push_back(movedValues->front());
       }
     }
   }
-  auto newForall =
-      scf::ForallOp::create(rewriter, forallLoop.getLoc(), forallLoop.getMixedLowerBound(),
-                            forallLoop.getMixedUpperBound(), forallLoop.getMixedStep(), newOutArgs,
-                            forallLoop.getMapping());
+  rewriter.setInsertionPoint(forallLoop);
+  ForallOutputExtension extension = cloneForallWithAppendedOutputs(
+      rewriter, forallLoop, ValueRange(newOutArgs).drop_front(nOldResults));
+  scf::ForallOp newForall = extension.forall;
   // Collect the region arguments of the new forall that correspond to the outputs of the
   // elementwise ops. We'll need that when we make the DPS init operands of the fused elemwise ops.
   SmallVector<SmallVector<BlockArgument>> loopOutArgsByElemwise;
@@ -298,13 +295,7 @@ FusionCloneFuseRfactorElemwiseOp::apply(transform::TransformRewriter &rewriter,
       regionArgs = regionArgs.drop_front(nResults);
     }
   }
-  // Map old forall induction vars and region args to the new forall.
-  IRMapping mapping;
-  mapping.map(forallLoop.getInductionVars(), newForall.getInductionVars());
-  mapping.map(forallLoop.getRegionOutArgs(), newForall.getRegionOutArgs().take_front(nOldResults));
-  // Clone loop body ops and terminators.
-  rewriter.setInsertionPointToStart(newForall.getBody());
-  cloneForallLoopBody(forallLoop, rewriter, newForall, mapping);
+  IRMapping mapping = std::move(extension.mapping);
   // Map rfactor ops from the old loop to the new loop.
   for (auto &op : rfactorOps) {
     if (op->getParentOp() != forallLoop) {

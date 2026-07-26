@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Transform/IR/TransformDialect.h"
+#include "stablehlo/dialect/StablehloOps.h"
 
 namespace {
 
@@ -17,6 +18,7 @@ public:
 
   void init() {
     declareDependentDialect<htile::HTileDialect>();
+    declareDependentDialect<mlir::stablehlo::StablehloDialect>();
     declareGeneratedDialect<mlir::bufferization::BufferizationDialect>();
     declareGeneratedDialect<mlir::memref::MemRefDialect>();
     registerTransformOps<

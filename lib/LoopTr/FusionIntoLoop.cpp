@@ -5,10 +5,15 @@
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/Tensor/Transforms/Transforms.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
+#include "mlir/Interfaces/DestinationStyleOpInterface.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 #include <deque>
+
+#define DEBUG_TYPE "fusion-into-loop"
 
 namespace mlir::transform {
 
@@ -83,7 +88,7 @@ DiagnosedSilenceableFailure
 FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewriter,
                                            TransformResults &transformResults,
                                            TransformState &state) {
-  const auto transform = cast<TransformOpInterface>(getOperation());
+  auto transform = cast<TransformOpInterface>(getOperation());
   scf::ForallOp loop;
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getProducerLoop, "producer loop", loop,
                                scf::ForallOp);
@@ -98,6 +103,7 @@ FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewrite
   const bool inlineElemwise = getInlineElementwise();
 
   SmallVector<Operation *> fusedOps;
+  DenseSet<Operation *> failedConsumers;
   OpBuilder::Listener *previousListener = rewriter.getListener();
   TrackedOperationsListener fusedOpsListener(fusedOps, previousListener);
   rewriter.setListener(&fusedOpsListener);
@@ -111,9 +117,13 @@ FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewrite
 
     SmallVector<Operation *> consumers;
     for (Operation *consumer : loop->getResult(resultNumber).getUsers()) {
+      if (failedConsumers.contains(consumer))
+        continue;
       if (stopOps.contains(consumer)) {
         // Stop all fusing when we reach the stop op.
         transformResults.set(getOperation()->getResult(0), fusedOps);
+        if (!failedConsumers.empty())
+          transform.emitRemark("did not fuse all discovered consumers into the producer loop");
         return DiagnosedSilenceableFailure::success();
       }
       consumers.push_back(consumer);
@@ -121,6 +131,8 @@ FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewrite
     if (consumers.empty()) {
       // No consumer found -- we are done.
       transformResults.set(getOperation()->getResult(0), fusedOps);
+      if (!failedConsumers.empty())
+        transform.emitRemark("did not fuse all discovered consumers into the producer loop");
       return DiagnosedSilenceableFailure::success();
     }
     // Sort by their position in the block so that we fuse consumers in program order.
@@ -141,10 +153,11 @@ FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewrite
       SmallVector<LoopLikeOpInterface> loops{loop};
       FailureOr<scf::SCFFuseConsumerOfSliceResult> fuseResult =
           tileAndFuseConsumerWithDebug(rewriter, *consumer, loops);
-      if (failed(fuseResult))
-        BAIL("failed to tile and fuse elementwise consumer into loop");
-      if (fuseResult->tiledOps.empty())
-        BAIL("consumer had no operands defined by the containing loop");
+      if (failed(fuseResult) || fuseResult->tiledOps.empty()) {
+        consumer->emitRemark("failed to fuse this consumer into the producer loop");
+        failedConsumers.insert(consumer);
+        continue;
+      }
       loop = cast<scf::ForallOp>(loops.front());
       fusedOps.append(fuseResult->tiledOps);
       if (isOpTriviallyDead(consumer))
@@ -160,21 +173,37 @@ FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewrite
   }
 }
 
-void FusionGreedyProducersIntoConsumerOp::getEffects(
+void FusionGreedyInputProducersIntoConsumerOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
-  onlyReadsHandle(getProducerOpsMutable(), effects);
   onlyReadsHandle(getConsumerOpMutable(), effects);
 
   producesHandle(getOperation()->getOpResults(), effects);
   modifiesPayload(effects);
 }
 
+/// Return true when `use` carries an initialization value rather than a data
+/// input whose producer should be pulled into the consumer loop.
+static bool isInitUse(OpOperand &use) {
+  if (auto dps = dyn_cast<DestinationStyleOpInterface>(use.getOwner()))
+    if (dps.isDpsInit(&use))
+      return true;
+
+  if (auto loop = dyn_cast<LoopLikeOpInterface>(use.getOwner()))
+    if (loop.getTiedLoopRegionIterArg(&use))
+      return true;
+
+  return false;
+}
+
+static bool hasDataUse(tensor::ExtractSliceOp slice) {
+  return llvm::any_of(slice->getUses(), [](OpOperand &use) { return !isInitUse(use); });
+}
+
 DiagnosedSilenceableFailure
-FusionGreedyProducersIntoConsumerOp::apply(transform::TransformRewriter &rewriter,
-                                           TransformResults &transformResults,
-                                           TransformState &state) {
+FusionGreedyInputProducersIntoConsumerOp::apply(transform::TransformRewriter &rewriter,
+                                                TransformResults &transformResults,
+                                                TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
-  CHECK_NON_EMPTY_OPS(state, transform, getProducerOps, "producer", producers);
   CHECK_NON_EMPTY_OPS(state, transform, getConsumerOp, "consumer loop", consumerLoops);
 
   // The consumer handle denotes a loop nest. Infer its outer-to-inner order
@@ -202,9 +231,8 @@ FusionGreedyProducersIntoConsumerOp::apply(transform::TransformRewriter &rewrite
   if (!isa<scf::ForallOp>(loops.front().getOperation()))
     BAIL("expected the outermost consumer loop to be an scf.forall");
 
-  // Expose an inner tile directly on the original producer. In particular,
-  // this composes an inner extract_slice with an outer extract_slice before
-  // producer fusion chooses the innermost loop as its placement boundary.
+  // Expose the deepest consumed tile directly on its original producer before
+  // deciding which loop level should contain that producer.
   if (loops.size() > 1) {
     RewritePatternSet patterns(rewriter.getContext());
     tensor::populateMergeConsecutiveInsertExtractSlicePatterns(patterns);
@@ -212,53 +240,74 @@ FusionGreedyProducersIntoConsumerOp::apply(transform::TransformRewriter &rewrite
     config.setListener(static_cast<RewriterBase::Listener *>(rewriter.getListener()));
     config.setStrictness(GreedyRewriteStrictness::ExistingAndNewOps);
     SmallVector<Operation *> slices;
-    loops.back()->walk(
+    loops.front()->walk(
         [&](tensor::ExtractSliceOp slice) { slices.push_back(slice.getOperation()); });
     if (!slices.empty() && failed(applyOpPatternsGreedily(
                                slices, FrozenRewritePatternSet(std::move(patterns)), config)))
       BAIL("failed to merge consecutive tensor slices in the consumer loop nest");
   }
 
-  Operation *fusionBoundary = loops.back().getOperation();
-  SmallVector<Value> producerResults;
-  for (Operation *producer : producers)
-    llvm::append_range(producerResults, producer->getResults());
-  DefUsePathCollection paths = collectOpsOnDefUsePaths(producerResults, [&](Operation *op) {
-    return fusionBoundary->isAncestor(op) && isa<tensor::ExtractSliceOp>(op);
-  });
-  DenseSet<Operation *> allowedOps;
-  allowedOps.insert(paths.operations.begin(), paths.operations.end());
-
-  std::deque<tensor::ExtractSliceOp> worklist;
-  auto enqueue = [&](tensor::ExtractSliceOp slice) {
-    auto source = dyn_cast<OpResult>(slice.getSource());
-    if (!source || fusionBoundary->isAncestor(source.getOwner()) ||
-        !allowedOps.contains(source.getOwner()))
-      return;
-    worklist.push_back(slice);
+  struct WorkItem {
+    tensor::ExtractSliceOp slice;
+    unsigned loopDepth;
   };
-  for (Operation *descendant : paths.descendants)
-    enqueue(cast<tensor::ExtractSliceOp>(descendant));
+
+  SmallVector<WorkItem> initialWorklist;
+  auto enqueue = [&](tensor::ExtractSliceOp slice, unsigned loopDepth,
+                     SmallVectorImpl<WorkItem> &items) {
+    Operation *fusionBoundary = loops[loopDepth].getOperation();
+    auto source = dyn_cast<OpResult>(slice.getSource());
+    if (!source || fusionBoundary->isAncestor(source.getOwner()) || !hasDataUse(slice))
+      return;
+    items.push_back(WorkItem{slice, loopDepth});
+  };
+
+  // Each boundary slice is placed at the deepest selected loop that contains
+  // it. In particular, a slice used after an inner loop is fused only into the
+  // surrounding outer loop.
+  loops.front()->walk([&](tensor::ExtractSliceOp slice) {
+    std::optional<unsigned> deepestLoop;
+    for (auto [index, loop] : llvm::enumerate(loops))
+      if (loop->isAncestor(slice))
+        deepestLoop = index;
+    if (deepestLoop)
+      enqueue(slice, *deepestLoop, initialWorklist);
+  });
+  llvm::stable_sort(initialWorklist, [](const WorkItem &lhs, const WorkItem &rhs) {
+    return lhs.loopDepth > rhs.loopDepth;
+  });
+  std::deque<WorkItem> worklist(initialWorklist.begin(), initialWorklist.end());
 
   SmallVector<Operation *> fusedOps;
+  bool hasFailure = false;
   while (!worklist.empty()) {
-    tensor::ExtractSliceOp slice = worklist.front();
+    WorkItem item = worklist.front();
     worklist.pop_front();
+    tensor::ExtractSliceOp slice = item.slice;
 
+    MutableArrayRef<LoopLikeOpInterface> loopPrefix(loops);
+    loopPrefix = loopPrefix.take_front(item.loopDepth + 1);
     std::optional<scf::SCFFuseProducerOfSliceResult> fused =
-        scf::tileAndFuseProducerOfSlice(rewriter, slice, loops);
+        scf::tileAndFuseProducerOfSlice(rewriter, slice, loopPrefix);
     if (!fused) {
-      slice.emitRemark("failed to fuse the producer of this slice");
       if (Operation *source = slice.getSource().getDefiningOp())
-        source->emitRemark("...which is this op");
+        source->emitRemark("failed to fuse this op into the consumer loop nest");
+      else
+        slice.emitRemark("failed to fuse the producer of this slice into the consumer loop nest");
+      hasFailure = true;
       continue;
     }
+    LLVM_DEBUG({
+      llvm::dbgs() << "greedy input-producer fusion into loop depth " << item.loopDepth << ":\n"
+                   << *fused->origProducer.getOwner() << "\n";
+    });
     fusedOps.append(fused->tiledOps);
 
-    fusionBoundary = loops.back().getOperation();
+    SmallVector<WorkItem> generatedItems;
     for (Operation *generated : fused->generatedSlices)
       if (auto generatedSlice = dyn_cast<tensor::ExtractSliceOp>(generated))
-        enqueue(generatedSlice);
+        enqueue(generatedSlice, item.loopDepth, generatedItems);
+    worklist.insert(worklist.end(), generatedItems.begin(), generatedItems.end());
 
     // tileAndFuseProducerOfSlice replaces the uses of the slice but
     // intentionally leaves the now-dead operation behind.
@@ -270,6 +319,8 @@ FusionGreedyProducersIntoConsumerOp::apply(transform::TransformRewriter &rewrite
       llvm::map_to_vector(loops, [](LoopLikeOpInterface loop) { return loop.getOperation(); });
   transformResults.set(getOperation()->getResult(0), fusedOps);
   transformResults.set(getOperation()->getResult(1), updatedLoops);
+  if (hasFailure)
+    transform.emitRemark("failed to fuse some producers into the consumer loop nest");
   return DiagnosedSilenceableFailure::success();
 }
 

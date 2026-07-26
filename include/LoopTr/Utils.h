@@ -118,8 +118,6 @@ FailureOr<BinaryReductionCombinerMatch> matchBinaryReductionCombiner(linalg::Gen
                                                                      unsigned resultNumber,
                                                                      bool emitDiagnostics = false);
 
-SmallVector<OpFoldResult> getUnitStrides(RewriterBase &rewriter, size_t rank);
-
 /// Returns the sizes of each dimension of `tensor` as a vector of `OpFoldResult`.
 /// For dynamic dimensions, creates a `tensor.dim` op to query the size at runtime;
 /// for static dimensions, returns the constant integer attribute directly.
@@ -141,21 +139,42 @@ cloneBlockWithoutTerminator(OpBuilder &builder, Block &block, IRMapping &mapping
   return clonedOps;
 }
 
-/// Clone the operations in `fromLoop`, including body ops and combining ops
-/// (tensor.parallel_insert_slice ops), into `intoLoop`.
-/// It calls `cloneBlockWithoutTerminator` to clone the body ops, and then clones the combining ops.
-/// Returns a vector of pairs of the original and cloned operations, and updates `mapping` to map
-/// the original operations to the cloned ones.
-SmallVector<std::pair<Operation *, Operation *>> cloneForallLoopBody(scf::ForallOp fromLoop,
-                                                                     OpBuilder &builder,
-                                                                     scf::ForallOp intoLoop,
-                                                                     IRMapping &mapping);
+struct ForallOutputExtension {
+  scf::ForallOp forall;
+  IRMapping mapping;
+  unsigned oldOutputCount;
+  SmallVector<std::pair<Operation *, Operation *>> clonedOps;
 
-FailureOr<Value> cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Value value,
-                                                    IRMapping &mapping);
+  ValueRange getAppendedOutputArgs() {
+    return forall.getRegionOutArgs().drop_front(oldOutputCount);
+  }
+  auto getAppendedResults() { return forall.getResults().drop_front(oldOutputCount); }
+  auto getPreservedResults() { return forall.getResults().take_front(oldOutputCount); }
+};
 
-/// A wrapper around `cloneValueDefChainAtInsertionPoint` that applies to all operands of
-/// `toMoveOperands`.
+/// Clone `forall` at the rewriter's current insertion point with the same
+/// iteration space and existing outputs, plus `appendedOutputs`. The body and
+/// combining ops are cloned, and `mapping` maps old induction variables,
+/// output arguments, body operations, and values to their clones. The old
+/// forall is left in place for the caller to replace at the appropriate point
+/// in its rewrite. All outputs must dominate the insertion point.
+ForallOutputExtension cloneForallWithAppendedOutputs(RewriterBase &rewriter, scf::ForallOp forall,
+                                                     ValueRange appendedOutputs);
+
+enum class DefChainAction : uint8_t { Clone, Move };
+
+/// Make all `values` available at the insertion point. In `Clone` mode, later
+/// same-block definition chains are copied. In `Move` mode, cloning is followed
+/// by replacing every result of each original operation and erasing it.
+/// Replacement is deferred until every chain has been cloned successfully.
+///
+/// Callers are responsible for establishing that cloning or moving the
+/// operations is legal and that the insertion point dominates replaced uses.
+FailureOr<SmallVector<Value>>
+makeValuesAvailableAtInsertionPoint(RewriterBase &rewriter, ValueRange values, IRMapping &mapping,
+                                    DefChainAction action = DefChainAction::Clone);
+
+/// Move all definition chains needed by the operands of `toMoveOperands`.
 LogicalResult recursiveMoveOperandsBeforeOp(Operation &toMoveOperands, RewriterBase &rewriter,
                                             Operation &moveBefore);
 
@@ -209,9 +228,6 @@ void eliminateLocalCommonSubexpressions(RewriterBase &rewriter, Operation *op);
 Value createExtractSliceFromState(RewriterBase &rewriter, Location loc, Value fullTensor,
                                   ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes,
                                   ArrayRef<OpFoldResult> strides);
-
-linalg::GenericOp cloneGenericOnTile(RewriterBase &rewriter, linalg::GenericOp sourceGeneric,
-                                     Value inputTile, Value initTile, Location loc);
 
 } // namespace mlir
 

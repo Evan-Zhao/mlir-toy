@@ -16,15 +16,11 @@ module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
     %func = transform.structured.match ops{["func.func"]} in %module
         : (!transform.any_op) -> !transform.any_op
-    %producer = transform.structured.match ops{["linalg.generic"]}
-        attributes {fusion_root} in %func
-        : (!transform.any_op) -> !transform.any_op
     %loop = transform.structured.match ops{["scf.forall"]} in %func
         : (!transform.any_op) -> !transform.any_op
-    %candidates, %new_loop = transform.fusion.greedy_producers_into_consumer
-        %producer into %loop
-        : (!transform.any_op, !transform.any_op)
-          -> (!transform.any_op, !transform.any_op)
+    %candidates, %new_loop =
+        transform.fusion.greedy_input_producers_into_consumer %loop
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     transform.yield
   }
 
@@ -74,24 +70,23 @@ module attributes {transform.with_named_sequence} {
 // -----
 
 // CHECK-LABEL: func.func @nested_loop_path
-// CHECK: %[[ROOT:.*]] = linalg.generic
+// CHECK: linalg.generic
 // CHECK-SAME: {fusion_root}
 // CHECK: scf.forall
-// CHECK: %[[OUTER_SLICE:.*]] = tensor.extract_slice %[[ROOT]]
+// The outer use is fused into the forall, not into the inner loop.
+// CHECK: %[[OUTER_ROOT:.*]] = linalg.generic
+// CHECK-SAME: {fusion_root}
 // CHECK: scf.for
-// CHECK-NOT: tensor.extract_slice %[[OUTER_SLICE]]
-// CHECK: %[[TILED_ROOT:.*]] = linalg.generic
+// The independent inner use is fused again at its deeper placement level.
+// CHECK: %[[INNER_ROOT:.*]] = linalg.generic
 // CHECK-SAME: {fusion_root}
 // CHECK: linalg.generic
-// CHECK-SAME: ins(%[[TILED_ROOT]]
+// CHECK-SAME: ins(%[[INNER_ROOT]]
 // CHECK-SAME: {inner_consumer}
 
 module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
     %func = transform.structured.match ops{["func.func"]} in %module
-        : (!transform.any_op) -> !transform.any_op
-    %producer = transform.structured.match ops{["linalg.generic"]}
-        attributes {fusion_root} in %func
         : (!transform.any_op) -> !transform.any_op
     %forall = transform.structured.match ops{["scf.forall"]} in %func
         : (!transform.any_op) -> !transform.any_op
@@ -101,10 +96,8 @@ module attributes {transform.with_named_sequence} {
     // loop order from payload nesting.
     %loop_nest = transform.merge_handles %for, %forall : !transform.any_op
     %candidates, %new_loop_nest =
-        transform.fusion.greedy_producers_into_consumer
-          %producer into %loop_nest
-        : (!transform.any_op, !transform.any_op)
-          -> (!transform.any_op, !transform.any_op)
+        transform.fusion.greedy_input_producers_into_consumer %loop_nest
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
     transform.yield
   }
 

@@ -1,5 +1,4 @@
 #include "HTile/HTileTransformOps.h"
-#include "HTile/HTileDialect.h"
 
 #include "LoopTr/Utils.h"
 #include "mlir/Dialect/Affine/Utils.h"
@@ -15,10 +14,12 @@
 #include "mlir/Dialect/Tensor/Transforms/Transforms.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/Debug.h"
@@ -1062,6 +1063,283 @@ DiagnosedSilenceableFailure HTileLinalgToSemanticOp::applyToOne(TransformRewrite
       })))
     BAIL("failed to apply tensor cleanup patterns");
 
+  return DiagnosedSilenceableFailure::success();
+}
+
+static LogicalResult verifyCloneableDefChainBefore(Value value, Operation *before,
+                                                   DominanceInfo &dominance,
+                                                   DenseSet<Operation *> &visited) {
+  if (dominance.dominates(value, before))
+    return success();
+
+  Operation *definition = value.getDefiningOp();
+  if (!definition || definition->getBlock() != before->getBlock())
+    return failure();
+  if (!visited.insert(definition).second)
+    return success();
+  if (!isMemoryEffectFree(definition))
+    return failure();
+  return success(llvm::all_of(definition->getOperands(), [&](Value operand) {
+    return succeeded(verifyCloneableDefChainBefore(operand, before, dominance, visited));
+  }));
+}
+
+struct ParallelScatterIndexing {
+  SmallVector<Value> indices;
+  SmallVector<int64_t> broadcastDims;
+};
+
+/// Convert a tiled StableHLO scatter publication to HTile's mixed advanced
+/// indexing form. Scatter start components become sliced tensor indices;
+/// update-window dimensions become scalar base offsets and `broadcast_dims`.
+static FailureOr<ParallelScatterIndexing>
+buildParallelScatterIndexing(RewriterBase &rewriter, stablehlo::ScatterOp scatter,
+                             tensor::ParallelInsertSliceOp publication) {
+  Location loc = scatter.getLoc();
+  RankedTensorType sourceType = publication.getSource().getType(),
+                   updatesType = publication.getDest().getType(),
+                   inputType = cast<RankedTensorType>(scatter.getInputs().front().getType()),
+                   scatterIndicesType = scatter.getScatterIndices().getType();
+  int64_t sourceRank = sourceType.getRank(), updateRank = updatesType.getRank(),
+          inputRank = inputType.getRank();
+  if (inputRank == 0)
+    return failure();
+
+  auto dimNums = scatter.getScatterDimensionNumbers();
+  ArrayRef<int64_t> updateWindowDims(dimNums.getUpdateWindowDims()),
+      insertedWindowDims(dimNums.getInsertedWindowDims()),
+      inputBatchingDims(dimNums.getInputBatchingDims()),
+      scatterDimsToOperandDims(dimNums.getScatterDimsToOperandDims());
+  int64_t indexVectorDim = dimNums.getIndexVectorDim();
+
+  // HTile's compact indexing form currently assumes that batching has already
+  // been expanded away and that publication strides are unit.
+  if (!inputBatchingDims.empty() || !dimNums.getScatterIndicesBatchingDims().empty() ||
+      !llvm::all_of(publication.getMixedStrides(),
+                    [](OpFoldResult stride) { return isOneInteger(stride); }))
+    return failure();
+
+  SmallVector<int64_t> updateScatterDims;
+  for (int64_t dim = 0; dim < updateRank; ++dim)
+    if (!llvm::is_contained(updateWindowDims, dim))
+      updateScatterDims.push_back(dim);
+
+  SmallVector<int64_t> windowOperandDims;
+  for (int64_t dim = 0; dim < inputRank; ++dim)
+    if (!llvm::is_contained(insertedWindowDims, dim) && !llvm::is_contained(inputBatchingDims, dim))
+      windowOperandDims.push_back(dim);
+  if (windowOperandDims.size() != updateWindowDims.size())
+    return failure();
+
+  llvm::SmallBitVector droppedUpdateDims = publication.getDroppedDims();
+  SmallVector<OpFoldResult> pubOffsets = publication.getMixedOffsets(),
+                            pubSizes = publication.getMixedSizes(),
+                            pubStrides = publication.getMixedStrides();
+  SmallVector<int64_t> updateDimToSourceDim(updateRank, -1);
+  for (int64_t updateDim = 0, sourceDim = 0; updateDim < updateRank; ++updateDim)
+    if (!droppedUpdateDims.test(updateDim))
+      updateDimToSourceDim[updateDim] = sourceDim++;
+
+  int64_t batchRank = 0;
+  SmallVector<int64_t> componentShape;
+  for (int64_t updateDim : updateScatterDims) {
+    int64_t sourceDim = updateDimToSourceDim[updateDim];
+    if (sourceDim < 0)
+      continue;
+    if (sourceDim != batchRank++)
+      return failure();
+    componentShape.push_back(sourceType.getDimSize(sourceDim));
+  }
+
+  ParallelScatterIndexing result;
+  result.indices.resize(inputRank);
+  SmallVector<bool> assigned(inputRank, false);
+  bool hasExplicitIndexVectorDim = indexVectorDim < scatterIndicesType.getRank();
+  for (auto [component, operandDim] : llvm::enumerate(scatterDimsToOperandDims)) {
+    if (assigned[operandDim])
+      return failure();
+    SmallVector<OpFoldResult> offsets, sizes, strides;
+    int64_t updateScatterPos = 0;
+    for (int64_t indicesDim = 0; indicesDim < scatterIndicesType.getRank(); ++indicesDim) {
+      if (hasExplicitIndexVectorDim && indicesDim == indexVectorDim) {
+        offsets.push_back(rewriter.getIndexAttr(static_cast<int64_t>(component)));
+        sizes.push_back(rewriter.getIndexAttr(1));
+        strides.push_back(rewriter.getIndexAttr(1));
+        continue;
+      }
+      int64_t updateDim = updateScatterDims[updateScatterPos++];
+      offsets.push_back(pubOffsets[updateDim]);
+      sizes.push_back(pubSizes[updateDim]);
+      strides.push_back(pubStrides[updateDim]);
+    }
+    auto componentType = RankedTensorType::get(componentShape, scatterIndicesType.getElementType());
+    result.indices[operandDim] = tensor::ExtractSliceOp::create(
+        rewriter, loc, componentType, scatter.getScatterIndices(), offsets, sizes, strides);
+    assigned[operandDim] = true;
+  }
+
+  int64_t windowSourceDim = batchRank;
+  for (auto [updateDim, inputDim] : llvm::zip_equal(updateWindowDims, windowOperandDims)) {
+    if (assigned[inputDim])
+      return failure();
+    result.indices[inputDim] =
+        getValueOrCreateConstantIndexOp(rewriter, loc, pubOffsets[updateDim]);
+    assigned[inputDim] = true;
+    if (droppedUpdateDims.test(updateDim))
+      continue;
+    if (updateDimToSourceDim[updateDim] != windowSourceDim++)
+      return failure();
+    result.broadcastDims.push_back(inputDim);
+  }
+  if (windowSourceDim != sourceRank)
+    return failure();
+
+  Value zero;
+  for (size_t inputDim = 0; inputDim < result.indices.size(); ++inputDim) {
+    if (assigned[inputDim])
+      continue;
+    if (!zero)
+      zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    result.indices[inputDim] = zero;
+  }
+  return result;
+}
+
+static void notifyClonedOpsRecursively(TransformRewriter &rewriter,
+                                       ArrayRef<std::pair<Operation *, Operation *>> clonedOps) {
+  for (auto [oldOp, newOp] : clonedOps) {
+    SmallVector<Operation *> oldNestedOps, newNestedOps;
+    oldOp->walk<WalkOrder::PreOrder>([&](Operation *nested) { oldNestedOps.push_back(nested); });
+    newOp->walk<WalkOrder::PreOrder>([&](Operation *nested) { newNestedOps.push_back(nested); });
+    assert(oldNestedOps.size() == newNestedOps.size() &&
+           "cloning must preserve nested operation structure");
+    for (auto [oldNested, newNested] : llvm::zip_equal(oldNestedOps, newNestedOps)) {
+      if (succeeded(rewriter.notifyPayloadOperationReplaced(oldNested, newNested)))
+        continue;
+      // Most cloned operations have no transform handle. In that case there is
+      // no mapping to update and the listener failure is expected.
+      rewriter.silenceTrackingFailure();
+    }
+  }
+}
+
+void HTileFuseScatterIntoForallOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  consumesHandle(getScatterMutable(), effects);
+  onlyReadsHandle(getForallMutable(), effects);
+  producesHandle(getOperation()->getOpResults(), effects);
+  modifiesPayload(effects);
+}
+
+DiagnosedSilenceableFailure HTileFuseScatterIntoForallOp::apply(TransformRewriter &rewriter,
+                                                                TransformResults &results,
+                                                                TransformState &state) {
+  auto transform = cast<TransformOpInterface>(getOperation());
+
+  stablehlo::ScatterOp scatter;
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getScatter, "scatter", scatter,
+                               stablehlo::ScatterOp);
+  scf::ForallOp forall;
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getForall, "forall", forall, scf::ForallOp);
+
+  if (scatter.getInputs().size() != 1 || scatter.getUpdates().size() != 1 ||
+      scatter->getNumResults() != 1)
+    BAIL("expected scatter to have exactly one input, update, and result");
+  if (!scatter.getUniqueIndices())
+    BAIL("expected scatter to have unique_indices = true");
+
+  auto indicesType = dyn_cast<RankedTensorType>(scatter.getScatterIndices().getType());
+  if (!indicesType)
+    BAIL("expected scatter indices to be a ranked tensor");
+  Type indexElementType = indicesType.getElementType();
+  auto integerType = dyn_cast<IntegerType>(indexElementType);
+  if (!indexElementType.isIndex() && (!integerType || !integerType.isSignless()))
+    BAIL("expected scatter indices to have signless integer or index element type");
+
+  Region &updateComputation = scatter.getUpdateComputation();
+  if (!updateComputation.hasOneBlock())
+    BAIL("expected scatter update computation to have one block");
+  Block &updateBlock = updateComputation.front();
+  if (updateBlock.getNumArguments() != 2 || !updateBlock.without_terminator().empty())
+    BAIL("expected scatter update computation to directly return the update argument");
+  auto returnOp = dyn_cast<stablehlo::ReturnOp>(updateBlock.getTerminator());
+  if (!returnOp || returnOp.getNumOperands() != 1 ||
+      returnOp.getOperand(0) != updateBlock.getArgument(1))
+    BAIL("expected scatter update computation to directly return the update argument");
+
+  auto updateResult = dyn_cast<OpResult>(scatter.getUpdates().front());
+  if (!updateResult || updateResult.getOwner() != forall.getOperation())
+    BAIL("expected the selected forall to directly produce the scatter update");
+  FailureOr<tensor::ParallelInsertSliceOp> updatePublication =
+      getParallelInsertSliceForLoopResult(forall, updateResult);
+  if (failed(updatePublication))
+    BAIL("expected the scatter update to be published by one tensor.parallel_insert_slice");
+
+  Value scatterInput = scatter.getInputs().front();
+  Value scatterIndices = scatter.getScatterIndices();
+  DominanceInfo dominance(forall->getParentOp());
+  DenseSet<Operation *> visited;
+  if (failed(verifyCloneableDefChainBefore(scatterInput, forall, dominance, visited)))
+    BAIL("expected the scatter input definition chain to be safely clonable before the forall");
+  if (failed(verifyCloneableDefChainBefore(scatterIndices, forall, dominance, visited)))
+    BAIL("expected the scatter indices definition chain to be safely clonable before the forall");
+
+  rewriter.setInsertionPoint(forall);
+  IRMapping movedDefinitions;
+  FailureOr<SmallVector<Value>> preparedValues = makeValuesAvailableAtInsertionPoint(
+      rewriter, {scatterInput, scatterIndices}, movedDefinitions, DefChainAction::Move);
+  if (failed(preparedValues))
+    BAIL("failed to make the scatter input and indices available before the forall");
+  Value preparedScatterInput = (*preparedValues)[0];
+
+  rewriter.setInsertionPoint(forall.getTerminator());
+  FailureOr<ParallelScatterIndexing> parallelScatterIndexing =
+      buildParallelScatterIndexing(rewriter, scatter, *updatePublication);
+  if (failed(parallelScatterIndexing))
+    BAIL("failed to build HTile indexing for the published update tile");
+
+  LLVM_DEBUG({
+    Value preparedScatterIndices = (*preparedValues)[1];
+    llvm::dbgs() << "validated scatter fusion candidate:\n"
+                 << *scatter << "\nupdate publication:\n"
+                 << *updatePublication << "\nprepared scatter input: ";
+    llvm::dbgs() << preparedScatterInput;
+    llvm::dbgs() << "\nprepared scatter indices: " << preparedScatterIndices;
+    llvm::dbgs() << "\nparallel scatter indices:";
+    for (Value index : parallelScatterIndexing->indices)
+      llvm::dbgs() << "\n  " << index;
+    llvm::dbgs() << "\nbroadcast dims: [";
+    llvm::interleaveComma(parallelScatterIndexing->broadcastDims, llvm::dbgs());
+    llvm::dbgs() << "]\n";
+  });
+
+  // Append the scatter destination to the forall outputs. Keep the old update
+  // tensor output for now so the existing publication and any DPS scratch uses
+  // remain valid while we introduce the direct scatter publication.
+  rewriter.setInsertionPoint(forall);
+  ForallOutputExtension extension =
+      cloneForallWithAppendedOutputs(rewriter, forall, ValueRange{preparedScatterInput});
+  scf::ForallOp newForall = extension.forall;
+  notifyClonedOpsRecursively(rewriter, extension.clonedOps);
+  Value clonedUpdateTile = extension.mapping.lookup(updatePublication->getSource());
+  SmallVector<Value> clonedScatterIndices =
+      llvm::map_to_vector(parallelScatterIndexing->indices,
+                          [&](Value index) { return extension.mapping.lookup(index); });
+  pointBuilderToForallParallel(rewriter, newForall);
+  auto parallelScatter = htile::ParallelScatterOp::create(
+      rewriter, scatter.getLoc(), clonedUpdateTile, extension.getAppendedOutputArgs().front(),
+      clonedScatterIndices, parallelScatterIndexing->broadcastDims, /*unique=*/true,
+      htile::ScatterOutOfBounds::Discard);
+
+  Value fusedResult = extension.getAppendedResults().front();
+  rewriter.replaceAllUsesWith(scatter->getResult(0), fusedResult);
+  rewriter.eraseOp(scatter);
+  if (failed(rewriter.notifyPayloadOperationReplaced(forall, newForall)))
+    BAIL("failed to preserve the scf.forall handle");
+  rewriter.replaceOp(forall, extension.getPreservedResults());
+
+  LLVM_DEBUG(llvm::dbgs() << "rebuilt forall with parallel scatter:\n" << parallelScatter << "\n");
+  results.set(getOperation()->getResult(0), ArrayRef<Operation *>{parallelScatter.getOperation()});
   return DiagnosedSilenceableFailure::success();
 }
 
