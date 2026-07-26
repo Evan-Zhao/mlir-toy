@@ -779,6 +779,31 @@ public:
     }
 
     auto exprTensorType = RankedTensorType::get(exprShape, exprType.getElementType());
+
+    // A splat StableHLO constant has no expression axes. Materialize it as an
+    // arith tensor constant directly instead of wrapping it in an axis-free TA
+    // scope, which would later become a rank-zero linalg.generic. When the
+    // boundary type is static, expand the splat attribute directly to that
+    // type instead of creating a rank-zero constant plus linalg.broadcast.
+    if (auto constant = output.getDefiningOp<ConstantOp>();
+        constant && exprType.getAxes().getAxes().empty()) {
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointAfter(scope);
+      RankedTensorType constantType = targetType.hasStaticShape() ? targetType : exprTensorType;
+      auto tensorValue = DenseElementsAttr::get(constantType, constant.getValue());
+      Value adapted = arith::ConstantOp::create(builder, loc, tensorValue);
+      if (constantType != targetType) {
+        Value init = tensor::EmptyOp::create(builder, loc, targetType.getShape(),
+                                             targetType.getElementType());
+        SmallVector<int64_t> addedDimensions(targetType.getRank());
+        std::iota(addedDimensions.begin(), addedDimensions.end(), 0);
+        adapted = linalg::BroadcastOp::create(builder, loc, adapted, init, addedDimensions)
+                      .getResult()[0];
+      }
+      scope.erase();
+      return adapted;
+    }
+
     scope.getResult().setType(exprTensorType);
     yield(output);
     relabelAxesForOutput(output);

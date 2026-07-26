@@ -67,6 +67,20 @@ func.func @attention(%q: tensor<1x2x4x3xf16>, %k: tensor<1x2x4x3xf16>,
   return %out : tensor<1x2x4x3xf16>
 }
 
+// CHECK-LABEL: func.func @constant_broadcast_boundary
+// CHECK: %[[CONSTANT:.+]] = arith.constant dense<0.000000e+00> : tensor<2x3xf16>
+// CHECK-NOT: ta.scope
+// CHECK-NOT: linalg.broadcast
+// CHECK: stablehlo.slice %[[CONSTANT]]
+func.func @constant_broadcast_boundary() -> tensor<2x3xf16> {
+  %constant = stablehlo.constant dense<0.000000e+00> : tensor<f16>
+  %broadcast = stablehlo.broadcast_in_dim %constant, dims = []
+      : (tensor<f16>) -> tensor<2x3xf16>
+  %slice = stablehlo.slice %broadcast [0:2, 0:3]
+      : (tensor<2x3xf16>) -> tensor<2x3xf16>
+  return %slice : tensor<2x3xf16>
+}
+
 // CHECK-LABEL: func.func @partition_around_unsupported_ops
 // CHECK: %[[LHS:.+]] = stablehlo.slice
 // CHECK: %[[RHS:.+]] = stablehlo.slice
