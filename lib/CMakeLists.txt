@@ -7,9 +7,9 @@ target_link_libraries(NeptuneMLIRCore INTERFACE
   LLVMSupport
 )
 
-add_subdirectory(HTile)
 add_subdirectory(TA)
 add_subdirectory(LoopTr)
+add_subdirectory(HTile)
 add_subdirectory(StableHLO)
 add_subdirectory(Python)
 
