@@ -6,10 +6,15 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %forall = transform.structured.match ops{["scf.forall"]} in %root
         : (!transform.any_op) -> !transform.any_op
-    %new_forall, %parallel_scatter =
+    %update_tile = transform.structured.match ops{["tensor.extract_slice"]} in %forall
+        : (!transform.any_op) -> !transform.any_op
+    %parallel_scatter =
         transform.htile.fuse_scatter_into_forall %scatter into %forall
-        : (!transform.any_op, !transform.any_op)
-          -> (!transform.any_op, !transform.any_op)
+        : (!transform.any_op, !transform.any_op) -> !transform.any_op
+    // Handles to the original loop and its cloned body remain valid.
+    transform.match.operation_name %forall ["scf.forall"] : !transform.any_op
+    transform.match.operation_name %update_tile ["tensor.extract_slice"]
+        : !transform.any_op
     transform.yield
   }
 
@@ -63,11 +68,10 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %forall = transform.structured.match ops{["scf.forall"]} in %root
         : (!transform.any_op) -> !transform.any_op
-    %new_forall, %parallel_scatter =
+    %parallel_scatter =
         // expected-error @below {{expected scatter to have unique_indices = true}}
         transform.htile.fuse_scatter_into_forall %scatter into %forall
-        : (!transform.any_op, !transform.any_op)
-          -> (!transform.any_op, !transform.any_op)
+        : (!transform.any_op, !transform.any_op) -> !transform.any_op
     transform.yield
   }
 
@@ -105,11 +109,10 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %forall = transform.structured.match ops{["scf.forall"]} in %root
         : (!transform.any_op) -> !transform.any_op
-    %new_forall, %parallel_scatter =
+    %parallel_scatter =
         // expected-error @below {{expected scatter update computation to directly return the update argument}}
         transform.htile.fuse_scatter_into_forall %scatter into %forall
-        : (!transform.any_op, !transform.any_op)
-          -> (!transform.any_op, !transform.any_op)
+        : (!transform.any_op, !transform.any_op) -> !transform.any_op
     transform.yield
   }
 

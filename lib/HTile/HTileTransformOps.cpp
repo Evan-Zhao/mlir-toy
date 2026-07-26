@@ -1205,10 +1205,28 @@ buildParallelScatterIndexing(RewriterBase &rewriter, stablehlo::ScatterOp scatte
   return result;
 }
 
+static void notifyClonedOpsRecursively(TransformRewriter &rewriter,
+                                       ArrayRef<std::pair<Operation *, Operation *>> clonedOps) {
+  for (auto [oldOp, newOp] : clonedOps) {
+    SmallVector<Operation *> oldNestedOps, newNestedOps;
+    oldOp->walk<WalkOrder::PreOrder>([&](Operation *nested) { oldNestedOps.push_back(nested); });
+    newOp->walk<WalkOrder::PreOrder>([&](Operation *nested) { newNestedOps.push_back(nested); });
+    assert(oldNestedOps.size() == newNestedOps.size() &&
+           "cloning must preserve nested operation structure");
+    for (auto [oldNested, newNested] : llvm::zip_equal(oldNestedOps, newNestedOps)) {
+      if (succeeded(rewriter.notifyPayloadOperationReplaced(oldNested, newNested)))
+        continue;
+      // Most cloned operations have no transform handle. In that case there is
+      // no mapping to update and the listener failure is expected.
+      rewriter.silenceTrackingFailure();
+    }
+  }
+}
+
 void HTileFuseScatterIntoForallOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   consumesHandle(getScatterMutable(), effects);
-  consumesHandle(getForallMutable(), effects);
+  onlyReadsHandle(getForallMutable(), effects);
   producesHandle(getOperation()->getOpResults(), effects);
   modifiesPayload(effects);
 }
@@ -1302,6 +1320,7 @@ DiagnosedSilenceableFailure HTileFuseScatterIntoForallOp::apply(TransformRewrite
   ForallOutputExtension extension =
       cloneForallWithAppendedOutputs(rewriter, forall, ValueRange{preparedScatterInput});
   scf::ForallOp newForall = extension.forall;
+  notifyClonedOpsRecursively(rewriter, extension.clonedOps);
   Value clonedUpdateTile = extension.mapping.lookup(updatePublication->getSource());
   SmallVector<Value> clonedScatterIndices =
       llvm::map_to_vector(parallelScatterIndexing->indices,
@@ -1315,11 +1334,12 @@ DiagnosedSilenceableFailure HTileFuseScatterIntoForallOp::apply(TransformRewrite
   Value fusedResult = extension.getAppendedResults().front();
   rewriter.replaceAllUsesWith(scatter->getResult(0), fusedResult);
   rewriter.eraseOp(scatter);
+  if (failed(rewriter.notifyPayloadOperationReplaced(forall, newForall)))
+    BAIL("failed to preserve the scf.forall handle");
   rewriter.replaceOp(forall, extension.getPreservedResults());
 
   LLVM_DEBUG(llvm::dbgs() << "rebuilt forall with parallel scatter:\n" << parallelScatter << "\n");
-  results.set(getOperation()->getResult(0), ArrayRef<Operation *>{newForall.getOperation()});
-  results.set(getOperation()->getResult(1), ArrayRef<Operation *>{parallelScatter.getOperation()});
+  results.set(getOperation()->getResult(0), ArrayRef<Operation *>{parallelScatter.getOperation()});
   return DiagnosedSilenceableFailure::success();
 }
 

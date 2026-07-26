@@ -39,8 +39,7 @@ def HTileLinalgToSemanticOp : Op<Transform_Dialect, "htile.linalg_to_semantic",
 
 def HTileFuseScatterIntoForallOp
     : Op<Transform_Dialect, "htile.fuse_scatter_into_forall",
-         [FunctionalStyleTransformOpTrait,
-          DeclareOpInterfaceMethods<TransformOpInterface>,
+         [DeclareOpInterfaceMethods<TransformOpInterface>,
           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
           ReportTrackingListenerFailuresOpTrait]> {
   let summary = "Fuse a unique StableHLO scatter into its update-producing forall";
@@ -51,13 +50,13 @@ def HTileFuseScatterIntoForallOp
 
     The transform rebuilds the forall over the scatter destination and replaces
     the update-tensor publication with an `htile.parallel_scatter` contribution.
-    It returns handles to the rebuilt forall and the parallel scatter.
+    The `forall` operand handle is updated to refer to the rebuilt loop, and the
+    transform returns a handle to the parallel scatter.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$scatter,
                        TransformHandleTypeInterface:$forall);
-  let results = (outs TransformHandleTypeInterface:$new_forall,
-                      TransformHandleTypeInterface:$parallel_scatter);
+  let results = (outs TransformHandleTypeInterface:$parallel_scatter);
 
   let assemblyFormat = "$scatter `into` $forall attr-dict `:` "
                        "functional-type(operands, results)";
