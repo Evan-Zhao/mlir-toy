@@ -151,6 +151,29 @@ SmallVector<std::pair<Operation *, Operation *>> cloneForallLoopBody(scf::Forall
                                                                      scf::ForallOp intoLoop,
                                                                      IRMapping &mapping);
 
+struct ForallOutputExtension {
+  scf::ForallOp forall;
+  IRMapping mapping;
+  unsigned oldOutputCount;
+  SmallVector<std::pair<Operation *, Operation *>> clonedOps;
+
+  ValueRange getAppendedOutputArgs() {
+    return forall.getRegionOutArgs().drop_front(oldOutputCount);
+  }
+  auto getAppendedResults() { return forall.getResults().drop_front(oldOutputCount); }
+  auto getPreservedResults() { return forall.getResults().take_front(oldOutputCount); }
+};
+
+/// Clone `forall` at the rewriter's current insertion point with the same
+/// iteration space and existing outputs, plus `appendedOutputs`. The body and
+/// combining ops are cloned, and `mapping` maps old induction variables,
+/// output arguments, body operations, and values to their clones. The old
+/// forall is left in place for the caller to replace at the appropriate point
+/// in its rewrite. All outputs must dominate the insertion point.
+ForallOutputExtension cloneForallWithAppendedOutputs(RewriterBase &rewriter,
+                                                     scf::ForallOp forall,
+                                                     ValueRange appendedOutputs);
+
 /// Make `value` available at the rewriter's insertion point by recursively
 /// cloning definitions that occur later in the same block. Definitions that
 /// are already available, block arguments, and definitions in other blocks are

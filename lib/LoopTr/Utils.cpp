@@ -389,6 +389,30 @@ SmallVector<std::pair<Operation *, Operation *>> cloneForallLoopBody(scf::Forall
   return clonedOps;
 }
 
+ForallOutputExtension cloneForallWithAppendedOutputs(RewriterBase &rewriter,
+                                                     scf::ForallOp forall,
+                                                     ValueRange appendedOutputs) {
+  unsigned oldOutputCount = forall.getNumResults();
+  SmallVector<Value> outputs = llvm::to_vector(forall.getOutputs());
+  llvm::append_range(outputs, appendedOutputs);
+
+  auto newForall = scf::ForallOp::create(
+      rewriter, forall.getLoc(), forall.getMixedLowerBound(), forall.getMixedUpperBound(),
+      forall.getMixedStep(), outputs, forall.getMapping());
+
+  IRMapping mapping;
+  mapping.map(forall.getInductionVars(), newForall.getInductionVars());
+  mapping.map(forall.getRegionOutArgs(),
+              newForall.getRegionOutArgs().take_front(oldOutputCount));
+  rewriter.setInsertionPointToStart(newForall.getBody());
+  auto clonedOps = cloneForallLoopBody(forall, rewriter, newForall, mapping);
+
+  return ForallOutputExtension{.forall = newForall,
+                               .mapping = std::move(mapping),
+                               .oldOutputCount = oldOutputCount,
+                               .clonedOps = std::move(clonedOps)};
+}
+
 FailureOr<DenseMap<OpResult, LoopResultRelaysT>>
 getChainedLoopResultMap(ArrayRef<Operation *> loops) {
   auto loopResultRelaysF = getNestedLoopResultRelays(loops);

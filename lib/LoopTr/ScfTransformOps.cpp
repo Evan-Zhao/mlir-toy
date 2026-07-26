@@ -578,16 +578,11 @@ rFactorReductionUnderForall(TransformOpInterface transform, TransformRewriter &r
     return consumer.emitError() << "failed to create partial reduction init tensor";
 
   // Create a new forall loop that has the RF init tensor as an additional output.
-  SmallVector<Value> newOutputs = llvm::to_vector(forall.getOutputs());
-  newOutputs.push_back(rfInits->front());
-  auto newForall =
-      scf::ForallOp::create(rewriter, loc, forall.getMixedLowerBound(), forall.getMixedUpperBound(),
-                            forall.getMixedStep(), newOutputs, forall.getMapping());
-  IRMapping mapping;
-  mapping.map(forall.getInductionVars(), newForall.getInductionVars());
-  mapping.map(forall.getRegionIterArgs(), newForall.getRegionIterArgs());
-  rewriter.setInsertionPointToStart(newForall.getBody());
-  auto clonedOps = cloneForallLoopBody(forall, rewriter, newForall, mapping);
+  ForallOutputExtension extension =
+      cloneForallWithAppendedOutputs(rewriter, forall, ValueRange{rfInits->front()});
+  scf::ForallOp newForall = extension.forall;
+  IRMapping mapping = std::move(extension.mapping);
+  auto clonedOps = std::move(extension.clonedOps);
 
   // Get the under-loop tile of the reduction input, and use tiling interface method to map this
   // input tile to a tile of the reduction's iter domain.
