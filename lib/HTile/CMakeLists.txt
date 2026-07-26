@@ -42,6 +42,7 @@ add_dependencies(NeptuneHTile
 setup_mlir_target(NeptuneHTile)
 target_link_libraries(NeptuneHTile PUBLIC
   NeptuneMLIRCore
+  StablehloOps
   MLIRAffineUtils
   MLIRArithDialect
   MLIRArithUtils

@@ -151,6 +151,15 @@ SmallVector<std::pair<Operation *, Operation *>> cloneForallLoopBody(scf::Forall
                                                                      scf::ForallOp intoLoop,
                                                                      IRMapping &mapping);
 
+/// Make `value` available at the rewriter's insertion point by recursively
+/// cloning definitions that occur later in the same block. Definitions that
+/// are already available, block arguments, and definitions in other blocks are
+/// left unchanged. `mapping` records and reuses clones across multiple calls.
+///
+/// This helper does not check whether cloned operations are pure, speculatable,
+/// or otherwise legal to duplicate, and it does not verify that unchanged
+/// values dominate the insertion point. Callers must establish those
+/// preconditions before calling it.
 FailureOr<Value> cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Value value,
                                                     IRMapping &mapping);
 
