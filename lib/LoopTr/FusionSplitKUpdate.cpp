@@ -269,16 +269,13 @@ FusionCloneFuseRfactorElemwiseOp::apply(transform::TransformRewriter &rewriter,
     IRMapping localMapping;
     for (auto elemwiseOp : elemwiseOps) {
       for (auto initVal : elemwiseOp.getDpsInits()) {
-        auto newInitVal = cloneValueDefChainAtInsertionPoint(rewriter, initVal, localMapping);
-        if (failed(newInitVal)) {
+        auto movedValues = makeValuesAvailableAtInsertionPoint(rewriter, {initVal}, localMapping,
+                                                               DefChainAction::Move);
+        if (failed(movedValues)) {
           ::emitRemark(initVal.getLoc()) << "when cloning this value and its use-def chain up";
           BAIL("failed to move the DPS init operand of an elementwise op before the forall loop");
         }
-        if (*newInitVal != initVal) {
-          rewriter.replaceAllUsesWith(initVal, *newInitVal);
-          rewriter.eraseOp(initVal.getDefiningOp());
-        }
-        newOutArgs.push_back(*newInitVal);
+        newOutArgs.push_back(movedValues->front());
       }
     }
   }

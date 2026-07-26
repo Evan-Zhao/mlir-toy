@@ -1194,10 +1194,14 @@ buildParallelScatterIndexing(RewriterBase &rewriter, stablehlo::ScatterOp scatte
   if (windowSourceDim != sourceRank)
     return failure();
 
-  Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
-  for (size_t inputDim = 0; inputDim < result.indices.size(); ++inputDim)
-    if (!assigned[inputDim])
-      result.indices[inputDim] = zero;
+  Value zero;
+  for (size_t inputDim = 0; inputDim < result.indices.size(); ++inputDim) {
+    if (assigned[inputDim])
+      continue;
+    if (!zero)
+      zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    result.indices[inputDim] = zero;
+  }
   return result;
 }
 
@@ -1263,17 +1267,12 @@ DiagnosedSilenceableFailure HTileFuseScatterIntoForallOp::apply(TransformRewrite
     BAIL("expected the scatter indices definition chain to be safely clonable before the forall");
 
   rewriter.setInsertionPoint(forall);
-  IRMapping clonedDefinitions;
-  FailureOr<Value> preparedScatterInput =
-      cloneValueDefChainAtInsertionPoint(rewriter, scatterInput, clonedDefinitions);
-  if (failed(preparedScatterInput))
-    BAIL("failed to make the scatter input available before the forall");
-  FailureOr<Value> preparedScatterIndices =
-      cloneValueDefChainAtInsertionPoint(rewriter, scatterIndices, clonedDefinitions);
-  if (failed(preparedScatterIndices))
-    BAIL("failed to make the scatter indices available before the forall");
-  scatter.getInputsMutable().assign(ValueRange{*preparedScatterInput});
-  scatter.getScatterIndicesMutable().set(*preparedScatterIndices);
+  IRMapping movedDefinitions;
+  FailureOr<SmallVector<Value>> preparedValues = makeValuesAvailableAtInsertionPoint(
+      rewriter, {scatterInput, scatterIndices}, movedDefinitions, DefChainAction::Move);
+  if (failed(preparedValues))
+    BAIL("failed to make the scatter input and indices available before the forall");
+  Value preparedScatterInput = (*preparedValues)[0];
 
   rewriter.setInsertionPoint(forall.getTerminator());
   FailureOr<ParallelScatterIndexing> parallelScatterIndexing =
@@ -1282,11 +1281,12 @@ DiagnosedSilenceableFailure HTileFuseScatterIntoForallOp::apply(TransformRewrite
     BAIL("failed to build HTile indexing for the published update tile");
 
   LLVM_DEBUG({
+    Value preparedScatterIndices = (*preparedValues)[1];
     llvm::dbgs() << "validated scatter fusion candidate:\n"
                  << *scatter << "\nupdate publication:\n"
                  << *updatePublication << "\nprepared scatter input: ";
-    llvm::dbgs() << *preparedScatterInput;
-    llvm::dbgs() << "\nprepared scatter indices: " << *preparedScatterIndices;
+    llvm::dbgs() << preparedScatterInput;
+    llvm::dbgs() << "\nprepared scatter indices: " << preparedScatterIndices;
     llvm::dbgs() << "\nparallel scatter indices:";
     for (Value index : parallelScatterIndexing->indices)
       llvm::dbgs() << "\n  " << index;
@@ -1295,10 +1295,31 @@ DiagnosedSilenceableFailure HTileFuseScatterIntoForallOp::apply(TransformRewrite
     llvm::dbgs() << "]\n";
   });
 
-  // Until the fusion rewrite is implemented, preserve the validated forall as
-  // the first result and return an empty handle for the future parallel scatter.
-  results.set(getOperation()->getResult(0), ArrayRef<Operation *>{forall.getOperation()});
-  results.set(getOperation()->getResult(1), ArrayRef<Operation *>{});
+  // Append the scatter destination to the forall outputs. Keep the old update
+  // tensor output for now so the existing publication and any DPS scratch uses
+  // remain valid while we introduce the direct scatter publication.
+  rewriter.setInsertionPoint(forall);
+  ForallOutputExtension extension =
+      cloneForallWithAppendedOutputs(rewriter, forall, ValueRange{preparedScatterInput});
+  scf::ForallOp newForall = extension.forall;
+  Value clonedUpdateTile = extension.mapping.lookup(updatePublication->getSource());
+  SmallVector<Value> clonedScatterIndices =
+      llvm::map_to_vector(parallelScatterIndexing->indices,
+                          [&](Value index) { return extension.mapping.lookup(index); });
+  pointBuilderToForallParallel(rewriter, newForall);
+  auto parallelScatter = htile::ParallelScatterOp::create(
+      rewriter, scatter.getLoc(), clonedUpdateTile, extension.getAppendedOutputArgs().front(),
+      clonedScatterIndices, parallelScatterIndexing->broadcastDims, /*unique=*/true,
+      htile::ScatterOutOfBounds::Discard);
+
+  Value fusedResult = extension.getAppendedResults().front();
+  rewriter.replaceAllUsesWith(scatter->getResult(0), fusedResult);
+  rewriter.eraseOp(scatter);
+  rewriter.replaceOp(forall, extension.getPreservedResults());
+
+  LLVM_DEBUG(llvm::dbgs() << "rebuilt forall with parallel scatter:\n" << parallelScatter << "\n");
+  results.set(getOperation()->getResult(0), ArrayRef<Operation *>{newForall.getOperation()});
+  results.set(getOperation()->getResult(1), ArrayRef<Operation *>{parallelScatter.getOperation()});
   return DiagnosedSilenceableFailure::success();
 }
 

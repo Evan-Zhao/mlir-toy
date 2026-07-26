@@ -389,21 +389,19 @@ SmallVector<std::pair<Operation *, Operation *>> cloneForallLoopBody(scf::Forall
   return clonedOps;
 }
 
-ForallOutputExtension cloneForallWithAppendedOutputs(RewriterBase &rewriter,
-                                                     scf::ForallOp forall,
+ForallOutputExtension cloneForallWithAppendedOutputs(RewriterBase &rewriter, scf::ForallOp forall,
                                                      ValueRange appendedOutputs) {
   unsigned oldOutputCount = forall.getNumResults();
   SmallVector<Value> outputs = llvm::to_vector(forall.getOutputs());
   llvm::append_range(outputs, appendedOutputs);
 
-  auto newForall = scf::ForallOp::create(
-      rewriter, forall.getLoc(), forall.getMixedLowerBound(), forall.getMixedUpperBound(),
-      forall.getMixedStep(), outputs, forall.getMapping());
+  auto newForall = scf::ForallOp::create(rewriter, forall.getLoc(), forall.getMixedLowerBound(),
+                                         forall.getMixedUpperBound(), forall.getMixedStep(),
+                                         outputs, forall.getMapping());
 
   IRMapping mapping;
   mapping.map(forall.getInductionVars(), newForall.getInductionVars());
-  mapping.map(forall.getRegionOutArgs(),
-              newForall.getRegionOutArgs().take_front(oldOutputCount));
+  mapping.map(forall.getRegionOutArgs(), newForall.getRegionOutArgs().take_front(oldOutputCount));
   rewriter.setInsertionPointToStart(newForall.getBody());
   auto clonedOps = cloneForallLoopBody(forall, rewriter, newForall, mapping);
 
@@ -468,8 +466,11 @@ SmallVector<OpFoldResult> getMixedTensorSizes(RewriterBase &rewriter, Location l
   return sizes;
 }
 
-FailureOr<Value> cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Value value,
-                                                    IRMapping &mapping) {
+using ClonedOperation = std::pair<Operation *, Operation *>;
+
+static FailureOr<Value>
+cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Value value, IRMapping &mapping,
+                                   SmallVectorImpl<ClonedOperation> *clonedOps) {
   if (Value mapped = mapping.lookupOrNull(value))
     return mapped;
 
@@ -486,7 +487,7 @@ FailureOr<Value> cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Valu
   IRMapping localMapping = mapping;
   for (Value operand : def->getOperands()) {
     FailureOr<Value> remappedOperand =
-        cloneValueDefChainAtInsertionPoint(rewriter, operand, mapping);
+        cloneValueDefChainAtInsertionPoint(rewriter, operand, mapping, clonedOps);
     if (failed(remappedOperand))
       return failure();
     localMapping.map(operand, *remappedOperand);
@@ -494,29 +495,43 @@ FailureOr<Value> cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Valu
 
   Operation *cloned = rewriter.clone(*def, localMapping);
   mapping.map(def->getResults(), cloned->getResults());
+  if (clonedOps)
+    clonedOps->emplace_back(def, cloned);
   return mapping.lookup(value);
+}
+
+FailureOr<SmallVector<Value>> makeValuesAvailableAtInsertionPoint(RewriterBase &rewriter,
+                                                                  ValueRange values,
+                                                                  IRMapping &mapping,
+                                                                  DefChainAction action) {
+  SmallVector<ClonedOperation> clonedOps;
+  SmallVector<Value> availableValues;
+  availableValues.reserve(values.size());
+  for (Value value : values) {
+    FailureOr<Value> available =
+        cloneValueDefChainAtInsertionPoint(rewriter, value, mapping, &clonedOps);
+    if (failed(available)) {
+      for (auto &[original, cloned] : llvm::reverse(clonedOps))
+        rewriter.eraseOp(cloned);
+      return failure();
+    }
+    availableValues.push_back(*available);
+  }
+
+  if (action == DefChainAction::Move)
+    for (auto &[original, cloned] : llvm::reverse(clonedOps))
+      rewriter.replaceOp(original, cloned->getResults());
+  return availableValues;
 }
 
 LogicalResult recursiveMoveOperandsBeforeOp(Operation &toMoveOperands, RewriterBase &rewriter,
                                             Operation &moveBefore) {
   IRMapping mapping;
   rewriter.setInsertionPoint(&moveBefore);
-  for (auto value : toMoveOperands.getOperands()) {
-    auto result = dyn_cast<OpResult>(value);
-    if (!result)
-      continue;
-    // This function does not clone if the value is already defined before the insertion point of
-    // the rewriter.
-    auto newValue = cloneValueDefChainAtInsertionPoint(rewriter, result, mapping);
-    if (failed(newValue)) {
-      result.getDefiningOp()->emitRemark("when cloning this operation");
-      return failure();
-    }
-    if (*newValue == value)
-      continue;
-    mapping.map(result, *newValue);
-    rewriter.replaceAllUsesWith(result, *newValue);
-    rewriter.eraseOp(result.getDefiningOp());
+  if (failed(makeValuesAvailableAtInsertionPoint(rewriter, toMoveOperands.getOperands(), mapping,
+                                                 DefChainAction::Move))) {
+    toMoveOperands.emitRemark("when moving operand definition chains");
+    return failure();
   }
   return success();
 }
