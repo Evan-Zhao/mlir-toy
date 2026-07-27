@@ -146,3 +146,42 @@ module attributes {transform.with_named_sequence} {
     return %result : tensor<8x8xf32>
   }
 }
+
+// -----
+
+// A failed fusion attempt must not leave its speculative producer and slice
+// clones behind.
+// CHECK-LABEL: func.func @failed_fusion_cleanup
+// CHECK-COUNT-1: tensor.from_elements
+// CHECK-COUNT-1: tensor.extract_slice
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %func = transform.structured.match ops{["func.func"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    %loop = transform.structured.match ops{["scf.forall"]} in %func
+        : (!transform.any_op) -> !transform.any_op
+    %candidates, %new_loop =
+        transform.fusion.greedy_input_producers_into_consumer %loop
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.yield
+  }
+
+  func.func @failed_fusion_cleanup() -> tensor<8xf32> {
+    %zero = arith.constant 0.0 : f32
+    %source = tensor.from_elements %zero, %zero, %zero, %zero,
+        %zero, %zero, %zero, %zero : tensor<8xf32>
+    %empty = tensor.empty() : tensor<8xf32>
+    %result = scf.forall (%iv) = (0) to (2) step (1)
+        shared_outs(%out = %empty) -> tensor<8xf32> {
+      %offset = affine.apply affine_map<(d0) -> (d0 * 4)>(%iv)
+      %slice = tensor.extract_slice %source[%offset] [4] [1]
+          : tensor<8xf32> to tensor<4xf32>
+      scf.forall.in_parallel {
+        tensor.parallel_insert_slice %slice into %out[%offset] [4] [1]
+            : tensor<4xf32> into tensor<8xf32>
+      }
+    }
+    return %result : tensor<8xf32>
+  }
+}
