@@ -61,6 +61,29 @@ mlir::LogicalResult LaunchFuncOp::verifySymbolUses(mlir::SymbolTableCollection &
   return mlir::success();
 }
 
+mlir::LogicalResult LoadOp::verify() {
+  bool hasMask = static_cast<bool>(getMask());
+  bool hasOther = static_cast<bool>(getOther());
+  if (hasMask != hasOther)
+    return emitOpError("requires mask and other to be supplied together");
+  if (!hasMask)
+    return mlir::success();
+
+  auto resultType = mlir::cast<mlir::RankedTensorType>(getResult().getType());
+  auto maskType = mlir::cast<mlir::RankedTensorType>(getMask().getType());
+  if (!maskType.getElementType().isInteger(1))
+    return emitOpError("requires mask to have i1 element type");
+  if (maskType.getShape() != resultType.getShape())
+    return emitOpError("requires mask shape to match result shape");
+
+  mlir::Type otherType = getOther().getType();
+  if (mlir::isa<mlir::ShapedType>(otherType))
+    return emitOpError("requires other to be a scalar");
+  if (otherType != resultType.getElementType())
+    return emitOpError("requires other type to match the result element type");
+  return mlir::success();
+}
+
 mlir::MutableOperandRange ParallelScatterOp::getUpdatedDestinations() {
   return getDestMutable();
 }

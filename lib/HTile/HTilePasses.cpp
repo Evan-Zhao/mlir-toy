@@ -102,7 +102,9 @@ struct DotTransposeToLoadOrderPass
 
   void foldPermuteIntoLoad(PermuteOp permute) {
     auto load = permute.getInput().getDefiningOp<LoadOp>();
-    if (!load)
+    // Folding a masked load also requires permuting its mask. Leave that to a
+    // dedicated rewrite rather than silently dropping predication.
+    if (!load || load.getMask())
       return;
 
     ArrayRef<int64_t> permutation = permute.getPermutation();

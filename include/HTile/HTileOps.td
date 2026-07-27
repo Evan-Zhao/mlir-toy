@@ -222,21 +222,44 @@ def HTile_GatherNdOp : Op<HTile_Dialect, "gather_nd"> {
                        "type($indices) `->` type($result)";
 }
 
-def HTile_LoadOp : Op<HTile_Dialect, "load"> {
+def HTile_LoadOp : Op<HTile_Dialect, "load", [AttrSizedOperandSegments]> {
   let summary = "load a tile from memory";
   let description = [{
     Loads a tile from a memory-like source at the given scalar offsets. This
     makes explicit the tile read semantics that Neptune currently represents
     with TIR BufferRegion reads.
 
+    An optional `mask` and `other` pair gives the load predicated semantics.
+    For every result coordinate, a true mask element loads from the source and
+    a false mask element produces `other` without accessing memory. An address
+    selected by a true mask element must be in bounds. The mask must have the
+    result shape and an `i1` element type; `other` must be a scalar with the
+    result element type. Supplying only one of the pair is invalid.
+
     Attributes can carry backend lowering hints such as `boundary_check`,
     `cache_modifier`, `eviction_policy`, or TMA/block-pointer metadata.
   }];
 
-  let arguments = (ins AnyType:$source, Variadic<Index>:$offsets);
+  let arguments = (ins AnyType:$source, Variadic<Index>:$offsets,
+                       Optional<AnyRankedTensor>:$mask, Optional<AnyType>:$other);
   let results = (outs AnyRankedTensor:$result);
 
-  let assemblyFormat = "$source `[` $offsets `]` attr-dict `:` type($source) `->` type($result)";
+  let builders = [
+    OpBuilder<(ins "::mlir::Type":$resultType, "::mlir::Value":$source,
+                   "::mlir::ValueRange":$offsets), [{
+      build($_builder, $_state, resultType, source, offsets,
+            ::mlir::Value(), ::mlir::Value());
+    }]>
+  ];
+
+  let assemblyFormat = [{
+    $source `[` $offsets `]`
+      (`mask` `(` $mask^ `:` type($mask) `)`
+       `other` `(` $other `:` type($other) `)`)?
+      attr-dict `:` type($source) `->` type($result)
+  }];
+
+  let hasVerifier = 1;
 }
 
 def HTile_CopyOp : Op<HTile_Dialect, "copy"> {
