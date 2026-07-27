@@ -1,4 +1,4 @@
-// RUN: neptune-opt --pass-pipeline='builtin.module(func.func(stablehlo-to-ta))' %s | FileCheck %s
+// RUN: neptune-opt --pass-pipeline='builtin.module(func.func(stablehlo-to-ta))' --mlir-print-debuginfo %s | FileCheck %s --check-prefix=LOC
 
 // CHECK-LABEL: func.func @attention
 // CHECK-NEXT: %[[SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 1, %i1 "i1" extent 2, %i2 "i2" extent 4, %i3 "i3" extent 3, %j0 "j0" extent 3, %j1 "j1" extent 4) {
@@ -79,6 +79,22 @@ func.func @constant_broadcast_boundary() -> tensor<2x3xf16> {
   %slice = stablehlo.slice %broadcast [0:2, 0:3]
       : (tensor<2x3xf16>) -> tensor<2x3xf16>
   return %slice : tensor<2x3xf16>
+}
+
+// LOC-LABEL: func.func @transpose_convert_boundary
+// LOC: linalg.transpose
+// LOC-SAME: loc(#[[FUSED_LOC:loc[0-9]+]])
+// LOC: #[[CONVERT_LOC:loc[0-9]+]] = loc("convert")
+// LOC: #[[TRANSPOSE_LOC:loc[0-9]+]] = loc("transpose")
+// LOC: #[[FUSED_LOC]] = loc(fused[#[[TRANSPOSE_LOC]], #[[CONVERT_LOC]]])
+func.func @transpose_convert_boundary(%arg: tensor<2x3xf32>) -> tensor<3x2xf16> {
+  %transpose = stablehlo.transpose %arg, dims = [1, 0]
+      : (tensor<2x3xf32>) -> tensor<3x2xf32> loc("transpose")
+  %convert = stablehlo.convert %transpose
+      : (tensor<3x2xf32>) -> tensor<3x2xf16> loc("convert")
+  %slice = stablehlo.slice %convert [0:3, 0:2]
+      : (tensor<3x2xf16>) -> tensor<3x2xf16>
+  return %slice : tensor<3x2xf16>
 }
 
 // CHECK-LABEL: func.func @partition_around_unsupported_ops

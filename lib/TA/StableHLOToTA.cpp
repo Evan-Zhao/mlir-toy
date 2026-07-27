@@ -754,7 +754,7 @@ public:
   // linalg.broadcast restores dimensions omitted from expression support, so an island boundary
   // does not constrain TA's internal order and remains visible to Linalg producer fusion.
   FailureOr<Value> materializeResult(Value output, const TensorAxes &targetAxes,
-                                     RankedTensorType targetType) {
+                                     RankedTensorType targetType, Location transposeLoc) {
     auto exprType = cast<ExprType>(output.getType());
     SmallVector<int64_t> exprShape;
     SmallVector<int64_t> broadcastDims;
@@ -832,10 +832,10 @@ public:
       SmallVector<int64_t> transposedShape;
       for (int64_t inputDim : permutation)
         transposedShape.push_back(exprTensorType.getDimSize(inputDim));
-      Value init =
-          tensor::EmptyOp::create(builder, loc, transposedShape, exprTensorType.getElementType());
-      adapted =
-          linalg::TransposeOp::create(builder, loc, adapted, init, permutation).getResult()[0];
+      Value init = tensor::EmptyOp::create(builder, transposeLoc, transposedShape,
+                                           exprTensorType.getElementType());
+      adapted = linalg::TransposeOp::create(builder, transposeLoc, adapted, init, permutation)
+                    .getResult()[0];
     }
 
     DenseSet<int64_t> mappedTargetDims(broadcastDims.begin(), broadcastDims.end());
@@ -1572,6 +1572,16 @@ static LogicalResult importFunctionAsTA(func::FuncOp func) {
     if (component.empty())
       return success();
 
+    // View-like transposes are represented as axis metadata in TA and are
+    // materialized only at the island boundary. Preserve both the transpose
+    // provenance and the root operation that caused materialization.
+    SmallVector<Location> materializationLocs;
+    for (Operation &op : rootDef->getBlock()->without_terminator())
+      if (component.contains(&op) && isa<stablehlo::TransposeOp>(op))
+        materializationLocs.push_back(op.getLoc());
+    materializationLocs.push_back(rootDef->getLoc());
+    Location materializationLoc = FusedLoc::get(func.getContext(), materializationLocs);
+
     ScopedTABuilder ta(rootDef, rootDef->getLoc(), resultType);
     FunctionEmitter emitter(ta, axisInfo, component, nextImportGroup);
     for (Operation &op : rootDef->getBlock()->without_terminator())
@@ -1582,7 +1592,8 @@ static LogicalResult importFunctionAsTA(func::FuncOp func) {
     auto axes = axisInfo.valueAxes.find(root);
     if (failed(expr) || axes == axisInfo.valueAxes.end())
       return failure();
-    FailureOr<Value> materialized = ta.materializeResult(*expr, axes->second, resultType);
+    FailureOr<Value> materialized =
+        ta.materializeResult(*expr, axes->second, resultType, materializationLoc);
     if (failed(materialized))
       return failure();
 
