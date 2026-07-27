@@ -1050,7 +1050,7 @@ DiagnosedSilenceableFailure HTileLinalgToSemanticOp::applyToOne(TransformRewrite
 
   for (Operation *op : originalLinalgOps) {
     if (failed(rewriteOriginalLinalgOp(rewriter, op)))
-      BAIL("failed to rewrite linalg op: ") << *op;
+      BAIL("failed to rewrite a linalg op");
   }
 
   if (failed(applyRewritesGreedily(rewriter, target, [&](RewritePatternSet &patterns) {
