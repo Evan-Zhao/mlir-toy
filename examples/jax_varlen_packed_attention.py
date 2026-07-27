@@ -1,8 +1,9 @@
 """Print a JAX packed variable-length attention program as StableHLO MLIR.
 
 This variant expresses documents as a parallel batch using ``vmap`` instead of a
-sequential ``fori_loop``. It loads fixed-size document windows with per-token gathers,
-applies regular masked attention over the dense ``[num_docs, max_doc_tokens, heads, head_dim]`` view,
+sequential ``fori_loop``. It pads the packed token axis and loads fixed-size document windows
+with ranged gathers, applies regular masked attention over the dense
+``[num_docs, max_doc_tokens, heads, head_dim]`` view,
 and scatters valid document results back to packed output.
 Runtime document lengths come from ``offsets``;
 the maximum document length must be provided statically via ``--max-doc-tokens``.
@@ -53,20 +54,21 @@ def doc_offset_attention(
     token_indices = starts[:, None] + token_offsets[None, :]
 
     # StableHLO has no masked slicing operation. A ranged load `[start, end)` in StableHLO
-    # clamps start to make the whole window in bound, which is surprising and not what we intend.
-    # Instead, use `lax.gather` in clip mode, which translate to a StableHLO gather (that we can
-    # lower to a masked load later).
-    # N.B. Use CLIP mode so the StableHLO IR is kept simple, and we can add on our own masking semantics later.
-    # FILL_OR_DROP would be more proper, but JAX would produce masking logic in the IR.
+    # clamps `start` to make the whole window in bound, which is surprising and not what we intend.
+    # Instead, pad the packed token axis first to prevent OOB before we gather.
+    # L0 rows (rather than L0 - 1) also cover a zero-length final document whose start equals LT.
+    # The padding value is unobservable: key positions beyond each document length are masked,
+    # while padded query rows are dropped by the final scatter.
     def masked_load_docs(x):
+        padded = jnp.pad(x, ((0, L0), (0, 0), (0, 0)), constant_values=0)
         return lax.gather(
-            x,
-            token_indices[..., None],
+            padded,
+            starts[:, None],
             dimension_numbers=lax.GatherDimensionNumbers(
-                offset_dims=(2, 3), collapsed_slice_dims=(0,), start_index_map=(0,)
+                offset_dims=(1, 2, 3), collapsed_slice_dims=(), start_index_map=(0,)
             ),
-            slice_sizes=(1, H, D),
-            mode=lax.GatherScatterMode.CLIP,
+            slice_sizes=(L0, H, D),
+            mode=lax.GatherScatterMode.PROMISE_IN_BOUNDS,
         )
 
     def one_doc_attention(q_doc, k_doc, v_doc, doc_len):
