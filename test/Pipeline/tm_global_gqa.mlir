@@ -28,7 +28,6 @@ module attributes {transform.with_named_sequence} {
     %bmm0 = transform.collect_matching @match_4d_matmul_transb in %func : (!any) -> !any
     transform.ta.to_linalg %func : !any
 
-    transform.linalg.greedy_inline_elementwise %bmm0 : !any
     %_1, %forall_loop = transform.structured.tile_using_forall
         %bmm0 tile_sizes [1, 1, 1, 128, 64, 0] : (!any) -> (!any, !any)
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
@@ -41,23 +40,22 @@ module attributes {transform.with_named_sequence} {
     %fused_bmax, %j0_loop = transform.scf.fuse_reduction_into_forall
         %bmax into %forall_loop : (!any, !any) -> (!any, !any)
 
-    %bmm1, %elemwise = transform.fusion.find_next_reduction
+    %bsum, %elemwise = transform.fusion.find_next_reduction
         %forall_loop : (!any) -> (!any, !any)
     %elemwise_sidecars = transform.fusion.clone_fuse_elemwise
         %elemwise into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
-    transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any
     %_3 = transform.fusion.repair_reduction_frontier
-        %bmm1 reduce_producer %fused_bmax
+        %bsum reduce_producer %fused_bmax
         substituting elemwise %elemwise -> %elemwise_sidecars
         into %forall_loop, %j0_loop
         : (!any, !any, !any, !any, !any, !any) -> !any
 
-    %bsum, %elemwise_1 = transform.fusion.find_next_reduction
+    %bmm1, %elemwise_1 = transform.fusion.find_next_reduction
         %forall_loop : (!any) -> (!any, !any)
     %elemwise_sidecars_1 = transform.fusion.clone_fuse_elemwise
         %elemwise_1 into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
     %_4 = transform.fusion.repair_reduction_frontier
-        %bsum reduce_producer %fused_bmax
+        %bmm1 reduce_producer %fused_bmax
         substituting elemwise %elemwise_1 -> %elemwise_sidecars_1
         into %forall_loop, %j0_loop
         : (!any, !any, !any, !any, !any, !any) -> !any
@@ -93,30 +91,28 @@ module attributes {transform.with_named_sequence} {
     %2 = stablehlo.broadcast_in_dim %1, dims = [0, 1, 2, 3, 4] : (tensor<1x1x2x1024x64xf16>) -> tensor<1x2x2x1024x64xf16>
     %3 = stablehlo.reshape %arg2 : (tensor<1x2x1024x64xf16>) -> tensor<1x1x2x1024x64xf16>
     %4 = stablehlo.broadcast_in_dim %3, dims = [0, 1, 2, 3, 4] : (tensor<1x1x2x1024x64xf16>) -> tensor<1x2x2x1024x64xf16>
-    %5 = stablehlo.convert %0 : (tensor<1x2x2x1024x64xf16>) -> tensor<1x2x2x1024x64xf32>
-    %6 = stablehlo.convert %2 : (tensor<1x2x2x1024x64xf16>) -> tensor<1x2x2x1024x64xf32>
-    %7 = stablehlo.transpose %6, dims = [0, 1, 2, 4, 3] : (tensor<1x2x2x1024x64xf32>) -> tensor<1x2x2x64x1024xf32>
-    %8 = stablehlo.broadcast_in_dim %7, dims = [0, 1, 2, 3, 4] : (tensor<1x2x2x64x1024xf32>) -> tensor<1x2x2x64x1024xf32>
-    %9 = stablehlo.dot_general %5, %8, batching_dims = [0, 1, 2] x [0, 1, 2], contracting_dims = [4] x [3] : (tensor<1x2x2x1024x64xf32>, tensor<1x2x2x64x1024xf32>) -> tensor<1x2x2x1024x1024xf32>
-    %10 = stablehlo.convert %cst_1 : (tensor<1xf64>) -> tensor<1xf32>
-    %11 = stablehlo.reshape %10 : (tensor<1xf32>) -> tensor<f32>
-    %12 = stablehlo.broadcast_in_dim %11, dims = [] : (tensor<f32>) -> tensor<1x2x2x1024x1024xf32>
-    %13 = stablehlo.multiply %9, %12 : tensor<1x2x2x1024x1024xf32>
-    %14 = stablehlo.reduce(%13 init: %cst) applies stablehlo.maximum across dimensions = [4] : (tensor<1x2x2x1024x1024xf32>, tensor<f32>) -> tensor<1x2x2x1024xf32>
-    %15 = stablehlo.reshape %14 : (tensor<1x2x2x1024xf32>) -> tensor<1x2x2x1024x1xf32>
-    %16 = stablehlo.broadcast_in_dim %15, dims = [0, 1, 2, 3, 4] : (tensor<1x2x2x1024x1xf32>) -> tensor<1x2x2x1024x1024xf32>
-    %17 = stablehlo.subtract %13, %16 : tensor<1x2x2x1024x1024xf32>
-    %18 = stablehlo.exponential %17 : tensor<1x2x2x1024x1024xf32>
-    %19 = stablehlo.reduce(%18 init: %cst_0) applies stablehlo.add across dimensions = [4] : (tensor<1x2x2x1024x1024xf32>, tensor<f32>) -> tensor<1x2x2x1024xf32>
-    %20 = stablehlo.reshape %19 : (tensor<1x2x2x1024xf32>) -> tensor<1x2x2x1024x1xf32>
-    %21 = stablehlo.broadcast_in_dim %20, dims = [0, 1, 2, 3, 4] : (tensor<1x2x2x1024x1xf32>) -> tensor<1x2x2x1024x1024xf32>
-    %22 = stablehlo.divide %18, %21 : tensor<1x2x2x1024x1024xf32>
-    %23 = stablehlo.convert %4 : (tensor<1x2x2x1024x64xf16>) -> tensor<1x2x2x1024x64xf32>
-    %24 = stablehlo.broadcast_in_dim %23, dims = [0, 1, 2, 3, 4] : (tensor<1x2x2x1024x64xf32>) -> tensor<1x2x2x1024x64xf32>
-    %25 = stablehlo.dot_general %22, %24, batching_dims = [0, 1, 2] x [0, 1, 2], contracting_dims = [4] x [3] : (tensor<1x2x2x1024x1024xf32>, tensor<1x2x2x1024x64xf32>) -> tensor<1x2x2x1024x64xf32>
-    %26 = stablehlo.convert %25 : (tensor<1x2x2x1024x64xf32>) -> tensor<1x2x2x1024x64xf16>
-    %27 = stablehlo.reshape %26 : (tensor<1x2x2x1024x64xf16>) -> tensor<1x2x2x1024x64xf16>
-    return %27 : tensor<1x2x2x1024x64xf16>
+    %5 = stablehlo.transpose %2, dims = [0, 1, 2, 4, 3] : (tensor<1x2x2x1024x64xf16>) -> tensor<1x2x2x64x1024xf16>
+    %6 = stablehlo.broadcast_in_dim %5, dims = [0, 1, 2, 3, 4] : (tensor<1x2x2x64x1024xf16>) -> tensor<1x2x2x64x1024xf16>
+    %7 = stablehlo.dot_general %0, %6, batching_dims = [0, 1, 2] x [0, 1, 2], contracting_dims = [4] x [3] : (tensor<1x2x2x1024x64xf16>, tensor<1x2x2x64x1024xf16>) -> tensor<1x2x2x1024x1024xf32>
+    %8 = stablehlo.convert %cst_1 : (tensor<1xf64>) -> tensor<1xf32>
+    %9 = stablehlo.reshape %8 : (tensor<1xf32>) -> tensor<f32>
+    %10 = stablehlo.broadcast_in_dim %9, dims = [] : (tensor<f32>) -> tensor<1x2x2x1024x1024xf32>
+    %11 = stablehlo.multiply %7, %10 : tensor<1x2x2x1024x1024xf32>
+    %12 = stablehlo.reduce(%11 init: %cst) applies stablehlo.maximum across dimensions = [4] : (tensor<1x2x2x1024x1024xf32>, tensor<f32>) -> tensor<1x2x2x1024xf32>
+    %13 = stablehlo.reshape %12 : (tensor<1x2x2x1024xf32>) -> tensor<1x2x2x1024x1xf32>
+    %14 = stablehlo.broadcast_in_dim %13, dims = [0, 1, 2, 3, 4] : (tensor<1x2x2x1024x1xf32>) -> tensor<1x2x2x1024x1024xf32>
+    %15 = stablehlo.subtract %11, %14 : tensor<1x2x2x1024x1024xf32>
+    %16 = stablehlo.exponential %15 : tensor<1x2x2x1024x1024xf32>
+    %17 = stablehlo.reduce(%16 init: %cst_0) applies stablehlo.add across dimensions = [4] : (tensor<1x2x2x1024x1024xf32>, tensor<f32>) -> tensor<1x2x2x1024xf32>
+    %18 = stablehlo.reshape %17 : (tensor<1x2x2x1024xf32>) -> tensor<1x2x2x1024x1xf32>
+    %19 = stablehlo.broadcast_in_dim %18, dims = [0, 1, 2, 3, 4] : (tensor<1x2x2x1024x1xf32>) -> tensor<1x2x2x1024x1024xf32>
+    %20 = stablehlo.divide %16, %19 : tensor<1x2x2x1024x1024xf32>
+    %21 = stablehlo.convert %20 : (tensor<1x2x2x1024x1024xf32>) -> tensor<1x2x2x1024x1024xf16>
+    %22 = stablehlo.broadcast_in_dim %4, dims = [0, 1, 2, 3, 4] : (tensor<1x2x2x1024x64xf16>) -> tensor<1x2x2x1024x64xf16>
+    %23 = stablehlo.dot_general %21, %22, batching_dims = [0, 1, 2] x [0, 1, 2], contracting_dims = [4] x [3] : (tensor<1x2x2x1024x1024xf16>, tensor<1x2x2x1024x64xf16>) -> tensor<1x2x2x1024x64xf32>
+    %24 = stablehlo.convert %23 : (tensor<1x2x2x1024x64xf32>) -> tensor<1x2x2x1024x64xf16>
+    %25 = stablehlo.reshape %24 : (tensor<1x2x2x1024x64xf16>) -> tensor<1x2x2x1024x64xf16>
+    return %25 : tensor<1x2x2x1024x64xf16>
   }
 }
 
@@ -157,9 +153,9 @@ module attributes {transform.with_named_sequence} {
 // CHECK: htile.reduce %{{.*}} axis 1 kind "max" : tensor<128x64xf32> -> tensor<128xf32>
 // CHECK: htile.broadcast %{{.*}} dimensions = [1] : tensor<128xf32> -> tensor<128x64xf32>
 // CHECK: math.exp2 %{{.*}} : tensor<128x64xf32>
-// CHECK: htile.load %arg2
-// CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<128x64xf32>, tensor<64x64xf16>, tensor<128x64xf32> -> tensor<128x64xf32>
 // CHECK: htile.reduce %{{.*}} axis 1 kind "sum" : tensor<128x64xf32> -> tensor<128xf32>
+// CHECK: htile.load %arg2
+// CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<128x64xf16>, tensor<64x64xf16>, tensor<128x64xf32> -> tensor<128x64xf32>
 // CHECK: arith.divf %{{.*}}, %{{.*}} : tensor<128x64xf32>
 // CHECK: arith.truncf %{{.*}} : tensor<128x64xf32> to tensor<128x64xf16>
 // CHECK: htile.store %{{.*}}, %arg3
