@@ -38,7 +38,6 @@ module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo
         %forall_loop : (!any) -> (!any, !any)
     %elemwise_sidecars = transform.fusion.clone_fuse_elemwise
         %elemwise into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
-    transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any
     %_3 = transform.fusion.repair_reduction_frontier
         %bmm1 reduce_producer %fused_bmax
         substituting elemwise %elemwise -> %elemwise_sidecars
@@ -149,27 +148,26 @@ module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo
     %36 = stablehlo.broadcast_in_dim %35, dims = [0, 1, 2] : (tensor<8x4x128xf32>) -> tensor<8x4x128x1xf32>
     %37 = stablehlo.broadcast_in_dim %36, dims = [0, 1, 2, 3] : (tensor<8x4x128x1xf32>) -> tensor<8x4x128x128xf32>
     %38 = stablehlo.divide %34, %37 : tensor<8x4x128x128xf32>
-    %39 = stablehlo.convert %15 : (tensor<8x128x4x64xf16>) -> tensor<8x128x4x64xf32>
-    %40 = stablehlo.convert %38 : tensor<8x4x128x128xf32>
-    %41 = stablehlo.dot_general %39, %40, batching_dims = [0, 2] x [0, 1], contracting_dims = [1] x [3], precision = [DEFAULT, DEFAULT] : (tensor<8x128x4x64xf32>, tensor<8x4x128x128xf32>) -> tensor<8x4x64x128xf32>
-    %42 = stablehlo.transpose %41, dims = [0, 3, 1, 2] : (tensor<8x4x64x128xf32>) -> tensor<8x128x4x64xf32>
-    %43 = stablehlo.convert %42 : (tensor<8x128x4x64xf32>) -> tensor<8x128x4x64xf16>
-    %44 = stablehlo.iota dim = 0 : tensor<8xi32>
-    %45 = stablehlo.compare GT, %20, %7, SIGNED : (tensor<8x128xi32>, tensor<8x128xi32>) -> tensor<8x128xi1>
-    %46 = stablehlo.broadcast_in_dim %44, dims = [0] : (tensor<8xi32>) -> tensor<8x1xi32>
-    %47 = stablehlo.broadcast_in_dim %c_0, dims = [] : (tensor<i32>) -> tensor<8x1xi32>
-    %48 = stablehlo.multiply %46, %47 : tensor<8x1xi32>
-    %49 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i32>) -> tensor<8x1xi32>
-    %50 = stablehlo.add %49, %48 : tensor<8x1xi32>
-    %51 = stablehlo.broadcast_in_dim %50, dims = [0, 1] : (tensor<8x1xi32>) -> tensor<8x128xi32>
-    %52 = stablehlo.add %51, %7 : tensor<8x128xi32>
-    %53 = stablehlo.select %45, %8, %52 : tensor<8x128xi1>, tensor<8x128xi32>
-    %54 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f16>) -> tensor<1024x4x64xf16>
-    %55 = stablehlo.broadcast_in_dim %53, dims = [0, 1] : (tensor<8x128xi32>) -> tensor<8x128x1xi32>
-    %56 = "stablehlo.scatter"(%54, %55, %43) <{indices_are_sorted = false, scatter_dimension_numbers = #stablehlo.scatter<update_window_dims = [2, 3], inserted_window_dims = [0], scatter_dims_to_operand_dims = [0], index_vector_dim = 2>, unique_indices = true}> ({
+    %39 = stablehlo.convert %38 : (tensor<8x4x128x128xf32>) -> tensor<8x4x128x128xf16>
+    %40 = stablehlo.dot_general %15, %39, batching_dims = [0, 2] x [0, 1], contracting_dims = [1] x [3], precision = [DEFAULT, DEFAULT] : (tensor<8x128x4x64xf16>, tensor<8x4x128x128xf16>) -> tensor<8x4x64x128xf32>
+    %41 = stablehlo.transpose %40, dims = [0, 3, 1, 2] : (tensor<8x4x64x128xf32>) -> tensor<8x128x4x64xf32>
+    %42 = stablehlo.convert %41 : (tensor<8x128x4x64xf32>) -> tensor<8x128x4x64xf16>
+    %43 = stablehlo.iota dim = 0 : tensor<8xi32>
+    %44 = stablehlo.compare GT, %20, %7, SIGNED : (tensor<8x128xi32>, tensor<8x128xi32>) -> tensor<8x128xi1>
+    %45 = stablehlo.broadcast_in_dim %43, dims = [0] : (tensor<8xi32>) -> tensor<8x1xi32>
+    %46 = stablehlo.broadcast_in_dim %c_0, dims = [] : (tensor<i32>) -> tensor<8x1xi32>
+    %47 = stablehlo.multiply %45, %46 : tensor<8x1xi32>
+    %48 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i32>) -> tensor<8x1xi32>
+    %49 = stablehlo.add %48, %47 : tensor<8x1xi32>
+    %50 = stablehlo.broadcast_in_dim %49, dims = [0, 1] : (tensor<8x1xi32>) -> tensor<8x128xi32>
+    %51 = stablehlo.add %50, %7 : tensor<8x128xi32>
+    %52 = stablehlo.select %44, %8, %51 : tensor<8x128xi1>, tensor<8x128xi32>
+    %53 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f16>) -> tensor<1024x4x64xf16>
+    %54 = stablehlo.broadcast_in_dim %52, dims = [0, 1] : (tensor<8x128xi32>) -> tensor<8x128x1xi32>
+    %55 = "stablehlo.scatter"(%53, %54, %42) <{indices_are_sorted = false, scatter_dimension_numbers = #stablehlo.scatter<update_window_dims = [2, 3], inserted_window_dims = [0], scatter_dims_to_operand_dims = [0], index_vector_dim = 2>, unique_indices = true}> ({
     ^bb0(%arg4: tensor<f16>, %arg5: tensor<f16>):
       stablehlo.return %arg5 : tensor<f16>
     }) : (tensor<1024x4x64xf16>, tensor<8x128x1xi32>, tensor<8x128x4x64xf16>) -> tensor<1024x4x64xf16>
-    return %56 : tensor<1024x4x64xf16>
+    return %55 : tensor<1024x4x64xf16>
   }
 }

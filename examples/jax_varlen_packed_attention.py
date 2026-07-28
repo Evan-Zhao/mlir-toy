@@ -81,7 +81,7 @@ def doc_offset_attention(
         # Padded query rows are scattered to out-of-bounds sink indices and
         # dropped, so only key positions need to be masked for valid outputs.
         scores = jnp.where(key_valid, scores, -jnp.inf)
-        probs = jax.nn.softmax(scores, axis=-1)
+        probs = jax.nn.softmax(scores, axis=-1).astype(q_doc.dtype)
         out_doc_f32 = jnp.einsum("hij,jhd->ihd", probs, v_doc, preferred_element_type=jnp.float32)
         return out_doc_f32.astype(q.dtype)
 
