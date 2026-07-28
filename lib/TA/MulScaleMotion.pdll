@@ -22,11 +22,6 @@ Constraint AddReduceKind(kind: Attr) [{
   return success(reduceKind && reduceKind.getValue() == ta::ReduceKind::Add);
 }];
 
-Constraint FloatElementType(value: Value) [{
-  auto type = dyn_cast<ta::ExprType>(value.getType());
-  return success(type && isa<FloatType>(type.getElementType()));
-}];
-
 Constraint F32F16F32CastChain(source: Value, narrowed: Value, widened: Value) [{
   auto sourceType = dyn_cast<ta::ExprType>(source.getType());
   auto narrowedType = dyn_cast<ta::ExprType>(narrowed.getType());
@@ -50,63 +45,6 @@ Rewrite RoundThroughF16(input: Value, narrowGroup: Attr, widenGroup: Attr) -> Va
   wide->setAttr("ta.import_group", widenGroup);
   return wide.getResult();
 }];
-
-Constraint RightAssociatedMulIsCheaper(a: Value, b: Value, c: Value) [{
-  auto aType = dyn_cast<ta::ExprType>(a.getType());
-  auto bType = dyn_cast<ta::ExprType>(b.getType());
-  auto cType = dyn_cast<ta::ExprType>(c.getType());
-  if (!aType || !bType || !cType)
-    return failure();
-
-  Operation *anchor = a.getDefiningOp();
-  if (!anchor)
-    return failure();
-  auto scope = anchor->getParentOfType<ta::ScopeOp>();
-  if (!scope)
-    return failure();
-
-  // C++ helper defined in TATransformOps.cpp
-  FailureOr<int64_t> rightElementCount =
-      getStaticUnionElementCount(scope, bType.getAxes(), cType.getAxes());
-  FailureOr<int64_t> leftElementCount =
-      getStaticUnionElementCount(scope, aType.getAxes(), bType.getAxes());
-  if (failed(rightElementCount) || failed(leftElementCount))
-    return failure();
-
-  return success(*rightElementCount < *leftElementCount);
-}];
-
-// sum((lhs / denom) * rhs) => sum(lhs * rhs) / denom
-Pattern SinkLeftDivAfterMatmul {
-  let div = op<ta.div>(lhs: Value, denom: Value) {"ta.import_group" = srcDiv: Attr};
-  let mul = op<ta.mul>(div, rhs: Value) {"ta.import_group" = srcMul: Attr};
-  let reduce = op<ta.reduce>(mul) {kind = kind: Attr, axes = axes: Attr, "ta.import_group" = srcReduce: Attr} -> (resultType: Type);
-  FloatElementType(lhs);
-  ValueAxesDisjointFromReduction(denom, axes);
-  AddReduceKind(kind);
-
-  rewrite reduce with {
-    let newMul = op<ta.mul>(lhs, rhs) {"ta.import_group" = srcMul};
-    let newReduce = op<ta.reduce>(newMul) {kind = kind, axes = axes, "ta.import_group" = srcReduce} -> (resultType);
-    replace reduce with op<ta.div>(newReduce, denom) {"ta.import_group" = srcDiv};
-  };
-}
-
-// sum(lhs * (rhs / denom)) => sum(lhs * rhs) / denom
-Pattern SinkRightDivAfterMatmul {
-  let div = op<ta.div>(rhs: Value, denom: Value) {"ta.import_group" = srcDiv: Attr};
-  let mul = op<ta.mul>(lhs: Value, div) {"ta.import_group" = srcMul: Attr};
-  let reduce = op<ta.reduce>(mul) {kind = kind: Attr, axes = axes: Attr, "ta.import_group" = srcReduce: Attr} -> (resultType: Type);
-  FloatElementType(lhs);
-  ValueAxesDisjointFromReduction(denom, axes);
-  AddReduceKind(kind);
-
-  rewrite reduce with {
-    let newMul = op<ta.mul>(lhs, rhs) {"ta.import_group" = srcMul};
-    let newReduce = op<ta.reduce>(newMul) {kind = kind, axes = axes, "ta.import_group" = srcReduce} -> (resultType);
-    replace reduce with op<ta.div>(newReduce, denom) {"ta.import_group" = srcDiv};
-  };
-}
 
 // sum(f32(f16(lhs / denom)) * rhs) => sum(f32(f16(lhs)) * rhs) / denom
 Pattern SinkLeftDivThroughF16AfterMatmul {
@@ -164,32 +102,5 @@ Pattern SinkRightMulThroughF16AfterMatmul with benefit(1) {
     let newMul = op<ta.mul>(lhs, roundedRhs) {"ta.import_group" = srcOuter};
     let newReduce = op<ta.reduce>(newMul) {kind = kind, axes = axes, "ta.import_group" = srcReduce} -> (resultType);
     replace reduce with op<ta.mul>(newReduce, factor) {"ta.import_group" = srcScaled};
-  };
-}
-
-// sum(lhs * (rhs * factor)) => sum(lhs * rhs) * factor
-Pattern SinkRightMulAfterMatmul {
-  let inner = op<ta.mul>(rhs: Value, factor: Value) {"ta.import_group" = srcInner: Attr};
-  let outer = op<ta.mul>(lhs: Value, inner) {"ta.import_group" = srcOuter: Attr};
-  let reduce = op<ta.reduce>(outer) {kind = kind: Attr, axes = axes: Attr, "ta.import_group" = srcReduce: Attr} -> (resultType: Type);
-  AddReduceKind(kind);
-  ValueAxesDisjointFromReduction(factor, axes);
-
-  rewrite reduce with {
-    let newMul = op<ta.mul>(lhs, rhs) {"ta.import_group" = srcOuter};
-    let newReduce = op<ta.reduce>(newMul) {kind = kind, axes = axes, "ta.import_group" = srcReduce} -> (resultType);
-    replace reduce with op<ta.mul>(newReduce, factor) {"ta.import_group" = srcInner};
-  };
-}
-
-// c * (a * b) => a * (b * c), when b * c has a smaller footprint.
-Pattern ReassociateRightMulIfCheaper {
-  let inner = op<ta.mul>(a: Value, b: Value) {"ta.import_group" = srcInner: Attr};
-  let outer = op<ta.mul>(c: Value, inner) {"ta.import_group" = srcOuter: Attr} -> (resultType: Type);
-  RightAssociatedMulIsCheaper(a, b, c);
-
-  rewrite outer with {
-    let newInner = op<ta.mul>(b, c) {"ta.import_group" = srcOuter};
-    replace outer with op<ta.mul>(a, newInner) {"ta.import_group" = srcInner} -> (resultType);
   };
 }

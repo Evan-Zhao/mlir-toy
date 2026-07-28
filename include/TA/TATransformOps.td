@@ -73,18 +73,19 @@ def TASinkDivAfterMatmulPatternsOp
   let summary = "Collect TA div-after-matmul sinking rewrite patterns";
 
   let description = [{
-    Collects PDLL-authored TA rewrite patterns that sink a division after a
-    multiplication and add reduction:
+    Collects PDLL-authored TA rewrite patterns that sink a division through
+    f16 operand rounding and after a multiplication and add reduction:
 
     ```
-      sum((num / denom) * rhs) -> sum(num * rhs) / denom
       sum(f32(f16(num / denom)) * rhs)
         -> sum(f32(f16(num)) * rhs) / denom
     ```
 
-    The cast-aware form supports f16 matmul operands with f32 accumulation. The
-    `denom` divisor must have axes disjoint from the reduction axes. The pattern
-    preserves the matched add reducer kind, axes, and import-group attributes.
+    The patterns support the left- and right-operand forms of f16 matmuls with
+    f32 accumulation. Moving the divisor across f16 rounding is intentionally
+    approximate. The `denom` divisor must have axes disjoint from the reduction
+    axes. The patterns preserve the matched add reducer kind, axes, and
+    import-group attributes.
   }];
 
   let assemblyFormat = "attr-dict";
@@ -96,37 +97,18 @@ def TASinkRightMulAfterMatmulPatternsOp
   let summary = "Collect rewrite patterns to sink an RHS multiplicative factor after a matmul";
 
   let description = [{
-    Collects PDLL-authored TA rewrite patterns that sink a multiplicative factor
-    after an add-reduced multiply. The pattern set may first reassociate a
-    multiply when the right-associated multiply has a smaller axis footprint:
+    Collects a PDLL-authored TA rewrite pattern that sinks a multiplicative
+    factor through f16 operand rounding and after an add-reduced multiply:
 
     ```
-      c * (a * b) -> a * (b * c)
-      sum(lhs * (rhs * factor)) -> sum(lhs * rhs) * factor
       sum(lhs * f32(f16(rhs * factor)))
         -> sum(lhs * f32(f16(rhs))) * factor
     ```
 
-    The cast-aware form supports f16 matmul operands with f32 accumulation.
-    Moving the factor across the f16 rounding is intentionally approximate.
-    The `factor` must have axes disjoint from the reduction axes. The patterns
-    preserve the matched add reducer kind, axes, and import-group attributes.
-  }];
-
-  let assemblyFormat = "attr-dict";
-}
-
-def TAReassociateRightMulfPatternsOp
-    : Op<Transform_Dialect, "apply_patterns.ta.reassociate_right_mulf",
-         [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
-  let summary = "Collect rewrite patterns to reassociate TA multiplications to the right";
-
-  let description = [{
-    Collects PDLL-authored TA rewrite patterns that reassociate a nested multiplication
-    ```
-      c * (a * b) -> a * (b * c)
-    ```
-    if the right-associated multiply involves fewer computed elements.
+    The pattern supports f16 matmul operands with f32 accumulation. Moving the
+    factor across f16 rounding is intentionally approximate. The `factor` must
+    have axes disjoint from the reduction axes. The pattern preserves the
+    matched add reducer kind, axes, and import-group attributes.
   }];
 
   let assemblyFormat = "attr-dict";

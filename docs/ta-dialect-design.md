@@ -217,16 +217,19 @@ No single rule needs to match the full attention graph.
 
 ### Division And Matmul
 
-The PDLL pattern set also includes a focused rewrite for:
+The PDLL pattern set also includes a focused rewrite for f16 matmul operands
+with f32 accumulation:
 
 ```text
-reduce_add_k((x / d) * y) => reduce_add_k(x * y) / d
+reduce_add_k(f32(f16(x / d)) * y)
+  => reduce_add_k(f32(f16(x)) * y) / d
 ```
 
-when `d` is independent of the reduced axes. This is representative of the
-intended TA rewrite style: match a small expression DAG, query axis
-side-conditions, create new ordinary `ta` ops, and let later lowering decide
-materialization boundaries.
+The symmetric right-operand form is supported as well. The rewrite requires
+`d` to be independent of the reduced axes and intentionally moves it across
+f16 rounding. This is representative of the intended TA rewrite style: match a
+small expression DAG, query axis side-conditions, create new ordinary `ta`
+ops, and let later lowering decide materialization boundaries.
 
 ## Importing From StableHLO
 
@@ -403,9 +406,10 @@ transform.named_sequence @__transform_main(%module: !transform.any_op) {
 }
 ```
 
-The resulting program has the same high-level tensor computation, but the
-softmax numerator uses `exp2`, and the score scale has absorbed the `log2(e)`
-factor.
+The resulting program uses `exp2`, absorbs the `log2(e)` factor into the score
+scale, and moves normalization after the second contraction while retaining
+explicit f16 operand rounding. The normalization motion across that rounding
+is intentionally approximate.
 
 The `test/Pipeline` directory contains the fuller transform schedules that use
 TA matching and rewrites before lowering back to linalg and continuing with
