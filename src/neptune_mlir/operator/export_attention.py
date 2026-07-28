@@ -22,6 +22,12 @@ from neptune_mlir.operator.variants import VARIANTS, AttentionVariant
 MaskF = Callable[[torch.Tensor], torch.Tensor | None]
 
 
+def _f16_matmul_f32(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    # Torch-MLIR exports this as f16 dot + f16-to-f32 convert. The StableHLO
+    # fixup below folds the convert into the dot's accumulation type.
+    return torch.matmul(lhs.to(torch.float16), rhs.to(torch.float16)).to(torch.float32)
+
+
 class Attention4DModule(torch.nn.Module):
     def __init__(self, mask_f: MaskF):
         super().__init__()
@@ -29,14 +35,14 @@ class Attention4DModule(torch.nn.Module):
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         scale = 1.0 / math.sqrt(q.shape[-1])
-        scores = torch.matmul(q.to(torch.float32), k.to(torch.float32).transpose(-1, -2))
+        scores = _f16_matmul_f32(q, k.transpose(-1, -2))
         scores = scores * scale
         mask = self.mask_f(scores)
         if mask is not None:
             neg_inf = torch.tensor(float("-inf"), dtype=scores.dtype, device=scores.device)
             scores = torch.where(mask, scores, neg_inf)
         probs = torch.softmax(scores, dim=-1)
-        out_f32 = torch.matmul(probs, v.to(torch.float32))
+        out_f32 = _f16_matmul_f32(probs, v)
         return out_f32.to(torch.float16)
 
 
@@ -62,7 +68,7 @@ class AlibiCausalAttentionModule(torch.nn.Module):
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, slopes: torch.Tensor
     ) -> torch.Tensor:
         scale = 1.0 / math.sqrt(q.shape[-1])
-        scores = torch.matmul(q.to(torch.float32), k.to(torch.float32).transpose(-1, -2))
+        scores = _f16_matmul_f32(q, k.transpose(-1, -2))
         scores = scores * scale
         *_, q_len, kv_len = scores.shape
         query_pos = torch.arange(q_len, dtype=torch.float32, device=scores.device)
@@ -73,7 +79,7 @@ class AlibiCausalAttentionModule(torch.nn.Module):
         neg_inf = torch.tensor(float("-inf"), dtype=scores.dtype, device=scores.device)
         scores = torch.where(mask, scores, neg_inf)
         probs = torch.softmax(scores, dim=-1)
-        out_f32 = torch.matmul(probs, v.to(torch.float32))
+        out_f32 = _f16_matmul_f32(probs, v)
         return out_f32.to(torch.float16)
 
 
@@ -88,10 +94,10 @@ class GlobalGQAModule(torch.nn.Module):
         k = k[:, None, :, :, :].expand(k.shape[0], groups, kv_heads, k.shape[2], k.shape[3])
         v = v[:, None, :, :, :].expand(v.shape[0], groups, kv_heads, v.shape[2], v.shape[3])
         scale = 1.0 / math.sqrt(q.shape[-1])
-        scores = torch.matmul(q.to(torch.float32), k.to(torch.float32).transpose(-1, -2))
+        scores = _f16_matmul_f32(q, k.transpose(-1, -2))
         scores = scores * scale
         probs = torch.softmax(scores, dim=-1)
-        out_f32 = torch.matmul(probs, v.to(torch.float32))
+        out_f32 = _f16_matmul_f32(probs, v)
         return out_f32.to(torch.float16).reshape(q.shape)
 
 
@@ -102,19 +108,83 @@ class KVOnlyQuantizedAttentionModule(torch.nn.Module):
         k_dq = k.to(torch.float32) * sk
         v_dq = v.to(torch.float32) * sv
         scale = 1.0 / math.sqrt(q.shape[-1])
-        scores = torch.matmul(q.to(torch.float32), k_dq.transpose(-1, -2))
+        scores = _f16_matmul_f32(q, k_dq.transpose(-1, -2))
         scores = scores * scale
         mask = causal_mask(scores)
         neg_inf = torch.tensor(float("-inf"), dtype=scores.dtype, device=scores.device)
         scores = torch.where(mask, scores, neg_inf)
         probs = torch.softmax(scores, dim=-1)
-        out_f32 = torch.matmul(probs, v_dq)
+        out_f32 = _f16_matmul_f32(probs, v_dq)
         return out_f32.to(torch.float16)
 
 
 class SparseMMModule(torch.nn.Module):
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return torch.sparse.mm(a, b)
+
+
+def _use_f32_accumulation_for_f16_dots(module) -> int:
+    """Make attention dots accumulate in f32 while retaining f16 operands.
+
+    Torch-MLIR cannot currently lower ``aten.bmm.dtype``. Exporting an f16
+    matmul followed by an f32 cast instead produces:
+
+      %dot = stablehlo.dot_general %lhs, %rhs
+          : (tensor<...xf16>, tensor<...xf16>) -> tensor<...xf16>
+      %result = stablehlo.convert %dot
+          : (tensor<...xf16>) -> tensor<...xf32>
+
+    StableHLO supports expressing the intended accumulation directly:
+
+      %result = stablehlo.dot_general %lhs, %rhs
+          : (tensor<...xf16>, tensor<...xf16>) -> tensor<...xf32>
+
+    Only fold a direct, single-use conversion so unrelated dots and conversions
+    retain their original semantics.
+    """
+    from torch_mlir.ir import (
+        F16Type,  # type: ignore[import]
+        F32Type,  # type: ignore[import]
+        Operation,  # type: ignore[import]
+        RankedTensorType,  # type: ignore[import]
+        WalkResult,  # type: ignore[import]
+    )
+
+    converts: list[Operation] = []
+
+    def collect_f16_dot_convert(op: Operation) -> WalkResult:
+        if op.name != "stablehlo.convert" or len(op.operands) != 1 or len(op.results) != 1:
+            return WalkResult.ADVANCE
+
+        dot_result = op.operands[0]
+        dot = getattr(dot_result.owner, "operation", dot_result.owner)
+        if not isinstance(dot, Operation) or dot.name != "stablehlo.dot_general":
+            return WalkResult.ADVANCE
+        if len(dot.operands) != 2:
+            return WalkResult.ADVANCE
+
+        values = [*dot.operands, dot_result, op.results[0]]
+        if not all(isinstance(value.type, RankedTensorType) for value in values):
+            return WalkResult.ADVANCE
+        types = [RankedTensorType(value.type) for value in values]
+        if not all(isinstance(type_.element_type, F16Type) for type_ in types[:3]):
+            return WalkResult.ADVANCE
+        if not isinstance(types[3].element_type, F32Type) or types[2].shape != types[3].shape:
+            return WalkResult.ADVANCE
+        if len(list(dot_result.uses)) != 1:
+            return WalkResult.ADVANCE
+
+        converts.append(op)
+        return WalkResult.ADVANCE
+
+    module.operation.walk(collect_f16_dot_convert)
+    for convert in converts:
+        dot_result = convert.operands[0]
+        dot_result.set_type(convert.results[0].type)
+        convert.results[0].replace_all_uses_with(dot_result)
+        convert.erase()
+    module.operation.verify()
+    return len(converts)
 
 
 def _module_to_text(module) -> str:
@@ -280,6 +350,12 @@ def export_attention(
         import_symbolic_shape_expressions=True,
         decomposition_table=decomposition_table,
     )
+    if variant != AttentionVariant.SPARSE_MM:
+        promoted_dot_count = _use_f32_accumulation_for_f16_dots(module)
+        if promoted_dot_count != 2:
+            raise RuntimeError(
+                f"expected to promote two f16 attention dots, promoted {promoted_dot_count}"
+            )
     return _module_to_text(module)
 
 
