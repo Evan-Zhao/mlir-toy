@@ -65,12 +65,19 @@ module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo
     %parallel_scatter =
         transform.htile.fuse_scatter_into_forall %scatter into %forall_loop : (!any, !any) -> !any
 
-    // Difference from dense attention (2): fuse data producers pre-loop downwards into the
-    // deepest loop that contains each use. Do this after scatter fusion, which brings the
-    // scatter-index producers to the outer forall boundary.
+    // Difference from dense attention (2): first fuse ordinary producer chains so ranged
+    // gathers become the immediate producers of in-loop slices. Gather itself is not fusable,
+    // so replace those boundary slices with masked rectangular HTile loads, then run producer
+    // fusion again for chains exposed by the replacement.
     %consumer_loops = transform.merge_handles %forall_loop, %j0_loop : !any
-    transform.fusion.greedy_input_producers_into_consumer %consumer_loops : (!any) -> (!any, !any)
-    // StableHLO slices were not fused because they are not fusable. However, we can convert them to
+    %_5, %consumer_loops_1 =
+        transform.fusion.greedy_input_producers_into_consumer %consumer_loops
+        : (!any) -> (!any, !any)
+    %gathers = transform.structured.match ops{["stablehlo.gather"]} in %func : (!any) -> !any
+    %loads = transform.htile.fuse_ranged_gather_into_loops
+        %gathers into %consumer_loops_1 : (!any, !any) -> !any
+
+    // StableHLO slices were not fused because they are not fusable either. However, we can convert them to
     // tensor.extract_slice ops, then combine them with existing tensor.extract_slice ops in the loop.
     transform.apply_conversion_patterns to %func {
       transform.apply_conversion_patterns.stablehlo.slice_to_tensor

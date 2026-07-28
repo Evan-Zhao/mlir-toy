@@ -1066,6 +1066,437 @@ DiagnosedSilenceableFailure HTileLinalgToSemanticOp::applyToOne(TransformRewrite
   return DiagnosedSilenceableFailure::success();
 }
 
+struct InLoopGatherUse {
+  OpOperand *use;
+  Operation *loop;
+};
+
+/// Operations prepared to replace one in-loop gather result tile with a
+/// rectangular load.
+struct PreparedRangedGatherUse {
+  stablehlo::PadOp pad;
+  tensor::ExtractSliceOp slice;
+  htile::LoadOp load;
+  Value replacement;
+};
+
+static Operation *findInnermostSelectedLoop(Operation *user,
+                                            const DenseSet<Operation *> &selectedLoops) {
+  for (Operation *parent = user->getParentOp(); parent; parent = parent->getParentOp())
+    if (selectedLoops.contains(parent))
+      return parent;
+  return nullptr;
+}
+
+static SmallVector<InLoopGatherUse>
+collectInLoopGatherUses(stablehlo::GatherOp gather, const DenseSet<Operation *> &selectedLoops) {
+  SmallVector<InLoopGatherUse> uses;
+  for (OpOperand &use : gather.getResult().getUses())
+    if (Operation *loop = findInnermostSelectedLoop(use.getOwner(), selectedLoops))
+      uses.push_back(InLoopGatherUse{&use, loop});
+  return uses;
+}
+
+/// Check only source bounds represented by positive edge padding. For example,
+/// high-only padding on `d0` produces `%offset[0] + i0 < dim(source, 0)`.
+static Value buildRangedGatherLoadMask(RewriterBase &rewriter, Location loc, stablehlo::PadOp pad,
+                                       ArrayRef<Value> offsets, ArrayRef<OpFoldResult> sizes) {
+  Value source = pad.getOperand();
+  auto sourceType = cast<RankedTensorType>(source.getType());
+  int64_t rank = sourceType.getRank();
+  ArrayRef<int64_t> lowPadding = pad.getEdgePaddingLow(), highPadding = pad.getEdgePaddingHigh();
+
+  // Upper bounds are needed only on dimensions where high padding created
+  // addresses beyond the source extent.
+  SmallVector<Value> sourceDims(rank);
+  for (int64_t dim = 0; dim < rank; ++dim) {
+    if (highPadding[dim] <= 0)
+      continue;
+    if (sourceType.isDynamicDim(dim))
+      sourceDims[dim] = tensor::DimOp::create(rewriter, loc, source, dim);
+    else
+      sourceDims[dim] = arith::ConstantIndexOp::create(rewriter, loc, sourceType.getDimSize(dim));
+  }
+
+  Value empty = tensor::EmptyOp::create(rewriter, loc, sizes, rewriter.getI1Type());
+  AffineMap identity = rewriter.getMultiDimIdentityMap(rank);
+  SmallVector<utils::IteratorType> iteratorTypes(rank, utils::IteratorType::parallel);
+  auto mask = linalg::GenericOp::create(
+      rewriter, loc, TypeRange{empty.getType()}, ValueRange{}, ValueRange{empty},
+      ArrayRef<AffineMap>{identity}, iteratorTypes,
+      [&](OpBuilder &builder, Location bodyLoc, ValueRange) {
+        Value inBounds;
+        auto appendCondition = [&](arith::CmpIPredicate predicate, Value lhs, Value rhs) {
+          Value cond = arith::CmpIOp::create(builder, bodyLoc, predicate, lhs, rhs);
+          inBounds = inBounds ? arith::AndIOp::create(builder, bodyLoc, inBounds, cond) : cond;
+        };
+        for (int64_t dim = 0; dim < rank; ++dim) {
+          bool checkLower = lowPadding[dim] > 0, checkUpper = highPadding[dim] > 0;
+          if (!checkLower && !checkUpper)
+            continue;
+
+          Value localIndex = linalg::IndexOp::create(builder, bodyLoc, dim);
+          Value sourceIndex = arith::AddIOp::create(builder, bodyLoc, offsets[dim], localIndex);
+          if (checkLower) {
+            Value zero = arith::ConstantIndexOp::create(builder, bodyLoc, 0);
+            appendCondition(arith::CmpIPredicate::sge, sourceIndex, zero);
+          }
+          if (checkUpper)
+            appendCondition(arith::CmpIPredicate::slt, sourceIndex, sourceDims[dim]);
+        }
+        if (!inBounds)
+          inBounds = arith::ConstantOp::create(builder, bodyLoc, builder.getBoolAttr(true));
+        linalg::YieldOp::create(builder, bodyLoc, inBounds);
+      });
+  return mask.getResult(0);
+}
+
+static RankedTensorType getTensorTypeFromSizes(ArrayRef<OpFoldResult> sizes, Type elementType,
+                                               Attribute encoding = {}) {
+  SmallVector<int64_t> shape;
+  shape.reserve(sizes.size());
+  for (OpFoldResult size : sizes)
+    shape.push_back(getConstantIntValue(size).value_or(ShapedType::kDynamic));
+  return RankedTensorType::get(shape, elementType, encoding);
+}
+
+/// Convert the operand-order load tile to the gather-result order without a
+/// permutation: drop collapsed operand dimensions, insert selected batch
+/// dimensions, and finally mirror any rank reduction performed by the slice.
+static Value reshapeRangedGatherLoad(RewriterBase &rewriter, Location loc, Value load,
+                                     ArrayRef<int64_t> operandResultDims,
+                                     RankedTensorType gatherResultType,
+                                     ArrayRef<OpFoldResult> resultSizes,
+                                     RankedTensorType sliceResultType) {
+  Value result = load;
+  auto loadType = cast<RankedTensorType>(load.getType());
+
+  SmallVector<ReassociationIndices> collapseReassociation;
+  SmallVector<int64_t> leadingCollapsedDims;
+  SmallVector<int64_t> representedResultDims;
+  for (int64_t operandDim = 0; operandDim < loadType.getRank(); ++operandDim) {
+    int64_t resultDim = operandResultDims[operandDim];
+    if (resultDim < 0) {
+      if (collapseReassociation.empty())
+        leadingCollapsedDims.push_back(operandDim);
+      else
+        collapseReassociation.back().push_back(operandDim);
+      continue;
+    }
+    collapseReassociation.emplace_back(leadingCollapsedDims.begin(), leadingCollapsedDims.end());
+    leadingCollapsedDims.clear();
+    collapseReassociation.back().push_back(operandDim);
+    representedResultDims.push_back(resultDim);
+  }
+  if (!leadingCollapsedDims.empty() && !collapseReassociation.empty())
+    collapseReassociation.back().append(leadingCollapsedDims);
+
+  if (representedResultDims.size() != static_cast<size_t>(loadType.getRank())) {
+    auto collapsedType =
+        tensor::CollapseShapeOp::inferCollapsedType(loadType, collapseReassociation);
+    result = tensor::CollapseShapeOp::create(rewriter, loc, collapsedType, result,
+                                             collapseReassociation);
+  }
+
+  auto fullResultType = getTensorTypeFromSizes(resultSizes, loadType.getElementType(),
+                                               gatherResultType.getEncoding());
+  if (cast<RankedTensorType>(result.getType()).getRank() != fullResultType.getRank()) {
+    SmallVector<ReassociationIndices> expandReassociation;
+    SmallVector<int64_t> leadingInsertedDims;
+    size_t nextRepresented = 0;
+    for (int64_t resultDim = 0; resultDim < fullResultType.getRank(); ++resultDim) {
+      bool represented = nextRepresented < representedResultDims.size() &&
+                         representedResultDims[nextRepresented] == resultDim;
+      if (!represented) {
+        if (expandReassociation.empty())
+          leadingInsertedDims.push_back(resultDim);
+        else
+          expandReassociation.back().push_back(resultDim);
+        continue;
+      }
+      expandReassociation.emplace_back(leadingInsertedDims.begin(), leadingInsertedDims.end());
+      leadingInsertedDims.clear();
+      expandReassociation.back().push_back(resultDim);
+      ++nextRepresented;
+    }
+    if (!leadingInsertedDims.empty() && !expandReassociation.empty())
+      expandReassociation.back().append(leadingInsertedDims);
+    result = tensor::ExpandShapeOp::create(rewriter, loc, fullResultType, result,
+                                           expandReassociation, resultSizes);
+  }
+
+  if (result.getType() != sliceResultType) {
+    SmallVector<OpFoldResult> zeros(fullResultType.getRank(), rewriter.getIndexAttr(0));
+    SmallVector<OpFoldResult> ones(fullResultType.getRank(), rewriter.getIndexAttr(1));
+    result = tensor::ExtractSliceOp::create(rewriter, loc, sliceResultType, result, zeros,
+                                            resultSizes, ones);
+  }
+  return result;
+}
+
+static FailureOr<PreparedRangedGatherUse> prepareRangedGatherUse(RewriterBase &rewriter,
+                                                                 stablehlo::GatherOp gather,
+                                                                 stablehlo::PadOp pad,
+                                                                 const InLoopGatherUse &inLoopUse) {
+#define PLAN_FAIL(message) return inLoopUse.use->getOwner()->emitError() << (message);
+
+  auto slice = dyn_cast<tensor::ExtractSliceOp>(inLoopUse.use->getOwner());
+  if (!slice || inLoopUse.use->getOperandNumber() != 0)
+    PLAN_FAIL("expected each in-loop gather user to be tensor.extract_slice");
+  if (!slice.hasUnitStride())
+    PLAN_FAIL("expected in-loop gather slices to have unit strides");
+
+  auto indicesType = gather.getStartIndices().getType();
+  int64_t resultRank = gather.getType().getRank();
+  int64_t operandRank = gather.getOperand().getType().getRank();
+  int64_t indicesRank = indicesType.getRank();
+  auto dimNumbers = gather.getDimensionNumbers();
+  int64_t indexVectorDim = dimNumbers.getIndexVectorDim();
+
+  DenseSet<int64_t> offsetDims(llvm::from_range, dimNumbers.getOffsetDims());
+  auto resultOffsets = slice.getMixedOffsets(), resultSizes = slice.getMixedSizes();
+  SmallVector<int64_t> resultBatchDims, startIndicesBatchDims;
+  for (int64_t dim = 0; dim < resultRank; ++dim)
+    if (!offsetDims.contains(dim))
+      resultBatchDims.push_back(dim);
+  for (int64_t dim = 0; dim < indicesRank; ++dim)
+    if (dim != indexVectorDim)
+      startIndicesBatchDims.push_back(dim);
+  for (int64_t resultDim : resultBatchDims)
+    if (!isOneInteger(resultSizes[resultDim]))
+      PLAN_FAIL("expected each gather tile to select exactly one start-index vector");
+
+  SmallVector<int64_t> operandWindowResultDims(operandRank, -1);
+  SmallVector<int64_t> operandBatchResultDims(operandRank, -1);
+  SmallVector<int64_t> operandStartComponents(operandRank, -1);
+  SmallVector<OpFoldResult> loadSizes(operandRank, rewriter.getIndexAttr(1));
+
+  auto insertToSet = [](DenseSet<int64_t> &set, ArrayRef<int64_t> dims) {
+    set.insert(dims.begin(), dims.end());
+  };
+  DenseSet<int64_t> collapsedAndBatchDims;
+  insertToSet(collapsedAndBatchDims, dimNumbers.getCollapsedSliceDims());
+  insertToSet(collapsedAndBatchDims, dimNumbers.getOperandBatchingDims());
+  SmallVector<int64_t> windowOperandDims;
+  for (int64_t operandDim = 0, offsetDim = 0; operandDim < operandRank; ++operandDim)
+    if (!collapsedAndBatchDims.contains(operandDim)) {
+      windowOperandDims.push_back(operandDim);
+      auto resultDim = dimNumbers.getOffsetDims()[offsetDim++];
+      operandWindowResultDims[operandDim] = resultDim;
+      loadSizes[operandDim] = resultSizes[resultDim];
+    }
+
+  for (auto [operandDim, indicesDim] : llvm::zip_equal(dimNumbers.getOperandBatchingDims(),
+                                                       dimNumbers.getStartIndicesBatchingDims())) {
+    int64_t batchPosition = indicesDim - static_cast<int64_t>(indexVectorDim < indicesDim);
+    operandBatchResultDims[operandDim] = resultBatchDims[batchPosition];
+  }
+
+  for (auto [component, operandDim] : llvm::enumerate(dimNumbers.getStartIndexMap()))
+    operandStartComponents[operandDim] = static_cast<int64_t>(component);
+
+  // Collapse/expand can insert or remove unit dimensions, but cannot reorder
+  // source dimensions. Reject gathers such as operand d0 -> result d1 and
+  // operand d1 -> result d0 before materializing any IR.
+  SmallVector<int64_t> operandResultDims(operandRank, -1);
+  int64_t previousResultDim = -1;
+  for (int64_t operandDim = 0; operandDim < operandRank; ++operandDim) {
+    int64_t resultDim = operandWindowResultDims[operandDim] >= 0
+                            ? operandWindowResultDims[operandDim]
+                            : operandBatchResultDims[operandDim];
+    operandResultDims[operandDim] = resultDim;
+    if (resultDim < 0)
+      continue;
+    if (resultDim <= previousResultDim)
+      PLAN_FAIL("expected gather result layout not to permute operand dimensions");
+    previousResultDim = resultDim;
+  }
+
+  // Enforce the anti-clamping padding convention. Nonnegative starts are a
+  // semantic precondition; sufficient high padding makes upper clamping
+  // unobservable once the padded operand is replaced by a masked source load.
+  if (!llvm::all_of(pad.getInteriorPadding(), [](int64_t padding) { return padding == 0; }))
+    PLAN_FAIL("expected ranged gather padding to have zero interior padding");
+  for (int64_t operandDim : dimNumbers.getStartIndexMap()) {
+    if (pad.getEdgePaddingLow()[operandDim] != 0)
+      PLAN_FAIL("expected zero low padding on each dynamically indexed operand dimension");
+    if (pad.getEdgePaddingHigh()[operandDim] < gather.getSliceSizes()[operandDim])
+      PLAN_FAIL("expected high padding to cover the full gather slice on each dynamically indexed "
+                "operand dimension");
+  }
+
+  // All validation is complete. Materialize the final operand-order load and
+  // the value that will replace the gather slice.
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(slice);
+  Location loc = slice.getLoc();
+  SmallVector<Value> materializedResultOffsets =
+      getValueOrCreateConstantIndexOp(rewriter, loc, resultOffsets);
+
+  SmallVector<Value> indicesCoord(indicesRank);
+  for (auto [indicesDim, resultDim] : llvm::zip_equal(startIndicesBatchDims, resultBatchDims))
+    indicesCoord[indicesDim] = materializedResultOffsets[resultDim];
+
+  SmallVector<Value> startComponents(dimNumbers.getStartIndexMap().size());
+  for (int64_t component = 0; component < static_cast<int64_t>(startComponents.size());
+       ++component) {
+    SmallVector<Value> componentCoord = indicesCoord;
+    if (indexVectorDim < indicesRank)
+      componentCoord[indexVectorDim] = arith::ConstantIndexOp::create(rewriter, loc, component);
+    Value start =
+        tensor::ExtractOp::create(rewriter, loc, gather.getStartIndices(), componentCoord);
+    if (!start.getType().isIndex())
+      start = arith::IndexCastOp::create(rewriter, loc, rewriter.getIndexType(), start);
+    startComponents[component] = start;
+  }
+
+  Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+  SmallVector<Value> loadOffsets;
+  loadOffsets.reserve(operandRank);
+  for (int64_t operandDim = 0; operandDim < operandRank; ++operandDim) {
+    Value paddedOffset = zero;
+    bool hasBaseOffset = false;
+    int64_t batchResultDim = operandBatchResultDims[operandDim];
+    int64_t startComponent = operandStartComponents[operandDim];
+    if (batchResultDim >= 0) {
+      paddedOffset = materializedResultOffsets[batchResultDim];
+      hasBaseOffset = true;
+    } else if (startComponent >= 0) {
+      // Ranged gathers promise nonnegative starts and enough high padding for
+      // a complete window. Upper-clamped and raw out-of-source starts both
+      // select only padding, so the later source mask makes them equivalent.
+      paddedOffset = startComponents[startComponent];
+      hasBaseOffset = true;
+    }
+
+    int64_t windowResultDim = operandWindowResultDims[operandDim];
+    if (windowResultDim >= 0) {
+      if (!hasBaseOffset)
+        paddedOffset = materializedResultOffsets[windowResultDim];
+      else if (!isZeroInteger(resultOffsets[windowResultDim]))
+        paddedOffset = arith::AddIOp::create(rewriter, loc, paddedOffset,
+                                             materializedResultOffsets[windowResultDim]);
+    }
+
+    int64_t lowPadding = pad.getEdgePaddingLow()[operandDim];
+    if (lowPadding != 0) {
+      Value low = arith::ConstantIndexOp::create(rewriter, loc, lowPadding);
+      paddedOffset = arith::SubIOp::create(rewriter, loc, paddedOffset, low);
+    }
+    loadOffsets.push_back(paddedOffset);
+  }
+
+  Value mask = buildRangedGatherLoadMask(rewriter, loc, pad, loadOffsets, loadSizes);
+  Value other = tensor::ExtractOp::create(rewriter, loc, pad.getPaddingValue(), ValueRange{});
+  auto sourceType = pad.getOperand().getType();
+  auto maskType = cast<RankedTensorType>(mask.getType());
+  auto loadType = RankedTensorType::get(maskType.getShape(), sourceType.getElementType(),
+                                        sourceType.getEncoding());
+  auto load =
+      htile::LoadOp::create(rewriter, loc, loadType, pad.getOperand(), loadOffsets, mask, other);
+  Value replacement = reshapeRangedGatherLoad(rewriter, loc, load, operandResultDims,
+                                              gather.getType(), resultSizes, slice.getResultType());
+  return PreparedRangedGatherUse{
+      .pad = pad, .slice = slice, .load = load, .replacement = replacement};
+#undef PLAN_FAIL
+}
+
+void HTileFuseRangedGatherIntoLoopsOp::getEffects(
+    SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
+  consumesHandle(getGathersMutable(), effects);
+  onlyReadsHandle(getLoopsMutable(), effects);
+  producesHandle(getOperation()->getOpResults(), effects);
+  modifiesPayload(effects);
+}
+
+DiagnosedSilenceableFailure HTileFuseRangedGatherIntoLoopsOp::apply(TransformRewriter &rewriter,
+                                                                     TransformResults &results,
+                                                                     TransformState &state) {
+  (void)results;
+  auto transform = cast<TransformOpInterface>(getOperation());
+
+  DenseSet<Operation *> selectedLoops;
+  for (Operation *payload : state.getPayloadOps(getLoops())) {
+    if (!isa<scf::ForOp, scf::ForallOp>(payload))
+      BAIL("expected the loops handle to contain only scf.for or scf.forall operations");
+    selectedLoops.insert(payload);
+  }
+  if (selectedLoops.empty())
+    BAIL("expected at least one selected loop");
+
+  SmallVector<stablehlo::GatherOp> gathers;
+  for (Operation *payload : state.getPayloadOps(getGathers())) {
+    auto gather = dyn_cast<stablehlo::GatherOp>(payload);
+    if (!gather)
+      BAIL("expected the gathers handle to contain only stablehlo.gather operations");
+    gathers.push_back(gather);
+  }
+  if (gathers.empty())
+    BAIL("expected at least one stablehlo.gather");
+
+  SmallVector<Operation *> loads;
+  DenseSet<Operation *> pads;
+  // Check that each gather describes rectangular windows selected by one index vector.
+  // The vector may dynamically position several operand dimensions, and start_indices may have
+  // arbitrary batch dimensions; each tiled use must select one such vector rather than a tensor
+  // of independently positioned windows.
+  for (auto gather : gathers) {
+    auto indicesType = gather.getStartIndices().getType();
+    auto dimNumbers = gather.getDimensionNumbers();
+    size_t numStartComponents = dimNumbers.getStartIndexMap().size();
+    if (numStartComponents == 0)
+      BAIL("expected ranged gather to have at least one start-index component");
+
+    int64_t indexVectorDim = dimNumbers.getIndexVectorDim();
+    if (indexVectorDim == indicesType.getRank()) {
+      if (numStartComponents != 1)
+        BAIL("expected an implicit index-vector dimension to have exactly one start component");
+    } else {
+      int64_t indexVectorSize = indicesType.getDimSize(indexVectorDim);
+      if (!ShapedType::isDynamic(indexVectorSize) &&
+          static_cast<size_t>(indexVectorSize) != numStartComponents)
+        BAIL("expected indices.size(dim=index_vector_dim) to match len(start_index_map)");
+    }
+
+    Type indexElementType = indicesType.getElementType();
+    if (!indexElementType.isIndex() && !indexElementType.isSignlessInteger())
+      BAIL("expected ranged gather start indices to have signless integer or index elements");
+
+    auto producingPad = gather.getOperand().getDefiningOp<stablehlo::PadOp>();
+    if (!producingPad)
+      BAIL("expected ranged gather operand to be produced by stablehlo.pad");
+
+    SmallVector<InLoopGatherUse> inLoopUses = collectInLoopGatherUses(gather, selectedLoops);
+    LLVM_DEBUG({
+      llvm::dbgs() << "ranged gather has " << inLoopUses.size() << " in-loop use(s):\n";
+      llvm::dbgs() << gather << "\n";
+    });
+    for (const InLoopGatherUse &inLoopUse : inLoopUses) {
+      FailureOr<PreparedRangedGatherUse> prepared =
+          prepareRangedGatherUse(rewriter, gather, producingPad, inLoopUse);
+      if (failed(prepared))
+        BAIL("failed to prepare a replacement for the in-loop ranged gather use");
+      LLVM_DEBUG({
+        llvm::dbgs() << "  prepared operand #" << inLoopUse.use->getOperandNumber() << " of ";
+        inLoopUse.use->getOwner()->print(llvm::dbgs());
+        llvm::dbgs() << "\n    inside " << inLoopUse.loop->getName() << "\n";
+      });
+      loads.push_back(prepared->load);
+      pads.insert(prepared->pad);
+      rewriter.replaceOp(prepared->slice, prepared->replacement);
+    }
+  }
+
+  // A gather can retain uses outside the selected loops. Remove only gathers
+  // and pads made dead by replacing all of their planned in-loop slices.
+  for (auto *op : llvm::concat<Operation *>(gathers, pads)) {
+    if (isOpTriviallyDead(op))
+      rewriter.eraseOp(op);
+  }
+  results.set(getOperation()->getResult(0), loads);
+  return DiagnosedSilenceableFailure::success();
+}
+
 static LogicalResult verifyCloneableDefChainBefore(Value value, Operation *before,
                                                    DominanceInfo &dominance,
                                                    DenseSet<Operation *> &visited) {

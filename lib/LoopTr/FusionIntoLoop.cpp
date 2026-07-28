@@ -278,6 +278,21 @@ FusionGreedyInputProducersIntoConsumerOp::apply(transform::TransformRewriter &re
   });
   std::deque<WorkItem> worklist(initialWorklist.begin(), initialWorklist.end());
 
+  // tileAndFuseProducerOfSlice speculatively inserts a cloned producer, a
+  // cloned candidate slice, and possibly tiling helpers immediately before the
+  // candidate slice. If tiling fails, the utility currently leaves those
+  // operations behind. Remove the trivially dead part of that insertion
+  // interval without disturbing unrelated operations in the loop.
+  auto eraseDeadFailedFusionInsertions = [&](Operation *previous, tensor::ExtractSliceOp anchor) {
+    SmallVector<Operation *> inserted;
+    Operation *operation = previous ? previous->getNextNode() : &anchor->getBlock()->front();
+    for (; operation != anchor; operation = operation->getNextNode())
+      inserted.push_back(operation);
+    for (Operation *insertedOp : llvm::reverse(inserted))
+      if (isOpTriviallyDead(insertedOp))
+        rewriter.eraseOp(insertedOp);
+  };
+
   SmallVector<Operation *> fusedOps;
   bool hasFailure = false;
   while (!worklist.empty()) {
@@ -287,9 +302,11 @@ FusionGreedyInputProducersIntoConsumerOp::apply(transform::TransformRewriter &re
 
     MutableArrayRef<LoopLikeOpInterface> loopPrefix(loops);
     loopPrefix = loopPrefix.take_front(item.loopDepth + 1);
+    Operation *previous = slice->getPrevNode();
     std::optional<scf::SCFFuseProducerOfSliceResult> fused =
         scf::tileAndFuseProducerOfSlice(rewriter, slice, loopPrefix);
     if (!fused) {
+      eraseDeadFailedFusionInsertions(previous, slice);
       if (Operation *source = slice.getSource().getDefiningOp())
         source->emitRemark("failed to fuse this op into the consumer loop nest");
       else
