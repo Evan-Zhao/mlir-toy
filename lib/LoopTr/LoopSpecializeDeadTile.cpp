@@ -636,6 +636,22 @@ ScalarExprState evaluateScalarValue(Value value, DenseMap<Value, ScalarExprState
     return ScalarExprState::getUnknown();
   };
   auto evaluate = [&](Value operand) { return evaluateScalarValue(operand, states, deadValue); };
+  // Preserve constants through the f32 -> f16 -> f32 path feeding mixed-precision dots.
+  auto foldFloatCast = [&](auto castOp) {
+    ScalarExprState operand = evaluate(castOp.getOperand());
+    auto operandAttr = operand.getConstantAttr();
+    auto floatAttr = operandAttr ? dyn_cast<FloatAttr>(*operandAttr) : nullptr;
+    auto resultType = dyn_cast<FloatType>(castOp.getResult().getType());
+    if (!floatAttr || !resultType)
+      return ScalarExprState::getUnknown();
+
+    APFloat result = floatAttr.getValue();
+    bool losesInfo = false;
+    if (result.convert(resultType.getFloatSemantics(), APFloat::rmNearestTiesToEven, &losesInfo) ==
+        APFloat::opInvalidOp)
+      return ScalarExprState::getUnknown();
+    return ScalarExprState::getConstant(FloatAttr::get(resultType, result));
+  };
   // Recognize the rolling-update idiom `(x * y) * (1 / y) -> x` (and swapped
   // operands). Plain recursive evaluation loses the reciprocal structure
   // because the current abstract domain does not represent `1 / y`.
@@ -693,6 +709,7 @@ ScalarExprState evaluateScalarValue(Value value, DenseMap<Value, ScalarExprState
 
   ScalarExprState result = llvm::TypeSwitch<Operation *, ScalarExprState>(def)
                                .Case<arith::ConstantOp>(foldConstant)
+                               .Case<arith::ExtFOp, arith::TruncFOp>(foldFloatCast)
                                .Case<math::ExpOp, math::Exp2Op>(foldExpOp)
                                .Case<arith::AddFOp, arith::AddIOp>(CASE_BIN_OP(foldAdd))
                                .Case<arith::SubFOp, arith::SubIOp>(CASE_BIN_OP(foldSub))
