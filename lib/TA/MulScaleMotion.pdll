@@ -146,6 +146,27 @@ Pattern SinkRightDivThroughF16AfterMatmul {
   };
 }
 
+// sum(lhs * f32(f16(rhs * factor))) => sum(lhs * f32(f16(rhs))) * factor
+// Prefer this over division sinking at the same reduction so the hoisted factor
+// remains outside any division exposed by the left matmul operand.
+Pattern SinkRightMulThroughF16AfterMatmul with benefit(1) {
+  let scaled = op<ta.mul>(rhs: Value, factor: Value) {"ta.import_group" = srcScaled: Attr};
+  let narrowed = op<ta.cast>(scaled) {"ta.import_group" = srcNarrow: Attr} -> (narrowType: Type);
+  let widened = op<ta.cast>(narrowed) {"ta.import_group" = srcWiden: Attr} -> (wideType: Type);
+  let outer = op<ta.mul>(lhs: Value, widened) {"ta.import_group" = srcOuter: Attr};
+  let reduce = op<ta.reduce>(outer) {kind = kind: Attr, axes = axes: Attr, "ta.import_group" = srcReduce: Attr} -> (resultType: Type);
+  F32F16F32CastChain(scaled, narrowed, widened);
+  ValueAxesDisjointFromReduction(factor, axes);
+  AddReduceKind(kind);
+
+  rewrite reduce with {
+    let roundedRhs = RoundThroughF16(rhs, srcNarrow, srcWiden);
+    let newMul = op<ta.mul>(lhs, roundedRhs) {"ta.import_group" = srcOuter};
+    let newReduce = op<ta.reduce>(newMul) {kind = kind, axes = axes, "ta.import_group" = srcReduce} -> (resultType);
+    replace reduce with op<ta.mul>(newReduce, factor) {"ta.import_group" = srcScaled};
+  };
+}
+
 // sum(lhs * (rhs * factor)) => sum(lhs * rhs) * factor
 Pattern SinkRightMulAfterMatmul {
   let inner = op<ta.mul>(rhs: Value, factor: Value) {"ta.import_group" = srcInner: Attr};

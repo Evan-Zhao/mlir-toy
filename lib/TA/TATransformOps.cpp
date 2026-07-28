@@ -284,6 +284,7 @@ void TASinkDivAfterMatmulPatternsOp::populatePatterns(RewritePatternSet &pattern
 
 void TASinkRightMulAfterMatmulPatternsOp::populatePatterns(RewritePatternSet &patterns) {
   patterns.add<ta_mul_scale_motion_pdl::SinkRightMulAfterMatmul>(patterns.getContext());
+  patterns.add<ta_mul_scale_motion_pdl::SinkRightMulThroughF16AfterMatmul>(patterns.getContext());
 }
 
 void TAReassociateRightMulfPatternsOp::populatePatterns(RewritePatternSet &patterns) {

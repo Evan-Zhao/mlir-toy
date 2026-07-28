@@ -43,6 +43,48 @@ module attributes {transform.with_named_sequence} {
     return %out : tensor<2x4xf32>
   }
 
+  // CHECK-LABEL: func.func @ta_sink_right_mul_through_f16_after_matmul(
+  func.func @ta_sink_right_mul_through_f16_after_matmul(
+      %scores: tensor<2x3xf32>, %scale: tensor<2xf32>,
+      %values: tensor<3x4xf32>) -> tensor<2x4xf32> {
+    %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3, %d "d" extent 4) {
+      // CHECK: %[[SCORES:.+]] = ta.at %{{.+}}[%i, %j]
+      %scores_expr = ta.at %scores[%i, %j]
+          : tensor<2x3xf32> -> !ta.expr<f32, [i, j]>
+      // CHECK: %[[SCALE:.+]] = ta.at %{{.+}}[%i]
+      %scale_expr = ta.at %scale[%i]
+          : tensor<2xf32> -> !ta.expr<f32, [i]>
+      // CHECK: %[[VALUES:.+]] = ta.at %{{.+}}[%j, %d]
+      %values_expr = ta.at %values[%j, %d]
+          : tensor<3x4xf32> -> !ta.expr<f32, [j, d]>
+      %scaled_values = ta.mul %values_expr, %scale_expr {ta.import_group = 5 : i64}
+          : (!ta.expr<f32, [j, d]>, !ta.expr<f32, [i]>)
+         -> !ta.expr<f32, [j, d, i]>
+      // CHECK: %[[NARROW:.+]] = ta.cast %[[VALUES]]
+      // CHECK-SAME: -> !ta.expr<f16, [j, d]>
+      %values_f16 = ta.cast %scaled_values {ta.import_group = 6 : i64}
+          : (!ta.expr<f32, [j, d, i]>) -> !ta.expr<f16, [j, d, i]>
+      // CHECK: %[[WIDE:.+]] = ta.cast %[[NARROW]]
+      // CHECK-SAME: -> !ta.expr<f32, [j, d]>
+      %values_f32 = ta.cast %values_f16 {ta.import_group = 7 : i64}
+          : (!ta.expr<f16, [j, d, i]>) -> !ta.expr<f32, [j, d, i]>
+      // CHECK: %[[PROD:.+]] = ta.mul %[[SCORES]], %[[WIDE]]
+      %prod = ta.mul %scores_expr, %values_f32 {ta.import_group = 11 : i64}
+          : (!ta.expr<f32, [i, j]>, !ta.expr<f32, [j, d, i]>)
+         -> !ta.expr<f32, [i, j, d]>
+      // CHECK: %[[RED:.+]] = ta.reduce <add> %[[PROD]]
+      // CHECK-SAME: axes = #ta.axes<j>
+      %sum = ta.reduce #ta.reduce_kind<add> %prod
+          {axes = #ta.axes<j>, ta.import_group = 11 : i64}
+          : !ta.expr<f32, [i, j, d]> -> !ta.expr<f32, [i, d]>
+      // CHECK: %[[HOISTED:.+]] = ta.mul %[[RED]], %[[SCALE]]
+      // CHECK-SAME: -> !ta.expr<f32, [i, d]>
+      // CHECK: ta.yield %[[HOISTED]]
+      ta.yield %sum : !ta.expr<f32, [i, d]>
+    } : () -> tensor<2x4xf32>
+    return %out : tensor<2x4xf32>
+  }
+
   // CHECK-LABEL: func.func @ta_sink_right_mul_after_matmul_reject_reduction_axis(
   func.func @ta_sink_right_mul_after_matmul_reject_reduction_axis(%scores: tensor<2x3xf32>,
                                                                   %scale: tensor<3xf32>,

@@ -103,10 +103,14 @@ def TASinkRightMulAfterMatmulPatternsOp
     ```
       c * (a * b) -> a * (b * c)
       sum(lhs * (rhs * factor)) -> sum(lhs * rhs) * factor
+      sum(lhs * f32(f16(rhs * factor)))
+        -> sum(lhs * f32(f16(rhs))) * factor
     ```
 
-    The `factor` must have axes disjoint from the reduction axes.
-    The pattern preserves the matched add reducer kind, axes, and import-group attributes.
+    The cast-aware form supports f16 matmul operands with f32 accumulation.
+    Moving the factor across the f16 rounding is intentionally approximate.
+    The `factor` must have axes disjoint from the reduction axes. The patterns
+    preserve the matched add reducer kind, axes, and import-group attributes.
   }];
 
   let assemblyFormat = "attr-dict";

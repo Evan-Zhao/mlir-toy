@@ -105,8 +105,8 @@ class KVOnlyQuantizedAttentionModule(torch.nn.Module):
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sk: torch.Tensor, sv: torch.Tensor
     ) -> torch.Tensor:
-        k_dq = k.to(torch.float32) * sk
-        v_dq = v.to(torch.float32) * sv
+        k_dq = (k.to(torch.float32) * sk).to(torch.float16)
+        v_dq = (v.to(torch.float32) * sv).to(torch.float16)
         scale = 1.0 / math.sqrt(q.shape[-1])
         scores = _f16_matmul_f32(q, k_dq.transpose(-1, -2))
         scores = scores * scale
