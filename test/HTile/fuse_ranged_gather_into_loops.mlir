@@ -1,17 +1,19 @@
 // RUN: neptune-opt --transform-interpreter --verify-diagnostics --split-input-file %s | FileCheck %s
 
 // CHECK-LABEL: func.func @fuse_ranged_gather
+// CHECK-SAME: %[[SOURCE:.*]]: tensor<16x4xf32>, %[[ALL_STARTS:.*]]: tensor<3xi32>
+// CHECK: %[[ZERO:.*]] = arith.constant 0.000000e+00 : f32
 // CHECK-NOT: stablehlo.pad
 // CHECK-NOT: stablehlo.gather
 // CHECK: scf.forall
-// CHECK: %[[START_I32:.*]] = tensor.extract %{{.*}}[%{{.*}}, %{{.*}}]
+// CHECK: %[[START_I32:.*]] = tensor.extract %[[ALL_STARTS]][%{{.*}}]
 // CHECK: %[[START:.*]] = arith.index_cast %[[START_I32]] : i32 to index
 // CHECK: %[[MASK:.*]] = linalg.generic
 // CHECK: linalg.index 0
 // CHECK: arith.cmpi slt
-// CHECK: %[[LOAD:.*]] = htile.load %[[SOURCE:.*]][%[[START]], %{{.*}}]
+// CHECK: %[[LOAD:.*]] = htile.load %[[SOURCE]][%[[START]], %{{.*}}]
 // CHECK-SAME: mask(%[[MASK]] : tensor<4x4xi1>)
-// CHECK-SAME: other(%{{.*}} : f32)
+// CHECK-SAME: other(%[[ZERO]] : f32)
 // CHECK-SAME: tensor<16x4xf32> -> tensor<4x4xf32>
 // CHECK: %[[EXPANDED:.*]] = tensor.expand_shape %[[LOAD]]
 // CHECK-SAME: tensor<4x4xf32> into tensor<1x4x4xf32>
@@ -29,8 +31,20 @@ module attributes {transform.with_named_sequence} {
   }
 
   func.func @fuse_ranged_gather(%source: tensor<16x4xf32>,
-                                %starts: tensor<2x1xi32>) -> tensor<2x4x4xf32> {
-    %zero = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                                %all_starts: tensor<3xi32>) -> tensor<2x4x4xf32> {
+    %starts_1d = stablehlo.slice %all_starts [0:2]
+        : (tensor<3xi32>) -> tensor<2xi32>
+    %starts_init = tensor.empty() : tensor<2x1xi32>
+    %starts = linalg.broadcast ins(%starts_1d : tensor<2xi32>)
+        outs(%starts_init : tensor<2x1xi32>) dimensions = [1]
+    %zero_scalar = arith.constant 0.000000e+00 : f32
+    %zero_init = tensor.empty() : tensor<f32>
+    %zero = linalg.generic {
+        indexing_maps = [affine_map<() -> ()>], iterator_types = []}
+        outs(%zero_init : tensor<f32>) {
+      ^bb0(%out: f32):
+        linalg.yield %zero_scalar : f32
+    } -> tensor<f32>
     %padded = stablehlo.pad %source, %zero,
         low = [0, 0], high = [4, 0], interior = [0, 0]
         : (tensor<16x4xf32>, tensor<f32>) -> tensor<20x4xf32>

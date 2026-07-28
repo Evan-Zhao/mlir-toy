@@ -1097,6 +1097,70 @@ collectInLoopGatherUses(stablehlo::GatherOp gather, const DenseSet<Operation *> 
   return uses;
 }
 
+/// Materialize one tensor element while peeling only the producer forms
+/// introduced around ranged-gather indices and padding values.
+static Value materializeTensorElement(RewriterBase &rewriter, Location loc, Value tensor,
+                                      ArrayRef<Value> indices) {
+  if (auto broadcast = tensor.getDefiningOp<linalg::BroadcastOp>()) {
+    DenseSet<int64_t> addedDims(llvm::from_range, broadcast.getDimensions());
+    SmallVector<Value> inputIndices;
+    for (auto [dim, index] : llvm::enumerate(indices))
+      if (!addedDims.contains(static_cast<int64_t>(dim)))
+        inputIndices.push_back(index);
+    return materializeTensorElement(rewriter, loc, broadcast.getInput(), inputIndices);
+  }
+
+  if (auto slice = tensor.getDefiningOp<stablehlo::SliceOp>();
+      slice && llvm::all_of(slice.getStrides(), [](int64_t stride) { return stride == 1; })) {
+    SmallVector<Value> sourceIndices;
+    sourceIndices.reserve(indices.size());
+    for (auto [index, offset] : llvm::zip_equal(indices, slice.getStartIndices())) {
+      if (offset == 0) {
+        sourceIndices.push_back(index);
+        continue;
+      }
+      Value offsetValue = arith::ConstantIndexOp::create(rewriter, loc, offset);
+      sourceIndices.push_back(arith::AddIOp::create(rewriter, loc, offsetValue, index));
+    }
+    return materializeTensorElement(rewriter, loc, slice.getOperand(), sourceIndices);
+  }
+
+  if (auto slice = tensor.getDefiningOp<tensor::ExtractSliceOp>();
+      slice && slice.hasUnitStride() &&
+      slice.getSourceType().getRank() == slice.getResultType().getRank()) {
+    SmallVector<Value> sourceIndices;
+    sourceIndices.reserve(indices.size());
+    for (auto [index, offset] : llvm::zip_equal(indices, slice.getMixedOffsets())) {
+      if (isZeroInteger(offset)) {
+        sourceIndices.push_back(index);
+        continue;
+      }
+      Value offsetValue = getValueOrCreateConstantIndexOp(rewriter, loc, offset);
+      sourceIndices.push_back(arith::AddIOp::create(rewriter, loc, offsetValue, index));
+    }
+    return materializeTensorElement(rewriter, loc, slice.getSource(), sourceIndices);
+  }
+
+  // `%tensor = linalg.generic ... { linalg.yield %scalar }` followed by
+  // `tensor.extract %tensor[]` is just `%scalar` when the body has no work and
+  // the yielded value is captured from outside the generic.
+  if (indices.empty()) {
+    if (auto result = dyn_cast<OpResult>(tensor)) {
+      if (auto generic = dyn_cast<linalg::GenericOp>(result.getOwner())) {
+        Block &body = generic.getRegion().front();
+        if (llvm::hasSingleElement(body.getOperations())) {
+          Value yielded =
+              cast<linalg::YieldOp>(body.getTerminator()).getValues()[result.getResultNumber()];
+          if (!generic.getRegion().isAncestor(yielded.getParentRegion()))
+            return yielded;
+        }
+      }
+    }
+  }
+
+  return tensor::ExtractOp::create(rewriter, loc, tensor, indices);
+}
+
 /// Check only source bounds represented by positive edge padding. For example,
 /// high-only padding on `d0` produces `%offset[0] + i0 < dim(source, 0)`.
 static Value buildRangedGatherLoadMask(RewriterBase &rewriter, Location loc, stablehlo::PadOp pad,
@@ -1343,8 +1407,7 @@ static FailureOr<PreparedRangedGatherUse> prepareRangedGatherUse(RewriterBase &r
     SmallVector<Value> componentCoord = indicesCoord;
     if (indexVectorDim < indicesRank)
       componentCoord[indexVectorDim] = arith::ConstantIndexOp::create(rewriter, loc, component);
-    Value start =
-        tensor::ExtractOp::create(rewriter, loc, gather.getStartIndices(), componentCoord);
+    Value start = materializeTensorElement(rewriter, loc, gather.getStartIndices(), componentCoord);
     if (!start.getType().isIndex())
       start = arith::IndexCastOp::create(rewriter, loc, rewriter.getIndexType(), start);
     startComponents[component] = start;
@@ -1387,7 +1450,7 @@ static FailureOr<PreparedRangedGatherUse> prepareRangedGatherUse(RewriterBase &r
   }
 
   Value mask = buildRangedGatherLoadMask(rewriter, loc, pad, loadOffsets, loadSizes);
-  Value other = tensor::ExtractOp::create(rewriter, loc, pad.getPaddingValue(), ValueRange{});
+  Value other = materializeTensorElement(rewriter, loc, pad.getPaddingValue(), ArrayRef<Value>{});
   auto sourceType = pad.getOperand().getType();
   auto maskType = cast<RankedTensorType>(mask.getType());
   auto loadType = RankedTensorType::get(maskType.getShape(), sourceType.getElementType(),
