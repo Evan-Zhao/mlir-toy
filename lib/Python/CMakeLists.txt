@@ -2,13 +2,9 @@ if(NEPTUNE_MLIR_BUILD_PYTHON_EXTENSIONS)
   Python3_add_library(_neptuneMlir MODULE WITH_SOABI
     NeptuneMLIRModule.cpp
     ../HTile/HTileDialect.cpp
-    ../HTile/HTilePasses.cpp
-    ../HTile/HTileTransformOps.cpp
-    ../LoopTr/Utils.cpp
   )
   target_include_directories(_neptuneMlir PRIVATE
     "${PROJECT_BINARY_DIR}/lib/HTile"
-    "${PROJECT_BINARY_DIR}/lib/LoopTr"
   )
   # All Python extension modules must use the single MLIR runtime embedded in
   # libMLIRPythonCAPI. Linking MLIR component archives here would create a
@@ -23,8 +19,6 @@ if(NEPTUNE_MLIR_BUILD_PYTHON_EXTENSIONS)
   add_dependencies(_neptuneMlir
     HTileOpsIncGen
     HTileAttrsIncGen
-    HTilePassesIncGen
-    HTileTransformOpsIncGen
   )
   setup_mlir_target(_neptuneMlir)
   set_target_properties(_neptuneMlir PROPERTIES

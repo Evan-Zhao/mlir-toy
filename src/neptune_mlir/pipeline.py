@@ -54,19 +54,21 @@ def _run_neptune_opt_file(input_path: Path, pass_pipeline: str) -> str:
     return result.stdout
 
 
-def _export_attention_subprocess(
+def export_attention_mlir(
     *,
-    variant: AttentionVariant,
-    batch: int,
-    q_heads: int,
-    kv_heads: int | None,
-    seq_len: int,
-    head_dim: int,
-    window_size: int | None,
-    func_name: str,
+    variant: AttentionVariant | str,
+    batch: int = 1,
+    q_heads: int = 4,
+    kv_heads: int | None = None,
+    seq_len: int = 128,
+    head_dim: int = 64,
+    window_size: int | None = 128,
+    func_name: str = "attention",
 ) -> str:
+    """Export attention to StableHLO in an isolated Torch-MLIR process."""
     # Torch-MLIR and the standalone MLIR Python bindings ship separate native
     # runtimes that cannot be loaded into one Python process in arbitrary order.
+    variant = _coerce_attention_variant(variant)
     cmd = [sys.executable, "-m", "neptune_mlir.operator.export_attention"]
     cmd += ["--variant", variant.value, "--batch", str(batch), "--q-heads", str(q_heads)]
     cmd += ["--seq-len", str(seq_len), "--head-dim", str(head_dim), "--func-name", func_name]
@@ -133,7 +135,7 @@ def export_attention_to_triton_input_mlir(
     schedule = _VARIANT_TO_SCHEDULE.get(variant.value)
     if schedule is None:
         raise ValueError(f"unsupported attention pipeline variant: {variant}")
-    input_mlir = _export_attention_subprocess(
+    input_mlir = export_attention_mlir(
         variant=variant,
         batch=batch,
         q_heads=q_heads,

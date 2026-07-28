@@ -7,6 +7,7 @@ import pytest
 from neptune_mlir.operator.variants import AttentionVariant
 from neptune_mlir.pipeline import (
     attention_to_triton_input_pass_pipeline,
+    export_attention_mlir,
     export_attention_to_triton_input_mlir,
 )
 from neptune_mlir.schedules import AttentionTileConfig
@@ -81,6 +82,42 @@ def require_export_deps():
         pytest.skip("PyTorch is required for attention export tests")
     if importlib.util.find_spec("torch_mlir") is None:
         pytest.skip("Torch-MLIR is required for attention export tests")
+
+
+def test_export_attention_uses_f16_dots_with_f32_accumulation() -> None:
+    require_export_deps()
+
+    exported = export_attention_mlir(
+        variant=AttentionVariant.GLOBAL_ATTN,
+        q_heads=2,
+        seq_len=8,
+        head_dim=4,
+    )
+    dots = [line for line in exported.splitlines() if "stablehlo.dot_general" in line]
+
+    assert len(dots) == 2
+    assert all(line.count("xf16>") >= 2 for line in dots)
+    assert all(line.rstrip().endswith("xf32>") for line in dots)
+
+
+def test_export_fp8_attention_preserves_quantized_kv_inputs() -> None:
+    require_export_deps()
+
+    exported = export_attention_mlir(
+        variant=AttentionVariant.KV_FP8_CAUSAL_ATTN,
+        q_heads=2,
+        seq_len=8,
+        head_dim=4,
+    )
+    signature = next(line for line in exported.splitlines() if "func.func @attention" in line)
+    fp8_to_f32 = [
+        line
+        for line in exported.splitlines()
+        if "stablehlo.convert" in line and "xf8E4M3FN>" in line and "xf32>" in line
+    ]
+
+    assert signature.count("xf8E4M3FN>") == 2
+    assert len(fp8_to_f32) == 2
 
 
 @pytest.mark.parametrize(
