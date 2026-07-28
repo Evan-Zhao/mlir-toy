@@ -77,10 +77,13 @@ def TASinkDivAfterMatmulPatternsOp
     multiplication and add reduction:
 
     ```
-      sum((num / denom) * rhs)  ->  sum(num * rhs) / denom
+      sum((num / denom) * rhs) -> sum(num * rhs) / denom
+      sum(f32(f16(num / denom)) * rhs)
+        -> sum(f32(f16(num)) * rhs) / denom
     ```
 
-    The `denom` divisor must have axes disjoint from the reduction axes. The pattern
+    The cast-aware form supports f16 matmul operands with f32 accumulation. The
+    `denom` divisor must have axes disjoint from the reduction axes. The pattern
     preserves the matched add reducer kind, axes, and import-group attributes.
   }];
 
