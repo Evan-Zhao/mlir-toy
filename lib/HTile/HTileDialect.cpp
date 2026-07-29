@@ -1,6 +1,7 @@
 #include "HTile/HTileDialect.h"
 #include "HTile/HTileAttrs.h"
 #include "HTile/HTileOps.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/SymbolTable.h"
@@ -82,6 +83,55 @@ mlir::LogicalResult LoadOp::verify() {
   if (otherType != resultType.getElementType())
     return emitOpError("requires other type to match the result element type");
   return mlir::success();
+}
+
+void MaskedParallelInsertSliceOp::build(mlir::OpBuilder &builder, mlir::OperationState &result,
+                                        mlir::Value source, mlir::Value dest,
+                                        llvm::ArrayRef<mlir::OpFoldResult> offsets,
+                                        llvm::ArrayRef<mlir::OpFoldResult> sizes,
+                                        llvm::ArrayRef<mlir::OpFoldResult> strides, mlir::Value mask,
+                                        llvm::ArrayRef<mlir::NamedAttribute> attrs) {
+  llvm::SmallVector<int64_t> staticOffsets, staticSizes, staticStrides;
+  llvm::SmallVector<mlir::Value> dynamicOffsets, dynamicSizes, dynamicStrides;
+  mlir::dispatchIndexOpFoldResults(offsets, dynamicOffsets, staticOffsets);
+  mlir::dispatchIndexOpFoldResults(sizes, dynamicSizes, staticSizes);
+  mlir::dispatchIndexOpFoldResults(strides, dynamicStrides, staticStrides);
+  result.addAttributes(attrs);
+  build(builder, result, {}, source, dest, dynamicOffsets, dynamicSizes, dynamicStrides, mask,
+        builder.getDenseI64ArrayAttr(staticOffsets), builder.getDenseI64ArrayAttr(staticSizes),
+        builder.getDenseI64ArrayAttr(staticStrides));
+}
+
+mlir::LogicalResult MaskedParallelInsertSliceOp::verify() {
+  if (!mlir::isa<mlir::InParallelOpInterface>(getOperation()->getParentOp()))
+    return emitOpError("must be directly nested in an in-parallel operation");
+
+  auto sourceType = getSourceType();
+  auto destType = getDestType();
+  auto maskType = mlir::cast<mlir::RankedTensorType>(getMask().getType());
+  if (sourceType.getElementType() != destType.getElementType())
+    return emitOpError("requires source and destination element types to match");
+  if (!maskType.getElementType().isInteger(1))
+    return emitOpError("requires mask to have i1 element type");
+  if (maskType.getShape() != sourceType.getShape())
+    return emitOpError("requires mask shape to match source shape");
+
+  if (!mlir::computeRankReductionMask(getStaticSizes(), sourceType.getShape(),
+                                      /*matchDynamic=*/true))
+    return emitOpError(
+        "requires source shape to match slice sizes after dropping static unit dimensions");
+  return mlir::success();
+}
+
+mlir::MutableOperandRange MaskedParallelInsertSliceOp::getUpdatedDestinations() {
+  return getDestMutable();
+}
+
+mlir::Operation *MaskedParallelInsertSliceOp::getIteratingParent() {
+  if (auto combiningOp =
+          mlir::dyn_cast<mlir::InParallelOpInterface>(getOperation()->getParentOp()))
+    return combiningOp->getParentOp();
+  return nullptr;
 }
 
 mlir::MutableOperandRange ParallelScatterOp::getUpdatedDestinations() {

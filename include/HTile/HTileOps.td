@@ -11,6 +11,7 @@ include "mlir/IR/SymbolInterfaces.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/Interfaces/ParallelCombiningOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
+include "mlir/Interfaces/ViewLikeInterface.td"
 
 def HTile_WarpPolicyAttr
     : Attr<And<[StrAttr.predicate,
@@ -277,6 +278,78 @@ def HTile_CopyOp : Op<HTile_Dialect, "copy"> {
   let results = (outs AnyRankedTensor:$result);
 
   let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
+}
+
+def HTile_MaskedParallelInsertSliceOp
+    : Op<HTile_Dialect, "masked_parallel_insert_slice", [
+        AttrSizedOperandSegments,
+        OffsetSizeAndStrideOpInterface,
+        DeclareOpInterfaceMethods<ParallelCombiningOpInterface,
+                                  ["getUpdatedDestinations", "getIteratingParent"]>
+      ]> {
+  let summary = "publish a masked tensor slice to an scf.forall result";
+  let description = [{
+    Contributes `source` to a slice of the shared `dest` tensor of an enclosing
+    `scf.forall`. The operation must be directly nested in the forall's
+    `scf.forall.in_parallel` terminator.
+
+    The slice descriptor and rank-reduction behavior match
+    `tensor.parallel_insert_slice`. The `mask` has the source shape and an `i1`
+    element type. A true mask element publishes the corresponding source
+    element. A false mask element leaves the destination unchanged and does not
+    access the corresponding destination address, even when that address would
+    be out of bounds. An address selected by a true mask element must be in
+    bounds.
+
+    As with `tensor.parallel_insert_slice`, conflicting parallel publications
+    have undefined behavior.
+  }];
+
+  let arguments = (ins AnyRankedTensor:$source,
+                       AnyRankedTensor:$dest,
+                       Variadic<Index>:$offsets,
+                       Variadic<Index>:$sizes,
+                       Variadic<Index>:$strides,
+                       AnyRankedTensor:$mask,
+                       DenseI64ArrayAttr:$static_offsets,
+                       DenseI64ArrayAttr:$static_sizes,
+                       DenseI64ArrayAttr:$static_strides);
+
+  let assemblyFormat = [{
+    $source `into` $dest ``
+    custom<DynamicIndexList>($offsets, $static_offsets)
+    custom<DynamicIndexList>($sizes, $static_sizes)
+    custom<DynamicIndexList>($strides, $static_strides)
+    `mask` `(` $mask `:` type($mask) `)`
+    attr-dict `:` type($source) `into` type($dest)
+  }];
+
+  let extraClassDeclaration = [{
+    ::mlir::RankedTensorType getSourceType() {
+      return ::llvm::cast<::mlir::RankedTensorType>(getSource().getType());
+    }
+
+    ::mlir::RankedTensorType getDestType() {
+      return ::llvm::cast<::mlir::RankedTensorType>(getDest().getType());
+    }
+
+    std::array<unsigned, 3> getArrayAttrMaxRanks() {
+      unsigned rank = getDestType().getRank();
+      return {rank, rank, rank};
+    }
+
+    static unsigned getOffsetSizeAndStrideStartOperandIndex() { return 2; }
+  }];
+
+  let builders = [
+    OpBuilder<(ins "::mlir::Value":$source, "::mlir::Value":$dest,
+      "::llvm::ArrayRef<::mlir::OpFoldResult>":$offsets,
+      "::llvm::ArrayRef<::mlir::OpFoldResult>":$sizes,
+      "::llvm::ArrayRef<::mlir::OpFoldResult>":$strides, "::mlir::Value":$mask,
+      CArg<"::llvm::ArrayRef<::mlir::NamedAttribute>", "{}">:$attrs)>
+  ];
+
+  let hasVerifier = 1;
 }
 
 def HTile_ParallelScatterOp
