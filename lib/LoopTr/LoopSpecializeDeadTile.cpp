@@ -249,6 +249,14 @@ private:
   }
 };
 
+enum class RelationKind : uint8_t { LE, LT, GE, GT };
+
+struct NecessaryLiveRelation {
+  AffineBound lhs;
+  AffineBound rhs;
+  RelationKind kind;
+};
+
 template <typename T, std::enable_if_t<!std::is_same_v<T, Attribute>, int> = 0>
 struct AbstractValueData {
   std::variant<Attribute, T, std::nullopt_t> value;
@@ -317,6 +325,9 @@ using AbstractValue = AbstractValueData<Value>;
 struct AffineInterval {
   // Semantics: [lower, upper), with absent endpoints meaning unbounded.
   std::optional<AffineBound> lower{}, upper{};
+  // Relations independent of the selected IV guard the entire interval. They
+  // arise, for example, when a query-tile predicate guards a key-tile loop.
+  SmallVector<NecessaryLiveRelation> guards;
   // We don't have a good way to represent an empty interval with just lower and upper.
   // (A {std::nullopt, std::nullopt} interval would technically mean (-∞, +∞).)
   // Use the `empty` flag to represent an empty interval.
@@ -383,6 +394,35 @@ FailureOr<Value> materializeAffineBound(RewriterBase &rewriter, scf::ForOp loop,
   return affine::AffineApplyOp::create(rewriter, loop.getLoc(), bound.map, operands).getResult();
 }
 
+FailureOr<Value> materializeRelation(RewriterBase &rewriter, scf::ForOp loop,
+                                     const NecessaryLiveRelation &relation,
+                                     DominanceInfo &dominance,
+                                     DenseMap<Value, Value> &normalizedOperands) {
+  FailureOr<Value> lhs =
+      materializeAffineBound(rewriter, loop, relation.lhs, dominance, normalizedOperands);
+  FailureOr<Value> rhs =
+      materializeAffineBound(rewriter, loop, relation.rhs, dominance, normalizedOperands);
+  if (failed(lhs) || failed(rhs))
+    return failure();
+
+  arith::CmpIPredicate predicate;
+  switch (relation.kind) {
+  case RelationKind::LE:
+    predicate = arith::CmpIPredicate::sle;
+    break;
+  case RelationKind::LT:
+    predicate = arith::CmpIPredicate::slt;
+    break;
+  case RelationKind::GE:
+    predicate = arith::CmpIPredicate::sge;
+    break;
+  case RelationKind::GT:
+    predicate = arith::CmpIPredicate::sgt;
+    break;
+  }
+  return arith::CmpIOp::create(rewriter, loop.getLoc(), predicate, *lhs, *rhs).getResult();
+}
+
 Value minOrMaxIndexValue(RewriterBase &rewriter, Location loc, Value lhs, Value rhs, bool isMax) {
   if (isMax)
     return arith::MaxSIOp::create(rewriter, loc, lhs, rhs).getResult();
@@ -391,7 +431,8 @@ Value minOrMaxIndexValue(RewriterBase &rewriter, Location loc, Value lhs, Value 
 
 FailureOr<std::pair<Value, Value>>
 materializeIntervalBounds(RewriterBase &rewriter, scf::ForOp loop, const AffineInterval &interval,
-                          DominanceInfo &dominance, DenseMap<Value, Value> &normalizedOperands) {
+                          DominanceInfo &dominance, DenseMap<Value, Value> &normalizedOperands,
+                          Value emptyPoint = {}) {
   Location loc = loop.getLoc();
   Value lower = loop.getLowerBound();
   Value upper = interval.empty ? loop.getLowerBound() : loop.getUpperBound();
@@ -414,6 +455,21 @@ materializeIntervalBounds(RewriterBase &rewriter, scf::ForOp loop, const AffineI
   lower = minOrMaxIndexValue(rewriter, loc, lower, loop.getUpperBound(), /*isMax=*/false);
   upper = minOrMaxIndexValue(rewriter, loc, upper, loop.getLowerBound(), /*isMax=*/true);
   upper = minOrMaxIndexValue(rewriter, loc, upper, loop.getUpperBound(), /*isMax=*/false);
+
+  // IV-independent relations are runtime preconditions for this whole interval.
+  // Force an empty half-open interval when any such precondition is false. A
+  // suffix interval uses its predecessor's upper bound as the empty point.
+  Value guard;
+  for (const NecessaryLiveRelation &relation : interval.guards) {
+    FailureOr<Value> next =
+        materializeRelation(rewriter, loop, relation, dominance, normalizedOperands);
+    if (failed(next))
+      return failure();
+    guard = guard ? arith::AndIOp::create(rewriter, loc, guard, *next).getResult() : *next;
+  }
+  if (guard)
+    upper = arith::SelectOp::create(rewriter, loc, guard, upper, emptyPoint ? emptyPoint : lower)
+                .getResult();
   return {{lower, upper}};
 }
 
@@ -484,7 +540,6 @@ AbstractValue getKnownState(Value value, const DenseMap<Value, AbstractValue> &s
   return AbstractValue::getUnknown();
 }
 
-enum class RelationKind : uint8_t { LE, LT, GE, GT };
 enum class LiveRelationStrength : uint8_t {
   // An iteration outside this interval is definitely dead. This is used to
   // truncate a suffix whose loop-carried state would not change.
@@ -492,12 +547,6 @@ enum class LiveRelationStrength : uint8_t {
   // Every element in the producer tile is live. This is the mask-free interval
   // where the dead-select producer can be bypassed entirely.
   FullyLive
-};
-
-struct NecessaryLiveRelation {
-  AffineBound lhs;
-  AffineBound rhs;
-  RelationKind kind;
 };
 
 FailureOr<NecessaryLiveRelation> getLiveRelation(PredicateAtom atom, linalg::GenericOp generic,
@@ -585,15 +634,26 @@ LogicalResult addNecessaryLiveConstraint(const NecessaryLiveRelation &relation,
 
 FailureOr<AffineInterval> getIvIntervalFromRelations(ArrayRef<NecessaryLiveRelation> relations,
                                                      Value iv) {
-  llvm::SetVector<Value> operandSet;
+  SmallVector<NecessaryLiveRelation> ivRelations, guards;
   for (const NecessaryLiveRelation &relation : relations) {
+    auto containsIv = [&](const AffineBound &bound) {
+      return llvm::is_contained(bound.operands, iv);
+    };
+    if (containsIv(relation.lhs) || containsIv(relation.rhs))
+      ivRelations.push_back(relation);
+    else
+      guards.push_back(relation);
+  }
+  if (ivRelations.empty())
+    return failure();
+
+  llvm::SetVector<Value> operandSet;
+  for (const NecessaryLiveRelation &relation : ivRelations) {
     for (Value value : relation.lhs.operands)
       operandSet.insert(value);
     for (Value value : relation.rhs.operands)
       operandSet.insert(value);
   }
-  if (!operandSet.contains(iv))
-    return failure();
 
   SmallVector<Value> operands;
   operands.push_back(iv);
@@ -609,12 +669,12 @@ FailureOr<AffineInterval> getIvIntervalFromRelations(ArrayRef<NecessaryLiveRelat
   affine::FlatAffineValueConstraints constraints(/*numDims=*/1,
                                                  /*numSymbols=*/operands.size() - 1,
                                                  /*numLocals=*/0, dimAndSymbolValues);
-  for (const NecessaryLiveRelation &relation : relations) {
+  for (const NecessaryLiveRelation &relation : ivRelations) {
     if (failed(addNecessaryLiveConstraint(relation, constraints)))
       return failure();
   }
   if (constraints.isEmpty())
-    return AffineInterval{.empty = true};
+    return AffineInterval{.guards = std::move(guards), .empty = true};
 
   unsigned ivPos;
   if (!constraints.findVar(iv, &ivPos))
@@ -648,7 +708,7 @@ FailureOr<AffineInterval> getIvIntervalFromRelations(ArrayRef<NecessaryLiveRelat
     if (ubMap.getNumResults() == 1)
       upper = AffineBound{ubMap, boundOperands}.offset(1);
   }
-  return AffineInterval{lower, upper};
+  return AffineInterval{lower, upper, std::move(guards)};
 }
 
 std::optional<unsigned> getGenericInputArgNumber(Value value, linalg::GenericOp generic) {
@@ -1170,8 +1230,8 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
 
   Value possiblyLiveUpper = loop.getUpperBound();
   if (canTruncateDeadSuffix) {
-    auto possiblyLiveBounds = materializeIntervalBounds(rewriter, loop, *possibleLiveInterval,
-                                                        dominance, normalizedOperands);
+    auto possiblyLiveBounds = materializeIntervalBounds(
+        rewriter, loop, *possibleLiveInterval, dominance, normalizedOperands, fullyLiveUpper);
     if (failed(possiblyLiveBounds))
       BAIL("failed to materialize the fully-dead suffix lower bound");
     possiblyLiveUpper = possiblyLiveBounds->second;
