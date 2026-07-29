@@ -74,16 +74,36 @@ def doc_offset_attention(
     def one_doc_attention(q_doc, k_doc, v_doc, doc_len):
         """Dense masked attention for one logical document window."""
 
-        scores = jnp.einsum("ihd,jhd->hij", q_doc, k_doc, preferred_element_type=jnp.float32)
-        scores = scores * scale
+        # Compute ihd @ jhd -> hij.
+        # The `dimension_numbers` argument is (
+        #   (lhs_contracting_dims, rhs_contracting_dims),
+        #   (lhs_batch_dims, rhs_batch_dims)).
+        # And the output order is determined: batch dims first, then lhs non-contracting dims,
+        # then rhs non-contracting dims.
+        # We are using lax.dot over jnp.einsum because lax.dot lowers directly to stablehlo.dot_general,
+        # while jnp.einsum may favor a different (equivalent) order for the contraction.
+        scores_hij = lax.dot(
+            q_doc,
+            k_doc,
+            dimension_numbers=(([2], [2]), ([1], [1])),
+            preferred_element_type=jnp.float32,
+        )
+        scores_hij = scores_hij * scale
         valid_tokens = token_offsets < doc_len
         key_valid = valid_tokens.reshape(1, 1, L0)
         # Padded query rows are scattered to out-of-bounds sink indices and
         # dropped, so only key positions need to be masked for valid outputs.
-        scores = jnp.where(key_valid, scores, -jnp.inf)
-        probs = jax.nn.softmax(scores, axis=-1).astype(q_doc.dtype)
-        out_doc_f32 = jnp.einsum("hij,jhd->ihd", probs, v_doc, preferred_element_type=jnp.float32)
-        return out_doc_f32.astype(q.dtype)
+        scores_hij = jnp.where(key_valid, scores_hij, -jnp.inf)
+        probs_hij = jax.nn.softmax(scores_hij, axis=-1).astype(q_doc.dtype)
+        # Compute hij @ jhd -> hid.
+        out_hid = lax.dot(
+            probs_hij,
+            v_doc,
+            dimension_numbers=(([2], [0]), ([0], [1])),
+            preferred_element_type=jnp.float32,
+        )
+        out_ihd = out_hid.transpose(1, 0, 2)
+        return out_ihd.astype(q.dtype)
 
     q_docs, k_docs, v_docs = [masked_load_docs(x) for x in (q, k, v)]
 

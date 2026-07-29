@@ -149,8 +149,8 @@ module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo
     %37 = stablehlo.broadcast_in_dim %36, dims = [0, 1, 2, 3] : (tensor<8x4x128x1xf32>) -> tensor<8x4x128x128xf32>
     %38 = stablehlo.divide %34, %37 : tensor<8x4x128x128xf32>
     %39 = stablehlo.convert %38 : (tensor<8x4x128x128xf32>) -> tensor<8x4x128x128xf16>
-    %40 = stablehlo.dot_general %15, %39, batching_dims = [0, 2] x [0, 1], contracting_dims = [1] x [3], precision = [DEFAULT, DEFAULT] : (tensor<8x128x4x64xf16>, tensor<8x4x128x128xf16>) -> tensor<8x4x64x128xf32>
-    %41 = stablehlo.transpose %40, dims = [0, 3, 1, 2] : (tensor<8x4x64x128xf32>) -> tensor<8x128x4x64xf32>
+    %40 = stablehlo.dot_general %39, %15, batching_dims = [0, 1] x [0, 2], contracting_dims = [3] x [1], precision = [DEFAULT, DEFAULT] : (tensor<8x4x128x128xf16>, tensor<8x128x4x64xf16>) -> tensor<8x4x128x64xf32>
+    %41 = stablehlo.transpose %40, dims = [0, 2, 1, 3] : (tensor<8x4x128x64xf32>) -> tensor<8x128x4x64xf32>
     %42 = stablehlo.convert %41 : (tensor<8x128x4x64xf32>) -> tensor<8x128x4x64xf16>
     %43 = stablehlo.iota dim = 0 : tensor<8xi32>
     %44 = stablehlo.compare GT, %20, %7, SIGNED : (tensor<8x128xi32>, tensor<8x128xi32>) -> tensor<8x128xi1>
