@@ -98,6 +98,16 @@ module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo
     } : !any
     transform.apply_cse to %func : !any
 
+    // Difference from dense attention (3): run LICM before specialize-dead-tile.
+    // LICM is needed to move `doc_len[b]` and `doc_len[b+1]` out of the inner loop,
+    // so the reduced loop range can be computed over these values.
+    transform.apply_licm to %j0_loop : !any
+    %live_loop, %mixed_loop = transform.loop.specialize_dead_tile in %j0_loop
+        {dead_value = 0xFF800000 : f32} : (!any) -> (!any, !any)
+    transform.apply_patterns to %func {
+      transform.apply_patterns.canonicalization
+    } : !any
+
     transform.yield
   }
 

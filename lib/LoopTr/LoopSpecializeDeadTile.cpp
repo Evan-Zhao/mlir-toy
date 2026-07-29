@@ -11,12 +11,12 @@
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
-#include <mlir/IR/Builders.h>
 #include <optional>
 #include <variant>
 
@@ -71,15 +71,10 @@ struct MatchedDeadSelect {
   std::optional<unsigned> liveInputOperandNumber;
 };
 
-struct AffineScalarExpr {
-  AffineExpr expr;
-  SmallVector<Value> values;
-};
-
 class AffineScalarBuilder {
 public:
-  AffineScalarBuilder(MLIRContext *context, unsigned numIndexDims)
-      : context(context), numIndexDims(numIndexDims) {}
+  explicit AffineScalarBuilder(linalg::GenericOp generic)
+      : generic(generic), context(generic.getContext()), numIndexDims(generic.getNumLoops()) {}
 
   FailureOr<AffineExpr> getExpr(Value value) {
     if (auto index = value.getDefiningOp<linalg::IndexOp>())
@@ -120,12 +115,27 @@ public:
         return getAffineConstantExpr(intAttr.getInt(), context);
     }
 
-    if (!value.getType().isIndex())
-      return failure();
+    // A block argument should not be used as is. When we materialize the affine expr to be the
+    // range of the loop (later), it will be materialized in an outer scope without access to this
+    // block argument. If the block argument is an argument of our current linalg.generic op, map
+    // it to the corresponding input operand.
+    // NOTE: this doesn't say anything about dominance yet. We'll do a dominance check when the
+    // materialization happens.
+    if (auto blockArg = dyn_cast<BlockArgument>(value);
+        blockArg && blockArg.getOwner() == generic.getBlock()) {
+      FailureOr<Value> symbol = getLinalgIterationInvariantInput(blockArg);
+      if (failed(symbol))
+        return failure();
+      return getAffineSymbolExpr(getOrAddValueSymbol(*symbol), context);
+    }
+
+    if (!value.getType().isIntOrIndex())
+      return generic.emitError() << "unsupported affine predicate leaf of type " << value.getType()
+                                 << ": " << value;
+    // Integer symbols are kept in their source type during Presburger analysis;
+    // only symbols that survive into a loop bound are cast to index.
     return getAffineSymbolExpr(getOrAddValueSymbol(value), context);
   }
-
-  AffineScalarExpr build(AffineExpr expr) const { return {expr, values}; }
 
   unsigned getNumIndexDims() const { return numIndexDims; }
   unsigned getNumDims() const { return numIndexDims; }
@@ -133,6 +143,30 @@ public:
   ArrayRef<Value> getValues() const { return values; }
 
 private:
+  // Resolve an input that is constant with respect to the Linalg iteration
+  // space. This does not require the input to be a compile-time constant.
+  FailureOr<Value> getLinalgIterationInvariantInput(BlockArgument blockArg) {
+    OpOperand *input = generic.getMatchingOpOperand(blockArg);
+    if (!generic.isDpsInput(input))
+      return generic.emitError() << "cannot use linalg output block argument #"
+                                 << blockArg.getArgNumber() << " as an affine predicate symbol";
+
+    // A zero-result map supplies one scalar value uniformly to the entire tile.
+    if (generic.getMatchingIndexingMap(input).getNumResults() != 0)
+      return generic.emitError() << "expected affine predicate input #" << input->getOperandNumber()
+                                 << " to be uniform across the linalg iteration space";
+    Value value = input->get();
+    if (value.getType().isIntOrIndex())
+      return value;
+    auto tensorType = dyn_cast<RankedTensorType>(value.getType());
+    if (!tensorType || tensorType.getRank() != 0 || !tensorType.getElementType().isIntOrIndex())
+      return generic.emitError() << "expected uniform affine predicate input #"
+                                 << input->getOperandNumber()
+                                 << " to be an integer scalar or rank-zero integer tensor, got "
+                                 << value.getType();
+    return value;
+  }
+
   unsigned getOrAddValueSymbol(Value value) {
     auto it = valueSymbols.find(value);
     if (it != valueSymbols.end())
@@ -144,6 +178,7 @@ private:
     return symbol;
   }
 
+  linalg::GenericOp generic;
   MLIRContext *context;
   unsigned numIndexDims;
   SmallVector<Value> values;
@@ -161,14 +196,14 @@ struct AffineBound {
             operands};
   }
 
-  static FailureOr<AffineBound> project(const AffineScalarExpr &expr, linalg::GenericOp generic,
-                                        bool lowerBound) {
+  static FailureOr<AffineBound> project(const AffineExpr &expr, ArrayRef<Value> values,
+                                        linalg::GenericOp generic, bool lowerBound) {
     MLIRContext *context = generic.getContext();
     unsigned numIndexDims = generic.getNumLoops();
-    unsigned numSymbols = expr.values.size();
+    unsigned numSymbols = values.size();
 
     SmallVector<std::optional<Value>> dimValues(numIndexDims, std::nullopt);
-    for (Value value : expr.values)
+    for (Value value : values)
       dimValues.push_back(value);
 
     affine::FlatAffineValueConstraints constraints(numIndexDims, numSymbols,
@@ -176,7 +211,7 @@ struct AffineBound {
     if (failed(addStaticIndexDomain(constraints, generic.getStaticLoopRanges())))
       return failure();
 
-    AffineMap exprMap = simplifyAffineMap(AffineMap::get(numIndexDims, numSymbols, expr.expr));
+    AffineMap exprMap = simplifyAffineMap(AffineMap::get(numIndexDims, numSymbols, expr));
     if (failed(constraints.composeMatchingMap(exprMap)))
       return failure();
 
@@ -288,11 +323,64 @@ struct AffineInterval {
   bool empty{false};
 };
 
-FailureOr<Value> materializeAffineBound(RewriterBase &rewriter, Location loc,
-                                        const AffineBound &bound) {
+FailureOr<Value> normalizeBoundOperand(RewriterBase &rewriter, scf::ForOp loop, Value value,
+                                       DominanceInfo &dominance,
+                                       DenseMap<Value, Value> &normalizedOperands) {
+  // Fully-live and possible-live intervals commonly share symbols. Reuse the
+  // extraction and cast emitted while materializing the first interval.
+  if (Value normalized = normalizedOperands.lookup(value))
+    return normalized;
+  if (!dominance.dominates(value, loop))
+    return loop.emitError() << "affine bound operand does not dominate the loop: " << value;
+
+  Value source = value;
+  Type type = value.getType();
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(loop);
+  if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
+    if (tensorType.getRank() != 0 || !tensorType.getElementType().isIntOrIndex())
+      return loop.emitError()
+             << "expected affine bound tensor operand to be a rank-zero integer tensor, got "
+             << type;
+    // Affine maps take scalar index operands, while StableHLO-derived uniform
+    // values arrive as rank-zero integer tensors. A rank-zero extract_slice
+    // denotes one source element, so read that element directly.
+    if (auto slice = value.getDefiningOp<tensor::ExtractSliceOp>()) {
+      SmallVector<Value> indices =
+          getValueOrCreateConstantIndexOp(rewriter, loop.getLoc(), slice.getMixedOffsets());
+      value = tensor::ExtractOp::create(rewriter, loop.getLoc(), slice.getSource(), indices);
+    } else {
+      value = tensor::ExtractOp::create(rewriter, loop.getLoc(), value, ValueRange{});
+    }
+    type = tensorType.getElementType();
+  }
+  if (!type.isIntOrIndex())
+    return loop.emitError() << "expected an integer affine bound operand, got " << type;
+  if (!type.isIndex())
+    value = arith::IndexCastOp::create(rewriter, loop.getLoc(), rewriter.getIndexType(), value);
+  if (!affine::isValidSymbol(value, loop->getParentRegion()))
+    return loop.emitError() << "normalized affine bound operand is not a valid symbol: " << value;
+
+  normalizedOperands[source] = value;
+  return value;
+}
+
+FailureOr<Value> materializeAffineBound(RewriterBase &rewriter, scf::ForOp loop,
+                                        const AffineBound &bound, DominanceInfo &dominance,
+                                        DenseMap<Value, Value> &normalizedOperands) {
   if (!bound.map || bound.map.getNumResults() != 1)
-    return failure();
-  return affine::AffineApplyOp::create(rewriter, loc, bound.map, bound.operands).getResult();
+    return loop.emitError("expected a single-result affine bound map");
+
+  SmallVector<Value> operands;
+  operands.reserve(bound.operands.size());
+  for (Value operand : bound.operands) {
+    FailureOr<Value> normalized =
+        normalizeBoundOperand(rewriter, loop, operand, dominance, normalizedOperands);
+    if (failed(normalized))
+      return failure();
+    operands.push_back(*normalized);
+  }
+  return affine::AffineApplyOp::create(rewriter, loop.getLoc(), bound.map, operands).getResult();
 }
 
 Value minOrMaxIndexValue(RewriterBase &rewriter, Location loc, Value lhs, Value rhs, bool isMax) {
@@ -302,18 +390,21 @@ Value minOrMaxIndexValue(RewriterBase &rewriter, Location loc, Value lhs, Value 
 }
 
 FailureOr<std::pair<Value, Value>>
-materializeIntervalBounds(RewriterBase &rewriter, scf::ForOp loop, const AffineInterval &interval) {
+materializeIntervalBounds(RewriterBase &rewriter, scf::ForOp loop, const AffineInterval &interval,
+                          DominanceInfo &dominance, DenseMap<Value, Value> &normalizedOperands) {
   Location loc = loop.getLoc();
   Value lower = loop.getLowerBound();
   Value upper = interval.empty ? loop.getLowerBound() : loop.getUpperBound();
   if (!interval.empty && interval.lower) {
-    FailureOr<Value> bound = materializeAffineBound(rewriter, loc, *interval.lower);
+    FailureOr<Value> bound =
+        materializeAffineBound(rewriter, loop, *interval.lower, dominance, normalizedOperands);
     if (failed(bound))
       return failure();
     lower = *bound;
   }
   if (!interval.empty && interval.upper) {
-    FailureOr<Value> bound = materializeAffineBound(rewriter, loc, *interval.upper);
+    FailureOr<Value> bound =
+        materializeAffineBound(rewriter, loop, *interval.upper, dominance, normalizedOperands);
     if (failed(bound))
       return failure();
     upper = *bound;
@@ -415,18 +506,17 @@ FailureOr<NecessaryLiveRelation> getLiveRelation(PredicateAtom atom, linalg::Gen
   if (!atom.liveWhenCmpIsTrue)
     predicate = arith::invertPredicate(predicate);
 
-  AffineScalarBuilder affineBuilder(generic.getContext(), generic.getNumLoops());
+  AffineScalarBuilder affineBuilder(generic);
   FailureOr<AffineExpr> lhsExpr = affineBuilder.getExpr(atom.cmp.getLhs());
   FailureOr<AffineExpr> rhsExpr = affineBuilder.getExpr(atom.cmp.getRhs());
   if (failed(lhsExpr) || failed(rhsExpr))
-    return failure();
+    return atom.cmp.emitError() << "failed to convert comparison operands to affine expressions";
 
-  AffineScalarExpr lhs = {*lhsExpr, llvm::to_vector(affineBuilder.getValues())};
-  AffineScalarExpr rhs = {*rhsExpr, llvm::to_vector(affineBuilder.getValues())};
-  FailureOr<AffineBound> lhsLower = AffineBound::project(lhs, generic, /*lowerBound=*/true),
-                         lhsUpper = AffineBound::project(lhs, generic, /*lowerBound=*/false),
-                         rhsLower = AffineBound::project(rhs, generic, /*lowerBound=*/true),
-                         rhsUpper = AffineBound::project(rhs, generic, /*lowerBound=*/false);
+  auto values = llvm::to_vector(affineBuilder.getValues());
+  auto lhsLower = AffineBound::project(*lhsExpr, values, generic, /*lowerBound=*/true),
+       lhsUpper = AffineBound::project(*lhsExpr, values, generic, /*lowerBound=*/false),
+       rhsLower = AffineBound::project(*rhsExpr, values, generic, /*lowerBound=*/true),
+       rhsUpper = AffineBound::project(*rhsExpr, values, generic, /*lowerBound=*/false);
   if (failed(lhsLower) || failed(lhsUpper) || failed(rhsLower) || failed(rhsUpper))
     return failure();
 
@@ -1058,7 +1148,10 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
     BAIL("expected producer live value to come from an input with the same indexing as the output");
 
   rewriter.setInsertionPoint(loop);
-  auto fullyLiveBounds = materializeIntervalBounds(rewriter, loop, *fullyLiveInterval);
+  DominanceInfo dominance(loop->getParentOp());
+  DenseMap<Value, Value> normalizedOperands;
+  auto fullyLiveBounds =
+      materializeIntervalBounds(rewriter, loop, *fullyLiveInterval, dominance, normalizedOperands);
   if (failed(fullyLiveBounds))
     BAIL("failed to materialize the fully-live prefix upper bound");
   auto [fullyLiveLower, fullyLiveUpper] = *fullyLiveBounds;
@@ -1077,7 +1170,8 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
 
   Value possiblyLiveUpper = loop.getUpperBound();
   if (canTruncateDeadSuffix) {
-    auto possiblyLiveBounds = materializeIntervalBounds(rewriter, loop, *possibleLiveInterval);
+    auto possiblyLiveBounds = materializeIntervalBounds(rewriter, loop, *possibleLiveInterval,
+                                                        dominance, normalizedOperands);
     if (failed(possiblyLiveBounds))
       BAIL("failed to materialize the fully-dead suffix lower bound");
     possiblyLiveUpper = possiblyLiveBounds->second;
