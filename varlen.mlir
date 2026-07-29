@@ -115,8 +115,8 @@ module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo
     transform.htile.linalg_to_semantic %func : !any
     %launches, %kernels = transform.htile.outline_kernels %forall_loop
         {kernel_names = ["attention_kernel"]} : (!any) -> (!any, !any)
-    // transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
-    // transform.verify %func : !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+    transform.verify %func : !any
     transform.yield
   }
 

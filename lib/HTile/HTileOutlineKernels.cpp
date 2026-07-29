@@ -93,6 +93,20 @@ LogicalResult materializeStoreForInsertSlice(RewriterBase &rewriter,
   return success();
 }
 
+LogicalResult materializeStoreForInsertSlice(RewriterBase &rewriter,
+                                             htile::MaskedParallelInsertSliceOp insert,
+                                             Value buffer) {
+  if (insert.getSourceType().getRank() != insert.getDestType().getRank())
+    return insert.emitError() << "unsupported rank-reduced masked publication";
+  if (!insert.hasUnitStride())
+    return insert.emitError() << "unsupported non-unit htile.masked_parallel_insert_slice stride";
+  SmallVector<Value> offsets =
+      getValueOrCreateConstantIndexOp(rewriter, insert.getLoc(), insert.getMixedOffsets());
+  htile::StoreOp::create(rewriter, insert.getLoc(), insert.getSource(), buffer, offsets,
+                         insert.getMask());
+  return success();
+}
+
 FailureOr<Value> materializeLoadForExtractSlice(OpBuilder &builder, tensor::ExtractSliceOp extract,
                                                 Value buffer, bool emitHTileLoad) {
   if (emitHTileLoad) {
@@ -139,11 +153,12 @@ LogicalResult bufferizeForallResults(RewriterBase &rewriter, ArrayRef<scf::Foral
   for (auto forall : forallOps) {
     // Create a memref buffer for each result tensor and map it to the tensor.
     for (OpResult result : forall->getResults()) {
+      size_t resultNum = result.getResultNumber();
       auto tensorType = dyn_cast<RankedTensorType>(result.getType());
       if (!tensorType)
         continue;
       if (!tensorType.hasStaticShape())
-        return forall.emitError() << "result # " << result.getResultNumber()
+        return forall.emitError() << "result # " << resultNum
                                   << " of this forall is a ranked tensor with dynamic shape";
       // Allocate the buffer before the forall loop.
       rewriter.setInsertionPoint(forall);
@@ -151,24 +166,42 @@ LogicalResult bufferizeForallResults(RewriterBase &rewriter, ArrayRef<scf::Foral
       auto buffer = memref::AllocOp::create(rewriter, forall.getLoc(), memrefType);
       map.mapTensorToMemref(result, buffer);
       map.mapTensorToMemref(forall.getTiedBlockArgument(result), buffer);
+
+      // Preserve the initial value of the tensor by copying it into the buffer before the forall.
+      Value initialTensor = forall.getOutputs()[resultNum];
+      if (!initialTensor.getDefiningOp<tensor::EmptyOp>()) {
+        Value initialBuffer = map.getOrCreateTensorMemrefForRead(rewriter, forall, initialTensor);
+        rewriter.setInsertionPoint(forall);
+        memref::CopyOp::create(rewriter, forall.getLoc(), initialBuffer, buffer);
+      }
     }
 
-    // Materialize each tensor.parallel_insert_slice op into a memref store.
-    // Insert the memref store ops before the forall terminator (i.e. not in in_parallel region).
+    // Materialize each slice publication into a memref store. Insert the stores
+    // before the forall terminator rather than inside the in_parallel region.
     rewriter.setInsertionPoint(forall.getTerminator());
     for (Operation &combiningOp : llvm::make_early_inc_range(forall.getTerminator())) {
-      auto insert = dyn_cast<tensor::ParallelInsertSliceOp>(&combiningOp);
-      if (!insert)
-        return combiningOp.emitError() << "expected forall in_parallel region to only have "
-                                          "tensor.parallel_insert_slice ops";
-      auto dest = insert.getDest();
-      auto buffer = map.getTensorMemref(dest);
-      if (!buffer)
-        return insert.emitError()
-               << "this op doesn't publish to a tensor-typed block argument of the loop";
-      if (failed(materializeStoreForInsertSlice(rewriter, insert, buffer)))
-        return failure();
-      rewriter.eraseOp(insert);
+      if (auto insert = dyn_cast<tensor::ParallelInsertSliceOp>(&combiningOp)) {
+        Value buffer = map.getTensorMemref(insert.getDest());
+        if (!buffer)
+          return insert.emitError()
+                 << "this op doesn't publish to a tensor-typed block argument of the loop";
+        if (failed(materializeStoreForInsertSlice(rewriter, insert, buffer)))
+          return failure();
+        rewriter.eraseOp(insert);
+        continue;
+      }
+      if (auto insert = dyn_cast<htile::MaskedParallelInsertSliceOp>(&combiningOp)) {
+        Value buffer = map.getTensorMemref(insert.getDest());
+        if (!buffer)
+          return insert.emitError()
+                 << "this op doesn't publish to a tensor-typed block argument of the loop";
+        if (failed(materializeStoreForInsertSlice(rewriter, insert, buffer)))
+          return failure();
+        rewriter.eraseOp(insert);
+        continue;
+      }
+      return combiningOp.emitError()
+             << "expected forall in_parallel region to contain only supported slice publications";
     }
   }
   return success();

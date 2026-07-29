@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter --split-input-file | FileCheck %s
+// RUN: neptune-opt %s --transform-interpreter --split-input-file --verify-diagnostics | FileCheck %s
 
 !any = !transform.any_op
 
@@ -118,3 +118,228 @@ module attributes {transform.with_named_sequence} {
 // CHECK: htile.store
 // CHECK: htile.store
 // CHECK: htile.return
+
+// -----
+
+!any = !transform.any_op
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !any) {
+    %func = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
+    %foralls = transform.structured.match ops{["scf.forall"]} in %func : (!any) -> !any
+    %launches, %kernels = transform.htile.outline_kernels %foralls
+        {kernel_names = ["preserve_initializer"]}
+        : (!any) -> (!any, !any)
+    transform.yield
+  }
+
+  func.func @preserve_shared_out_initializer() -> tensor<4xf32> {
+    %init = arith.constant dense<1.0> : tensor<4xf32>
+    %result = scf.forall (%i) in (2) shared_outs(%out = %init) -> tensor<4xf32> {
+      %tile = arith.constant dense<2.0> : tensor<1xf32>
+      scf.forall.in_parallel {
+        tensor.parallel_insert_slice %tile into %out[%i] [1] [1]
+            : tensor<1xf32> into tensor<4xf32>
+      }
+    }
+    return %result : tensor<4xf32>
+  }
+}
+
+// CHECK-LABEL: func.func @preserve_shared_out_initializer
+// CHECK: %[[INIT:.+]] = arith.constant dense<1.000000e+00> : tensor<4xf32>
+// CHECK: %[[RESULT_BUFFER:.+]] = memref.alloc() : memref<4xf32>
+// CHECK: %[[INIT_BUFFER:.+]] = bufferization.to_buffer %[[INIT]]
+// CHECK: memref.copy %[[INIT_BUFFER]], %[[RESULT_BUFFER]]
+// CHECK: htile.launch_func @preserve_initializer
+// CHECK: %[[RESULT:.+]] = bufferization.to_tensor %[[RESULT_BUFFER]]
+// CHECK: return %[[RESULT]] : tensor<4xf32>
+
+// CHECK-LABEL: htile.kernel @preserve_initializer
+// CHECK: htile.store
+// CHECK: htile.return
+
+// -----
+
+!any = !transform.any_op
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !any) {
+    %func = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
+    %foralls = transform.structured.match ops{["scf.forall"]} in %func : (!any) -> !any
+    %launches, %kernels = transform.htile.outline_kernels %foralls
+        {kernel_names = ["masked_publication"]}
+        : (!any) -> (!any, !any)
+    transform.yield
+  }
+
+  func.func @masked_publication() -> tensor<8x2x4xf32> {
+    %empty = tensor.empty() : tensor<8x2x4xf32>
+    %result = scf.forall (%head) in (2) shared_outs(%out = %empty)
+        -> tensor<8x2x4xf32> {
+      %source = arith.constant dense<1.0> : tensor<4x1x4xf32>
+      %mask = arith.constant dense<true> : tensor<4x1x4xi1>
+      scf.forall.in_parallel {
+        htile.masked_parallel_insert_slice
+            %source into %out[0, %head, 0] [4, 1, 4] [1, 1, 1]
+            mask(%mask : tensor<4x1x4xi1>)
+            : tensor<4x1x4xf32> into tensor<8x2x4xf32>
+      }
+    }
+    return %result : tensor<8x2x4xf32>
+  }
+}
+
+// CHECK-LABEL: func.func @masked_publication
+// CHECK: %[[RESULT_BUFFER:.+]] = memref.alloc() : memref<8x2x4xf32>
+// CHECK: htile.launch_func @masked_publication_0(%[[RESULT_BUFFER]])
+// CHECK: %[[RESULT:.+]] = bufferization.to_tensor %[[RESULT_BUFFER]]
+// CHECK: return %[[RESULT]] : tensor<8x2x4xf32>
+
+// CHECK-LABEL: htile.kernel @masked_publication_0
+// CHECK-SAME: %[[BUFFER:[^ ]+]] : memref<8x2x4xf32>
+// CHECK: %[[HEAD:[^ ]+]] = htile.program_id 0
+// CHECK: %[[SOURCE:.+]] = arith.constant dense<1.000000e+00> : tensor<4x1x4xf32>
+// CHECK: %[[MASK:.+]] = arith.constant dense<true> : tensor<4x1x4xi1>
+// CHECK: htile.store %[[SOURCE]], %[[BUFFER]][%{{.*}}, %[[HEAD]], %{{.*}}]
+// CHECK-SAME: mask(%[[MASK]] : tensor<4x1x4xi1>)
+// CHECK-SAME: tensor<4x1x4xf32>, memref<8x2x4xf32>
+// CHECK: htile.return
+
+// -----
+
+!any = !transform.any_op
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !any) {
+    %func = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
+    %foralls = transform.structured.match ops{["scf.forall"]} in %func : (!any) -> !any
+    // expected-error @below {{failed to validate selected scf.forall ops}}
+    %launches, %kernels = transform.htile.outline_kernels %foralls
+        {kernel_names = ["nested"]} : (!any) -> (!any, !any)
+    transform.yield
+  }
+
+  func.func @nested_forall(%flag: i1) {
+    scf.if %flag {
+      // expected-error @below {{expected selected scf.forall to be a top-level op directly inside func.func}}
+      scf.forall (%i) in (4) {
+        scf.forall.in_parallel {
+        }
+      }
+    }
+    return
+  }
+}
+
+// -----
+
+!any = !transform.any_op
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !any) {
+    %func = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
+    %foralls = transform.structured.match ops{["scf.forall"]} in %func : (!any) -> !any
+    // expected-error @below {{failed to create htile.kernel ops}}
+    %launches, %kernels = transform.htile.outline_kernels %foralls
+        {kernel_names = ["scalar_capture"]} : (!any) -> (!any, !any)
+    transform.yield
+  }
+
+  func.func @unsupported_scalar_capture(%scale: f32) -> tensor<4xf32> {
+    %empty = tensor.empty() : tensor<4xf32>
+    // expected-error @below {{unsupported non-memref kernel capture}}
+    %result = scf.forall (%i) in (4) shared_outs(%out = %empty) -> tensor<4xf32> {
+      %tile_empty = tensor.empty() : tensor<1xf32>
+      %tile = linalg.fill ins(%scale : f32) outs(%tile_empty : tensor<1xf32>)
+          -> tensor<1xf32>
+      scf.forall.in_parallel {
+        tensor.parallel_insert_slice %tile into %out[%i] [1] [1]
+            : tensor<1xf32> into tensor<4xf32>
+      }
+    }
+    return %result : tensor<4xf32>
+  }
+}
+
+// -----
+
+!any = !transform.any_op
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !any) {
+    %func = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
+    %foralls = transform.structured.match ops{["scf.forall"]} in %func : (!any) -> !any
+    // expected-error @below {{failed to create htile.kernel ops}}
+    %launches, %kernels = transform.htile.outline_kernels %foralls
+        {kernel_names = ["dynamic_bounds"]} : (!any) -> (!any, !any)
+    transform.yield
+  }
+
+  func.func @dynamic_bounds(%n: index) {
+    // expected-error @below {{expected static lower/upper/step for forall dimension 0}}
+    scf.forall (%i) in (%n) {
+      scf.forall.in_parallel {
+      }
+    }
+    return
+  }
+}
+
+// -----
+
+!any = !transform.any_op
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !any) {
+    %func = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
+    %foralls = transform.structured.match ops{["scf.forall"]} in %func : (!any) -> !any
+    // expected-error @below {{failed to bufferize forall results}}
+    %launches, %kernels = transform.htile.outline_kernels %foralls
+        {kernel_names = ["non_unit_masked_stride"]} : (!any) -> (!any, !any)
+    transform.yield
+  }
+
+  func.func @non_unit_masked_stride() -> tensor<4xf32> {
+    %empty = tensor.empty() : tensor<4xf32>
+    %result = scf.forall (%i) in (1) shared_outs(%out = %empty) -> tensor<4xf32> {
+      %source = arith.constant dense<1.0> : tensor<2xf32>
+      %mask = arith.constant dense<true> : tensor<2xi1>
+      scf.forall.in_parallel {
+        // expected-error @below {{unsupported non-unit htile.masked_parallel_insert_slice stride}}
+        htile.masked_parallel_insert_slice %source into %out[0] [2] [2]
+            mask(%mask : tensor<2xi1>) : tensor<2xf32> into tensor<4xf32>
+      }
+    }
+    return %result : tensor<4xf32>
+  }
+}
+
+// -----
+
+!any = !transform.any_op
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !any) {
+    %func = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
+    %foralls = transform.structured.match ops{["scf.forall"]} in %func : (!any) -> !any
+    // expected-error @below {{failed to bufferize forall results}}
+    %launches, %kernels = transform.htile.outline_kernels %foralls
+        {kernel_names = ["rank_reduced_masked_publication"]} : (!any) -> (!any, !any)
+    transform.yield
+  }
+
+  func.func @rank_reduced_masked_publication() -> tensor<4x1xf32> {
+    %empty = tensor.empty() : tensor<4x1xf32>
+    %result = scf.forall (%i) in (1) shared_outs(%out = %empty) -> tensor<4x1xf32> {
+      %source = arith.constant dense<1.0> : tensor<4xf32>
+      %mask = arith.constant dense<true> : tensor<4xi1>
+      scf.forall.in_parallel {
+        // expected-error @below {{unsupported rank-reduced masked publication}}
+        htile.masked_parallel_insert_slice %source into %out[0, 0] [4, 1] [1, 1]
+            mask(%mask : tensor<4xi1>) : tensor<4xf32> into tensor<4x1xf32>
+      }
+    }
+    return %result : tensor<4x1xf32>
+  }
+}
