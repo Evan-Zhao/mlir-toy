@@ -128,86 +128,9 @@ mlir::MutableOperandRange MaskedParallelInsertSliceOp::getUpdatedDestinations() 
 }
 
 mlir::Operation *MaskedParallelInsertSliceOp::getIteratingParent() {
-  if (auto combiningOp =
-          mlir::dyn_cast<mlir::InParallelOpInterface>(getOperation()->getParentOp()))
+  if (auto combiningOp = mlir::dyn_cast<mlir::InParallelOpInterface>(getOperation()->getParentOp()))
     return combiningOp->getParentOp();
   return nullptr;
-}
-
-mlir::MutableOperandRange ParallelScatterOp::getUpdatedDestinations() {
-  return getDestMutable();
-}
-
-mlir::Operation *ParallelScatterOp::getIteratingParent() {
-  if (auto combiningOp =
-          mlir::dyn_cast<mlir::InParallelOpInterface>(getOperation()->getParentOp()))
-    return combiningOp->getParentOp();
-  return nullptr;
-}
-
-static bool isValidIndexElementType(mlir::Type type) {
-  if (type.isIndex())
-    return true;
-  auto integerType = mlir::dyn_cast<mlir::IntegerType>(type);
-  return integerType && integerType.isSignless();
-}
-
-mlir::LogicalResult ParallelScatterOp::verify() {
-  if (!mlir::isa<mlir::InParallelOpInterface>(getOperation()->getParentOp()))
-    return emitOpError("must be directly nested in an in-parallel operation");
-  if (!getUnique())
-    return emitOpError("requires the 'unique' keyword");
-
-  auto sourceType = mlir::cast<mlir::RankedTensorType>(getSource().getType());
-  auto destType = mlir::cast<mlir::RankedTensorType>(getDest().getType());
-  if (sourceType.getElementType() != destType.getElementType())
-    return emitOpError("requires source and destination element types to match");
-  if (getIndices().size() != static_cast<size_t>(destType.getRank()))
-    return emitOpError("requires one index entry per destination dimension");
-
-  llvm::ArrayRef<int64_t> broadcastDims = getBroadcastDims();
-  int64_t previous = -1;
-  for (int64_t dim : broadcastDims) {
-    if (dim < 0 || dim >= destType.getRank())
-      return emitOpError("broadcast dimension ") << dim << " is outside destination rank "
-                                                  << destType.getRank();
-    if (dim <= previous)
-      return emitOpError("requires broadcast dimensions to be strictly increasing");
-    previous = dim;
-  }
-  if (broadcastDims.size() > static_cast<size_t>(sourceType.getRank()))
-    return emitOpError("has more broadcast dimensions than source dimensions");
-
-  int64_t batchRank = sourceType.getRank() - static_cast<int64_t>(broadcastDims.size());
-  for (auto [destDim, index] : llvm::enumerate(getIndices())) {
-    mlir::Type indexType = index.getType();
-    bool isBroadcastDim =
-        llvm::is_contained(broadcastDims, static_cast<int64_t>(destDim));
-    if (auto tensorType = mlir::dyn_cast<mlir::RankedTensorType>(indexType)) {
-      if (isBroadcastDim)
-        return emitOpError("requires the index for broadcast dimension ")
-               << destDim << " to be a scalar base offset";
-      if (!isValidIndexElementType(tensorType.getElementType()))
-        return emitOpError("requires tensor indices to have signless integer or index elements");
-      if (tensorType.getRank() > batchRank)
-        return emitOpError("index tensor rank exceeds source batch rank");
-      int64_t sourceDim = batchRank - tensorType.getRank();
-      for (int64_t indexDim = 0; indexDim < tensorType.getRank(); ++indexDim, ++sourceDim) {
-        int64_t indexExtent = tensorType.getDimSize(indexDim);
-        int64_t sourceExtent = sourceType.getDimSize(sourceDim);
-        if (indexExtent != 1 && indexExtent != mlir::ShapedType::kDynamic &&
-            sourceExtent != mlir::ShapedType::kDynamic && indexExtent != sourceExtent)
-          return emitOpError("index tensor dimension ")
-                 << indexDim << " does not broadcast to source batch dimension " << sourceDim;
-      }
-      continue;
-    }
-    if (!isValidIndexElementType(indexType))
-      return emitOpError("requires each index to be a scalar or ranked tensor of signless "
-                         "integer or index type");
-  }
-
-  return mlir::success();
 }
 
 mlir::LogicalResult BroadcastOp::verify() {

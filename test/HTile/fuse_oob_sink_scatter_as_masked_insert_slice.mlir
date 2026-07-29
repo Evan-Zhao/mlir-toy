@@ -35,7 +35,6 @@ module attributes {transform.with_named_sequence} {
   // CHECK: %[[MASK_INIT:.+]] = tensor.empty() : tensor<1x4xi1>
   // CHECK: %[[SOURCE_MASK:.+]] = linalg.broadcast ins(%[[MASK_TILE]] : tensor<1xi1>) outs(%[[MASK_INIT]] : tensor<1x4xi1>) dimensions = [1]
   // CHECK: htile.masked_parallel_insert_slice %[[SOURCE]] into %{{.*}}[%[[ROW]], 0] [1, 4] [1, 1] mask(%[[SOURCE_MASK]] : tensor<1x4xi1>)
-  // CHECK-NOT: htile.parallel_scatter
   // CHECK-NOT: "stablehlo.scatter"
   // CHECK-NOT: tensor.cast
   func.func @candidate(

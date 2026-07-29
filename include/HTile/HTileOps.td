@@ -352,51 +352,6 @@ def HTile_MaskedParallelInsertSliceOp
   let hasVerifier = 1;
 }
 
-def HTile_ParallelScatterOp
-    : Op<HTile_Dialect, "parallel_scatter", [
-        DeclareOpInterfaceMethods<ParallelCombiningOpInterface,
-                                  ["getUpdatedDestinations", "getIteratingParent"]>
-      ]> {
-  let summary = "scatter a tensor contribution into an scf.forall result";
-  let description = [{
-    Contributes `source` to the shared `dest` tensor of an enclosing
-    `scf.forall`. The operation must be directly nested in the forall's
-    `scf.forall.in_parallel` terminator.
-
-    There is one entry in `indices` per destination dimension. A ranked tensor
-    entry supplies indirect absolute coordinates and broadcasts over the
-    leading batch dimensions of `source`. A scalar entry supplies one absolute
-    coordinate. For dimensions listed in `broadcast_dims`, the corresponding
-    scalar is instead a base offset and the matching trailing source coordinate
-    is added to it. For example, indexing `tensor<NxHxF>` with
-    `[%rows, %head, %c0]` and `broadcast_dims([2])` has the semantics of the
-    NumPy expression `dest[rows, head, 0:F]`.
-
-    `unique` promises that the destination elements written by parallel
-    contributions do not overlap. Violating this promise is undefined
-    behavior. `out_of_bounds <discard>` specifies that a source element whose
-    destination coordinate is out of bounds does not update the destination.
-  }];
-
-  let arguments = (ins AnyRankedTensor:$source,
-                       AnyRankedTensor:$dest,
-                       Variadic<AnyType>:$indices,
-                       DenseI64ArrayAttr:$broadcast_dims,
-                       UnitAttr:$unique,
-                       HTile_ScatterOutOfBoundsAttr:$out_of_bounds);
-
-  let assemblyFormat = [{
-    $source `into` $dest `[` $indices `]`
-      `broadcast_dims` `(` $broadcast_dims `)`
-      (`unique` $unique^)?
-      `out_of_bounds` $out_of_bounds
-      attr-dict `:` `(` type($source) `,` type($indices) `)`
-      `->` `(` type($dest) `)`
-  }];
-
-  let hasVerifier = 1;
-}
-
 def HTile_StoreOp : Op<HTile_Dialect, "store"> {
   let summary = "store a tile to memory";
   let description = [{

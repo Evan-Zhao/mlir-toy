@@ -56,12 +56,10 @@ module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     // Difference from dense attention (1): fuse linalg ops post-loop upwards into the loop,
-    // then fuse stablehlo.scatter into the loop nest and transform it.
-    // This special fusion for scatter does not preserve the scatter op -- it creates a htile.parallel_scatter,
-    // placed in the parallel region of the forall loop.
+    // then fuse stablehlo.scatter into the loop nest as a masked slice publication.
     %scatter = transform.structured.match ops{["stablehlo.scatter"]} in %func : (!any) -> !any
     transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %scatter : (!any, !any) -> !any
-    %parallel_scatter =
+    %masked_insert_slice =
         transform.htile.fuse_oob_sink_scatter_as_masked_insert_slice %scatter into %forall_loop : (!any, !any) -> !any
 
     // Difference from dense attention (2): first fuse ordinary producer chains so ranged
