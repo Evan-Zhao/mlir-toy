@@ -12,12 +12,13 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Transforms/Transforms.h"
+#include "mlir/Dialect/Tensor/Utils/Utils.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/PatternMatch.h"
-#include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/InferIntRangeInterface.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/ADT/STLExtras.h"
@@ -1066,6 +1067,7 @@ DiagnosedSilenceableFailure HTileLinalgToSemanticOp::applyToOne(TransformRewrite
   return DiagnosedSilenceableFailure::success();
 }
 
+namespace {
 struct InLoopGatherUse {
   OpOperand *use;
   Operation *loop;
@@ -1464,6 +1466,8 @@ static FailureOr<PreparedRangedGatherUse> prepareRangedGatherUse(RewriterBase &r
 #undef PLAN_FAIL
 }
 
+} // namespace
+
 void HTileFuseRangedGatherIntoLoopsOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   consumesHandle(getGathersMutable(), effects);
@@ -1473,8 +1477,8 @@ void HTileFuseRangedGatherIntoLoopsOp::getEffects(
 }
 
 DiagnosedSilenceableFailure HTileFuseRangedGatherIntoLoopsOp::apply(TransformRewriter &rewriter,
-                                                                     TransformResults &results,
-                                                                     TransformState &state) {
+                                                                    TransformResults &results,
+                                                                    TransformState &state) {
   (void)results;
   auto transform = cast<TransformOpInterface>(getOperation());
 
@@ -1560,6 +1564,8 @@ DiagnosedSilenceableFailure HTileFuseRangedGatherIntoLoopsOp::apply(TransformRew
   return DiagnosedSilenceableFailure::success();
 }
 
+namespace {
+
 static LogicalResult verifyCloneableDefChainBefore(Value value, Operation *before,
                                                    DominanceInfo &dominance,
                                                    DenseSet<Operation *> &visited) {
@@ -1578,124 +1584,471 @@ static LogicalResult verifyCloneableDefChainBefore(Value value, Operation *befor
   }));
 }
 
-struct ParallelScatterIndexing {
-  SmallVector<Value> indices;
-  SmallVector<int64_t> broadcastDims;
+/// The global, untiled pieces recovered from a ranged scatter index.
+///
+/// For indices built as `select %mask, %valid_rows, %oob_sinks`, this records
+/// the values that survive after replacing the sink convention with a masked
+/// publication. `rangeDim` is the `valid_rows` dimension whose coordinates are
+/// `base + linalg.index rangeDim`.
+struct RangedScatterPlan {
+  Value mask;
+  Value validRows;
+  size_t rangeDim;
 };
 
-/// Convert a tiled StableHLO scatter publication to HTile's mixed advanced
-/// indexing form. Scatter start components become sliced tensor indices;
-/// update-window dimensions become scalar base offsets and `broadcast_dims`.
-static FailureOr<ParallelScatterIndexing>
-buildParallelScatterIndexing(RewriterBase &rewriter, stablehlo::ScatterOp scatter,
-                             tensor::ParallelInsertSliceOp publication) {
-  Location loc = scatter.getLoc();
-  RankedTensorType sourceType = publication.getSource().getType(),
-                   updatesType = publication.getDest().getType(),
-                   inputType = cast<RankedTensorType>(scatter.getInputs().front().getType()),
-                   scatterIndicesType = scatter.getScatterIndices().getType();
-  int64_t sourceRank = sourceType.getRank(), updateRank = updatesType.getRank(),
-          inputRank = inputType.getRank();
-  if (inputRank == 0)
+/// Ask an operation's InferIntRangeInterface model to infer `value`, using
+/// ranges supplied by the caller for its operands. Keeping this plumbing local
+/// lets the Linalg-specific code below reuse MLIR's overflow-aware arithmetic
+/// transfer functions instead of reimplementing them.
+static IntegerValueRange
+inferIntegerRangeFromInterface(Value value,
+                               llvm::function_ref<IntegerValueRange(Value)> getOperandRange) {
+  auto interface = dyn_cast_or_null<InferIntRangeInterface>(value.getDefiningOp());
+  if (!interface)
+    return IntegerValueRange{};
+  SmallVector<IntegerValueRange> operandRanges;
+  operandRanges.reserve(interface->getNumOperands());
+  for (Value operand : interface->getOperands()) {
+    IntegerValueRange range = getOperandRange(operand);
+    if (range.isUninitialized())
+      return IntegerValueRange{};
+    operandRanges.push_back(range);
+  }
+  IntegerValueRange resultRange;
+  interface.inferResultRangesFromOptional(operandRanges,
+                                          [&](Value result, const IntegerValueRange &range) {
+                                            if (result == value && !range.isUninitialized())
+                                              resultRange = range;
+                                          });
+  return resultRange;
+}
+
+static IntegerValueRange getTensorIntegerRange(Value value);
+
+/// Evaluate the element range of a scalar expression in a linalg.generic body.
+/// Block arguments inherit the range of their DPS input; output/init arguments
+/// are deliberately unknown because their contents do not describe indices.
+static IntegerValueRange getScalarIntegerRange(Value value, linalg::GenericOp generic,
+                                               ArrayRef<IntegerValueRange> inputRanges) {
+  if (auto blockArg = dyn_cast<BlockArgument>(value)) {
+    if (blockArg.getOwner() != generic.getBody())
+      return IntegerValueRange{};
+    unsigned argumentNumber = blockArg.getArgNumber();
+    if (argumentNumber >= generic.getNumDpsInputs())
+      return IntegerValueRange{};
+    return inputRanges[argumentNumber];
+  }
+  if (auto index = value.getDefiningOp<linalg::IndexOp>()) {
+    auto resultType = cast<RankedTensorType>(generic->getResult(0).getType());
+    int64_t extent = resultType.getDimSize(index.getDim());
+    if (extent == ShapedType::kDynamic || extent <= 0)
+      return IntegerValueRange{};
+
+    // linalg.index has no InferIntRangeInterface model. The identity output map
+    // checked by getTensorIntegerRange makes its iteration range [0, extent).
+    unsigned width = ConstantIntRanges::getStorageBitwidth(value.getType());
+    return IntegerValueRange{
+        ConstantIntRanges::fromUnsigned(APInt::getZero(width), APInt(width, extent - 1))};
+  }
+
+  return inferIntegerRangeFromInterface(
+      value, [&](Value operand) { return getScalarIntegerRange(operand, generic, inputRanges); });
+}
+
+/// Compute a conservative integer range covering every element of a tensor.
+///
+/// MLIR's integer-range interface handles constants and elementwise arithmetic.
+/// This function only bridges ranges across Linalg's tensor operations and
+/// between a linalg.generic result and the scalar expression that it yields.
+static IntegerValueRange getTensorIntegerRange(Value value) {
+  auto valueType = dyn_cast<ShapedType>(value.getType());
+  if (!valueType || !valueType.getElementType().isIntOrIndex())
+    return IntegerValueRange{};
+
+  if (auto broadcast = value.getDefiningOp<linalg::BroadcastOp>())
+    return getTensorIntegerRange(broadcast.getInput());
+
+  auto inferredRange = inferIntegerRangeFromInterface(value, getTensorIntegerRange);
+  if (!inferredRange.isUninitialized())
+    return inferredRange;
+
+  auto generic = value.getDefiningOp<linalg::GenericOp>();
+  if (!generic || !isSingleResultTensorGeneric(generic) ||
+      !llvm::all_of(generic.getIteratorTypesArray(), [](utils::IteratorType iteratorType) {
+        return iteratorType == utils::IteratorType::parallel;
+      }))
+    return IntegerValueRange{};
+  auto resultType = cast<RankedTensorType>(generic->getResult(0).getType());
+  if (!resultType.hasStaticShape() || !generic.getIndexingMapsArray().back().isIdentity())
+    return IntegerValueRange{};
+
+  SmallVector<IntegerValueRange> inputRanges;
+  inputRanges.reserve(generic.getNumDpsInputs());
+  for (Value input : generic.getInputs())
+    inputRanges.push_back(getTensorIntegerRange(input));
+  auto yield = cast<linalg::YieldOp>(generic.getBody()->getTerminator());
+  if (yield.getValues().size() != 1)
+    return IntegerValueRange{};
+  return getScalarIntegerRange(yield.getValues().front(), generic, inputRanges);
+}
+
+/// Return whether the signed lower bound of `range` is at least `bound`.
+static bool hasSignedLowerBound(const IntegerValueRange &range, int64_t bound) {
+  const APInt &lower = range.getValue().smin();
+  unsigned comparisonWidth = std::max(lower.getBitWidth(), 64u) + 1;
+  APInt extendedLower = lower.sext(comparisonWidth);
+  APInt extendedBound = APInt(64, bound).sext(comparisonWidth);
+  return extendedLower.sge(extendedBound);
+}
+
+/// Match a row tensor whose selected dimension is a unit-stride range.
+///
+/// The expected scalar body is equivalent to:
+///
+/// ```mlir
+/// %i = linalg.index RANGE_DIM
+/// %i_int = arith.index_cast %i
+/// %row = arith.addi %base, %i_int
+/// linalg.yield %row
+/// ```
+///
+/// The base input's indexing map must not depend on `RANGE_DIM`; therefore the
+/// first row of any tile is sufficient to recover a scalar insertion offset.
+static FailureOr<size_t> matchContiguousRows(Value value) {
+  auto generic = value.getDefiningOp<linalg::GenericOp>();
+  if (!generic || !isSingleResultTensorGeneric(generic) || generic.getNumDpsInputs() != 1 ||
+      !llvm::all_of(generic.getIteratorTypesArray(), [](utils::IteratorType iteratorType) {
+        return iteratorType == utils::IteratorType::parallel;
+      }))
+    return failure();
+  auto maps = generic.getIndexingMapsArray();
+  if (!maps.back().isIdentity())
     return failure();
 
+  SmallVector<Operation *> bodyOps = llvm::map_to_vector(generic.getBody()->without_terminator(),
+                                                         [](Operation &op) { return &op; });
+  if (bodyOps.size() != 3)
+    return failure();
+  auto index = dyn_cast<linalg::IndexOp>(bodyOps[0]);
+  auto castOp = dyn_cast<arith::IndexCastOp>(bodyOps[1]);
+  auto add = dyn_cast<arith::AddIOp>(bodyOps[2]);
+  auto yield = dyn_cast<linalg::YieldOp>(generic.getBody()->getTerminator());
+  if (!index || !castOp || !add || !yield || castOp.getIn() != index.getResult() ||
+      yield.getValues().size() != 1 || yield.getValues().front() != add.getResult())
+    return failure();
+  BlockArgument base = generic.getBody()->getArgument(0);
+  if (!((add.getLhs() == base && add.getRhs() == castOp.getResult()) ||
+        (add.getRhs() == base && add.getLhs() == castOp.getResult())))
+    return failure();
+
+  size_t rangeDim = index.getDim();
+  if (maps.front().isFunctionOfDim(rangeDim))
+    return failure();
+  return rangeDim;
+}
+
+/// Recognize the fill-or-drop convention emitted by packed varlen attention.
+///
+/// Before the scatter, the relevant graph has the form:
+///
+/// ```mlir
+/// %selected = linalg.generic ins(%mask, %valid_rows, %oob_sinks) {
+///   %row = arith.select %mask_element, %valid_row, %sink_row
+///   linalg.yield %row
+/// }
+/// %indices = linalg.broadcast %selected dimensions = [INDEX_VECTOR_DIM]
+/// ```
+///
+/// StableHLO requires the final singleton dimension because each scatter index
+/// is a vector, even though this pattern indexes only destination dimension 0.
+/// The false branch can become a mask only after proving all of its rows are
+/// outside that dimension. The true branch must be contiguous so it can later
+/// become one masked insert slice instead of an indirect scatter.
+static FailureOr<RangedScatterPlan> matchRangedScatter(stablehlo::ScatterOp scatter) {
+  auto inputType = cast<RankedTensorType>(scatter.getInputs().front().getType());
+  auto indicesType = cast<RankedTensorType>(scatter.getScatterIndices().getType());
   auto dimNums = scatter.getScatterDimensionNumbers();
-  ArrayRef<int64_t> updateWindowDims(dimNums.getUpdateWindowDims()),
-      insertedWindowDims(dimNums.getInsertedWindowDims()),
-      inputBatchingDims(dimNums.getInputBatchingDims()),
-      scatterDimsToOperandDims(dimNums.getScatterDimsToOperandDims());
   int64_t indexVectorDim = dimNums.getIndexVectorDim();
-
-  // HTile's compact indexing form currently assumes that batching has already
-  // been expanded away and that publication strides are unit.
-  if (!inputBatchingDims.empty() || !dimNums.getScatterIndicesBatchingDims().empty() ||
-      !llvm::all_of(publication.getMixedStrides(),
-                    [](OpFoldResult stride) { return isOneInteger(stride); }))
+  // The first prototype supports one indirect row coordinate. Update-window
+  // dimensions become the ordinary dimensions of the eventual insert slice.
+  if (indexVectorDim >= indicesType.getRank() ||
+      dimNums.getScatterDimsToOperandDims().size() != 1 ||
+      dimNums.getScatterDimsToOperandDims().front() != 0)
     return failure();
 
+  // Remove the singleton shape adaptation around the scalar row tensor.
+  auto indexVectorBroadcast = scatter.getScatterIndices().getDefiningOp<linalg::BroadcastOp>();
+  if (!indexVectorBroadcast || indexVectorBroadcast.getDimensions().size() != 1 ||
+      indexVectorBroadcast.getDimensions().front() != indexVectorDim ||
+      indicesType.getDimSize(indexVectorDim) != 1)
+    return failure();
+  // Recover the three global tensors before publication offsets tile them.
+  Value selectedRows = indexVectorBroadcast.getInput();
+  auto selectGeneric = selectedRows.getDefiningOp<linalg::GenericOp>();
+  if (!selectGeneric || !isSingleResultTensorGeneric(selectGeneric) ||
+      selectGeneric.getNumDpsInputs() != 3 ||
+      !llvm::all_of(selectGeneric.getIteratorTypesArray(),
+                    [](utils::IteratorType iteratorType) {
+                      return iteratorType == utils::IteratorType::parallel;
+                    }) ||
+      !llvm::all_of(selectGeneric.getIndexingMapsArray(),
+                    [](AffineMap map) { return map.isIdentity(); }))
+    return failure();
+  SmallVector<Operation *> bodyOps = llvm::map_to_vector(
+      selectGeneric.getBody()->without_terminator(), [](Operation &op) { return &op; });
+  auto yield = dyn_cast<linalg::YieldOp>(selectGeneric.getBody()->getTerminator());
+  if (bodyOps.size() != 1 || !yield || yield.getValues().size() != 1)
+    return failure();
+  auto select = dyn_cast<arith::SelectOp>(bodyOps.front());
+  if (!select || yield.getValues().front() != select.getResult())
+    return failure();
+  Block &body = *selectGeneric.getBody();
+  if (select.getCondition() != body.getArgument(0) ||
+      select.getTrueValue() != body.getArgument(1) || select.getFalseValue() != body.getArgument(2))
+    return failure();
+
+  Value mask = selectGeneric.getInputs()[0];
+  Value validRows = selectGeneric.getInputs()[1];
+  Value sinkRows = selectGeneric.getInputs()[2];
+  auto maskType = dyn_cast<RankedTensorType>(mask.getType());
+  auto validRowsType = dyn_cast<RankedTensorType>(validRows.getType());
+  auto sinkRowsType = dyn_cast<RankedTensorType>(sinkRows.getType());
+  if (!maskType || !validRowsType || !sinkRowsType || !maskType.getElementType().isInteger(1) ||
+      maskType.getShape() != validRowsType.getShape() ||
+      maskType.getShape() != sinkRowsType.getShape())
+    return failure();
+  // Both proofs are global: no forall IVs or tile-local HTile expressions need
+  // to be reverse engineered here.
+  FailureOr<size_t> rangeDim = matchContiguousRows(validRows);
+  if (failed(rangeDim))
+    return failure();
+  IntegerValueRange sinkRange = getTensorIntegerRange(sinkRows);
+  if (sinkRange.isUninitialized() || inputType.isDynamicDim(0) ||
+      !hasSignedLowerBound(sinkRange, inputType.getDimSize(0)))
+    return failure();
+  return RangedScatterPlan{mask, validRows, *rangeDim};
+}
+
+struct RangedScatterTile {
+  Value mask;
+  Value validRows;
+  size_t rangeDim;
+};
+
+static SmallVector<int64_t> getUpdateScatterDims(int64_t updateRank,
+                                                 ArrayRef<int64_t> updateWindowDims) {
   SmallVector<int64_t> updateScatterDims;
   for (int64_t dim = 0; dim < updateRank; ++dim)
     if (!llvm::is_contained(updateWindowDims, dim))
       updateScatterDims.push_back(dim);
+  return updateScatterDims;
+}
 
-  SmallVector<int64_t> windowOperandDims;
-  for (int64_t dim = 0; dim < inputRank; ++dim)
-    if (!llvm::is_contained(insertedWindowDims, dim) && !llvm::is_contained(inputBatchingDims, dim))
-      windowOperandDims.push_back(dim);
-  if (windowOperandDims.size() != updateWindowDims.size())
+/// Slice the recovered mask and rows with the scatter dimensions of the update
+/// publication. For example, an update tile at `[doc, token, head, 0]` with
+/// size `[1, 128, 1, 64]` produces `%mask[doc, token] [1, 128]`.
+///
+/// The slices intentionally retain every scatter dimension, including
+/// unit-sized dimensions. A later reshape can align the mask with the
+/// potentially rank-reduced update tile without changing `rangeDim` here.
+static FailureOr<RangedScatterTile> tileRangedScatterPlan(RewriterBase &rewriter,
+                                                          stablehlo::ScatterOp scatter,
+                                                          tensor::ParallelInsertSliceOp publication,
+                                                          const RangedScatterPlan &plan) {
+  auto maskType = cast<RankedTensorType>(plan.mask.getType());
+  auto validRowsType = cast<RankedTensorType>(plan.validRows.getType());
+  auto updatesType = cast<RankedTensorType>(publication.getDest().getType());
+  ArrayRef<int64_t> updateWindowDims = scatter.getScatterDimensionNumbers().getUpdateWindowDims();
+  SmallVector<int64_t> updateScatterDims =
+      getUpdateScatterDims(updatesType.getRank(), updateWindowDims);
+  if (updateScatterDims.size() != static_cast<size_t>(maskType.getRank()) ||
+      plan.rangeDim >= updateScatterDims.size())
     return failure();
 
+  SmallVector<OpFoldResult> offsets, sizes, strides;
+  SmallVector<OpFoldResult> publicationOffsets = publication.getMixedOffsets();
+  SmallVector<OpFoldResult> publicationSizes = publication.getMixedSizes();
+  SmallVector<OpFoldResult> publicationStrides = publication.getMixedStrides();
+  for (int64_t updateDim : updateScatterDims) {
+    offsets.push_back(publicationOffsets[updateDim]);
+    sizes.push_back(publicationSizes[updateDim]);
+    strides.push_back(publicationStrides[updateDim]);
+  }
+
+  RankedTensorType maskTileType = tensor::ExtractSliceOp::inferResultType(maskType, sizes);
+  RankedTensorType validRowsTileType =
+      tensor::ExtractSliceOp::inferResultType(validRowsType, sizes);
+  Value maskTile = tensor::ExtractSliceOp::create(rewriter, scatter.getLoc(), maskTileType,
+                                                  plan.mask, offsets, sizes, strides);
+  Value validRowsTile = tensor::ExtractSliceOp::create(
+      rewriter, scatter.getLoc(), validRowsTileType, plan.validRows, offsets, sizes, strides);
+  return RangedScatterTile{maskTile, validRowsTile, plan.rangeDim};
+}
+
+struct MaskedInsertSlicePlan {
+  Value source;
+  Value mask;
+  SmallVector<OpFoldResult> offsets;
+  SmallVector<OpFoldResult> sizes;
+  SmallVector<OpFoldResult> strides;
+};
+
+/// Convert the update publication and its ranged-scatter tile to one ordinary
+/// destination slice. Non-range scatter dimensions identify which range is
+/// being published and must therefore be unit dimensions of the update tile.
+/// The surviving range dimension becomes destination row dimension zero.
+static FailureOr<MaskedInsertSlicePlan>
+buildMaskedInsertSlicePlan(RewriterBase &rewriter, stablehlo::ScatterOp scatter,
+                           tensor::ParallelInsertSliceOp publication,
+                           const RangedScatterTile &tile) {
+  Location loc = scatter.getLoc();
+  RankedTensorType sourceType = publication.getSource().getType();
+  RankedTensorType updatesType = publication.getDest().getType();
+  RankedTensorType destType = cast<RankedTensorType>(scatter.getInputs().front().getType());
+  int64_t updateRank = updatesType.getRank();
+  int64_t destRank = destType.getRank();
+
+  auto dimNums = scatter.getScatterDimensionNumbers();
+  ArrayRef<int64_t> updateWindowDims = dimNums.getUpdateWindowDims();
+  ArrayRef<int64_t> insertedWindowDims = dimNums.getInsertedWindowDims();
+  ArrayRef<int64_t> inputBatchingDims = dimNums.getInputBatchingDims();
+  if (!inputBatchingDims.empty() || !dimNums.getScatterIndicesBatchingDims().empty())
+    return failure();
+
+  SmallVector<int64_t> updateScatterDims = getUpdateScatterDims(updateRank, updateWindowDims);
+  if (tile.rangeDim >= updateScatterDims.size())
+    return failure();
+  int64_t rangeUpdateDim = updateScatterDims[tile.rangeDim];
+  int64_t rangeDestDim = dimNums.getScatterDimsToOperandDims().front();
+
+  SmallVector<int64_t> windowDestDims;
+  for (int64_t dim = 0; dim < destRank; ++dim)
+    if (!llvm::is_contained(insertedWindowDims, dim) && !llvm::is_contained(inputBatchingDims, dim))
+      windowDestDims.push_back(dim);
+  if (windowDestDims.size() != updateWindowDims.size())
+    return failure();
+
+  SmallVector<OpFoldResult> pubOffsets = publication.getMixedOffsets();
+  SmallVector<OpFoldResult> pubSizes = publication.getMixedSizes();
+  SmallVector<OpFoldResult> pubStrides = publication.getMixedStrides();
   llvm::SmallBitVector droppedUpdateDims = publication.getDroppedDims();
-  SmallVector<OpFoldResult> pubOffsets = publication.getMixedOffsets(),
-                            pubSizes = publication.getMixedSizes(),
-                            pubStrides = publication.getMixedStrides();
   SmallVector<int64_t> updateDimToSourceDim(updateRank, -1);
   for (int64_t updateDim = 0, sourceDim = 0; updateDim < updateRank; ++updateDim)
     if (!droppedUpdateDims.test(updateDim))
       updateDimToSourceDim[updateDim] = sourceDim++;
 
-  int64_t batchRank = 0;
-  SmallVector<int64_t> componentShape;
-  for (int64_t updateDim : updateScatterDims) {
+  // Scatter batch dimensions other than the contiguous range select a tile;
+  // they do not appear in the destination slice shape.
+  llvm::SmallBitVector dropSourceDims(sourceType.getRank());
+  auto maskTileType = cast<RankedTensorType>(tile.mask.getType());
+  for (auto [scatterDim, updateDim] : llvm::enumerate(updateScatterDims)) {
+    if (scatterDim == tile.rangeDim)
+      continue;
+    if (maskTileType.getDimSize(scatterDim) != 1)
+      return failure();
     int64_t sourceDim = updateDimToSourceDim[updateDim];
     if (sourceDim < 0)
       continue;
-    if (sourceDim != batchRank++)
+    if (sourceType.getDimSize(sourceDim) != 1)
       return failure();
-    componentShape.push_back(sourceType.getDimSize(sourceDim));
+    dropSourceDims.set(sourceDim);
   }
 
-  ParallelScatterIndexing result;
-  result.indices.resize(inputRank);
-  SmallVector<bool> assigned(inputRank, false);
-  bool hasExplicitIndexVectorDim = indexVectorDim < scatterIndicesType.getRank();
-  for (auto [component, operandDim] : llvm::enumerate(scatterDimsToOperandDims)) {
-    if (assigned[operandDim])
-      return failure();
-    SmallVector<OpFoldResult> offsets, sizes, strides;
-    int64_t updateScatterPos = 0;
-    for (int64_t indicesDim = 0; indicesDim < scatterIndicesType.getRank(); ++indicesDim) {
-      if (hasExplicitIndexVectorDim && indicesDim == indexVectorDim) {
-        offsets.push_back(rewriter.getIndexAttr(static_cast<int64_t>(component)));
-        sizes.push_back(rewriter.getIndexAttr(1));
-        strides.push_back(rewriter.getIndexAttr(1));
-        continue;
-      }
-      int64_t updateDim = updateScatterDims[updateScatterPos++];
-      offsets.push_back(pubOffsets[updateDim]);
-      sizes.push_back(pubSizes[updateDim]);
-      strides.push_back(pubStrides[updateDim]);
-    }
-    auto componentType = RankedTensorType::get(componentShape, scatterIndicesType.getElementType());
-    result.indices[operandDim] = tensor::ExtractSliceOp::create(
-        rewriter, loc, componentType, scatter.getScatterIndices(), offsets, sizes, strides);
-    assigned[operandDim] = true;
-  }
+  Value source = publication.getSource();
+  if (dropSourceDims.any())
+    source = tensor::dropGivenUnitDims(rewriter, loc, source, dropSourceDims);
+  auto collapsedSourceType = cast<RankedTensorType>(source.getType());
 
-  int64_t windowSourceDim = batchRank;
-  for (auto [updateDim, inputDim] : llvm::zip_equal(updateWindowDims, windowOperandDims)) {
-    if (assigned[inputDim])
-      return failure();
-    result.indices[inputDim] =
-        getValueOrCreateConstantIndexOp(rewriter, loc, pubOffsets[updateDim]);
-    assigned[inputDim] = true;
-    if (droppedUpdateDims.test(updateDim))
+  // Validate that the remaining update dimensions have the same order as the
+  // destination dimensions. A slice insertion cannot express a permutation.
+  SmallVector<int64_t> updateDimToDestDim(updateRank, -1);
+  updateDimToDestDim[rangeUpdateDim] = rangeDestDim;
+  for (auto [updateDim, destDim] : llvm::zip_equal(updateWindowDims, windowDestDims))
+    updateDimToDestDim[updateDim] = destDim;
+  SmallVector<int64_t> sourceDestDims;
+  for (int64_t updateDim = 0; updateDim < updateRank; ++updateDim) {
+    int64_t sourceDim = updateDimToSourceDim[updateDim];
+    if (sourceDim < 0 || dropSourceDims.test(sourceDim))
       continue;
-    if (updateDimToSourceDim[updateDim] != windowSourceDim++)
+    int64_t destDim = updateDimToDestDim[updateDim];
+    if (destDim < 0 || (!sourceDestDims.empty() && sourceDestDims.back() >= destDim))
       return failure();
-    result.broadcastDims.push_back(inputDim);
+    sourceDestDims.push_back(destDim);
   }
-  if (windowSourceDim != sourceRank)
+  if (sourceDestDims.size() != static_cast<size_t>(collapsedSourceType.getRank()))
     return failure();
 
-  Value zero;
-  for (size_t inputDim = 0; inputDim < result.indices.size(); ++inputDim) {
-    if (assigned[inputDim])
-      continue;
-    if (!zero)
-      zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
-    result.indices[inputDim] = zero;
+  Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+  SmallVector<Value> zeroIndices(maskTileType.getRank(), zero);
+  Value rowOffset = tensor::ExtractOp::create(rewriter, loc, tile.validRows, zeroIndices);
+  if (!rowOffset.getType().isIndex())
+    rowOffset = arith::IndexCastOp::create(rewriter, loc, rewriter.getIndexType(), rowOffset);
+
+  OpFoldResult zeroAttr = rewriter.getIndexAttr(0);
+  OpFoldResult oneAttr = rewriter.getIndexAttr(1);
+  MaskedInsertSlicePlan result;
+  result.offsets.assign(destRank, zeroAttr);
+  result.sizes.assign(destRank, oneAttr);
+  result.strides.assign(destRank, oneAttr);
+  result.offsets[rangeDestDim] = rowOffset;
+  result.sizes[rangeDestDim] = pubSizes[rangeUpdateDim];
+  result.strides[rangeDestDim] = pubStrides[rangeUpdateDim];
+  for (auto [updateDim, destDim] : llvm::zip_equal(updateWindowDims, windowDestDims)) {
+    result.offsets[destDim] = pubOffsets[updateDim];
+    result.sizes[destDim] = pubSizes[updateDim];
+    result.strides[destDim] = pubStrides[updateDim];
   }
+
+  SmallVector<int64_t> staticSizes = llvm::map_to_vector(result.sizes, [](OpFoldResult size) {
+    std::optional<int64_t> constant = getConstantIntValue(size);
+    return constant.value_or(ShapedType::kDynamic);
+  });
+  if (!computeRankReductionMask(staticSizes, collapsedSourceType.getShape(),
+                                /*matchDynamic=*/true))
+    return failure();
+
+  // Keep the range mask dimension only when the publication source kept the
+  // corresponding update dimension, then broadcast over all window dimensions.
+  int64_t oldRangeSourceDim = updateDimToSourceDim[rangeUpdateDim];
+  llvm::SmallBitVector dropMaskDims(maskTileType.getRank(), true);
+  int64_t rangeSourceDim = -1;
+  if (oldRangeSourceDim >= 0) {
+    dropMaskDims.reset(tile.rangeDim);
+    rangeSourceDim = 0;
+    for (int64_t dim = 0; dim < oldRangeSourceDim; ++dim)
+      if (!dropSourceDims.test(dim))
+        ++rangeSourceDim;
+  }
+  for (int64_t dim : dropMaskDims.set_bits())
+    if (maskTileType.getDimSize(dim) != 1)
+      return failure();
+
+  Value mask = tile.mask;
+  if (dropMaskDims.any())
+    mask = tensor::dropGivenUnitDims(rewriter, loc, mask, dropMaskDims);
+  auto compactMaskType = cast<RankedTensorType>(mask.getType());
+  int64_t expectedMaskRank = rangeSourceDim < 0 ? 0 : 1;
+  if (compactMaskType.getRank() != expectedMaskRank)
+    return failure();
+
+  auto targetMaskType = RankedTensorType::get(collapsedSourceType.getShape(), rewriter.getI1Type());
+  if (mask.getType() != targetMaskType) {
+    SmallVector<Value> dynamicSizes;
+    for (int64_t dim = 0; dim < collapsedSourceType.getRank(); ++dim)
+      if (collapsedSourceType.isDynamicDim(dim))
+        dynamicSizes.push_back(tensor::DimOp::create(rewriter, loc, source, dim));
+    Value emptyMask = tensor::EmptyOp::create(rewriter, loc, targetMaskType.getShape(),
+                                              rewriter.getI1Type(), dynamicSizes);
+    SmallVector<int64_t> broadcastDims;
+    for (int64_t dim = 0; dim < collapsedSourceType.getRank(); ++dim)
+      if (dim != rangeSourceDim)
+        broadcastDims.push_back(dim);
+    mask =
+        linalg::BroadcastOp::create(rewriter, loc, mask, emptyMask, broadcastDims).getResult()[0];
+  }
+
+  result.source = source;
+  result.mask = mask;
   return result;
 }
 
@@ -1717,7 +2070,9 @@ static void notifyClonedOpsRecursively(TransformRewriter &rewriter,
   }
 }
 
-void HTileFuseScatterIntoForallOp::getEffects(
+} // namespace
+
+void HTileFuseOOBSinkScatterAsMaskedInsertSliceOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   consumesHandle(getScatterMutable(), effects);
   onlyReadsHandle(getForallMutable(), effects);
@@ -1725,9 +2080,16 @@ void HTileFuseScatterIntoForallOp::getEffects(
   modifiesPayload(effects);
 }
 
-DiagnosedSilenceableFailure HTileFuseScatterIntoForallOp::apply(TransformRewriter &rewriter,
-                                                                TransformResults &results,
-                                                                TransformState &state) {
+// Replace this two-stage publication:
+//
+//   %updates = scf.forall ...
+//   %result = stablehlo.scatter %init, %indices, %updates
+//
+// with a forall output published by htile.masked_parallel_insert_slice. The
+// scatter is analyzed globally first; only then are its mask and valid rows
+// tiled using the forall's existing update publication.
+DiagnosedSilenceableFailure HTileFuseOOBSinkScatterAsMaskedInsertSliceOp::apply(
+    TransformRewriter &rewriter, TransformResults &results, TransformState &state) {
   auto transform = cast<TransformOpInterface>(getOperation());
 
   stablehlo::ScatterOp scatter;
@@ -1736,6 +2098,8 @@ DiagnosedSilenceableFailure HTileFuseScatterIntoForallOp::apply(TransformRewrite
   scf::ForallOp forall;
   CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getForall, "forall", forall, scf::ForallOp);
 
+  // A masked insertion implements one overwrite update, not a general
+  // variadic scatter or reduction update.
   if (scatter.getInputs().size() != 1 || scatter.getUpdates().size() != 1 ||
       scatter->getNumResults() != 1)
     BAIL("expected scatter to have exactly one input, update, and result");
@@ -1761,6 +2125,8 @@ DiagnosedSilenceableFailure HTileFuseScatterIntoForallOp::apply(TransformRewrite
       returnOp.getOperand(0) != updateBlock.getArgument(1))
     BAIL("expected scatter update computation to directly return the update argument");
 
+  // The existing tensor.parallel_insert_slice is the source of truth for the
+  // update tile's offsets, sizes, strides, and rank reduction.
   auto updateResult = dyn_cast<OpResult>(scatter.getUpdates().front());
   if (!updateResult || updateResult.getOwner() != forall.getOperation())
     BAIL("expected the selected forall to directly produce the scatter update");
@@ -1769,62 +2135,102 @@ DiagnosedSilenceableFailure HTileFuseScatterIntoForallOp::apply(TransformRewrite
   if (failed(updatePublication))
     BAIL("expected the scatter update to be published by one tensor.parallel_insert_slice");
 
-  Value scatterInput = scatter.getInputs().front();
-  Value scatterIndices = scatter.getScatterIndices();
+  // Match the untiled index graph while the select, contiguous valid rows, and
+  // provably OOB sink rows are still visible together.
+  FailureOr<RangedScatterPlan> rangedScatter = matchRangedScatter(scatter);
+  if (failed(rangedScatter))
+    BAIL("expected scatter indices to select contiguous rows or provably OOB sink rows");
+  LLVM_DEBUG({
+    auto printPlanValue = [](StringRef label, Value value) {
+      llvm::dbgs() << "  " << label << ": ";
+      value.printAsOperand(llvm::dbgs(), OpPrintingFlags());
+      llvm::dbgs() << " : " << value.getType();
+      if (Operation *producer = value.getDefiningOp())
+        llvm::dbgs() << " from " << producer->getName();
+      llvm::dbgs() << "\n";
+    };
+    llvm::dbgs() << "matched ranged scatter:\n"
+                 << "  range dimension: " << rangedScatter->rangeDim << "\n";
+    printPlanValue("mask", rangedScatter->mask);
+    printPlanValue("valid rows", rangedScatter->validRows);
+  });
+
+  // The replacement does not consume the sink rows or selected scatter
+  // indices. Move only the destination initializer, mask, and valid rows that
+  // survive in the rebuilt forall.
+  Value scatterInit = scatter.getInputs().front();
   DominanceInfo dominance(forall->getParentOp());
   DenseSet<Operation *> visited;
-  if (failed(verifyCloneableDefChainBefore(scatterInput, forall, dominance, visited)))
-    BAIL("expected the scatter input definition chain to be safely clonable before the forall");
-  if (failed(verifyCloneableDefChainBefore(scatterIndices, forall, dominance, visited)))
-    BAIL("expected the scatter indices definition chain to be safely clonable before the forall");
+  if (failed(verifyCloneableDefChainBefore(scatterInit, forall, dominance, visited)))
+    BAIL("expected the scatter initializer definition chain to be safely clonable before the "
+         "forall");
+  if (failed(verifyCloneableDefChainBefore(rangedScatter->mask, forall, dominance, visited)) ||
+      failed(verifyCloneableDefChainBefore(rangedScatter->validRows, forall, dominance, visited)))
+    BAIL("expected the ranged scatter mask and rows to be safely clonable before the forall");
 
   rewriter.setInsertionPoint(forall);
   IRMapping movedDefinitions;
   FailureOr<SmallVector<Value>> preparedValues = makeValuesAvailableAtInsertionPoint(
-      rewriter, {scatterInput, scatterIndices}, movedDefinitions, DefChainAction::Move);
+      rewriter, {scatterInit, rangedScatter->mask, rangedScatter->validRows}, movedDefinitions,
+      DefChainAction::Move);
   if (failed(preparedValues))
-    BAIL("failed to make the scatter input and indices available before the forall");
-  Value preparedScatterInput = (*preparedValues)[0];
+    BAIL("failed to make the scatter input, mask, and rows available before the forall");
+  Value preparedInit = (*preparedValues)[0];
+  RangedScatterPlan preparedRangedScatter{(*preparedValues)[1], (*preparedValues)[2],
+                                          rangedScatter->rangeDim};
 
+  // Materialize the tile-local row base and source-shaped mask in the old
+  // forall body. Cloning the forall below remaps this complete plan at once.
   rewriter.setInsertionPoint(forall.getTerminator());
-  FailureOr<ParallelScatterIndexing> parallelScatterIndexing =
-      buildParallelScatterIndexing(rewriter, scatter, *updatePublication);
-  if (failed(parallelScatterIndexing))
-    BAIL("failed to build HTile indexing for the published update tile");
+  FailureOr<RangedScatterTile> rangedScatterTile =
+      tileRangedScatterPlan(rewriter, scatter, *updatePublication, preparedRangedScatter);
+  if (failed(rangedScatterTile))
+    BAIL("failed to tile the ranged scatter mask and valid rows");
+  FailureOr<MaskedInsertSlicePlan> maskedInsertPlan =
+      buildMaskedInsertSlicePlan(rewriter, scatter, *updatePublication, *rangedScatterTile);
+  if (failed(maskedInsertPlan))
+    BAIL("failed to build a masked insert slice for the published update tile");
 
   LLVM_DEBUG({
-    Value preparedScatterIndices = (*preparedValues)[1];
     llvm::dbgs() << "validated scatter fusion candidate:\n"
                  << *scatter << "\nupdate publication:\n"
-                 << *updatePublication << "\nprepared scatter input: ";
-    llvm::dbgs() << preparedScatterInput;
-    llvm::dbgs() << "\nprepared scatter indices: " << preparedScatterIndices;
-    llvm::dbgs() << "\nparallel scatter indices:";
-    for (Value index : parallelScatterIndexing->indices)
-      llvm::dbgs() << "\n  " << index;
-    llvm::dbgs() << "\nbroadcast dims: [";
-    llvm::interleaveComma(parallelScatterIndexing->broadcastDims, llvm::dbgs());
-    llvm::dbgs() << "]\n";
+                 << *updatePublication << "\nprepared scatter initializer: " << preparedInit
+                 << "\ntiled mask: " << rangedScatterTile->mask
+                 << "\ntiled valid rows: " << rangedScatterTile->validRows
+                 << "\nmasked source: " << maskedInsertPlan->source
+                 << "\nsource-shaped mask: " << maskedInsertPlan->mask << "\n";
   });
 
   // Append the scatter destination to the forall outputs. Keep the old update
-  // tensor output for now so the existing publication and any DPS scratch uses
-  // remain valid while we introduce the direct scatter publication.
+  // tensor output so its publication and any DPS scratch uses remain valid
+  // while the new masked publication writes the appended destination.
   rewriter.setInsertionPoint(forall);
   ForallOutputExtension extension =
-      cloneForallWithAppendedOutputs(rewriter, forall, ValueRange{preparedScatterInput});
+      cloneForallWithAppendedOutputs(rewriter, forall, ValueRange{preparedInit});
   scf::ForallOp newForall = extension.forall;
   notifyClonedOpsRecursively(rewriter, extension.clonedOps);
-  Value clonedUpdateTile = extension.mapping.lookup(updatePublication->getSource());
-  SmallVector<Value> clonedScatterIndices =
-      llvm::map_to_vector(parallelScatterIndexing->indices,
-                          [&](Value index) { return extension.mapping.lookup(index); });
-  pointBuilderToForallParallel(rewriter, newForall);
-  auto parallelScatter = htile::ParallelScatterOp::create(
-      rewriter, scatter.getLoc(), clonedUpdateTile, extension.getAppendedOutputArgs().front(),
-      clonedScatterIndices, parallelScatterIndexing->broadcastDims, /*unique=*/true,
-      htile::ScatterOutOfBounds::Discard);
 
+  // The plan was built against the original forall. Remap both its tensor
+  // values and any dynamic slice descriptor values into the clone.
+  auto remapMixedValues = [&](ArrayRef<OpFoldResult> values) {
+    return llvm::map_to_vector(values, [&](OpFoldResult value) -> OpFoldResult {
+      if (auto dynamic = dyn_cast<Value>(value))
+        return extension.mapping.lookupOrDefault(dynamic);
+      return value;
+    });
+  };
+  Value clonedSource = extension.mapping.lookupOrDefault(maskedInsertPlan->source);
+  Value clonedMask = extension.mapping.lookupOrDefault(maskedInsertPlan->mask);
+  SmallVector<OpFoldResult> clonedOffsets = remapMixedValues(maskedInsertPlan->offsets);
+  SmallVector<OpFoldResult> clonedSizes = remapMixedValues(maskedInsertPlan->sizes);
+  SmallVector<OpFoldResult> clonedStrides = remapMixedValues(maskedInsertPlan->strides);
+  pointBuilderToForallParallel(rewriter, newForall);
+  auto maskedInsert = htile::MaskedParallelInsertSliceOp::create(
+      rewriter, scatter.getLoc(), clonedSource, extension.getAppendedOutputArgs().front(),
+      clonedOffsets, clonedSizes, clonedStrides, clonedMask);
+
+  // The appended forall result now has the scatter's semantics, so replace the
+  // external scatter and preserve handles to the rebuilt loop and publication.
   Value fusedResult = extension.getAppendedResults().front();
   rewriter.replaceAllUsesWith(scatter->getResult(0), fusedResult);
   rewriter.eraseOp(scatter);
@@ -1832,8 +2238,8 @@ DiagnosedSilenceableFailure HTileFuseScatterIntoForallOp::apply(TransformRewrite
     BAIL("failed to preserve the scf.forall handle");
   rewriter.replaceOp(forall, extension.getPreservedResults());
 
-  LLVM_DEBUG(llvm::dbgs() << "rebuilt forall with parallel scatter:\n" << parallelScatter << "\n");
-  results.set(getOperation()->getResult(0), ArrayRef<Operation *>{parallelScatter.getOperation()});
+  LLVM_DEBUG(llvm::dbgs() << "rebuilt forall with masked insert slice:\n" << maskedInsert << "\n");
+  results.set(getOperation()->getResult(0), ArrayRef<Operation *>{maskedInsert.getOperation()});
   return DiagnosedSilenceableFailure::success();
 }
 

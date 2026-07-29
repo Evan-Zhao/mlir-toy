@@ -51,6 +51,7 @@ target_link_libraries(NeptuneHTile
   MLIRArithUtils
   MLIRBufferizationDialect
   MLIRFuncDialect
+  MLIRInferIntRangeInterface
   MLIRLinalgDialect
   MLIRLinalgTransforms
   MLIRMemRefDialect
@@ -58,6 +59,7 @@ target_link_libraries(NeptuneHTile
   MLIRSCFDialect
   MLIRTensorDialect
   MLIRTensorTransforms
+  MLIRTensorUtils
   MLIRTransformDialectInterfaces
   MLIRTransformUtils
 )

@@ -62,7 +62,7 @@ module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo
     %scatter = transform.structured.match ops{["stablehlo.scatter"]} in %func : (!any) -> !any
     transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %scatter : (!any, !any) -> !any
     %parallel_scatter =
-        transform.htile.fuse_scatter_into_forall %scatter into %forall_loop : (!any, !any) -> !any
+        transform.htile.fuse_oob_sink_scatter_as_masked_insert_slice %scatter into %forall_loop : (!any, !any) -> !any
 
     // Difference from dense attention (2): first fuse ordinary producer chains so ranged
     // gathers become the immediate producers of in-loop slices. Gather itself is not fusable,

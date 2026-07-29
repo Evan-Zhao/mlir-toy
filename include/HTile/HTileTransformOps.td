@@ -37,26 +37,91 @@ def HTileLinalgToSemanticOp : Op<Transform_Dialect, "htile.linalg_to_semantic",
   }];
 }
 
-def HTileFuseScatterIntoForallOp
-    : Op<Transform_Dialect, "htile.fuse_scatter_into_forall",
+def HTileFuseOOBSinkScatterAsMaskedInsertSliceOp
+    : Op<Transform_Dialect, "htile.fuse_oob_sink_scatter_as_masked_insert_slice",
          [DeclareOpInterfaceMethods<TransformOpInterface>,
           DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
           ReportTrackingListenerFailuresOpTrait]> {
-  let summary = "Fuse a unique StableHLO scatter into its update-producing forall";
+  let summary = "Fuse an OOB-sink scatter as a masked forall publication";
 
   let description = [{
-    Fuses the `stablehlo.scatter` identified by `scatter` into the `scf.forall`
-    identified by `forall`. The forall must produce the scatter's updates.
+    Fuses a specific overwrite `stablehlo.scatter` into the `scf.forall` that
+    produces its updates. This transform recognizes the convention where a
+    predicate selects either a contiguous destination row or an index that is
+    guaranteed to be out of bounds:
 
-    The transform rebuilds the forall over the scatter destination and replaces
-    the update-tensor publication with an `htile.parallel_scatter` contribution.
+    ```mlir
+    %valid_rows = linalg.generic ... {
+      %i = linalg.index RANGE_DIM
+      %i_int = arith.index_cast %i
+      %row = arith.addi %base, %i_int
+      linalg.yield %row
+    }
+    %selected_rows = linalg.generic
+        ins(%mask, %valid_rows, %sink_rows : ...) ... {
+    ^bb0(%valid: i1, %row: i32, %sink: i32, ...):
+      %selected = arith.select %valid, %row, %sink
+      linalg.yield %selected
+    }
+    %indices = linalg.broadcast ins(%selected_rows : tensor<BxTxi32>) ...
+        dimensions = [2]  // tensor<BxTxi32> -> tensor<BxTx1xi32>
+    %result = "stablehlo.scatter"(%init, %indices, %updates) <{
+      scatter_dimension_numbers = #stablehlo.scatter<
+          update_window_dims = [2, 3], inserted_window_dims = [0],
+          scatter_dims_to_operand_dims = [0], index_vector_dim = 2>,
+      unique_indices = true
+    }> ...
+    ```
+
+    The final extent-one dimension is StableHLO's one-component index vector.
+    The transform strips that shape adaptation and matches the elementwise
+    `select` exactly. The true branch must be `base + linalg.index RANGE_DIM`;
+    the indexing map for `base` must be invariant in `RANGE_DIM`.
+
+    The false branch is not assumed to be out of bounds merely because it is
+    named a sink. The transform conservatively infers the signed element range
+    of `%sink_rows` and requires its lower bound to be at least the static
+    extent of destination dimension zero. For example, with a destination
+    extent of 1024, sink rows computed as
+    `1024 + document_id * 512 + token_id` have lower bound 1024. StableHLO drops
+    these updates, so the original `%mask` can replace the sink convention.
+    If the range cannot be proven, the transform fails without treating the
+    false branch as a mask.
+
+    The selected `forall` must directly produce `%updates` through one
+    `tensor.parallel_insert_slice`. Its publication descriptor tiles
+    `%valid_rows` and `%mask`. The first tiled valid row becomes the destination
+    row offset, non-range scatter dimensions must be unit tile dimensions, and
+    the mask is reshaped and broadcast to the published source shape. The
+    resulting publication is equivalent to:
+
+    ```mlir
+    %result = scf.forall ... shared_outs(..., %dest = %init) {
+      %source = ... : tensor<128x1x64xf16>
+      %mask_tile = ... : tensor<128x1x64xi1>
+      %row = ... : index
+      scf.forall.in_parallel {
+        htile.masked_parallel_insert_slice
+            %source into %dest[%row, %head, 0] [128, 1, 64] [1, 1, 1]
+            mask(%mask_tile : tensor<128x1x64xi1>)
+            : tensor<128x1x64xf16> into tensor<1024x4x64xf16>
+      }
+    }
+    ```
+
+    The current implementation supports one indirect destination dimension,
+    mapped to dimension zero, and does not support scatter batching or a
+    permutation between the surviving update dimensions and destination
+    dimensions. The scatter must have one input, update, and result; an
+    overwrite update computation; and `unique_indices = true`.
+
     The `forall` operand handle is updated to refer to the rebuilt loop, and the
-    transform returns a handle to the parallel scatter.
+    transform returns a handle to the masked insertion.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$scatter,
                        TransformHandleTypeInterface:$forall);
-  let results = (outs TransformHandleTypeInterface:$parallel_scatter);
+  let results = (outs TransformHandleTypeInterface:$masked_insert_slice);
 
   let assemblyFormat = "$scatter `into` $forall attr-dict `:` "
                        "functional-type(operands, results)";
