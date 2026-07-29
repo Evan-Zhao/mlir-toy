@@ -85,11 +85,25 @@ mlir::LogicalResult LoadOp::verify() {
   return mlir::success();
 }
 
+mlir::LogicalResult StoreOp::verify() {
+  if (!getMask())
+    return mlir::success();
+
+  auto valueType = mlir::cast<mlir::RankedTensorType>(getValue().getType());
+  auto maskType = mlir::cast<mlir::RankedTensorType>(getMask().getType());
+  if (!maskType.getElementType().isInteger(1))
+    return emitOpError("requires mask to have i1 element type");
+  if (maskType.getShape() != valueType.getShape())
+    return emitOpError("requires mask shape to match value shape");
+  return mlir::success();
+}
+
 void MaskedParallelInsertSliceOp::build(mlir::OpBuilder &builder, mlir::OperationState &result,
                                         mlir::Value source, mlir::Value dest,
                                         llvm::ArrayRef<mlir::OpFoldResult> offsets,
                                         llvm::ArrayRef<mlir::OpFoldResult> sizes,
-                                        llvm::ArrayRef<mlir::OpFoldResult> strides, mlir::Value mask,
+                                        llvm::ArrayRef<mlir::OpFoldResult> strides,
+                                        mlir::Value mask,
                                         llvm::ArrayRef<mlir::NamedAttribute> attrs) {
   llvm::SmallVector<int64_t> staticOffsets, staticSizes, staticStrides;
   llvm::SmallVector<mlir::Value> dynamicOffsets, dynamicSizes, dynamicStrides;

@@ -352,19 +352,39 @@ def HTile_MaskedParallelInsertSliceOp
   let hasVerifier = 1;
 }
 
-def HTile_StoreOp : Op<HTile_Dialect, "store"> {
+def HTile_StoreOp
+    : Op<HTile_Dialect, "store", [AttrSizedOperandSegments]> {
   let summary = "store a tile to memory";
   let description = [{
     Stores a tile to a memory-like destination at the given scalar offsets. This
     makes explicit the tile write semantics that Neptune currently represents
     with TIR BufferRegion stores.
 
+    An optional `mask` gives the store predicated semantics. For every value
+    coordinate, a true mask element stores to the destination and a false mask
+    element does not access memory. An address selected by a true mask element
+    must be in bounds. The mask must have the value shape and an `i1` element
+    type.
+
     Attributes can carry backend lowering hints such as `boundary_check`,
     `cache_modifier`, `eviction_policy`, or TMA/block-pointer metadata.
   }];
 
-  let arguments = (ins AnyRankedTensor:$value, AnyType:$dest, Variadic<Index>:$offsets);
+  let arguments = (ins AnyRankedTensor:$value, AnyType:$dest, Variadic<Index>:$offsets,
+                       Optional<AnyRankedTensor>:$mask);
 
-  let assemblyFormat =
-      "$value `,` $dest `[` $offsets `]` attr-dict `:` type($value) `,` type($dest)";
+  let builders = [
+    OpBuilder<(ins "::mlir::Value":$value, "::mlir::Value":$dest,
+                   "::mlir::ValueRange":$offsets), [{
+      build($_builder, $_state, value, dest, offsets, ::mlir::Value());
+    }]>
+  ];
+
+  let assemblyFormat = [{
+    $value `,` $dest `[` $offsets `]`
+      (`mask` `(` $mask^ `:` type($mask) `)`)?
+      attr-dict `:` type($value) `,` type($dest)
+  }];
+
+  let hasVerifier = 1;
 }

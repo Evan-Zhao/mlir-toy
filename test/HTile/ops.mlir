@@ -190,3 +190,57 @@ module {
     return
   }
 }
+
+// -----
+
+module {
+  // CHECK-LABEL: func.func @unmasked_store
+  func.func @unmasked_store(%value: tensor<4x8xf32>, %dest: memref<16x8xf32>) {
+    %c0 = arith.constant 0 : index
+    // CHECK: htile.store %{{.*}}, %{{.*}}[%{{.*}}, %{{.*}}] : tensor<4x8xf32>, memref<16x8xf32>
+    htile.store %value, %dest[%c0, %c0]
+        : tensor<4x8xf32>, memref<16x8xf32>
+    return
+  }
+
+  // CHECK-LABEL: func.func @masked_store
+  func.func @masked_store(%value: tensor<4x8xf32>, %dest: memref<16x8xf32>,
+                          %mask: tensor<4x8xi1>) {
+    %c0 = arith.constant 0 : index
+    // CHECK: htile.store %{{.*}}, %{{.*}}[%{{.*}}, %{{.*}}] mask(%{{.*}} : tensor<4x8xi1>) : tensor<4x8xf32>, memref<16x8xf32>
+    htile.store %value, %dest[%c0, %c0]
+        mask(%mask : tensor<4x8xi1>)
+        : tensor<4x8xf32>, memref<16x8xf32>
+    return
+  }
+}
+
+// -----
+
+module {
+  func.func @wrong_store_mask_shape(
+      %value: tensor<4x8xf32>, %dest: memref<16x8xf32>,
+      %mask: tensor<2x8xi1>) {
+    %c0 = arith.constant 0 : index
+    // expected-error@+1 {{requires mask shape to match value shape}}
+    htile.store %value, %dest[%c0, %c0]
+        mask(%mask : tensor<2x8xi1>)
+        : tensor<4x8xf32>, memref<16x8xf32>
+    return
+  }
+}
+
+// -----
+
+module {
+  func.func @wrong_store_mask_element_type(
+      %value: tensor<4x8xf32>, %dest: memref<16x8xf32>,
+      %mask: tensor<4x8xi8>) {
+    %c0 = arith.constant 0 : index
+    // expected-error@+1 {{requires mask to have i1 element type}}
+    htile.store %value, %dest[%c0, %c0]
+        mask(%mask : tensor<4x8xi8>)
+        : tensor<4x8xf32>, memref<16x8xf32>
+    return
+  }
+}
