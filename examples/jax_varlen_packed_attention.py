@@ -145,7 +145,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch", type=positive_int, default=8)
     parser.add_argument("--heads", type=positive_int, default=4)
     parser.add_argument("--total-tokens", type=positive_int, default=1024)
-    parser.add_argument("--max-doc-tokens", type=positive_int, default=None)
+    parser.add_argument("--max-doc-tokens", type=positive_int, default=512)
     parser.add_argument("--head-dim", type=positive_int, default=64)
     parser.add_argument("--index-dtype", choices=("int32", "int64"), default="int32")
     return parser.parse_args()
@@ -154,8 +154,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     max_doc_tokens = args.max_doc_tokens
-    if max_doc_tokens is None:
-        max_doc_tokens = (args.total_tokens + args.batch - 1) // args.batch
     index_dtype = jnp.dtype(args.index_dtype)
     shape = (args.total_tokens, args.heads, args.head_dim)
     q, k, v = [jax.ShapeDtypeStruct(shape, jnp.float16) for _ in range(3)]
