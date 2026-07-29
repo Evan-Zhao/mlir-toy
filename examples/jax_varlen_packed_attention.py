@@ -89,11 +89,14 @@ def doc_offset_attention(
             preferred_element_type=jnp.float32,
         )
         scores_hij = scores_hij * scale
+
+        # Apply an OOB mask to both the key and the query, so it looks like a sub-square within a square.
+        # We have passes to convert this mask to actual reduction in number of iterations during lowering.
         valid_tokens = token_offsets < doc_len
+        query_valid = valid_tokens.reshape(1, L0, 1)
         key_valid = valid_tokens.reshape(1, 1, L0)
-        # Padded query rows are scattered to out-of-bounds sink indices and
-        # dropped, so only key positions need to be masked for valid outputs.
-        scores_hij = jnp.where(key_valid, scores_hij, -jnp.inf)
+        scores_hij = jnp.where(query_valid & key_valid, scores_hij, -jnp.inf)
+
         probs_hij = jax.nn.softmax(scores_hij, axis=-1).astype(q_doc.dtype)
         # Compute hij @ jhd -> hid.
         out_hid = lax.dot(
