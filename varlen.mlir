@@ -56,23 +56,25 @@ module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     // Difference from dense attention (1): fuse linalg ops post-loop upwards into the loop,
-    // then fuse stablehlo.scatter into the loop nest as a masked slice publication.
-    %scatter = transform.structured.match ops{["stablehlo.scatter"]} in %func : (!any) -> !any
-    transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %scatter : (!any, !any) -> !any
-    %masked_insert_slice =
-        transform.htile.fuse_oob_sink_scatter_as_masked_insert_slice %scatter into %forall_loop : (!any, !any) -> !any
+    // then fuse our custom insert op neptune.packed_window_insert into the loop nest
+    // as a masked slice publication.
+    %insert = transform.structured.match
+        ops{["stablehlo.custom_call"]} attributes {call_target_name = "neptune.packed_window_insert"}
+        in %func : (!any) -> !any
+    transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %insert : (!any, !any) -> !any
+    transform.htile.fuse_packed_window_insert %insert into %forall_loop : (!any, !any) -> !any
 
-    // Difference from dense attention (2): first fuse ordinary producer chains so ranged
-    // gathers become the immediate producers of in-loop slices. Gather itself is not fusable,
-    // so replace those boundary slices with masked rectangular HTile loads, then run producer
-    // fusion again for chains exposed by the replacement.
+    // Difference from dense attention (2): first fuse ordinary producer chains so our custom
+    // packed_window_extract become the immediate producers of in-loop slices.
+    // Then fuse the packed_window_extract into the loop nest as a masked slice consumption.
     %consumer_loops = transform.merge_handles %forall_loop, %j0_loop : !any
     %_5, %consumer_loops_1 =
         transform.fusion.greedy_input_producers_into_consumer %consumer_loops
         : (!any) -> (!any, !any)
-    %gathers = transform.structured.match ops{["stablehlo.gather"]} in %func : (!any) -> !any
-    %loads = transform.htile.fuse_ranged_gather_into_loops
-        %gathers into %consumer_loops_1 : (!any, !any) -> !any
+    %extracts = transform.structured.match
+        ops{["stablehlo.custom_call"]} attributes {call_target_name = "neptune.packed_window_extract"}
+        in %func : (!any) -> !any
+    transform.htile.fuse_packed_window_extract %extracts into %consumer_loops_1 : (!any, !any) -> !any
 
     // StableHLO slices were not fused because they are not fusable either. However, we can convert them to
     // tensor.extract_slice ops, then combine them with existing tensor.extract_slice ops in the loop.
