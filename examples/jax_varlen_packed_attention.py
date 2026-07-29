@@ -1,12 +1,10 @@
 """Print a JAX packed variable-length attention program as StableHLO MLIR.
 
-This variant expresses documents as a parallel batch using ``vmap`` instead of a
-sequential ``fori_loop``. It pads the packed token axis and loads fixed-size document windows
-with ranged gathers, applies regular masked attention over the dense
-``[num_docs, max_doc_tokens, heads, head_dim]`` view,
-and scatters valid document results back to packed output.
-Runtime document lengths come from ``offsets``;
-the maximum document length must be provided statically via ``--max-doc-tokens``.
+This variant expresses documents as a parallel batch using ``vmap`` instead of a sequential
+``fori_loop``. Neptune custom calls preserve contiguous masked window reads and insertion around a
+regular masked attention computation over the dense
+``[num_docs, max_doc_tokens, heads, head_dim]`` view. Runtime document lengths come from
+``offsets``; the maximum document length must be provided statically via ``--max-doc-tokens``.
 """
 
 import argparse
@@ -18,9 +16,73 @@ import jax.numpy as jnp
 from jax import lax
 
 
-@partial(jax.jit, static_argnames=("max_doc_len"))
+def packed_window_extract(
+    packed: jax.Array,
+    starts: jax.Array,
+    lengths: jax.Array,
+    other: jax.Array,
+    *,
+    max_doc_len: int,
+) -> jax.Array:
+    """Extract contiguous masked windows from ``packed[T, ...]``.
+
+    ``starts`` and ``lengths`` have shape ``[N]``, ``other`` is scalar, and the result has shape
+    ``[N, max_doc_len, ...]``. Element ``[d, i, ...]`` reads
+    ``packed[starts[d] + i, ...]`` when ``i < lengths[d]``; otherwise it produces ``other`` without
+    accessing ``packed``. Each range must satisfy
+    ``0 <= lengths[d] <= max_doc_len`` and ``0 <= starts[d] <= T - lengths[d]``.
+
+    ``max_doc_len`` is static and encoded by the result type. The StableHLO custom call is currently
+    a compiler marker, not an executable FFI implementation.
+    """
+
+    if starts.shape != lengths.shape or starts.ndim != 1:
+        raise ValueError("Expected starts and lengths to be rank-one arrays with the same shape")
+    if other.shape or other.dtype != packed.dtype:
+        raise ValueError("Expected other to be a scalar with the packed element dtype")
+    result = jax.ShapeDtypeStruct((starts.shape[0], max_doc_len, *packed.shape[1:]), packed.dtype)
+    return jax.ffi.ffi_call("neptune.packed_window_extract", result, has_side_effect=False)(
+        packed, starts, lengths, other
+    )
+
+
+def packed_window_insert(
+    windows: jax.Array,
+    destination: jax.Array,
+    starts: jax.Array,
+    lengths: jax.Array,
+) -> jax.Array:
+    """Insert masked ``windows[N, W, ...]`` into ``destination[T, ...]``.
+
+    The result has the destination shape. When ``i < lengths[d]``, element ``[d, i, ...]`` is
+    inserted at ``starts[d] + i``; otherwise no memory access occurs. Unwritten destination
+    elements are preserved. Each range must satisfy ``0 <= lengths[d] <= W`` and
+    ``0 <= starts[d] <= T - lengths[d]``, and valid ranges must not overlap.
+
+    The StableHLO custom call is pure and currently serves as a compiler marker, not an executable
+    FFI implementation.
+    """
+
+    if starts.shape != lengths.shape or starts.ndim != 1:
+        raise ValueError("Expected starts and lengths to be rank-one arrays with the same shape")
+    if windows.ndim < 2 or windows.shape[0] != starts.shape[0]:
+        raise ValueError("Expected one window per start")
+    if destination.shape[1:] != windows.shape[2:] or destination.dtype != windows.dtype:
+        raise ValueError("Expected destination and window element shapes and dtypes to match")
+    result = jax.ShapeDtypeStruct(destination.shape, destination.dtype)
+    return jax.ffi.ffi_call("neptune.packed_window_insert", result, has_side_effect=False)(
+        windows, destination, starts, lengths
+    )
+
+
+@partial(jax.jit, static_argnames=("max_doc_len",))
 def doc_offset_attention(
-    q: jax.Array, k: jax.Array, v: jax.Array, offsets: jax.Array, *, max_doc_len: int
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    offsets: jax.Array,
+    *,
+    max_doc_len: int,
 ) -> jax.Array:
     """
     Document-offset attention over packed Q/K/V.
@@ -33,9 +95,9 @@ def doc_offset_attention(
     This computes per-document attention:
         out[offsets[d] : offsets[d+1], :, :] = softmax(q_d @ k_d.T / sqrt(Dq)) @ v_d
 
-    but avoids dynamically sized slices by using a fixed max_doc_len.
-    The source intentionally uses ``vmap`` and a ``unique_indices=True`` scatter to expose
-    document-level parallelism to the compiler.
+    but avoids dynamically sized tensors by using a fixed max_doc_len. The source intentionally
+    uses ``vmap`` and semantic packed-window calls to expose document-level parallelism while
+    preserving contiguous access information for the compiler.
     `offsets` must describe a monotonic, non-overlapping partition of the packed token axis,
     with every document length <= max_doc_len.
     """
@@ -46,30 +108,10 @@ def doc_offset_attention(
         )
     LT, H, D = q.shape
     L0 = max_doc_len
-    N = offsets.shape[0] - 1
     starts = offsets[:-1]
     lengths = offsets[1:] - starts
     token_offsets = jnp.arange(L0, dtype=offsets.dtype)
     scale = jnp.asarray(1.0 / math.sqrt(D), dtype=jnp.float32)
-    token_indices = starts[:, None] + token_offsets[None, :]
-
-    # StableHLO has no masked slicing operation. A ranged load `[start, end)` in StableHLO
-    # clamps `start` to make the whole window in bound, which is surprising and not what we intend.
-    # Instead, pad the packed token axis first to prevent OOB before we gather.
-    # L0 rows (rather than L0 - 1) also cover a zero-length final document whose start equals LT.
-    # The padding value is unobservable: key positions beyond each document length are masked,
-    # while padded query rows are dropped by the final scatter.
-    def masked_load_docs(x):
-        padded = jnp.pad(x, ((0, L0), (0, 0), (0, 0)), constant_values=0)
-        return lax.gather(
-            padded,
-            starts[:, None],
-            dimension_numbers=lax.GatherDimensionNumbers(
-                offset_dims=(1, 2, 3), collapsed_slice_dims=(), start_index_map=(0,)
-            ),
-            slice_sizes=(L0, H, D),
-            mode=lax.GatherScatterMode.PROMISE_IN_BOUNDS,
-        )
 
     def one_doc_attention(q_doc, k_doc, v_doc, doc_len):
         """Dense masked attention for one logical document window."""
@@ -108,32 +150,17 @@ def doc_offset_attention(
         out_ihd = out_hid.transpose(1, 0, 2)
         return out_ihd.astype(q.dtype)
 
-    q_docs, k_docs, v_docs = [masked_load_docs(x) for x in (q, k, v)]
+    q_docs, k_docs, v_docs = [
+        packed_window_extract(x, starts, lengths, jnp.zeros((), dtype=x.dtype), max_doc_len=L0)
+        for x in (q, k, v)
+    ]
 
     # [N, M, H, D]. `vmap` makes the whole per-document attention computation a
     # batched, document-parallel map rather than a loop-carried sequential loop.
     out_docs = jax.vmap(one_doc_attention)(q_docs, k_docs, v_docs, lengths)
 
-    # Scatter valid document tokens back to packed layout. Invalid padded tokens
-    # are sent to unique out-of-bounds sink positions so the scatter can be marked
-    # unique and the OOB updates can be dropped instead of materializing sinks.
-    doc_ids = jnp.arange(N, dtype=offsets.dtype)
-    valid_doc_tokens = lengths[:, None] > token_offsets[None, :]
-    sink_indices = LT + doc_ids[:, None] * L0 + token_offsets[None, :]
-    scatter_indices = jnp.where(valid_doc_tokens, token_indices, sink_indices)
-    return lax.scatter(
-        jnp.zeros((LT, H, D), dtype=q.dtype),
-        scatter_indices[..., None],  # [N, L0, 1]
-        out_docs,  # [N, L0, H, D]
-        dimension_numbers=lax.ScatterDimensionNumbers(
-            update_window_dims=(2, 3),
-            inserted_window_dims=(0,),
-            scatter_dims_to_operand_dims=(0,),
-        ),
-        indices_are_sorted=False,
-        unique_indices=True,
-        mode=lax.GatherScatterMode.FILL_OR_DROP,
-    )
+    destination = jnp.zeros((LT, H, D), dtype=q.dtype)
+    return packed_window_insert(out_docs, destination, starts, lengths)
 
 
 def parse_args() -> argparse.Namespace:
