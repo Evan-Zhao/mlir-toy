@@ -386,6 +386,24 @@ ForallOutputExtension cloneForallWithAppendedOutputs(RewriterBase &rewriter, scf
                                .clonedOps = std::move(clonedOps)};
 }
 
+void notifyClonedOpsRecursively(
+    RewriterBase &rewriter,
+    ArrayRef<std::pair<Operation *, Operation *>> clonedOps) {
+  auto *listener = dyn_cast_if_present<RewriterBase::Listener>(rewriter.getListener());
+  if (!listener)
+    return;
+
+  for (auto [oldOp, newOp] : clonedOps) {
+    SmallVector<Operation *> oldNestedOps, newNestedOps;
+    oldOp->walk<WalkOrder::PreOrder>([&](Operation *op) { oldNestedOps.push_back(op); });
+    newOp->walk<WalkOrder::PreOrder>([&](Operation *op) { newNestedOps.push_back(op); });
+    if (oldNestedOps.size() != newNestedOps.size())
+      continue;
+    for (auto [oldNested, newNested] : llvm::zip(oldNestedOps, newNestedOps))
+      listener->notifyOperationReplaced(oldNested, newNested);
+  }
+}
+
 FailureOr<DenseMap<OpResult, LoopResultRelaysT>>
 getChainedLoopResultMap(ArrayRef<Operation *> loops) {
   auto loopResultRelaysF = getNestedLoopResultRelays(loops);

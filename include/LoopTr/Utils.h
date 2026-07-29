@@ -161,6 +161,12 @@ struct ForallOutputExtension {
 ForallOutputExtension cloneForallWithAppendedOutputs(RewriterBase &rewriter, scf::ForallOp forall,
                                                      ValueRange appendedOutputs);
 
+/// Notify the rewriter listener that each cloned operation, and each nested
+/// operation at the same preorder position, replaces its original counterpart.
+void notifyClonedOpsRecursively(
+    RewriterBase &rewriter,
+    ArrayRef<std::pair<Operation *, Operation *>> clonedOps);
+
 enum class DefChainAction : uint8_t { Clone, Move };
 
 /// Make all `values` available at the insertion point. In `Clone` mode, later

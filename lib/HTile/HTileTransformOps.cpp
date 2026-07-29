@@ -12,13 +12,16 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Transforms/Transforms.h"
+#include "mlir/Dialect/Tensor/Utils/Utils.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SmallBitVector.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "htile-transform-ops"
@@ -1063,6 +1066,333 @@ DiagnosedSilenceableFailure HTileLinalgToSemanticOp::applyToOne(TransformRewrite
   return DiagnosedSilenceableFailure::success();
 }
 
+namespace {
+
+enum class PackedWindowCallKind : uint8_t { Extract, Insert };
+
+static constexpr llvm::StringLiteral packedWindowExtractTarget = "neptune.packed_window_extract";
+static constexpr llvm::StringLiteral packedWindowInsertTarget = "neptune.packed_window_insert";
+
+/// The semantic operands and types shared by packed-window extraction and
+/// insertion. `packed` is the source of an extraction and the destination of
+/// an insertion; `other` is present only for extraction.
+struct PackedWindowCallInfo {
+  PackedWindowCallKind kind;
+  stablehlo::CustomCallOp call;
+  Value packed;
+  Value windows;
+  Value starts;
+  Value lengths;
+  Value other;
+  RankedTensorType packedType;
+  RankedTensorType windowsType;
+  RankedTensorType startsType;
+};
+
+/// Validate the custom-call ABI and expose it independently of operand order.
+static FailureOr<PackedWindowCallInfo> validatePackedWindowCall(stablehlo::CustomCallOp call,
+                                                                PackedWindowCallKind kind) {
+  StringRef target =
+      kind == PackedWindowCallKind::Extract ? packedWindowExtractTarget : packedWindowInsertTarget;
+  constexpr unsigned expectedInputs = 4;
+  if (call.getCallTargetName() != target)
+    return call.emitError() << "expected custom call target @" << target;
+  if (call.getHasSideEffect())
+    return call.emitError("expected packed-window custom call to be side-effect free");
+  if (!call.getCalledComputations().empty())
+    return call.emitError("expected packed-window custom call to have no called computations");
+  if (!call.getOutputOperandAliases().empty())
+    return call.emitError("expected packed-window custom call to have no output aliases");
+  if (call.getInputs().size() != expectedInputs || call->getNumResults() != 1)
+    return call.emitError() << "expected four inputs and one result";
+
+  for (Type type : llvm::concat<Type>(call.getInputs().getTypes(), call->getResultTypes())) {
+    auto rankedType = dyn_cast<RankedTensorType>(type);
+    if (!rankedType)
+      return call.emitError("expected all inputs and results to be ranked tensors");
+    if (!rankedType.hasStaticShape())
+      return call.emitError("expected all packed-window shapes to be static");
+  }
+
+  ValueRange inputs = call.getInputs();
+  Value packed = kind == PackedWindowCallKind::Extract ? inputs[0] : inputs[1];
+  Value windows = kind == PackedWindowCallKind::Extract ? call->getResult(0) : inputs[0];
+  Value starts = kind == PackedWindowCallKind::Extract ? inputs[1] : inputs[2];
+  PackedWindowCallInfo info{
+      .kind = kind,
+      .call = call,
+      .packed = packed,
+      .windows = windows,
+      .starts = starts,
+      .lengths = kind == PackedWindowCallKind::Extract ? inputs[2] : inputs[3],
+      .other = kind == PackedWindowCallKind::Extract ? inputs[3] : Value{},
+      .packedType = cast<RankedTensorType>(packed.getType()),
+      .windowsType = cast<RankedTensorType>(windows.getType()),
+      .startsType = cast<RankedTensorType>(starts.getType()),
+  };
+  RankedTensorType lengthsType = cast<RankedTensorType>(info.lengths.getType());
+
+  if (info.startsType.getRank() != 1 || info.startsType != lengthsType)
+    return call.emitError("expected starts and lengths to have the same rank-one tensor type");
+  Type indexType = info.startsType.getElementType();
+  if (!indexType.isIndex() && !indexType.isSignlessInteger())
+    return call.emitError("expected starts and lengths to contain indices or signless integers");
+  if (info.windowsType.getRank() < 2 ||
+      info.windowsType.getDimSize(0) != info.startsType.getDimSize(0))
+    return call.emitError("expected one window per start and length");
+
+  if (kind == PackedWindowCallKind::Extract) {
+    RankedTensorType otherType = cast<RankedTensorType>(info.other.getType());
+    if (info.packedType.getRank() < 1 ||
+        info.windowsType.getRank() != info.packedType.getRank() + 1)
+      return call.emitError("expected windows rank to be packed rank plus one");
+    if (otherType.getRank() != 0 ||
+        otherType.getElementType() != info.packedType.getElementType() ||
+        info.windowsType.getElementType() != info.packedType.getElementType())
+      return call.emitError("expected packed, windows, and scalar other element types to match");
+    if (!llvm::equal(info.packedType.getShape().drop_front(),
+                     info.windowsType.getShape().drop_front(2)))
+      return call.emitError("expected window element shape to match packed element shape");
+  } else {
+    RankedTensorType resultType = cast<RankedTensorType>(call->getResult(0).getType());
+    if (info.windowsType.getRank() != info.packedType.getRank() + 1)
+      return call.emitError("expected windows rank to be destination rank plus one");
+    if (info.windowsType.getElementType() != info.packedType.getElementType() ||
+        resultType != info.packedType)
+      return call.emitError(
+          "expected windows element type and destination/result tensor types to match");
+    if (!llvm::equal(info.windowsType.getShape().drop_front(2),
+                     info.packedType.getShape().drop_front()))
+      return call.emitError("expected window element shape to match destination element shape");
+  }
+  return info;
+}
+
+/// An analyzed tile in `[document, token, tail...]` window coordinates. This
+/// contains only existing values and attributes, so every tile can be checked
+/// before either transform starts mutating the payload IR.
+struct PackedWindowTilePlan {
+  PackedWindowCallInfo call;
+  Operation *tileOp;
+  RankedTensorType tileType;
+  OpFoldResult documentOffset;
+  OpFoldResult tokenOffset;
+  OpFoldResult tokenSize;
+  SmallVector<OpFoldResult> trailingOffsets;
+  SmallVector<OpFoldResult> trailingSizes;
+  SmallVector<OpFoldResult> trailingStrides;
+  llvm::SmallBitVector rankReducedWindowDims;
+};
+
+static FailureOr<PackedWindowTilePlan>
+analyzePackedWindowTile(const PackedWindowCallInfo &call,
+                        OffsetSizeAndStrideOpInterface publishingOp, RankedTensorType tileType) {
+  size_t windowRank = call.windowsType.getRank();
+  auto offsets = publishingOp.getMixedOffsets();
+  auto sizes = publishingOp.getMixedSizes();
+  auto strides = publishingOp.getMixedStrides();
+  if (offsets.size() != windowRank || sizes.size() != windowRank || strides.size() != windowRank)
+    return publishingOp->emitError("expected a full-rank packed-window tile descriptor");
+  if (!tileType.hasStaticShape())
+    return publishingOp->emitError("expected the packed-window tile shape to be static");
+  if (tileType.getElementType() != call.windowsType.getElementType())
+    return publishingOp->emitError("expected the tile and windows element types to match");
+  if (!llvm::all_of(strides, isOneInteger))
+    return publishingOp->emitError("expected packed-window tile strides to be one");
+
+  SmallVector<int64_t> staticSizes;
+  staticSizes.reserve(sizes.size());
+  for (OpFoldResult size : sizes) {
+    std::optional<int64_t> constant = getConstantIntValue(size);
+    if (!constant || *constant <= 0)
+      return publishingOp->emitError("expected positive static packed-window tile sizes");
+    staticSizes.push_back(*constant);
+  }
+  if (staticSizes[0] != 1)
+    return publishingOp->emitError("expected each packed-window tile to select one document");
+
+  std::optional<llvm::SmallDenseSet<unsigned>> droppedDims =
+      computeRankReductionMask(staticSizes, tileType.getShape(), /*matchDynamic=*/false);
+  if (!droppedDims)
+    return publishingOp->emitError(
+        "expected the packed-window tile type to be a rank reduction of its "
+        "descriptor sizes");
+  llvm::SmallBitVector rankReducedWindowDims(windowRank);
+  for (unsigned dim : *droppedDims)
+    rankReducedWindowDims.set(dim);
+
+  return PackedWindowTilePlan{
+      .call = call,
+      .tileOp = publishingOp.getOperation(),
+      .tileType = tileType,
+      .documentOffset = offsets[0],
+      .tokenOffset = offsets[1],
+      .tokenSize = sizes[1],
+      .trailingOffsets = SmallVector<OpFoldResult>(ArrayRef(offsets).drop_front(2)),
+      .trailingSizes = SmallVector<OpFoldResult>(ArrayRef(sizes).drop_front(2)),
+      .trailingStrides = SmallVector<OpFoldResult>(ArrayRef(strides).drop_front(2)),
+      .rankReducedWindowDims = std::move(rankReducedWindowDims),
+  };
+}
+
+/// The tile-local address and predicate materialized from a validated plan.
+/// Its descriptor is in packed coordinates and therefore omits the logical
+/// document dimension of the window tensor.
+struct MaterializedPackedWindowTile {
+  Value documentIndex;
+  Value tokenOffset;
+  Value start;
+  Value length;
+  Value rowOffset;
+  Value mask;
+  RankedTensorType physicalTileType;
+  SmallVector<OpFoldResult> packedOffsets;
+  SmallVector<OpFoldResult> packedSizes;
+  SmallVector<OpFoldResult> packedStrides;
+};
+
+static Value castToIndex(RewriterBase &rewriter, Location loc, Value value) {
+  if (value.getType().isIndex())
+    return value;
+  return arith::IndexCastOp::create(rewriter, loc, rewriter.getIndexType(), value);
+}
+
+static MaterializedPackedWindowTile materializePackedWindowTile(RewriterBase &rewriter,
+                                                                const PackedWindowTilePlan &plan,
+                                                                Operation *insertionPoint) {
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(insertionPoint);
+  Location loc = plan.tileOp->getLoc();
+
+  Value documentIndex = getValueOrCreateConstantIndexOp(rewriter, loc, plan.documentOffset);
+  Value tokenOffset = getValueOrCreateConstantIndexOp(rewriter, loc, plan.tokenOffset);
+  Value start =
+      tensor::ExtractOp::create(rewriter, loc, plan.call.starts, ValueRange{documentIndex});
+  Value length =
+      tensor::ExtractOp::create(rewriter, loc, plan.call.lengths, ValueRange{documentIndex});
+  start = castToIndex(rewriter, loc, start);
+  length = castToIndex(rewriter, loc, length);
+  Value rowOffset = arith::AddIOp::create(rewriter, loc, start, tokenOffset);
+
+  SmallVector<int64_t> physicalShape;
+  for (int64_t windowDim = 1; windowDim < plan.call.windowsType.getRank(); ++windowDim) {
+    if (plan.rankReducedWindowDims.test(windowDim))
+      continue;
+    OpFoldResult size = windowDim == 1 ? plan.tokenSize : plan.trailingSizes[windowDim - 2];
+    physicalShape.push_back(*getConstantIntValue(size));
+  }
+  auto physicalTileType = RankedTensorType::get(physicalShape, plan.tileType.getElementType(),
+                                                plan.tileType.getEncoding());
+
+  Value emptyMask = tensor::EmptyOp::create(rewriter, loc, physicalShape, rewriter.getI1Type());
+  AffineMap identity = rewriter.getMultiDimIdentityMap(physicalShape.size());
+  SmallVector<utils::IteratorType> iteratorTypes(physicalShape.size(),
+                                                 utils::IteratorType::parallel);
+  bool tokenDimensionDropped = plan.rankReducedWindowDims.test(1);
+  auto mask = linalg::GenericOp::create(
+      rewriter, loc, TypeRange{emptyMask.getType()}, ValueRange{}, ValueRange{emptyMask},
+      ArrayRef<AffineMap>{identity}, iteratorTypes,
+      [&](OpBuilder &builder, Location bodyLoc, ValueRange) {
+        Value localToken;
+        if (tokenDimensionDropped)
+          localToken = arith::ConstantIndexOp::create(builder, bodyLoc, 0);
+        else
+          localToken = linalg::IndexOp::create(builder, bodyLoc, 0);
+        Value windowToken = arith::AddIOp::create(builder, bodyLoc, tokenOffset, localToken);
+        Value valid =
+            arith::CmpIOp::create(builder, bodyLoc, arith::CmpIPredicate::slt, windowToken, length);
+        linalg::YieldOp::create(builder, bodyLoc, valid);
+      });
+
+  OpFoldResult one = rewriter.getIndexAttr(1);
+  SmallVector<OpFoldResult> packedOffsets{rowOffset};
+  llvm::append_range(packedOffsets, plan.trailingOffsets);
+  SmallVector<OpFoldResult> packedSizes{plan.tokenSize};
+  llvm::append_range(packedSizes, plan.trailingSizes);
+  SmallVector<OpFoldResult> packedStrides{one};
+  llvm::append_range(packedStrides, plan.trailingStrides);
+  return MaterializedPackedWindowTile{
+      .documentIndex = documentIndex,
+      .tokenOffset = tokenOffset,
+      .start = start,
+      .length = length,
+      .rowOffset = rowOffset,
+      .mask = mask.getResult(0),
+      .physicalTileType = physicalTileType,
+      .packedOffsets = std::move(packedOffsets),
+      .packedSizes = std::move(packedSizes),
+      .packedStrides = std::move(packedStrides),
+  };
+}
+
+static void printOpFoldResults(llvm::raw_ostream &os, ArrayRef<OpFoldResult> values) {
+  llvm::interleaveComma(values, os, [&](OpFoldResult value) {
+    if (auto attribute = dyn_cast<Attribute>(value)) {
+      os << attribute;
+      return;
+    }
+    cast<Value>(value).printAsOperand(os, OpPrintingFlags());
+  });
+}
+
+static Value restoreLogicalWindowTile(RewriterBase &rewriter, Location loc, Value physicalTile,
+                                      const PackedWindowTilePlan &plan) {
+  if (plan.rankReducedWindowDims.test(0)) {
+    assert(physicalTile.getType() == plan.tileType &&
+           "a tile that dropped the document dimension is already in logical shape");
+    return physicalTile;
+  }
+
+  auto physicalType = cast<RankedTensorType>(physicalTile.getType());
+  assert(plan.tileType.getRank() == physicalType.getRank() + 1 &&
+         plan.tileType.getDimSize(0) == 1 &&
+         "the physical tile must omit exactly the unit document dimension");
+  if (physicalType.getRank() == 0) {
+    Value scalar = tensor::ExtractOp::create(rewriter, loc, physicalTile, ValueRange{});
+    return tensor::FromElementsOp::create(rewriter, loc, plan.tileType, ValueRange{scalar});
+  }
+
+  SmallVector<ReassociationIndices> reassociation;
+  reassociation.push_back({0, 1});
+  for (int64_t physicalDim = 1; physicalDim < physicalType.getRank(); ++physicalDim)
+    reassociation.push_back({physicalDim + 1});
+  return tensor::ExpandShapeOp::create(rewriter, loc, plan.tileType, physicalTile, reassociation);
+}
+
+static void printMaterializedPackedWindowTile(llvm::raw_ostream &os,
+                                              const MaterializedPackedWindowTile &tile) {
+  os << "materialized packed-window tile:\n"
+     << "  physical tile type: " << tile.physicalTileType << "\n"
+     << "  document index: ";
+  tile.documentIndex.printAsOperand(os, OpPrintingFlags());
+  os << "\n  token offset: ";
+  tile.tokenOffset.printAsOperand(os, OpPrintingFlags());
+  os << "\n  start: ";
+  tile.start.printAsOperand(os, OpPrintingFlags());
+  os << "\n  length: ";
+  tile.length.printAsOperand(os, OpPrintingFlags());
+  os << "\n  row offset: ";
+  tile.rowOffset.printAsOperand(os, OpPrintingFlags());
+  os << "\n  packed offsets: [";
+  printOpFoldResults(os, tile.packedOffsets);
+  os << "]\n  packed sizes: [";
+  printOpFoldResults(os, tile.packedSizes);
+  os << "]\n  packed strides: [";
+  printOpFoldResults(os, tile.packedStrides);
+  os << "]\n  mask: ";
+  tile.mask.printAsOperand(os, OpPrintingFlags());
+  os << " : " << tile.mask.getType() << "\n";
+}
+
+static Operation *findSelectedLoop(Operation *user, const DenseSet<Operation *> &selectedLoops) {
+  for (Operation *parent = user->getParentOp(); parent; parent = parent->getParentOp())
+    if (selectedLoops.contains(parent))
+      return parent;
+  return nullptr;
+}
+
+} // namespace
+
 void HTileFusePackedWindowInsertOp::getEffects(
     SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {
   consumesHandle(getInsertMutable(), effects);
@@ -1071,12 +1401,97 @@ void HTileFusePackedWindowInsertOp::getEffects(
   modifiesPayload(effects);
 }
 
-DiagnosedSilenceableFailure HTileFusePackedWindowInsertOp::apply(
-    TransformRewriter &rewriter, TransformResults &results, TransformState &state) {
-  (void)rewriter;
-  (void)results;
-  (void)state;
-  return emitDefiniteFailure() << "packed-window insertion fusion is not implemented";
+DiagnosedSilenceableFailure HTileFusePackedWindowInsertOp::apply(TransformRewriter &rewriter,
+                                                                 TransformResults &results,
+                                                                 TransformState &state) {
+  auto transform = cast<TransformOpInterface>(getOperation());
+
+  stablehlo::CustomCallOp insert;
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getInsert, "insert", insert,
+                               stablehlo::CustomCallOp);
+  FailureOr<PackedWindowCallInfo> insertInfo =
+      validatePackedWindowCall(insert, PackedWindowCallKind::Insert);
+  if (failed(insertInfo))
+    BAIL("invalid packed-window insertion custom call");
+
+  scf::ForallOp forall;
+  CHECK_EXTRACT_UNIQUE_OP_CAST(state, transform, getForall, "forall", forall, scf::ForallOp);
+  auto windows = dyn_cast<OpResult>(insertInfo->windows);
+  if (!windows || windows.getOwner() != forall)
+    BAIL("expected the selected forall to directly produce the windows input");
+  FailureOr<tensor::ParallelInsertSliceOp> publication =
+      getParallelInsertSliceForLoopResult(forall, windows);
+  if (failed(publication))
+    BAIL("expected the windows to be published by one tensor.parallel_insert_slice");
+
+  FailureOr<PackedWindowTilePlan> tilePlan = analyzePackedWindowTile(
+      *insertInfo, cast<OffsetSizeAndStrideOpInterface>(publication->getOperation()),
+      publication->getSourceType());
+  if (failed(tilePlan))
+    BAIL("invalid packed-window insertion tile");
+
+  // The packed destination and range metadata become operands of the rebuilt
+  // forall. Keep availability handling centralized in the shared loop helper.
+  rewriter.setInsertionPoint(forall);
+  IRMapping availableMapping;
+  FailureOr<SmallVector<Value>> availableValues = makeValuesAvailableAtInsertionPoint(
+      rewriter, {insertInfo->packed, insertInfo->starts, insertInfo->lengths}, availableMapping,
+      DefChainAction::Move);
+  if (failed(availableValues))
+    BAIL("failed to make the packed destination, starts, and lengths available before the forall");
+  tilePlan->call.packed = (*availableValues)[0];
+  tilePlan->call.starts = (*availableValues)[1];
+  tilePlan->call.lengths = (*availableValues)[2];
+
+  MaterializedPackedWindowTile materializedTile =
+      materializePackedWindowTile(rewriter, *tilePlan, forall.getTerminator());
+  LLVM_DEBUG(printMaterializedPackedWindowTile(llvm::dbgs(), materializedTile));
+
+  // The publication source is in logical window coordinates. Remove its unit
+  // document dimension before publishing to the packed destination.
+  rewriter.setInsertionPoint(forall.getTerminator());
+  Value physicalSource = publication->getSource();
+  if (!tilePlan->rankReducedWindowDims.test(0)) {
+    llvm::SmallBitVector dropDocumentDim(publication->getSourceType().getRank());
+    dropDocumentDim.set(0);
+    physicalSource =
+        tensor::dropGivenUnitDims(rewriter, insert.getLoc(), physicalSource, dropDocumentDim);
+  }
+  assert(physicalSource.getType() == materializedTile.physicalTileType &&
+         "tile analysis must determine the physical publication type");
+
+  rewriter.setInsertionPoint(forall);
+  ForallOutputExtension extension =
+      cloneForallWithAppendedOutputs(rewriter, forall, ValueRange{tilePlan->call.packed});
+  scf::ForallOp newForall = extension.forall;
+  notifyClonedOpsRecursively(rewriter, extension.clonedOps);
+
+  auto remapMixedValues = [&](ArrayRef<OpFoldResult> values) {
+    return llvm::map_to_vector(values, [&](OpFoldResult value) -> OpFoldResult {
+      if (auto dynamic = dyn_cast<Value>(value))
+        return extension.mapping.lookupOrDefault(dynamic);
+      return value;
+    });
+  };
+  Value clonedSource = extension.mapping.lookupOrDefault(physicalSource);
+  Value clonedMask = extension.mapping.lookupOrDefault(materializedTile.mask);
+  SmallVector<OpFoldResult> clonedOffsets = remapMixedValues(materializedTile.packedOffsets);
+  SmallVector<OpFoldResult> clonedSizes = remapMixedValues(materializedTile.packedSizes);
+  SmallVector<OpFoldResult> clonedStrides = remapMixedValues(materializedTile.packedStrides);
+  pointBuilderToForallParallel(rewriter, newForall);
+  auto maskedInsert = htile::MaskedParallelInsertSliceOp::create(
+      rewriter, insert.getLoc(), clonedSource, extension.getAppendedOutputArgs().front(),
+      clonedOffsets, clonedSizes, clonedStrides, clonedMask);
+
+  rewriter.replaceOp(insert, extension.getAppendedResults().front());
+  if (failed(rewriter.notifyPayloadOperationReplaced(forall, newForall)))
+    BAIL("failed to preserve the scf.forall handle");
+  rewriter.replaceOp(forall, extension.getPreservedResults());
+
+  LLVM_DEBUG(llvm::dbgs() << "rebuilt forall with packed-window insertion:\n"
+                          << maskedInsert << "\n");
+  results.set(getOperation()->getResult(0), ArrayRef<Operation *>{maskedInsert.getOperation()});
+  return DiagnosedSilenceableFailure::success();
 }
 
 void HTileFusePackedWindowExtractOp::getEffects(
@@ -1087,12 +1502,83 @@ void HTileFusePackedWindowExtractOp::getEffects(
   modifiesPayload(effects);
 }
 
-DiagnosedSilenceableFailure HTileFusePackedWindowExtractOp::apply(
-    TransformRewriter &rewriter, TransformResults &results, TransformState &state) {
-  (void)rewriter;
-  (void)results;
-  (void)state;
-  return emitDefiniteFailure() << "packed-window extraction fusion is not implemented";
+DiagnosedSilenceableFailure HTileFusePackedWindowExtractOp::apply(TransformRewriter &rewriter,
+                                                                  TransformResults &results,
+                                                                  TransformState &state) {
+  auto transform = cast<TransformOpInterface>(getOperation());
+
+  DenseSet<Operation *> loops;
+  for (Operation *payload : state.getPayloadOps(getLoops())) {
+    if (!isa<scf::ForOp, scf::ForallOp>(payload))
+      BAIL("expected the loops handle to contain only scf.for or scf.forall operations");
+    loops.insert(payload);
+  }
+  if (loops.empty())
+    BAIL("expected at least one selected loop");
+
+  SmallVector<PackedWindowCallInfo> extracts;
+  for (Operation *payload : state.getPayloadOps(getExtracts())) {
+    auto extract = dyn_cast<stablehlo::CustomCallOp>(payload);
+    if (!extract)
+      BAIL("expected the extracts handle to contain only stablehlo.custom_call operations");
+    FailureOr<PackedWindowCallInfo> extractInfo =
+        validatePackedWindowCall(extract, PackedWindowCallKind::Extract);
+    if (failed(extractInfo))
+      BAIL("invalid packed-window extraction custom call");
+    extracts.push_back(*extractInfo);
+  }
+  if (extracts.empty())
+    BAIL("expected at least one packed-window extraction custom call");
+
+  SmallVector<PackedWindowTilePlan, 0> tilePlans;
+  for (const PackedWindowCallInfo &extract : extracts) {
+    bool foundInLoopTile = false;
+    for (OpOperand &use : extract.windows.getUses()) {
+      if (!findSelectedLoop(use.getOwner(), loops))
+        continue;
+      auto slice = dyn_cast<tensor::ExtractSliceOp>(use.getOwner());
+      if (!slice || use.getOperandNumber() != 0)
+        BAIL("expected each in-loop packed-window extraction user to be tensor.extract_slice");
+      FailureOr<PackedWindowTilePlan> tilePlan = analyzePackedWindowTile(
+          extract, cast<OffsetSizeAndStrideOpInterface>(slice.getOperation()),
+          slice.getResultType());
+      if (failed(tilePlan))
+        BAIL("invalid packed-window extraction tile");
+      tilePlans.push_back(std::move(*tilePlan));
+      foundInLoopTile = true;
+    }
+    if (!foundInLoopTile)
+      BAIL("expected each packed-window extraction to have an in-loop tile");
+  }
+
+  SmallVector<MaterializedPackedWindowTile, 0> materializedTiles;
+  materializedTiles.reserve(tilePlans.size());
+  for (const PackedWindowTilePlan &plan : tilePlans) {
+    materializedTiles.push_back(materializePackedWindowTile(rewriter, plan, plan.tileOp));
+    LLVM_DEBUG(printMaterializedPackedWindowTile(llvm::dbgs(), materializedTiles.back()));
+  }
+
+  SmallVector<Operation *> loads;
+  for (auto [plan, materialized] : llvm::zip_equal(tilePlans, materializedTiles)) {
+    auto slice = cast<tensor::ExtractSliceOp>(plan.tileOp);
+    rewriter.setInsertionPoint(slice);
+    Location loc = slice.getLoc();
+    SmallVector<Value> loadOffsets =
+        getValueOrCreateConstantIndexOp(rewriter, loc, materialized.packedOffsets);
+    Value other = tensor::ExtractOp::create(rewriter, loc, plan.call.other, ValueRange{});
+    auto load = htile::LoadOp::create(rewriter, loc, materialized.physicalTileType,
+                                      plan.call.packed, loadOffsets, materialized.mask, other);
+    Value replacement = restoreLogicalWindowTile(rewriter, loc, load, plan);
+    rewriter.replaceOp(slice, replacement);
+    loads.push_back(load);
+  }
+
+  for (const PackedWindowCallInfo &extract : extracts)
+    if (extract.call->use_empty())
+      rewriter.eraseOp(extract.call);
+
+  results.set(getOperation()->getResult(0), loads);
+  return DiagnosedSilenceableFailure::success();
 }
 
 void HTileOutlineKernelsOp::getEffects(SmallVectorImpl<MemoryEffects::EffectInstance> &effects) {

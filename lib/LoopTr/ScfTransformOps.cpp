@@ -164,27 +164,6 @@ Value expandTensor(OpBuilder &builder, Location loc, Value value, const FoldedTe
   return tensor::ExpandShapeOp::create(builder, loc, info.oldType, value, info.reassociation);
 }
 
-void notifyReplacedRecursively(Operation *oldOp, RewriterBase &rewriter, Operation *newOp) {
-  auto *listener = dyn_cast_if_present<RewriterBase::Listener>(rewriter.getListener());
-  if (!listener)
-    return;
-
-  SmallVector<Operation *> oldOps, newOps;
-  oldOp->walk<WalkOrder::PreOrder>([&](Operation *op) { oldOps.push_back(op); });
-  newOp->walk<WalkOrder::PreOrder>([&](Operation *op) { newOps.push_back(op); });
-  if (oldOps.size() != newOps.size())
-    return;
-
-  for (auto [oldNested, newNested] : llvm::zip(oldOps, newOps))
-    listener->notifyOperationReplaced(oldNested, newNested);
-}
-
-template <typename OpRange>
-void notifyClonedOpsRecursively(RewriterBase &rewriter, OpRange &&clonedOps) {
-  for (auto [oldOp, newOp] : clonedOps)
-    notifyReplacedRecursively(oldOp, rewriter, newOp);
-}
-
 void notifyLoopReplaced(RewriterBase &rewriter, Operation *oldLoop, Operation *newLoop) {
   if (auto *listener = dyn_cast_if_present<RewriterBase::Listener>(rewriter.getListener()))
     listener->notifyOperationReplaced(oldLoop, newLoop);
