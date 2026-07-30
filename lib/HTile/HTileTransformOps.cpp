@@ -1257,6 +1257,20 @@ static Value castToIndex(RewriterBase &rewriter, Location loc, Value value) {
   return arith::IndexCastOp::create(rewriter, loc, rewriter.getIndexType(), value);
 }
 
+/// Preserve a tensor tile edge so producer fusion can follow it into the loop,
+/// then scalarize only the rank-zero tile.
+static Value extractRankOneTensorElement(RewriterBase &rewriter, Location loc, Value tensor,
+                                         Value index) {
+  auto tensorType = cast<RankedTensorType>(tensor.getType());
+  auto elementTensorType =
+      RankedTensorType::get({}, tensorType.getElementType(), tensorType.getEncoding());
+  OpFoldResult one = rewriter.getIndexAttr(1);
+  auto slice = tensor::ExtractSliceOp::create(
+      rewriter, loc, elementTensorType, tensor, ArrayRef<OpFoldResult>{index},
+      ArrayRef<OpFoldResult>{one}, ArrayRef<OpFoldResult>{one});
+  return tensor::ExtractOp::create(rewriter, loc, slice, ValueRange{});
+}
+
 static MaterializedPackedWindowTile materializePackedWindowTile(RewriterBase &rewriter,
                                                                 const PackedWindowTilePlan &plan,
                                                                 Operation *insertionPoint) {
@@ -1266,10 +1280,8 @@ static MaterializedPackedWindowTile materializePackedWindowTile(RewriterBase &re
 
   Value documentIndex = getValueOrCreateConstantIndexOp(rewriter, loc, plan.documentOffset);
   Value tokenOffset = getValueOrCreateConstantIndexOp(rewriter, loc, plan.tokenOffset);
-  Value start =
-      tensor::ExtractOp::create(rewriter, loc, plan.call.starts, ValueRange{documentIndex});
-  Value length =
-      tensor::ExtractOp::create(rewriter, loc, plan.call.lengths, ValueRange{documentIndex});
+  Value start = extractRankOneTensorElement(rewriter, loc, plan.call.starts, documentIndex);
+  Value length = extractRankOneTensorElement(rewriter, loc, plan.call.lengths, documentIndex);
   start = castToIndex(rewriter, loc, start);
   length = castToIndex(rewriter, loc, length);
   Value rowOffset = arith::AddIOp::create(rewriter, loc, start, tokenOffset);

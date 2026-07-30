@@ -75,6 +75,9 @@ module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo
         ops{["stablehlo.custom_call"]} attributes {call_target_name = "neptune.packed_window_extract"}
         in %func : (!any) -> !any
     transform.htile.fuse_packed_window_extract %extracts into %consumer_loops_1 : (!any, !any) -> !any
+    %_6, %consumer_loops_2 =
+        transform.fusion.greedy_input_producers_into_consumer %consumer_loops
+        : (!any) -> (!any, !any)
 
     // StableHLO slices were not fused because they are not fusable either. However, we can convert them to
     // tensor.extract_slice ops, then combine them with existing tensor.extract_slice ops in the loop.

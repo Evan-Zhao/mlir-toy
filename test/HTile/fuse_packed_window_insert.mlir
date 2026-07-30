@@ -3,8 +3,12 @@
 // CHECK-LABEL: func.func @fuse_packed_window_insert(
 // CHECK-NOT: stablehlo.custom_call
 // CHECK: scf.forall
-// CHECK: tensor.extract %[[STARTS:.*]][%{{.*}}] : tensor<2xi32>
-// CHECK: tensor.extract %[[LENGTHS:.*]][%{{.*}}] : tensor<2xi32>
+// CHECK: %[[START_SLICE:.*]] = tensor.extract_slice %{{.*}}[%{{.*}}] [1] [1]
+// CHECK-SAME: tensor<2xi32> to tensor<i32>
+// CHECK: tensor.extract %[[START_SLICE]][] : tensor<i32>
+// CHECK: %[[LENGTH_SLICE:.*]] = tensor.extract_slice %{{.*}}[%{{.*}}] [1] [1]
+// CHECK-SAME: tensor<2xi32> to tensor<i32>
+// CHECK: tensor.extract %[[LENGTH_SLICE]][] : tensor<i32>
 // CHECK: arith.addi
 // CHECK: %[[MASK:.*]] = linalg.generic
 // CHECK: arith.cmpi slt

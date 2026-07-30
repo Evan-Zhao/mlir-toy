@@ -6,8 +6,12 @@
 // CHECK-SAME: %[[LENGTHS:[^,]+]]: tensor<2xi32>
 // CHECK-SAME: %[[OTHER_TENSOR:[^)]+]]: tensor<f32>
 // CHECK-NOT: stablehlo.custom_call
-// CHECK: tensor.extract %[[STARTS]][%{{.*}}] : tensor<2xi32>
-// CHECK: tensor.extract %[[LENGTHS]][%{{.*}}] : tensor<2xi32>
+// CHECK: %[[START_SLICE:.*]] = tensor.extract_slice %[[STARTS]][%{{.*}}] [1] [1]
+// CHECK-SAME: tensor<2xi32> to tensor<i32>
+// CHECK: tensor.extract %[[START_SLICE]][] : tensor<i32>
+// CHECK: %[[LENGTH_SLICE:.*]] = tensor.extract_slice %[[LENGTHS]][%{{.*}}] [1] [1]
+// CHECK-SAME: tensor<2xi32> to tensor<i32>
+// CHECK: tensor.extract %[[LENGTH_SLICE]][] : tensor<i32>
 // CHECK: %[[MASK:.*]] = linalg.generic
 // CHECK: arith.cmpi slt
 // CHECK: %[[OTHER:.*]] = tensor.extract %[[OTHER_TENSOR]][] : tensor<f32>
