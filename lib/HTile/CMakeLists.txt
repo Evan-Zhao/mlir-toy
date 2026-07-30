@@ -29,6 +29,7 @@ add_public_tablegen_target(HTilePassesIncGen)
 
 add_library(NeptuneHTile STATIC
   HTileDialect.cpp
+  HTileOutlineKernels.cpp
   HTilePasses.cpp
   HTileTransformExtension.cpp
   HTileTransformOps.cpp
