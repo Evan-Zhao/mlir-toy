@@ -1,4 +1,5 @@
 import ast
+import tempfile
 from itertools import product
 from pathlib import Path
 
@@ -23,6 +24,10 @@ def make_attn_pytest_param(
     window_size: int | None = None,
 ):
     kwargs = {"batch": batch, "q_heads": qh, "kv_heads": kvh, "seq_len": seq_len, "head_dim": dhead}
+    if variant == AttentionVariant.ALIBI_CAUSAL_ATTN:
+        input_dtypes = ("float16", "float16", "float16", "float32")
+    else:
+        input_dtypes = ("float16", "float16", "float16")
     if window_size is not None:
         assert variant == AttentionVariant.WINDOWED_CAUSAL_ATTN
         kwargs["window_size"] = window_size
@@ -30,7 +35,7 @@ def make_attn_pytest_param(
     else:
         variant_name = variant.value
     case_id = f"{variant_name}-b{batch}-qh{qh}-kvh{kvh}-s{seq_len}-d{dhead}"
-    return pytest.param(variant, kwargs, id=case_id)
+    return pytest.param((variant, kwargs, input_dtypes), id=case_id)
 
 
 BATCHES = (1, 2)
@@ -162,15 +167,79 @@ def test_custom_tile_config_reaches_lowered_loop_bounds() -> None:
     assert "htile.store" in lowered
 
 
-@pytest.mark.parametrize(("variant", "kwargs"), TRANSLATOR_INPUT_CASES)
-def test_lowered_attention_full_pipeline(variant, kwargs) -> None:
+@pytest.fixture(scope="module", params=TRANSLATOR_INPUT_CASES)
+def lowered_triton_case(request):
+    """Lower one attention case once for source checks and optional compilation."""
     require_export_deps()
     from neptune_mlir.translators.triton import translate_mlir_text
 
+    variant, kwargs, input_dtypes = request.param
     lowered = export_attention_to_triton_input_mlir(variant=variant, **kwargs)
-    source = ast.unparse(translate_mlir_text(lowered))
+    source = ast.unparse(translate_mlir_text(lowered)) + "\n"
+    return source, input_dtypes
+
+
+def require_nvidia_triton():
+    import importlib.util
+
+    if importlib.util.find_spec("triton") is None:
+        pytest.skip("Triton is required for Triton compilation tests")
+    if importlib.util.find_spec("torch") is None:
+        pytest.skip("PyTorch is required for Triton compilation tests")
+
+    import torch
+    import triton
+
+    if torch.version.cuda is None or not torch.cuda.is_available():
+        pytest.skip("An Nvidia GPU is required for Triton compilation tests")
+    try:
+        torch.cuda.init()
+        target = triton.runtime.driver.active.get_current_target()
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"Triton CUDA initialization failed: {exc}")
+    if target.backend != "cuda":  # type: ignore
+        pytest.skip(f"Triton compilation tests require the CUDA backend, got {target.backend}")  # type: ignore
+    return torch
+
+
+def compile_triton_source(source: str, input_dtypes: tuple[str, ...], torch) -> None:
+    """Import generated source and force Triton to compile its attention kernel."""
+    import importlib.util
+    import inspect
+    import sys
+
+    module_name = f"compiled_attention_{abs(hash(source))}"
+    with tempfile.TemporaryDirectory(prefix="neptune_triton_compile_") as temp_dir:
+        module_path = Path(temp_dir) / f"{module_name}.py"
+        module_path.write_text(source)
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Failed to load generated Triton module from {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+            kernel = module.attention
+            parameter_count = len(inspect.signature(kernel.fn).parameters)
+            assert parameter_count == len(input_dtypes)
+            args = [
+                torch.empty(1, dtype=getattr(torch, dtype), device="cuda") for dtype in input_dtypes
+            ]
+            kernel.warmup(*args, grid=(1, 1, 1))
+        finally:
+            sys.modules.pop(module_name, None)
+
+
+def test_attention_lowering_pipeline(lowered_triton_case) -> None:
+    source, _ = lowered_triton_case
     assert "@triton.jit" in source
     assert "def attention" in source
+
+
+def test_attention_lowering_and_triton_compilation(lowered_triton_case) -> None:
+    source, input_dtypes = lowered_triton_case
+    torch = require_nvidia_triton()
+    compile_triton_source(source, input_dtypes, torch)
 
 
 def test_attention_pass_pipeline_embeds_schedule_preload() -> None:

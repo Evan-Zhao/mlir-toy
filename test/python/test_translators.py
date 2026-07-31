@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import ast
 import importlib.util
 import math
@@ -8,12 +7,12 @@ from pathlib import Path
 
 import pytest
 
+from neptune_mlir.dist import find_neptune_opt
 from neptune_mlir.translators.common import translate_file_with
 from neptune_mlir.translators.cutile import translate_mlir_text as translate_cutile
 from neptune_mlir.translators.tilelang import translate_mlir_text as translate_tilelang
 from neptune_mlir.translators.triton import Translator as TritonTranslator
 from neptune_mlir.translators.triton import translate_mlir_text as translate_triton
-from neptune_mlir.dist import find_neptune_opt
 
 PARENT_DIR = Path(__file__).resolve().parent
 GOLDEN_DIR = PARENT_DIR / "golden"
@@ -38,7 +37,7 @@ def require_cuda_torch():
         pytest.skip("A working CUDA runtime is required for functional translator tests")
     try:
         torch.cuda.init()
-    except Exception as exc:  # pragma: no cover - hardware/runtime dependent
+    except Exception as exc:  # noqa: BLE001
         pytest.skip(f"CUDA initialization failed: {exc}")
     return torch
 
