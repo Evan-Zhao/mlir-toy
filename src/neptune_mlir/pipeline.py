@@ -1,12 +1,11 @@
 """Python orchestration for Neptune MLIR lowering pipelines."""
 
-from __future__ import annotations
-
 import ast
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Literal
 
 from .dist import find_neptune_opt
 from .operator.variants import AttentionVariant
@@ -45,7 +44,7 @@ def _run_neptune_opt_file(input_path: Path, pass_pipeline: str) -> str:
         str(input_path),
         f"--pass-pipeline={pass_pipeline}",
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         stderr = result.stderr.strip()
         stdout = result.stdout.strip()
@@ -61,22 +60,29 @@ def export_attention_mlir(
     q_heads: int = 4,
     kv_heads: int | None = None,
     seq_len: int = 128,
+    kv_seq_len: int | None = None,
     head_dim: int = 64,
     window_size: int | None = 128,
     func_name: str = "attention",
+    output_type: Literal["stablehlo", "linalg"] = "stablehlo",
 ) -> str:
-    """Export attention to StableHLO in an isolated Torch-MLIR process."""
+    """Export attention through Torch-MLIR in an isolated process."""
     # Torch-MLIR and the standalone MLIR Python bindings ship separate native
     # runtimes that cannot be loaded into one Python process in arbitrary order.
     variant = _coerce_attention_variant(variant)
-    cmd = [sys.executable, "-m", "neptune_mlir.operator.export_attention"]
+    if output_type not in {"stablehlo", "linalg"}:
+        raise ValueError(f"unsupported Torch-MLIR output type: {output_type}")
+    cmd = [sys.executable, "-m", "neptune_mlir.operator.torch_mlir_export"]
     cmd += ["--variant", variant.value, "--batch", str(batch), "--q-heads", str(q_heads)]
     cmd += ["--seq-len", str(seq_len), "--head-dim", str(head_dim), "--func-name", func_name]
+    cmd += ["--output-type", output_type]
     if kv_heads is not None:
         cmd += ["--kv-heads", str(kv_heads)]
+    if kv_seq_len is not None:
+        cmd += ["--kv-seq-len", str(kv_seq_len)]
     if window_size is not None:
         cmd += ["--window-size", str(window_size)]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         stderr = result.stderr.strip()
         stdout = result.stdout.strip()
@@ -126,13 +132,14 @@ def export_attention_to_triton_input_mlir(
     q_heads: int = 4,
     kv_heads: int | None = None,
     seq_len: int = 128,
+    kv_seq_len: int | None = None,
     head_dim: int = 64,
     window_size: int = 128,
     func_name: str = "attention",
     tile_config: AttentionTileConfig | None = None,
 ) -> str:
     variant = _coerce_attention_variant(variant)
-    schedule = _VARIANT_TO_SCHEDULE.get(variant.value)
+    schedule = _VARIANT_TO_SCHEDULE.get(variant.value)  # type: ignore
     if schedule is None:
         raise ValueError(f"unsupported attention pipeline variant: {variant}")
     input_mlir = export_attention_mlir(
@@ -141,6 +148,7 @@ def export_attention_to_triton_input_mlir(
         q_heads=q_heads,
         kv_heads=kv_heads,
         seq_len=seq_len,
+        kv_seq_len=kv_seq_len,
         head_dim=head_dim,
         window_size=window_size,
         func_name=func_name,

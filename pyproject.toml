@@ -15,7 +15,7 @@ dev = ["pytest>=8.0"]
 export = ["torch", "torch-mlir"]
 
 [project.scripts]
-neptune-export-attn = "neptune_mlir.operator.export_attention:main"
+neptune-export-attn = "neptune_mlir.cli.export_attention:main"
 
 [tool.scikit-build]
 cmake.version = ">=3.20"

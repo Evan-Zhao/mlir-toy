@@ -1,13 +1,7 @@
-#!/usr/bin/env python3
-"""Export attention-like PyTorch modules to linalg-on-tensors MLIR.
+"""Isolated Torch-MLIR worker for exporting built-in attention variants.
 
-Usage:
-  python export_attention.py --variant global-attn > attention.mlir
-  python export_attention.py --variant global-gqa > attention_gqa.mlir
-  python export_attention.py --variant alibi-causal-attn > attention_alibi.mlir
-  python export_attention.py --variant windowed-causal-attn > attention_sw.mlir
-  python export_attention.py --variant kv-only-quantized > attention_kv_quant.mlir
-  python export_attention.py --variant sparse-mm > sparse_probe.mlir
+The public ``neptune-export-attn`` CLI invokes this module in a subprocess so
+Torch-MLIR and Neptune's standalone MLIR Python runtime are not loaded together.
 """
 
 import argparse
@@ -227,6 +221,12 @@ def parse_args() -> argparse.Namespace:
         default="attention",
         help="symbol name for the exported MLIR function",
     )
+    parser.add_argument(
+        "--output-type",
+        choices=("stablehlo", "linalg"),
+        default="stablehlo",
+        help="Torch-MLIR output type",
+    )
     return parser.parse_args()
 
 
@@ -331,6 +331,7 @@ def export_attention(
     head_dim: int = 64,
     window_size: int = 128,
     func_name: str = "attention",
+    output_type: str = "stablehlo",
 ) -> str:
     from torch_mlir.extras.fx_decomp_util import get_decomposition_table
 
@@ -343,14 +344,17 @@ def export_attention(
         variant, batch, q_heads, kv_heads or q_heads, seq_len, kv_seq_len, head_dim, window_size
     )
     exported_program = torch.export.export(model, example_args)
+    if output_type not in {"stablehlo", "linalg"}:
+        raise ValueError(f"unsupported Torch-MLIR output type: {output_type}")
+    torch_mlir_output_type = "linalg-on-tensors" if output_type == "linalg" else output_type
     module = fx.export_and_import(
         exported_program,
-        output_type="stablehlo",
+        output_type=torch_mlir_output_type,
         func_name=func_name,
         import_symbolic_shape_expressions=True,
         decomposition_table=decomposition_table,
     )
-    if variant != AttentionVariant.SPARSE_MM:
+    if output_type == "stablehlo" and variant != AttentionVariant.SPARSE_MM:
         promoted_dot_count = _use_f32_accumulation_for_f16_dots(module)
         if promoted_dot_count != 2:
             raise RuntimeError(
@@ -372,6 +376,7 @@ def main():
             head_dim=args.head_dim,
             window_size=args.window_size,
             func_name=args.func_name,
+            output_type=args.output_type,
         )
     )
 
