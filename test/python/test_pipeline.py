@@ -69,8 +69,9 @@ TRANSLATOR_INPUT_CASES = (
 
 
 def test_native_htile_dialect_typeids_match_mlir_runtime() -> None:
+    from mlir import ir
+
     from neptune_mlir.dist import register_dialects
-    from neptune_mlir.mlir_bindings import ir
 
     context = ir.Context()
     register_dialects(context)

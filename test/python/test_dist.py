@@ -1,9 +1,6 @@
 from pathlib import Path
 
-import pytest
-
-import neptune_mlir.dist as dist
-from neptune_mlir.mlir_bindings import ir
+from neptune_mlir import dist
 
 
 def _make_executable(path: Path) -> Path:
@@ -36,6 +33,8 @@ def test_finds_neptune_opt_on_path(tmp_path, monkeypatch) -> None:
 
 
 def test_register_htile_dialect_parses_custom_form_htile() -> None:
+    from mlir import ir
+
     ctx = ir.Context()
     ctx.allow_unregistered_dialects = True
     with ctx:

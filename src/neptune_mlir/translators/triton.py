@@ -1,12 +1,9 @@
-#!/usr/bin/env python3
-"""HTile MLIR -> Triton Python translator using MLIR Python bindings.
-
-neptune-opt is called as a subprocess to convert HTile dialect ops to generic form.
-"""
+"""HTile kernel MLIR -> Triton Python translator using MLIR Python bindings."""
 
 import ast
 
-from ..mlir_bindings import ir
+from mlir import ir
+
 from .common import (
     _assign,
     _call,

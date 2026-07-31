@@ -1,13 +1,9 @@
-#!/usr/bin/env python3
 """Shared helpers for HTile MLIR Python translators."""
-
-from __future__ import annotations
 
 import ast
 import subprocess
-from typing import Type
 
-from ..mlir_bindings import ir
+from mlir import ir
 
 # ---------------------------------------------------------------------------
 # AST helpers
@@ -226,7 +222,7 @@ def _register_neptune_dialects(ctx: ir.Context) -> None:
 
 def translate_file_with(
     path: str,
-    translator_cls: Type,
+    translator_cls: type,
     pass_pipeline: str | None = None,
 ) -> ast.Module:
     module = parse_mlir_module(path, pass_pipeline)

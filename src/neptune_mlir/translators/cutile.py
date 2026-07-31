@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """HTile MLIR -> NVIDIA cuTile Python translator using MLIR Python bindings.
 
 This backend is intentionally value-based: cuTile tiles are immutable values, so
@@ -7,7 +6,8 @@ the lowering is closer to the Triton translator than to TileLang.
 
 import ast
 
-from ..mlir_bindings import ir
+from mlir import ir
+
 from .common import (
     _assign,
     _attr,

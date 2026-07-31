@@ -1,12 +1,10 @@
-#!/usr/bin/env python3
 """HTile MLIR -> TileLang Python translator using MLIR Python bindings."""
-
-from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
 
-from ..mlir_bindings import ir
+from mlir import ir
+
 from .common import (
     _T,
     _assign,
