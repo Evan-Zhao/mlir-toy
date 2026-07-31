@@ -214,6 +214,48 @@ module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%module: !any) {
     %func = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
     %foralls = transform.structured.match ops{["scf.forall"]} in %func : (!any) -> !any
+    %launches, %kernels = transform.htile.outline_kernels %foralls
+        {kernel_names = ["four_dimensions"]} : (!any) -> (!any, !any)
+    transform.yield
+  }
+
+  func.func @four_dimensions() {
+    scf.forall (%i, %j, %k, %l) in (2, 3, 4, 5) {
+      %ij = arith.addi %i, %j : index
+      %kl = arith.addi %k, %l : index
+      %all = arith.addi %ij, %kl : index
+      scf.forall.in_parallel {
+      }
+    }
+    return
+  }
+}
+
+// CHECK-LABEL: func.func @four_dimensions
+// CHECK: htile.launch_func @four_dimensions_0
+// CHECK-SAME: {program_bounds = array<i64: 6, 4, 5>}
+
+// CHECK-LABEL: htile.kernel @four_dimensions_0
+// CHECK-SAME: attributes {program_bounds = array<i64: 6, 4, 5>}
+// CHECK: %[[FLAT:.+]] = htile.program_id 0
+// CHECK: %[[THREE:.+]] = arith.constant 3 : index
+// CHECK: %[[J:.+]] = arith.remui %[[FLAT]], %[[THREE]] : index
+// CHECK: %[[I:.+]] = arith.divui %[[FLAT]], %[[THREE]] : index
+// CHECK: %[[K:.+]] = htile.program_id 1
+// CHECK: %[[L:.+]] = htile.program_id 2
+// CHECK-NOT: htile.program_id 3
+// CHECK: arith.addi %[[I]], %[[J]] : index
+// CHECK: arith.addi %[[K]], %[[L]] : index
+// CHECK: htile.return
+
+// -----
+
+!any = !transform.any_op
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !any) {
+    %func = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
+    %foralls = transform.structured.match ops{["scf.forall"]} in %func : (!any) -> !any
     // expected-error @below {{failed to validate selected scf.forall ops}}
     %launches, %kernels = transform.htile.outline_kernels %foralls
         {kernel_names = ["nested"]} : (!any) -> (!any, !any)

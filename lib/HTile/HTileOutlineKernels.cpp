@@ -12,6 +12,7 @@
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/Support/CheckedArithmetic.h"
 
 using namespace mlir;
 using bufferization::ToTensorOp;
@@ -311,17 +312,17 @@ struct OutlinedKernel {
 };
 
 FailureOr<std::pair<SmallVector<Value>, SmallVector<int64_t>>>
-getLoopNormalizedIVsAndTripCounts(RewriterBase &rewriter, scf::ForallOp forall) {
+getLoopIVsAndProgramBounds(RewriterBase &rewriter, scf::ForallOp forall) {
   auto lowerBounds = forall.getMixedLowerBound(), upperBounds = forall.getMixedUpperBound(),
        steps = forall.getMixedStep();
   Location loc = forall.getLoc();
   Type indexType = rewriter.getIndexType();
 
   size_t nDims = lowerBounds.size();
-  SmallVector<int64_t> tripCounts;
-  tripCounts.reserve(nDims);
-  SmallVector<Value> ids;
-  ids.reserve(nDims);
+  SmallVector<int64_t> lowers, stepValues, logicalTripCounts;
+  lowers.reserve(nDims);
+  stepValues.reserve(nDims);
+  logicalTripCounts.reserve(nDims);
   for (size_t index = 0; index < nDims; ++index) {
     std::optional<int64_t> maybeLower = getConstantIntValue(lowerBounds[index]),
                            maybeUpper = getConstantIntValue(upperBounds[index]),
@@ -335,22 +336,68 @@ getLoopNormalizedIVsAndTripCounts(RewriterBase &rewriter, scf::ForallOp forall) 
       return forall.emitError() << "expected upper bound to be >= lower bound for dimension "
                                 << index;
 
-    Value id = htile::ProgramIdOp::create(rewriter, loc, indexType, index);
-    if (*maybeStep != 1) {
-      Value stepValue = arith::ConstantIndexOp::create(rewriter, loc, *maybeStep);
-      id = arith::MulIOp::create(rewriter, loc, id, stepValue);
-    }
-    if (*maybeLower != 0) {
-      Value lowerValue = arith::ConstantIndexOp::create(rewriter, loc, *maybeLower);
-      id = arith::AddIOp::create(rewriter, loc, id, lowerValue);
-    }
-    ids.push_back(id);
-
+    lowers.push_back(*maybeLower);
+    stepValues.push_back(*maybeStep);
     int64_t distance = *maybeUpper - *maybeLower;
-    tripCounts.push_back((distance + *maybeStep - 1) / *maybeStep);
+    logicalTripCounts.push_back((distance + *maybeStep - 1) / *maybeStep);
   }
 
-  return std::make_pair(ids, tripCounts);
+  constexpr size_t maxProgramDimensions = 3;
+  SmallVector<Value> normalizedIds(nDims);
+  SmallVector<int64_t> programBounds;
+  if (nDims <= maxProgramDimensions) {
+    programBounds = logicalTripCounts;
+    for (size_t index = 0; index < nDims; ++index)
+      normalizedIds[index] = htile::ProgramIdOp::create(rewriter, loc, indexType, index);
+  } else {
+    // GPU launch grids have at most three dimensions. Flatten the leading
+    // dimensions into axis 0 and recover their row-major logical IDs.
+    size_t collapsedDims = nDims - (maxProgramDimensions - 1);
+    int64_t collapsedBound = 1;
+    for (int64_t tripCount : ArrayRef(logicalTripCounts).take_front(collapsedDims)) {
+      std::optional<int64_t> product = llvm::checkedMul(collapsedBound, tripCount);
+      if (!product)
+        return forall.emitError("collapsed program bound overflows i64");
+      collapsedBound = *product;
+    }
+    programBounds.push_back(collapsedBound);
+    programBounds.append(logicalTripCounts.begin() + collapsedDims, logicalTripCounts.end());
+
+    if (collapsedBound == 0) {
+      for (size_t index = 0; index < collapsedDims; ++index)
+        normalizedIds[index] = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    } else {
+      Value remaining = htile::ProgramIdOp::create(rewriter, loc, indexType, 0);
+      for (size_t index = collapsedDims; index-- > 1;) {
+        Value bound = arith::ConstantIndexOp::create(rewriter, loc, logicalTripCounts[index]);
+        normalizedIds[index] = arith::RemUIOp::create(rewriter, loc, remaining, bound);
+        remaining = arith::DivUIOp::create(rewriter, loc, remaining, bound);
+      }
+      normalizedIds[0] = remaining;
+    }
+    for (size_t index = collapsedDims; index < nDims; ++index) {
+      size_t programDimension = index - collapsedDims + 1;
+      normalizedIds[index] =
+          htile::ProgramIdOp::create(rewriter, loc, indexType, programDimension);
+    }
+  }
+
+  SmallVector<Value> ids;
+  ids.reserve(nDims);
+  for (auto [index, normalizedId] : llvm::enumerate(normalizedIds)) {
+    Value id = normalizedId;
+    if (stepValues[index] != 1) {
+      Value step = arith::ConstantIndexOp::create(rewriter, loc, stepValues[index]);
+      id = arith::MulIOp::create(rewriter, loc, id, step);
+    }
+    if (lowers[index] != 0) {
+      Value lower = arith::ConstantIndexOp::create(rewriter, loc, lowers[index]);
+      id = arith::AddIOp::create(rewriter, loc, id, lower);
+    }
+    ids.push_back(id);
+  }
+
+  return std::make_pair(ids, programBounds);
 }
 
 FailureOr<SmallVector<Value>> legalizeKernelExternalValues(RewriterBase &rewriter,
@@ -415,10 +462,10 @@ FailureOr<SmallVector<OutlinedKernel>> createKernelOps(RewriterBase &rewriter, O
 
     // Map the induction variables to the program IDs, then clone the forall body into the kernel.
     rewriter.setInsertionPointToStart(body);
-    auto ivsAndTripCounts = getLoopNormalizedIVsAndTripCounts(rewriter, forall);
-    if (failed(ivsAndTripCounts))
+    auto ivsAndProgramBounds = getLoopIVsAndProgramBounds(rewriter, forall);
+    if (failed(ivsAndProgramBounds))
       return failure();
-    auto [programIds, programBounds] = *ivsAndTripCounts;
+    auto [programIds, programBounds] = *ivsAndProgramBounds;
     kernel.setProgramBoundsAttr(DenseI64ArrayAttr::get(rewriter.getContext(), programBounds));
     IRMapping mapping;
     mapping.map(forall.getInductionVars(), programIds);
