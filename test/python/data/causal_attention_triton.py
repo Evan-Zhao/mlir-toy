@@ -4,15 +4,15 @@ from triton import language as tl
 
 @triton.jit
 def attention_kernel(ptr_0, ptr_1, ptr_2, ptr_3):
-    c_4 = 2
-    c_5 = 64
-    c_6 = 128
-    c_7 = 1
-    c_8 = 0.1803368777036667
-    c_9 = 16
-    c_10 = 0
-    c_11 = 0.0
-    c_12 = -1e309
+    c_4: tl.constexpr = 2
+    c_5: tl.constexpr = 64
+    c_6: tl.constexpr = 128
+    c_7: tl.constexpr = 1
+    c_8: tl.constexpr = 0.1803368777036667
+    c_9: tl.constexpr = 16
+    c_10: tl.constexpr = 0
+    c_11: tl.constexpr = 0.0
+    c_12: tl.constexpr = -1e309
     pid_13 = tl.program_id(0)
     pid_14 = tl.program_id(1)
     v_15 = pid_14 * c_6

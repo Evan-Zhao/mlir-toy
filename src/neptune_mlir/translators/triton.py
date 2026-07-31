@@ -157,7 +157,14 @@ class Translator:
             val = attr.value
         else:
             raise NotImplementedError(f"unsupported arith.constant value attr: {attr}")
-        return [_assign(name, _const(val))]
+        return [
+            ast.AnnAssign(
+                target=_name(name, ast.Store()),
+                annotation=_tl("constexpr"),
+                value=_const(val),
+                simple=1,
+            )
+        ]
 
     def _binop(self, op: ir.OpView, py_op: ast.operator) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
