@@ -75,6 +75,7 @@ def _store_subscript(value: ast.expr, indices: list[ast.expr]) -> ast.Subscript:
 
 def _mlir_dtype_to_tl_str(dtype: str) -> str:
     mapping = {
+        "index": "int64",
         "f16": "float16",
         "f32": "float32",
         "f64": "float64",
@@ -83,7 +84,9 @@ def _mlir_dtype_to_tl_str(dtype: str) -> str:
         "i32": "int32",
         "i64": "int64",
     }
-    return mapping.get(dtype, dtype)
+    if dtype not in mapping:
+        raise NotImplementedError(f"unsupported MLIR dtype: {dtype}")
+    return mapping[dtype]
 
 
 def _mlir_dtype_to_tl(dtype: str) -> ast.expr:

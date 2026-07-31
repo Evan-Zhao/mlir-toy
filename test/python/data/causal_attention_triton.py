@@ -113,14 +113,14 @@ def attention_kernel(ptr_0, ptr_1, ptr_2, ptr_3):
         v_72 = tile_70 * tile_71
         range_73 = tl.arange(c_10, c_6)
         bcast_74 = range_73[:, None]
-        tile_75 = tl.full((128, 64), pid_14, tl.index)
-        tile_76 = tl.full((128, 64), c_6, tl.index)
+        tile_75 = tl.full((128, 64), pid_14, tl.int64)
+        tile_76 = tl.full((128, 64), c_6, tl.int64)
         v_77 = tile_75 * tile_76
         v_78 = v_77 + bcast_74
         range_79 = tl.arange(c_10, c_5)
         bcast_80 = range_79[None, :]
-        tile_81 = tl.full((128, 64), j_62, tl.index)
-        tile_82 = tl.full((128, 64), c_5, tl.index)
+        tile_81 = tl.full((128, 64), j_62, tl.int64)
+        tile_82 = tl.full((128, 64), c_5, tl.int64)
         v_83 = tile_81 * tile_82
         v_84 = v_83 + bcast_80
         cmp_85 = v_84 <= v_78
