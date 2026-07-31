@@ -6,5 +6,3 @@ uv.lock
 .codex
 .agents/
 .vscode/
-
-3rdparty/stablehlo/
