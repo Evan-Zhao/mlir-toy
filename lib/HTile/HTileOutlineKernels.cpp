@@ -400,6 +400,19 @@ getLoopIVsAndProgramBounds(RewriterBase &rewriter, scf::ForallOp forall) {
   return std::make_pair(ids, programBounds);
 }
 
+std::optional<unsigned> getSourceFuncArgumentNumber(Value value) {
+  if (auto toBuffer = value.getDefiningOp<bufferization::ToBufferOp>())
+    value = toBuffer.getTensor();
+
+  auto blockArg = dyn_cast<BlockArgument>(value);
+  if (!blockArg)
+    return std::nullopt;
+  Block *owner = blockArg.getOwner();
+  if (!owner->isEntryBlock() || !isa<func::FuncOp>(owner->getParentOp()))
+    return std::nullopt;
+  return blockArg.getArgNumber();
+}
+
 FailureOr<SmallVector<Value>> legalizeKernelExternalValues(RewriterBase &rewriter,
                                                            htile::KernelOp kernel) {
   Region &region = kernel.getBody();
@@ -413,10 +426,22 @@ FailureOr<SmallVector<Value>> legalizeKernelExternalValues(RewriterBase &rewrite
     }
   });
 
+  // First-use order inside the kernel is not a stable ABI: e.g. ALiBi is read
+  // before V even though it follows V in the host function signature. Prefer
+  // source function argument order, then retain first-use order for allocations.
+  SmallVector<Value> orderedCaptures(captures.begin(), captures.end());
+  llvm::stable_sort(orderedCaptures, [](Value lhs, Value rhs) {
+    std::optional<unsigned> lhsArg = getSourceFuncArgumentNumber(lhs);
+    std::optional<unsigned> rhsArg = getSourceFuncArgumentNumber(rhs);
+    if (lhsArg && rhsArg)
+      return *lhsArg < *rhsArg;
+    return lhsArg.has_value() && !rhsArg.has_value();
+  });
+
   SmallVector<Value> operands;
   OpBuilder::InsertionGuard guard(rewriter);
   // Allow captures to be memrefs or arith.constant. If it's a constant, copy it into the kernel.
-  for (Value capture : captures) {
+  for (Value capture : orderedCaptures) {
     if (isa<MemRefType>(capture.getType())) {
       BlockArgument arg = entryBlock.addArgument(capture.getType(), capture.getLoc());
       rewriter.replaceUsesWithIf(capture, arg, [&](OpOperand &use) {

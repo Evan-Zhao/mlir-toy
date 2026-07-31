@@ -9,8 +9,8 @@
 // CHECK-LABEL: htile.kernel @attention_kernel
 // CHECK-SAME: memref<1x4x1024x64xf16>
 // CHECK-SAME: memref<1x4x1024x64xf8E4M3FN>
-// CHECK-SAME: memref<1x4x1x1xf32>
 // CHECK-SAME: memref<1x4x1024x64xf8E4M3FN>
+// CHECK-SAME: memref<1x4x1x1xf32>
 // CHECK-SAME: memref<1x4x1x1xf32>
 // CHECK-SAME: memref<1x4x1024x64xf16>
 // CHECK-SAME: attributes {program_bounds = array<i64: 4, 8>}

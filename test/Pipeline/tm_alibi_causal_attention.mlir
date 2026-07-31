@@ -155,7 +155,12 @@ module attributes {transform.with_named_sequence} {
 // CHECK-SAME: %arg0: tensor<1x4x1024x64xf16>, %arg1: tensor<1x4x1024x64xf16>, %arg2: tensor<1x4x1024x64xf16>, %arg3: tensor<4xf32>) -> tensor<1x4x1024x64xf16>
 // CHECK-NOT: tensor.empty() : tensor<4x1024x64xf32>
 // CHECK-NOT: tensor.empty() : tensor<4x1024x64xf16>
-// CHECK: htile.launch_func @attention_kernel
+// CHECK-DAG: %[[OUT:.+]] = memref.alloc() : memref<1x4x1024x64xf16>
+// CHECK-DAG: %[[Q:.+]] = bufferization.to_buffer %arg0 read_only
+// CHECK-DAG: %[[K:.+]] = bufferization.to_buffer %arg1 read_only
+// CHECK-DAG: %[[V:.+]] = bufferization.to_buffer %arg2 read_only
+// CHECK-DAG: %[[ALIBI:.+]] = bufferization.to_buffer %arg3 read_only
+// CHECK: htile.launch_func @attention_kernel(%[[Q]], %[[K]], %[[V]], %[[ALIBI]], %[[OUT]])
 // CHECK-SAME: {program_bounds = array<i64: 4, 16>}
 // CHECK-NOT: scf.forall
 // CHECK: return
@@ -163,8 +168,8 @@ module attributes {transform.with_named_sequence} {
 // CHECK-LABEL: htile.kernel @attention_kernel
 // CHECK-SAME: memref<1x4x1024x64xf16>
 // CHECK-SAME: memref<1x4x1024x64xf16>
-// CHECK-SAME: memref<4xf32>
 // CHECK-SAME: memref<1x4x1024x64xf16>
+// CHECK-SAME: memref<4xf32>
 // CHECK-SAME: memref<1x4x1024x64xf16>
 // CHECK-SAME: attributes {program_bounds = array<i64: 4, 16>}
 // CHECK: htile.program_id 0
@@ -178,7 +183,7 @@ module attributes {transform.with_named_sequence} {
 // CHECK: htile.load %arg0
 // CHECK: htile.load %arg1
 // CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} {transpose_b} : tensor<64x64xf16>, tensor<64x64xf16>, tensor<64x64xf32> -> tensor<64x64xf32>
-// CHECK: htile.load %arg2
+// CHECK: htile.load %arg3
 // CHECK: arith.muli %{{.*}}, %{{.*}} {{.*}} : index
 // CHECK: arith.muli %{{.*}}, %{{.*}} {{.*}} : index
 // CHECK: htile.broadcast %{{.*}} dimensions = [0, 1] : tensor<f32> -> tensor<64x64xf32>
@@ -200,7 +205,7 @@ module attributes {transform.with_named_sequence} {
 // CHECK: htile.reduce %[[LIVE_SCORES]] axis 1 kind "max" : tensor<64x64xf32> -> tensor<64xf32>
 // CHECK: math.exp2
 // CHECK: htile.reduce %{{.*}} axis 1 kind "sum" : tensor<64x64xf32> -> tensor<64xf32>
-// CHECK: htile.load %arg3
+// CHECK: htile.load %arg2
 // CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<64x64xf16>, tensor<64x64xf16>, tensor<64x64xf32> -> tensor<64x64xf32>
 // CHECK: %[[DEAD_BOUND_RAW:.+]] = affine.apply
 // CHECK: %[[DEAD_BOUND_MAX:.+]] = arith.maxsi %[[DEAD_BOUND_RAW]], %c0 : index
@@ -209,7 +214,7 @@ module attributes {transform.with_named_sequence} {
 // CHECK: htile.load %arg0
 // CHECK: htile.load %arg1
 // CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} {transpose_b} : tensor<64x64xf16>, tensor<64x64xf16>, tensor<64x64xf32> -> tensor<64x64xf32>
-// CHECK: htile.load %arg2
+// CHECK: htile.load %arg3
 // CHECK: htile.broadcast %{{.*}} dimensions = [0, 1] : tensor<f32> -> tensor<64x64xf32>
 // CHECK: arith.subf %{{.*}}, %{{.*}} : tensor<64x64xf32>
 // CHECK: arith.mulf %{{.*}}, %{{.*}} : tensor<64x64xf32>
@@ -221,7 +226,7 @@ module attributes {transform.with_named_sequence} {
 // CHECK: htile.reduce %{{.*}} axis 1 kind "max" : tensor<64x64xf32> -> tensor<64xf32>
 // CHECK: math.exp2
 // CHECK: htile.reduce %{{.*}} axis 1 kind "sum" : tensor<64x64xf32> -> tensor<64xf32>
-// CHECK: htile.load %arg3
+// CHECK: htile.load %arg2
 // CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<64x64xf16>, tensor<64x64xf16>, tensor<64x64xf32> -> tensor<64x64xf32>
 // CHECK: arith.divf %{{.*}}, %{{.*}} : tensor<64x64xf32>
 // CHECK: arith.truncf %{{.*}} : tensor<64x64xf32> to tensor<64x64xf16>
