@@ -15,6 +15,7 @@
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
@@ -497,6 +498,20 @@ LogicalResult rewriteElementwise(RewriterBase &rewriter, linalg::GenericOp op) {
     return failure();
   if (failed(expandAffineApplyOpsInLinalgBody(op)))
     return failure();
+
+  // Move invariant operations out of linalg.generic so we can have more scalar ops
+  // and fewer tensor ones.
+  Region &body = op.getRegion();
+  moveLoopInvariantCode(
+      {&body},
+      [](Value value, Region *region) {
+        Region *parent = value.getParentRegion();
+        return parent && parent->isProperAncestor(region);
+      },
+      [](Operation *candidate, Region *) {
+        return !isa<linalg::IndexOp>(candidate) && isPure(candidate);
+      },
+      [](Operation *candidate, Region *region) { candidate->moveBefore(region->getParentOp()); });
 
   RankedTensorType resultType = cast<RankedTensorType>(op.getResult(0).getType());
   SmallVector<AffineMap> maps = op.getIndexingMapsArray();

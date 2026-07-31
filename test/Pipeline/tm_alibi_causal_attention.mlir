@@ -179,13 +179,18 @@ module attributes {transform.with_named_sequence} {
 // CHECK: htile.load %arg1
 // CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} {transpose_b} : tensor<64x64xf16>, tensor<64x64xf16>, tensor<64x64xf32> -> tensor<64x64xf32>
 // CHECK: htile.load %arg2
+// CHECK: arith.muli %{{.*}}, %{{.*}} {{.*}} : index
+// CHECK: arith.muli %{{.*}}, %{{.*}} {{.*}} : index
 // CHECK: htile.broadcast %{{.*}} dimensions = [0, 1] : tensor<f32> -> tensor<64x64xf32>
 // CHECK: htile.arange %c0 to %c64 : tensor<64xindex>
 // CHECK: htile.broadcast %{{.*}} dimensions = [1] : tensor<64xindex> -> tensor<64x64xindex>
-// CHECK: arith.muli %{{.*}}, %{{.*}} {{.*}} : tensor<64x64xindex>
+// CHECK: htile.full %{{.*}} : index -> tensor<64x64xindex>
+// CHECK-NOT: arith.muli %{{.*}}, %{{.*}} {{.*}} : tensor<64x64xindex>
 // CHECK: arith.addi %{{.*}}, %{{.*}} : tensor<64x64xindex>
 // CHECK: htile.arange %c0 to %c64 : tensor<64xindex>
 // CHECK: htile.broadcast %{{.*}} dimensions = [0] : tensor<64xindex> -> tensor<64x64xindex>
+// CHECK: htile.full %{{.*}} : index -> tensor<64x64xindex>
+// CHECK: arith.addi %{{.*}}, %{{.*}} : tensor<64x64xindex>
 // CHECK: arith.subf %{{.*}}, %{{.*}} : tensor<64x64xf32>
 // CHECK: arith.mulf %{{.*}}, %{{.*}} : tensor<64x64xf32>
 // CHECK: htile.full %{{.*}} : f32 -> tensor<64x64xf32>

@@ -156,12 +156,13 @@ module attributes {transform.with_named_sequence} {
 // CHECK: %{{.*}}:3 = scf.for %{{.*}} = %c0 to %c2 step %c1 iter_args(%{{.*}} = %[[LIVE]]#0, %{{.*}} = %[[LIVE]]#1, %{{.*}} = %[[LIVE]]#2)
 // CHECK: htile.load %arg0
 // CHECK: htile.load %arg1
+// CHECK: arith.muli %{{.*}}, %{{.*}} {{.*}} : index
 // CHECK: htile.arange %c0 to %c128 : tensor<128xindex>
 // CHECK: htile.broadcast %{{.*}} dimensions = [1] : tensor<128xindex> -> tensor<128x64xindex>
 // CHECK: htile.arange %c0 to %c64 : tensor<64xindex>
 // CHECK: htile.broadcast %{{.*}} dimensions = [0] : tensor<64xindex> -> tensor<128x64xindex>
 // CHECK: htile.full %{{.*}} : index -> tensor<128x64xindex>
-// CHECK: arith.muli %{{.*}}, %{{.*}} {{.*}} : tensor<128x64xindex>
+// CHECK-NOT: arith.muli %{{.*}}, %{{.*}} {{.*}} : tensor<128x64xindex>
 // CHECK: arith.addi %{{.*}}, %{{.*}} : tensor<128x64xindex>
 // CHECK: arith.index_cast %{{.*}} : tensor<128x64xindex> to tensor<128x64xi64>
 // CHECK: arith.index_cast %{{.*}} : tensor<128x64xindex> to tensor<128x64xi64>
