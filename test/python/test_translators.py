@@ -139,6 +139,24 @@ def test_triton_translator_matches_causal_attention():
     assert actual == expected
 
 
+def test_triton_scalar_memref_access_uses_pointer_arithmetic():
+    source = """
+    module {
+      htile.kernel @scalar_access(%src: memref<4xf32>, %dst: memref<4xf32>) {
+        %c2 = arith.constant 2 : index
+        %value = htile.load %src[%c2] : memref<4xf32> -> tensor<f32>
+        htile.store %value, %dst[%c2] : tensor<f32>, memref<4xf32>
+        htile.return
+      }
+    }
+    """
+    translated = ast.unparse(translate_triton(source))
+    assert "tl.make_block_ptr" not in translated
+    assert translated.count("tl.load(") == 1
+    assert translated.count("tl.store(") == 1
+    assert "shape=[]" not in translated
+
+
 def test_cutile_translator_matches_golden():
     require_translator_deps()
     mlir_text = HTILE_LOAD_ORDER_INPUT.read_text()

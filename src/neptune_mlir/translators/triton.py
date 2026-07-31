@@ -256,6 +256,13 @@ class Translator:
         tile_shape, _ = _tensor_shape(op.results[0].type)
         indices = list(op.operands[1:])
 
+        # Scalar (0D) loads cannot use block pointer. Load directly.
+        if not tile_shape:
+            stmts, ptr = self._scalar_memref_ptr(op.operands[0], indices, mem_shape)
+            tile = self._bind(op.results[0], "tile")
+            stmts.append(_assign(tile, _tl_call("load", ptr)))
+            return stmts
+
         stmts, base_ptr, tile_indices, tile_strides = self._fold_batch_dims(
             op.operands[0], indices, mem_shape, tile_shape
         )
@@ -300,6 +307,11 @@ class Translator:
         tile_shape, _ = _tensor_shape(op.operands[0].type)
         indices = list(op.operands[2:])
 
+        if not tile_shape:
+            stmts, ptr = self._scalar_memref_ptr(op.operands[1], indices, mem_shape)
+            stmts.append(ast.Expr(value=_tl_call("store", ptr, self._expr(tile_val))))
+            return stmts
+
         stmts, base_ptr, tile_indices, tile_strides = self._fold_batch_dims(
             op.operands[1], indices, mem_shape, tile_shape
         )
@@ -329,6 +341,27 @@ class Translator:
             )
         )
         return stmts
+
+    def _scalar_memref_ptr(
+        self, memref_val: ir.Value, indices: list[ir.Value], mem_shape: list[int]
+    ) -> tuple[list[ast.stmt], ast.expr]:
+        if len(indices) != len(mem_shape):
+            raise NotImplementedError(
+                f"scalar memref access rank mismatch: {len(indices)} indices for rank {len(mem_shape)}"
+            )
+
+        strides = [1] * len(mem_shape)
+        for i in range(len(mem_shape) - 2, -1, -1):
+            strides[i] = strides[i + 1] * mem_shape[i + 1]
+
+        offset: ast.expr = _const(0)
+        for index, stride in zip(indices, strides):
+            term = ast.BinOp(left=self._expr(index), op=ast.Mult(), right=_const(stride))
+            offset = ast.BinOp(left=offset, op=ast.Add(), right=term)
+
+        ptr = self._fresh("ptr")
+        stmt = _assign(ptr, ast.BinOp(left=self._expr(memref_val), op=ast.Add(), right=offset))
+        return [stmt], _name(ptr)
 
     def _fold_batch_dims(
         self,
