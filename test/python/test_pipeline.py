@@ -25,9 +25,9 @@ def make_attn_pytest_param(
 ):
     kwargs = {"batch": batch, "q_heads": qh, "kv_heads": kvh, "seq_len": seq_len, "head_dim": dhead}
     if variant == AttentionVariant.ALIBI_CAUSAL_ATTN:
-        input_dtypes = ("float16", "float16", "float16", "float32")
+        input_dtypes = ("float16", "float16", "float16", "float32", "float16")
     else:
-        input_dtypes = ("float16", "float16", "float16")
+        input_dtypes = ("float16", "float16", "float16", "float16")
     if window_size is not None:
         assert variant == AttentionVariant.WINDOWED_CAUSAL_ATTN
         kwargs["window_size"] = window_size
@@ -171,9 +171,9 @@ def test_custom_tile_config_reaches_lowered_loop_bounds() -> None:
 @pytest.fixture(scope="module", params=TRANSLATOR_INPUT_CASES)
 def lowered_triton_case(request):
     """Lower one attention case once for source checks and optional compilation."""
-    require_export_deps()
     from neptune_mlir.translators.triton import translate_mlir_text
 
+    require_export_deps()
     variant, kwargs, input_dtypes = request.param
     lowered = export_attention_to_triton_input_mlir(variant=variant, **kwargs)
     source = ast.unparse(translate_mlir_text(lowered)) + "\n"
@@ -220,7 +220,7 @@ def compile_triton_source(source: str, input_dtypes: tuple[str, ...], torch) -> 
         sys.modules[module_name] = module
         try:
             spec.loader.exec_module(module)
-            kernel = module.attention
+            kernel = module.attention_kernel
             parameter_count = len(inspect.signature(kernel.fn).parameters)
             assert parameter_count == len(input_dtypes)
             args = [
@@ -234,7 +234,7 @@ def compile_triton_source(source: str, input_dtypes: tuple[str, ...], torch) -> 
 def test_attention_lowering_pipeline(lowered_triton_case) -> None:
     source, _ = lowered_triton_case
     assert "@triton.jit" in source
-    assert "def attention" in source
+    assert "def attention_kernel" in source
 
 
 def test_attention_lowering_and_triton_compilation(lowered_triton_case) -> None:
@@ -249,5 +249,7 @@ def test_attention_pass_pipeline_embeds_schedule_preload() -> None:
     assert pipeline.startswith("builtin.module(transform-preload-library")
     assert "transform-library-paths=/tmp/schedule.mlir" in pipeline
     assert "transform-interpreter" in pipeline
-    assert "convert-parallel-loops-to-gpu" in pipeline
+    assert "lower-affine" in pipeline
+    assert "gpu-map-parallel-loops" not in pipeline
+    assert "convert-parallel-loops-to-gpu" not in pipeline
     assert "htile-dot-transpose-to-load-order" in pipeline

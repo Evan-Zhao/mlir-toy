@@ -21,6 +21,7 @@ from .common import (
     _tensor_shape,
     _tl,
     _tl_call,
+    _tuple,
     parse_mlir_module_from_text,
 )
 
@@ -62,15 +63,14 @@ class Translator:
             ),
         ]
         for op in _module_top_ops(module):
-            if _op_type_name(op) == "func.func":
-                body.append(self._func(op))
+            if _op_type_name(op) == "htile.kernel":
+                body.append(self._htile_kernel(op))
         mod = ast.Module(body=body, type_ignores=[])
         ast.fix_missing_locations(mod)
         return mod
 
-    def _func(self, op: ir.OpView) -> ast.FunctionDef:
+    def _htile_kernel(self, op: ir.OpView) -> ast.FunctionDef:
         entry = op.regions[0].blocks[0]
-
         kernel_name = _func_sym_name(op)
 
         params: list[ast.arg] = []
@@ -78,15 +78,7 @@ class Translator:
             pname = self._bind(arg, "ptr")
             params.append(ast.arg(arg=pname, annotation=None))
 
-        pre_stmts: list[ast.stmt] = []
-        kernel_stmts: list[ast.stmt] = []
-        for child_op in entry.operations:
-            if _op_type_name(child_op) == "arith.constant":
-                pre_stmts.extend(self._arith_constant(child_op))
-            elif _op_type_name(child_op) == "gpu.launch":
-                kernel_stmts = self._gpu_launch(child_op)
-
-        body = pre_stmts + kernel_stmts or [ast.Pass()]
+        body = self._block_ops(entry) or [ast.Pass()]
         decorator = ast.Attribute(value=_name("triton"), attr="jit", ctx=ast.Load())
         arguments = ast.arguments(
             posonlyargs=[],
@@ -106,23 +98,6 @@ class Translator:
             lineno=0,
             col_offset=0,
         )
-
-    # --- gpu.launch -> kernel body ---
-
-    def _gpu_launch(self, op: ir.OpView) -> list[ast.stmt]:
-        body_block = op.regions[0].blocks[0]
-        args = list(body_block.arguments)
-        stmts: list[ast.stmt] = []
-
-        pid_names = ["pid_m", "pid_h", "pid_b"]
-        for arg, pid, axis in zip(args[:3], pid_names, [0, 1, 2]):
-            self._names[arg] = pid
-            stmts.append(_assign(pid, _tl_call("program_id", _const(axis))))
-        for arg in args[3:]:
-            self._names[arg] = "_"
-
-        stmts.extend(self._block_ops(body_block))
-        return stmts
 
     # --- block and op dispatch ---
 
@@ -152,6 +127,7 @@ class Translator:
             "arith.sitofp": self._arith_cast,
             "arith.truncf": self._arith_cast,
             "math.exp2": lambda o: self._tl_unary(o, "exp2"),
+            "htile.program_id": self._htile_program_id,
             "htile.load": self._htile_load,
             "htile.store": self._htile_store,
             "htile.full": self._htile_full,
@@ -164,8 +140,7 @@ class Translator:
             "scf.for": self._scf_for,
             "scf.yield": self._scf_yield,
             "tensor.empty": lambda o: [],
-            "gpu.terminator": lambda o: [],
-            "func.return": lambda o: [],
+            "htile.return": lambda o: [],
             "linalg.yield": lambda o: [],
         }
         handler = dispatch.get(_op_type_name(op))
@@ -178,9 +153,7 @@ class Translator:
     def _arith_constant(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "c")
         attr = op.attributes.get("value")
-        if isinstance(attr, ir.IntegerAttr):
-            val = attr.value
-        elif isinstance(attr, ir.FloatAttr):
+        if isinstance(attr, (ir.IntegerAttr, ir.FloatAttr)):
             val = attr.value
         else:
             raise NotImplementedError(f"unsupported arith.constant value attr: {attr}")
@@ -217,6 +190,7 @@ class Translator:
     def _arith_cmpi(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "cmp")
         predicate_attr = op.attributes.get("predicate")
+        assert predicate_attr is not None, "arith.cmpi missing 'predicate' attribute"
         predicate = ir.IntegerAttr(predicate_attr).value
         predicate_to_op = {
             0: ast.Eq,
@@ -262,6 +236,11 @@ class Translator:
         ]
 
     # --- htile ops ---
+
+    def _htile_program_id(self, op: ir.OpView) -> list[ast.stmt]:
+        dimension = ir.IntegerAttr(op.attributes["dimension"]).value
+        name = self._bind(op.results[0], "pid")
+        return [_assign(name, _tl_call("program_id", _const(dimension)))]
 
     def _htile_load(self, op: ir.OpView) -> list[ast.stmt]:
         mem_shape, _ = _memref_shape(op.operands[0].type)
@@ -373,8 +352,19 @@ class Translator:
         return stmts, base_ptr, indices, [1] * len(tile_shape)
 
     def _htile_full(self, op: ir.OpView) -> list[ast.stmt]:
-        self._names[op.results[0]] = self._get(op.operands[0])
-        return []
+        shape, dtype = _tensor_shape(op.results[0].type)
+        name = self._bind(op.results[0], "tile")
+        return [
+            _assign(
+                name,
+                _tl_call(
+                    "full",
+                    _tuple(*[_const(extent) for extent in shape]),
+                    self._expr(op.operands[0]),
+                    _mlir_dtype_to_tl(dtype),
+                ),
+            )
+        ]
 
     def _htile_arange(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "range")

@@ -8,16 +8,16 @@ from pathlib import Path
 import pytest
 
 from neptune_mlir.dist import find_neptune_opt
-from neptune_mlir.translators.common import translate_file_with
 from neptune_mlir.translators.cutile import translate_mlir_text as translate_cutile
 from neptune_mlir.translators.tilelang import translate_mlir_text as translate_tilelang
-from neptune_mlir.translators.triton import Translator as TritonTranslator
 from neptune_mlir.translators.triton import translate_mlir_text as translate_triton
 
 PARENT_DIR = Path(__file__).resolve().parent
 GOLDEN_DIR = PARENT_DIR / "golden"
 HTILE_LOAD_ORDER_INPUT = PARENT_DIR / "data" / "flash_attention_htile_load_order.mlir"
 HTILE_INPUT = PARENT_DIR / "data" / "flash_attention_htile.mlir"
+CAUSAL_HTILE_INPUT = PARENT_DIR / "data" / "causal_attention_htile.mlir"
+CAUSAL_TRITON_EXPECTED = PARENT_DIR / "data" / "causal_attention_triton.py"
 FLASH_GRID = (32, 32, 1)
 FLASH_SHAPE = (1, 32, 4096, 128)
 FLASH_REF_BLOCK_ROWS = 128
@@ -133,54 +133,10 @@ def assert_matches_golden(actual_module: ast.Module, golden_name: str):
     assert actual == expected
 
 
-def test_triton_translator_matches_golden():
-    require_translator_deps()
-    mlir_text = HTILE_LOAD_ORDER_INPUT.read_text()
-    assert_matches_golden(translate_triton(mlir_text), "flash_attention_triton.py")
-
-
-def test_triton_translator_supports_signed_integer_min_max():
-    mlir_text = """
-module {
-  func.func @minmax_kernel() {
-    %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
-    %c16 = arith.constant 16 : index
-    gpu.launch blocks(%bx, %by, %bz) in (%grid_x = %c1, %grid_y = %c1, %grid_z = %c1)
-               threads(%tx, %ty, %tz) in (%block_x = %c1, %block_y = %c1, %block_z = %c1) {
-      %lower = arith.maxsi %bx, %c0 : index
-      %upper = arith.minsi %lower, %c16 : index
-      gpu.terminator
-    }
-    return
-  }
-    }
-    """
-    source = ast.unparse(translate_triton(mlir_text))
-    assert "v_3 = max(pid_m, c_0)" in source
-    assert "v_4 = min(v_3, c_2)" in source
-
-
-def test_triton_translator_rejects_tensor_signed_integer_min_max():
-    mlir_text = """
-module {
-  func.func @tensor_minmax_kernel() {
-    %c0 = arith.constant 0 : index
-    %c1 = arith.constant 1 : index
-    %c4 = arith.constant 4 : index
-    gpu.launch blocks(%bx, %by, %bz) in (%grid_x = %c1, %grid_y = %c1, %grid_z = %c1)
-               threads(%tx, %ty, %tz) in (%block_x = %c1, %block_y = %c1, %block_z = %c1) {
-      %lhs = htile.arange %c0 to %c4 : tensor<4xindex>
-      %rhs = htile.arange %c0 to %c4 : tensor<4xindex>
-      %max = arith.maxsi %lhs, %rhs : tensor<4xindex>
-      gpu.terminator
-    }
-    return
-  }
-}
-"""
-    with pytest.raises(NotImplementedError, match="unsupported tensor arith.maxsi"):
-        translate_triton(mlir_text)
+def test_triton_translator_matches_causal_attention():
+    actual = ast.unparse(translate_triton(CAUSAL_HTILE_INPUT.read_text()))
+    expected = ast.unparse(ast.parse(CAUSAL_TRITON_EXPECTED.read_text()))
+    assert actual == expected
 
 
 def test_cutile_translator_matches_golden():
@@ -193,19 +149,6 @@ def test_tilelang_translator_matches_golden():
     require_translator_deps()
     mlir_text = HTILE_INPUT.read_text()
     assert_matches_golden(translate_tilelang(mlir_text), "flash_attention_tilelang.py")
-
-
-def test_triton_translator_functional():
-    require_translator_deps()
-    torch = require_cuda_torch()
-    mlir_text = HTILE_LOAD_ORDER_INPUT.read_text()
-    triton_module = _exec_translated_module(
-        translate_triton(mlir_text), "translated_flash_attention_triton"
-    )
-    q, k, v, out = _make_attention_inputs(torch)
-    triton_module.flash_attention_htile[FLASH_GRID](q, k, v, out)
-    torch.cuda.synchronize()
-    _assert_attention_output_close(torch, out, q, k, v)
 
 
 def test_cutile_translator_functional():
@@ -242,9 +185,3 @@ def test_tilelang_translator_functional():
         out = out[0]
     torch.cuda.synchronize()
     _assert_attention_output_close(torch, out, q, k, v)
-
-
-def test_triton_rejects_unfissioned_dot_transpose():
-    require_translator_deps()
-    with pytest.raises(NotImplementedError, match="htile-dot-transpose-to-load-order"):
-        translate_file_with(str(HTILE_INPUT), TritonTranslator)

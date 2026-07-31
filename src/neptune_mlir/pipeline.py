@@ -17,7 +17,6 @@ from .schedules import (
 
 ATTENTION_TO_TRITON_INPUT_PIPELINE_BODY = (
     "transform-interpreter,"
-    "func.func(scf-forall-to-parallel,gpu-map-parallel-loops,convert-parallel-loops-to-gpu),"
     "lower-affine,"
     "htile-dot-transpose-to-load-order,"
     "cse,"
