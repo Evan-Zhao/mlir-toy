@@ -17,13 +17,18 @@ from neptune_mlir.schedules import AttentionTileConfig
 def make_attn_pytest_param(
     variant: AttentionVariant,
     batch: int,
-    qh: int,
-    kvh: int,
+    q_heads: int,
     seq_len: int,
-    dhead: int,
+    head_dim: int,
+    kv_heads: int | None = None,
+    kv_seq_len: int | None = None,
     window_size: int | None = None,
 ):
-    kwargs = {"batch": batch, "q_heads": qh, "kv_heads": kvh, "seq_len": seq_len, "head_dim": dhead}
+    kwargs = {"batch": batch, "q_heads": q_heads, "seq_len": seq_len, "head_dim": head_dim}
+    if kv_heads is not None:
+        kwargs["kv_heads"] = kv_heads
+    if kv_seq_len is not None:
+        kwargs["kv_seq_len"] = kv_seq_len
     if variant == AttentionVariant.ALIBI_CAUSAL_ATTN:
         input_dtypes = ("float16", "float16", "float16", "float32", "float16")
     else:
@@ -34,7 +39,9 @@ def make_attn_pytest_param(
         variant_name = f"{variant.value}-w{window_size}"
     else:
         variant_name = variant.value
-    case_id = f"{variant_name}-b{batch}-qh{qh}-kvh{kvh}-s{seq_len}-d{dhead}"
+    kvh_name = f"-kv{kv_heads}" if kv_heads is not None else ""
+    kv_seq_name = f"-ks{kv_seq_len}" if kv_seq_len is not None else ""
+    case_id = f"{variant_name}-b{batch}-qh{q_heads}{kvh_name}-qs{seq_len}{kv_seq_name}-d{head_dim}"
     return pytest.param((variant, kwargs, input_dtypes), id=case_id)
 
 
@@ -50,17 +57,25 @@ ATTN_VARIANTS = (
 GQA_HEADS = ((4, 2), (4, 1))  # (4, 1) would be MQA
 TRANSLATOR_INPUT_CASES = (
     [
-        make_attn_pytest_param(variant, batch, heads, heads, seq_len, hdim)
+        make_attn_pytest_param(variant, batch, heads, seq_len, hdim)
         for variant, batch, heads, seq_len, hdim in product(
             ATTN_VARIANTS, BATCHES, ATTN_HEADS, SEQ_LENS, HEAD_DIMS
         )
     ]
     + [
-        make_attn_pytest_param(AttentionVariant.ALIBI_CAUSAL_ATTN, batch, heads, heads, seq_len, 64)
+        make_attn_pytest_param(
+            AttentionVariant.CAUSAL_ATTN, 1, 2, seq_len=s1, head_dim=64, kv_seq_len=s2
+        )
+        for s1, s2 in product(SEQ_LENS, SEQ_LENS)
+    ]
+    + [
+        make_attn_pytest_param(AttentionVariant.ALIBI_CAUSAL_ATTN, batch, heads, seq_len, 64)
         for batch, heads, seq_len in product(BATCHES, ATTN_HEADS, SEQ_LENS)
     ]
     + [
-        make_attn_pytest_param(AttentionVariant.GLOBAL_GQA, batch, q_heads, kv_heads, seq_len, hd)
+        make_attn_pytest_param(
+            AttentionVariant.GLOBAL_GQA, batch, q_heads, seq_len, hd, kv_heads=kv_heads
+        )
         for batch, (q_heads, kv_heads), seq_len, hd in product(
             BATCHES, GQA_HEADS, SEQ_LENS, HEAD_DIMS
         )
