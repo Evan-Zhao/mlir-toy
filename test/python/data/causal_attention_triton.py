@@ -36,7 +36,7 @@ def attention_kernel(ptr_0, ptr_1, ptr_2, ptr_3):
             block_shape=[128, 64],
             order=[1, 0],
         )
-        tile_29 = tl.load(bp_28, boundary_check=[0, 1])
+        tile_29 = tl.load(bp_28)
         ptr_30 = ptr_1 + (0 + c_10 * 262144 + pid_13 * 65536)
         bp_31 = tl.make_block_ptr(
             base=ptr_30,
@@ -46,7 +46,7 @@ def attention_kernel(ptr_0, ptr_1, ptr_2, ptr_3):
             block_shape=[64, 64],
             order=[0, 1],
         )
-        tile_32 = tl.load(bp_31, boundary_check=[0, 1])
+        tile_32 = tl.load(bp_31)
         tile_33 = tl.dot(tile_29, tile_32, tile_18)
         tile_34 = tl.full((128, 64), c_8, tl.float32)
         v_35 = tile_33 * tile_34
@@ -75,7 +75,7 @@ def attention_kernel(ptr_0, ptr_1, ptr_2, ptr_3):
             block_shape=[64, 64],
             order=[1, 0],
         )
-        tile_54 = tl.load(bp_53, boundary_check=[0, 1])
+        tile_54 = tl.load(bp_53)
         tile_55 = tl.dot(v_46, tile_54, v_51)
         acc_22 = v_37
         acc_23 = v_45
@@ -97,7 +97,7 @@ def attention_kernel(ptr_0, ptr_1, ptr_2, ptr_3):
             block_shape=[128, 64],
             order=[1, 0],
         )
-        tile_66 = tl.load(bp_65, boundary_check=[0, 1])
+        tile_66 = tl.load(bp_65)
         ptr_67 = ptr_1 + (0 + c_10 * 262144 + pid_13 * 65536)
         bp_68 = tl.make_block_ptr(
             base=ptr_67,
@@ -107,7 +107,7 @@ def attention_kernel(ptr_0, ptr_1, ptr_2, ptr_3):
             block_shape=[64, 64],
             order=[0, 1],
         )
-        tile_69 = tl.load(bp_68, boundary_check=[0, 1])
+        tile_69 = tl.load(bp_68)
         tile_70 = tl.dot(tile_66, tile_69, tile_18)
         tile_71 = tl.full((128, 64), c_8, tl.float32)
         v_72 = tile_70 * tile_71
@@ -151,7 +151,7 @@ def attention_kernel(ptr_0, ptr_1, ptr_2, ptr_3):
             block_shape=[64, 64],
             order=[1, 0],
         )
-        tile_106 = tl.load(bp_105, boundary_check=[0, 1])
+        tile_106 = tl.load(bp_105)
         tile_107 = tl.dot(v_98, tile_106, v_103)
         acc_59 = v_89
         acc_60 = v_97
@@ -168,4 +168,4 @@ def attention_kernel(ptr_0, ptr_1, ptr_2, ptr_3):
         block_shape=[128, 64],
         order=[1, 0],
     )
-    tl.store(bp_112, v_110, boundary_check=[0, 1])
+    tl.store(bp_112, v_110)

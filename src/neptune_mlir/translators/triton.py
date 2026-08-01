@@ -289,16 +289,7 @@ class Translator:
             )
         )
         tile = self._bind(op.results[0], "tile")
-        stmts.append(
-            _assign(
-                tile,
-                _tl_call(
-                    "load",
-                    _name(bp),
-                    boundary_check=_list(*[_const(i) for i in range(len(tile_shape))]),
-                ),
-            )
-        )
+        stmts.append(_assign(tile, _tl_call("load", _name(bp))))
         return stmts
 
     def _htile_store(self, op: ir.OpView) -> list[ast.stmt]:
@@ -330,16 +321,7 @@ class Translator:
                 ),
             )
         )
-        stmts.append(
-            ast.Expr(
-                value=_tl_call(
-                    "store",
-                    _name(bp),
-                    self._expr(tile_val),
-                    boundary_check=_list(*[_const(i) for i in range(len(tile_shape))]),
-                )
-            )
-        )
+        stmts.append(ast.Expr(value=_tl_call("store", _name(bp), self._expr(tile_val))))
         return stmts
 
     def _scalar_memref_ptr(
