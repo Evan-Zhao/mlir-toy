@@ -165,16 +165,16 @@ private:
   // Return one union-find ID per tensor dimension. ArrayRef keeps call sites lightweight while the
   // vectors remain owned by valueAxisIds for the lifetime of discovery. Dynamic shapes are
   // rejected here so all later axis materialization can use compile-time extents.
-  FailureOr<ArrayRef<AxisId>> getOrCreateValueAxes(Value value) {
+  FailureOr<AxisIds> getOrCreateValueAxes(Value value) {
     auto type = dyn_cast<RankedTensorType>(value.getType());
     if (!type || !type.hasStaticShape())
       return failure();
     auto [it, inserted] = valueAxisIds.try_emplace(value);
     if (!inserted)
-      return ArrayRef(it->second);
+      return it->second;
     for (int64_t extent : type.getShape())
       it->second.push_back(makeAxis(("v" + Twine(nextAxisName++)).str(), extent));
-    return ArrayRef(it->second);
+    return it->second;
   }
 
   AxisId makeAxis(std::string name, int64_t extent) {
