@@ -1,7 +1,12 @@
 // RUN: neptune-opt --transform-interpreter %s 2>&1 | FileCheck %s
 
 // CHECK-LABEL: func.func @attention(%arg0: tensor<1x4x1024x64xf16>, %arg1: tensor<1x4x1024x64xf8E4M3FN>, %arg2: tensor<1x4x1024x64xf8E4M3FN>, %arg3: tensor<1x4x1x1xf32>, %arg4: tensor<1x4x1x1xf32>) -> tensor<1x4x1024x64xf16>
-// CHECK: htile.launch_func @attention_kernel
+// CHECK-DAG: %[[Q:.+]] = bufferization.to_buffer %arg0 read_only
+// CHECK-DAG: %[[K:.+]] = bufferization.to_buffer %arg1 read_only
+// CHECK-DAG: %[[V:.+]] = bufferization.to_buffer %arg2 read_only
+// CHECK-DAG: %[[K_SCALE:.+]] = bufferization.to_buffer %arg3 read_only
+// CHECK-DAG: %[[V_SCALE:.+]] = bufferization.to_buffer %arg4 read_only
+// CHECK: htile.launch_func @attention_kernel(%[[Q]], %[[K]], %[[V]], %[[K_SCALE]], %[[V_SCALE]], %{{.+}})
 // CHECK-SAME: {program_bounds = array<i64: 4, 8>}
 // CHECK-NOT: scf.forall
 // CHECK: return
@@ -53,7 +58,6 @@ module attributes {transform.with_named_sequence} {
     %bmm0 = transform.collect_matching @match_4d_matmul_transb in %func : (!any) -> !any
     transform.ta.to_linalg %func : !any
 
-    transform.linalg.greedy_inline_elementwise %bmm0 : !any
     %_1, %forall_loop = transform.structured.tile_using_forall
         %bmm0 tile_sizes [1, 1, 128, 64, 0] : (!any) -> (!any, !any)
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
@@ -80,7 +84,6 @@ module attributes {transform.with_named_sequence} {
         %forall_loop : (!any) -> (!any, !any)
     %elemwise_sidecars_1 = transform.fusion.clone_fuse_elemwise
         %elemwise_1 into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
-    transform.linalg.greedy_inline_elementwise %bmm1 { operand_number = 1 } : !any
     %_4 = transform.fusion.repair_reduction_frontier
         %bmm1 reduce_producer %fused_bmax
         substituting elemwise %elemwise_1 -> %elemwise_sidecars_1
@@ -90,6 +93,11 @@ module attributes {transform.with_named_sequence} {
 
     %ret = transform.structured.match ops{["func.return"]} in %func : (!any) -> !any
     transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %ret : (!any, !any) -> !any
+
+    // Fuse KV scale multiplication downwards into the loops.
+    %consumer_loops = transform.merge_handles %forall_loop, %j0_loop : !any
+    %_5, %_6 = transform.fusion.greedy_input_producers_into_consumer %consumer_loops
+        : (!any) -> (!any, !any)
 
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.scf.localize_scratch_tensors %func : !any
