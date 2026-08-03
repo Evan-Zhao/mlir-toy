@@ -25,6 +25,13 @@ def test_custom_attention_schedule_tile_sizes() -> None:
     assert "transform.loop.specialize_dead_tile" in text
 
 
+def test_fp8_schedule_fuses_kv_dequantization() -> None:
+    text = materialize_attention_schedule(AttentionSchedule.KV_FP8_CAUSAL_ATTN)
+    assert "transform.fusion.greedy_input_producers_into_consumer %consumer_loops" in text
+    assert "transform.linalg.greedy_inline_elementwise %bmm0" not in text
+    assert "transform.apply_patterns.ta.sink_right_mul_after_matmul" in text
+
+
 def test_gqa_keeps_batch_group_head_tiles_fixed() -> None:
     text = materialize_attention_schedule(
         AttentionSchedule.GLOBAL_GQA,

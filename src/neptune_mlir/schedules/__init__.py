@@ -10,6 +10,7 @@ class AttentionSchedule(str, Enum):
     GLOBAL_ATTN = "global-attn"
     MASKED_ATTN = "masked-attn"
     ALIBI_CAUSAL_ATTN = "alibi-causal-attn"
+    KV_FP8_CAUSAL_ATTN = "kv-fp8-causal-attn"
     GLOBAL_GQA = "global-gqa"
 
     def __str__(self) -> str:
@@ -40,6 +41,7 @@ _SCHEDULE_TEMPLATES = {
     AttentionSchedule.GLOBAL_ATTN: ("attention.mlir.in", 2),
     AttentionSchedule.MASKED_ATTN: ("attention.mlir.in", 2),
     AttentionSchedule.ALIBI_CAUSAL_ATTN: ("attention.mlir.in", 2),
+    AttentionSchedule.KV_FP8_CAUSAL_ATTN: ("attention_kv_fp8.mlir.in", 2),
     AttentionSchedule.GLOBAL_GQA: ("attention.mlir.in", 3),
 }
 _PACKAGE = __name__

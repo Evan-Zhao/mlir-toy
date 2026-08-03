@@ -28,6 +28,7 @@ _VARIANT_TO_SCHEDULE = {
     AttentionVariant.CAUSAL_ATTN: AttentionSchedule.MASKED_ATTN,
     AttentionVariant.ALIBI_CAUSAL_ATTN: AttentionSchedule.ALIBI_CAUSAL_ATTN,
     AttentionVariant.WINDOWED_CAUSAL_ATTN: AttentionSchedule.MASKED_ATTN,
+    AttentionVariant.KV_FP8_CAUSAL_ATTN: AttentionSchedule.KV_FP8_CAUSAL_ATTN,
     AttentionVariant.GLOBAL_GQA: AttentionSchedule.GLOBAL_GQA,
 }
 

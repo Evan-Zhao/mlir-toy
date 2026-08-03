@@ -127,6 +127,7 @@ class Translator:
             "arith.cmpi": self._arith_cmpi,
             "arith.select": self._arith_select,
             "arith.sitofp": self._arith_cast,
+            "arith.extf": self._arith_cast,
             "arith.truncf": self._arith_cast,
             "math.exp2": lambda o: self._tl_unary(o, "exp2"),
             "htile.program_id": self._htile_program_id,
@@ -403,6 +404,14 @@ class Translator:
         name = self._bind(op.results[0], "tile")
         lhs = self._expr(op.operands[0])
         rhs = self._expr(op.operands[1])
+        _, lhs_dtype = _tensor_shape(op.operands[0].type)
+        _, rhs_dtype = _tensor_shape(op.operands[1].type)
+        lhs_is_fp8, rhs_is_fp8 = lhs_dtype == "f8", rhs_dtype == "f8"
+        if lhs_is_fp8 != rhs_is_fp8:
+            raise NotImplementedError(
+                "Triton does not support mixed FP8/non-FP8 htile.dot operands; "
+                f"got {lhs_dtype} x {rhs_dtype}. Dequantize FP8 operands before htile.dot."
+            )
         acc = self._expr(op.operands[2]) if len(op.operands) > 2 else None
         call = _tl_call("dot", lhs, rhs) if acc is None else _tl_call("dot", lhs, rhs, acc)
         return [_assign(name, call)]

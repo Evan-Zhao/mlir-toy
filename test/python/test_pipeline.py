@@ -31,6 +31,15 @@ def make_attn_pytest_param(
         kwargs["kv_seq_len"] = kv_seq_len
     if variant == AttentionVariant.ALIBI_CAUSAL_ATTN:
         input_dtypes = ("float16", "float16", "float16", "float32", "float16")
+    elif variant == AttentionVariant.KV_FP8_CAUSAL_ATTN:
+        input_dtypes = (
+            "float16",
+            "float8_e4m3fn",
+            "float8_e4m3fn",
+            "float32",
+            "float32",
+            "float16",
+        )
     else:
         input_dtypes = ("float16", "float16", "float16", "float16")
     if window_size is not None:
@@ -72,6 +81,7 @@ TRANSLATOR_INPUT_CASES = (
         make_attn_pytest_param(AttentionVariant.ALIBI_CAUSAL_ATTN, batch, heads, seq_len, 64)
         for batch, heads, seq_len in product(BATCHES, ATTN_HEADS, SEQ_LENS)
     ]
+    + [make_attn_pytest_param(AttentionVariant.KV_FP8_CAUSAL_ATTN, 1, 4, 1024, 64)]
     + [
         make_attn_pytest_param(
             AttentionVariant.GLOBAL_GQA, batch, q_heads, seq_len, hd, kv_heads=kv_heads
@@ -148,6 +158,7 @@ def test_export_fp8_attention_preserves_quantized_kv_inputs() -> None:
         (AttentionVariant.CAUSAL_ATTN, {"q_heads": 2}),
         (AttentionVariant.ALIBI_CAUSAL_ATTN, {"q_heads": 2}),
         (AttentionVariant.WINDOWED_CAUSAL_ATTN, {"q_heads": 2, "window_size": 128}),
+        (AttentionVariant.KV_FP8_CAUSAL_ATTN, {"q_heads": 2}),
         (AttentionVariant.GLOBAL_GQA, {"q_heads": 4, "kv_heads": 2}),
     ],
 )
