@@ -22,6 +22,14 @@ Constraint AddReduceKind(kind: Attr) [{
   return success(reduceKind && reduceKind.getValue() == ta::ReduceKind::Add);
 }];
 
+Constraint FloatToF32Cast(source: Value, widened: Value) [{
+  auto sourceType = dyn_cast<ta::ExprType>(source.getType());
+  auto widenedType = dyn_cast<ta::ExprType>(widened.getType());
+  return success(sourceType && widenedType &&
+                 isa<FloatType>(sourceType.getElementType()) &&
+                 widenedType.getElementType().isF32());
+}];
+
 Constraint F32F16F32CastChain(source: Value, narrowed: Value, widened: Value) [{
   auto sourceType = dyn_cast<ta::ExprType>(source.getType());
   auto narrowedType = dyn_cast<ta::ExprType>(narrowed.getType());
@@ -34,14 +42,16 @@ Constraint F32F16F32CastChain(source: Value, narrowed: Value, widened: Value) [{
 
 Rewrite RoundThroughF16(input: Value, narrowGroup: Attr, widenGroup: Attr) -> Value [{
   auto inputType = dyn_cast<ta::ExprType>(input.getType());
-  if (!inputType || !inputType.getElementType().isF32())
+  if (!inputType || !isa<FloatType>(inputType.getElementType()))
     return Value();
 
   auto narrowType = ta::ExprType::get(rewriter.getContext(), rewriter.getF16Type(),
                                       inputType.getAxes());
   auto narrow = ta::CastOp::create(rewriter, input.getLoc(), narrowType, input);
   narrow->setAttr("ta.import_group", narrowGroup);
-  auto wide = ta::CastOp::create(rewriter, input.getLoc(), inputType, narrow);
+  auto wideType = ta::ExprType::get(rewriter.getContext(), rewriter.getF32Type(),
+                                    inputType.getAxes());
+  auto wide = ta::CastOp::create(rewriter, input.getLoc(), wideType, narrow);
   wide->setAttr("ta.import_group", widenGroup);
   return wide.getResult();
 }];
@@ -84,15 +94,19 @@ Pattern SinkRightDivThroughF16AfterMatmul {
   };
 }
 
-// sum(lhs * f32(f16(rhs * factor))) => sum(lhs * f32(f16(rhs))) * factor
-// Prefer this over division sinking at the same reduction so the hoisted factor
-// remains outside any division exposed by the left matmul operand.
-Pattern SinkRightMulThroughF16AfterMatmul with benefit(1) {
-  let scaled = op<ta.mul>(rhs: Value, factor: Value) {"ta.import_group" = srcScaled: Attr};
+// sum(lhs * f32(f16(f32(rhs) * factor)))
+//   => sum(lhs * f32(f16(rhs))) * factor
+//
+// Match the dequantization cast as part of the rewrite so the replacement does
+// not retain the redundant rhs -> f32 -> f16 round trip.
+Pattern SinkRightMulWithPreWidenThroughF16AfterMatmul with benefit(2) {
+  let rhsF32 = op<ta.cast>(rhs: Value) {"ta.import_group" = srcRhsWiden: Attr} -> (rhsF32Type: Type);
+  let scaled = op<ta.mul>(rhsF32, factor: Value) {"ta.import_group" = srcScaled: Attr};
   let narrowed = op<ta.cast>(scaled) {"ta.import_group" = srcNarrow: Attr} -> (narrowType: Type);
   let widened = op<ta.cast>(narrowed) {"ta.import_group" = srcWiden: Attr} -> (wideType: Type);
   let outer = op<ta.mul>(lhs: Value, widened) {"ta.import_group" = srcOuter: Attr};
   let reduce = op<ta.reduce>(outer) {kind = kind: Attr, axes = axes: Attr, "ta.import_group" = srcReduce: Attr} -> (resultType: Type);
+  FloatToF32Cast(rhs, rhsF32);
   F32F16F32CastChain(scaled, narrowed, widened);
   ValueAxesDisjointFromReduction(factor, axes);
   AddReduceKind(kind);
