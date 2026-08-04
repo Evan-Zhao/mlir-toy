@@ -10,6 +10,7 @@ from .common import (
     _assign,
     _attr,
     _const,
+    _dimension_order,
     _expr_stmt,
     _func_sym_name,
     _is_ranked_tensor_type,
@@ -43,6 +44,7 @@ class Translator:
         self._names: dict[ir.Value, str] = {}
         self._counter = 0
         self._broadcasts: dict[ir.Value, BroadcastInfo] = {}
+        self._transposed_tiles: set[ir.Value] = set()
         self._yield_dests: list[list[str]] = []
 
     def _fresh(self, hint="v") -> str:
@@ -72,13 +74,13 @@ class Translator:
             ast.Import(names=[ast.alias(name="tilelang.language", asname="T")]),
         ]
         for op in _module_top_ops(module):
-            if _op_type_name(op) == "func.func":
-                body.append(self._func(op))
+            if _op_type_name(op) == "htile.kernel":
+                body.append(self._htile_kernel(op))
         mod = ast.Module(body=body, type_ignores=[])
         ast.fix_missing_locations(mod)
         return mod
 
-    def _func(self, op: ir.OpView) -> ast.FunctionDef:
+    def _htile_kernel(self, op: ir.OpView) -> ast.FunctionDef:
         entry = op.regions[0].blocks[0]
         kernel_name = _func_sym_name(op)
 
@@ -87,22 +89,37 @@ class Translator:
             pname = self._bind(arg, "buf")
             shape, dtype = _memref_shape(arg.type)
             annotation = _T_call(
-                "Buffer",
+                "Tensor",
                 _tuple(*[_const(s) for s in shape]),
                 _const(_mlir_dtype_to_tl_str(dtype)),
             )
             params.append(ast.arg(arg=pname, annotation=annotation))
 
-        body: list[ast.stmt] = []
+        bounds_attr = op.attributes.get("program_bounds")
+        if bounds_attr is None:
+            raise ValueError("htile.kernel requires program_bounds for TileLang translation")
+        program_bounds = _parse_dense_i64_array(bounds_attr)
+        pid_names = [self._fresh("bid") for _ in program_bounds]
         for child_op in entry.operations:
-            if _op_type_name(child_op) == "arith.constant":
-                body.extend(self._arith_constant(child_op))
-            elif _op_type_name(child_op) == "gpu.launch":
-                body.extend(self._gpu_launch(child_op))
+            if _op_type_name(child_op) != "htile.program_id":
+                continue
+            dimension = ir.IntegerAttr(child_op.attributes["dimension"]).value
+            if dimension >= len(pid_names):
+                raise ValueError(f"program ID dimension {dimension} is outside program_bounds")
+            self._names[child_op.results[0]] = pid_names[dimension]
 
-        if not body:
-            body = [ast.Pass()]
-
+        kernel_body = self._collect_allocs(entry) + self._block_ops(entry)
+        with_item = ast.withitem(
+            context_expr=_T_call(
+                "Kernel",
+                *[_const(bound) for bound in program_bounds],
+                threads=_const(128),
+            ),
+            optional_vars=_tuple(
+                *[_name(name, ast.Store()) for name in pid_names], ctx=ast.Store()
+            ),
+        )
+        body: list[ast.stmt] = [ast.With(items=[with_item], body=kernel_body or [ast.Pass()])]
         arguments = ast.arguments(
             posonlyargs=[],
             args=params,
@@ -112,48 +129,10 @@ class Translator:
             kwarg=None,
             defaults=[],
         )
+        attr_kernel: list[ast.expr] = [_T("prim_func")]
         return ast.FunctionDef(
-            name=kernel_name,
-            args=arguments,
-            body=body,
-            decorator_list=[_T("prim_func")],
-            returns=None,
-            lineno=0,
-            col_offset=0,
+            name=kernel_name, args=arguments, body=body, decorator_list=attr_kernel, type_params=[]
         )
-
-    # --- gpu.launch ---
-
-    def _gpu_launch(self, op: ir.OpView) -> list[ast.stmt]:
-        body_block = op.regions[0].blocks[0]
-        args = list(body_block.arguments)
-
-        block_names = ["bx", "by", "bz"]
-        for arg, name in zip(args[:3], block_names):
-            self._names[arg] = name
-        for arg in args[3:]:
-            self._names[arg] = "_"
-
-        allocs = self._collect_allocs(body_block)
-        body = allocs + self._block_ops(body_block)
-        if not body:
-            body = [ast.Pass()]
-
-        grid = [self._expr(v) for v in op.operands[:3]]
-        block = [self._expr(v) for v in op.operands[3:6]]
-        threads: ast.expr
-        if self._const_int(op.operands[4]) == 1 and self._const_int(op.operands[5]) == 1:
-            threads = block[0]
-        else:
-            threads = _list(*block)
-
-        with_item = ast.withitem(
-            context_expr=_T_call("Kernel", *grid, threads=threads),
-            optional_vars=_tuple(
-                *[_name(name, ast.Store()) for name in block_names], ctx=ast.Store()
-            ),
-        )
-        return [ast.With(items=[with_item], body=body, lineno=0, col_offset=0)]  # type: ignore
 
     # --- allocation pass ---
 
@@ -177,7 +156,11 @@ class Translator:
             if _is_ranked_tensor_type(result.type):
                 name = self._bind(result, self._result_hint(op_name))
                 shape, dtype = _tensor_shape(result.type)
-                alloc_fn = "alloc_shared" if self._is_shared(result.type) else "alloc_fragment"
+                alloc_fn = (
+                    "alloc_shared"
+                    if op_name == "htile.load" or self._is_shared(result.type)
+                    else "alloc_fragment"
+                )
                 allocs.append(
                     _assign(
                         name,
@@ -212,18 +195,25 @@ class Translator:
     def _op(self, op: ir.OpView) -> list[ast.stmt]:
         dispatch = {
             "arith.constant": self._arith_constant,
-            "arith.muli": lambda o: self._scalar_binop(o, ast.Mult()),
-            "arith.addi": lambda o: self._scalar_binop(o, ast.Add()),
+            "arith.muli": lambda o: self._elementwise_binop(o, ast.Mult()),
+            "arith.addi": lambda o: self._elementwise_binop(o, ast.Add()),
             "arith.addf": lambda o: self._elementwise_binop(o, ast.Add()),
             "arith.mulf": lambda o: self._elementwise_binop(o, ast.Mult()),
             "arith.subf": lambda o: self._elementwise_binop(o, ast.Sub()),
             "arith.divf": lambda o: self._elementwise_binop(o, ast.Div()),
+            "arith.maxsi": lambda o: self._scalar_call_binop(o, "max"),
+            "arith.minsi": lambda o: self._scalar_call_binop(o, "min"),
             "arith.maximumf": self._elementwise_maximum,
+            "arith.index_cast": self._arith_index_cast,
+            "arith.cmpi": self._arith_cmpi,
+            "arith.select": self._arith_select,
             "arith.truncf": self._arith_truncf,
             "math.exp2": self._math_exp2,
+            "htile.program_id": lambda o: [],
             "htile.load": self._htile_load,
             "htile.store": self._htile_store,
             "htile.full": self._htile_full,
+            "htile.arange": self._htile_arange,
             "htile.dot": self._htile_dot,
             "htile.reduce": self._htile_reduce,
             "htile.copy": self._htile_copy,
@@ -231,13 +221,12 @@ class Translator:
             "scf.for": self._scf_for,
             "scf.yield": self._scf_yield,
             "tensor.empty": lambda o: [],
-            "gpu.terminator": lambda o: [],
-            "func.return": lambda o: [],
+            "htile.return": lambda o: [],
             "linalg.yield": lambda o: [],
         }
         handler = dispatch.get(_op_type_name(op))
         if handler is None:
-            return [_expr_stmt(_const(f"# TODO: {_op_type_name(op)}"))]
+            raise NotImplementedError(f"unsupported op: {_op_type_name(op)}")
         return handler(op)
 
     # --- scalar and elementwise ops ---
@@ -245,9 +234,7 @@ class Translator:
     def _arith_constant(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "c")
         attr = op.attributes.get("value")
-        if isinstance(attr, ir.IntegerAttr):
-            val = attr.value
-        elif isinstance(attr, ir.FloatAttr):
+        if isinstance(attr, (ir.IntegerAttr, ir.FloatAttr)):
             val = attr.value
         else:
             raise NotImplementedError(f"unsupported arith.constant value attr: {attr}")
@@ -279,6 +266,15 @@ class Translator:
 
         return self._parallel_store(op.results[0], build)
 
+    def _scalar_call_binop(self, op: ir.OpView, fn: str) -> list[ast.stmt]:
+        name = self._bind(op.results[0], "v")
+        return [
+            _assign(
+                name,
+                _T_call(fn, self._expr(op.operands[0]), self._expr(op.operands[1])),
+            )
+        ]
+
     def _elementwise_maximum(self, op: ir.OpView) -> list[ast.stmt]:
         if not _is_ranked_tensor_type(op.results[0].type):
             name = self._bind(op.results[0], "v")
@@ -302,6 +298,55 @@ class Translator:
         return self._parallel_store(
             op.results[0],
             lambda indices: _T_call("exp2", self._value_at(op.operands[0], indices)),
+        )
+
+    def _arith_index_cast(self, op: ir.OpView) -> list[ast.stmt]:
+        _, dtype = _tensor_shape(op.results[0].type)
+        dtype_str = _mlir_dtype_to_tl_str(dtype)
+        return self._parallel_store(
+            op.results[0],
+            lambda indices: _T_call(
+                "cast", self._value_at(op.operands[0], indices), _const(dtype_str)
+            ),
+        )
+
+    def _arith_cmpi(self, op: ir.OpView) -> list[ast.stmt]:
+        predicate_attr = op.attributes.get("predicate")
+        assert predicate_attr is not None, "arith.cmpi missing 'predicate' attribute"
+        predicate = ir.IntegerAttr(predicate_attr).value
+        predicate_to_op = {
+            0: ast.Eq,
+            1: ast.NotEq,
+            2: ast.Lt,
+            3: ast.LtE,
+            4: ast.Gt,
+            5: ast.GtE,
+            6: ast.Lt,
+            7: ast.LtE,
+            8: ast.Gt,
+            9: ast.GtE,
+        }
+        cmp_op = predicate_to_op.get(predicate)
+        if cmp_op is None:
+            raise NotImplementedError(f"unsupported arith.cmpi predicate: {predicate}")
+        return self._parallel_store(
+            op.results[0],
+            lambda indices: ast.Compare(
+                left=self._value_at(op.operands[0], indices),
+                ops=[cmp_op()],
+                comparators=[self._value_at(op.operands[1], indices)],
+            ),
+        )
+
+    def _arith_select(self, op: ir.OpView) -> list[ast.stmt]:
+        return self._parallel_store(
+            op.results[0],
+            lambda indices: _T_call(
+                "if_then_else",
+                self._value_at(op.operands[0], indices),
+                self._value_at(op.operands[1], indices),
+                self._value_at(op.operands[2], indices),
+            ),
         )
 
     def _arith_truncf(self, op: ir.OpView) -> list[ast.stmt]:
@@ -354,6 +399,14 @@ class Translator:
     # --- htile ops ---
 
     def _htile_load(self, op: ir.OpView) -> list[ast.stmt]:
+        shape, _ = _tensor_shape(op.results[0].type)
+        dimension_order = _dimension_order(op, len(shape))
+        if dimension_order != list(range(len(shape))):
+            if dimension_order != [1, 0]:
+                raise NotImplementedError(
+                    f"unsupported TileLang load dimension_order: {dimension_order}"
+                )
+            self._transposed_tiles.add(op.results[0])
         src = self._mem_region(op.operands[0], list(op.operands[1:]), op.results[0])
         return [_expr_stmt(_T_call("copy", src, self._expr(op.results[0])))]
 
@@ -364,21 +417,29 @@ class Translator:
     def _htile_full(self, op: ir.OpView) -> list[ast.stmt]:
         return [_expr_stmt(_T_call("fill", self._expr(op.results[0]), self._expr(op.operands[0])))]
 
+    def _htile_arange(self, op: ir.OpView) -> list[ast.stmt]:
+        start = self._expr(op.operands[0])
+        return self._parallel_store(
+            op.results[0],
+            lambda indices: ast.BinOp(left=start, op=ast.Add(), right=indices[0]),
+        )
+
     def _htile_dot(self, op: ir.OpView) -> list[ast.stmt]:
         dst = self._expr(op.results[0])
         stmts: list[ast.stmt] = []
-        clear_accum = len(op.operands) <= 2
-        if len(op.operands) > 2:
-            stmts.append(_expr_stmt(_T_call("copy", self._expr(op.operands[2]), dst)))
+        accumulator = op.operands[2] if len(op.operands) > 2 else None
+        clear_accum = accumulator is None or _op_type_name(accumulator.owner) == "htile.full"
+        if accumulator is not None and not clear_accum:
+            stmts.append(_expr_stmt(_T_call("copy", self._expr(accumulator), dst)))
 
         kwargs: dict[str, ast.expr] = {"clear_accum": _const(clear_accum)}
-        if op.attributes.get("transpose_a") is not None:
+        if op.attributes.get("transpose_a") is not None or op.operands[0] in self._transposed_tiles:
             kwargs["transpose_A"] = _const(True)
-        if op.attributes.get("transpose_b") is not None:
+        if op.attributes.get("transpose_b") is not None or op.operands[1] in self._transposed_tiles:
             kwargs["transpose_B"] = _const(True)
         policy_attr = op.attributes.get("warp_policy")
-        if policy_attr is not None:
-            kwargs["policy"] = self._warp_policy_expr(_parse_attr_str(policy_attr))
+        policy = _parse_attr_str(policy_attr) if policy_attr is not None else "full_row"
+        kwargs["policy"] = self._warp_policy_expr(policy)
 
         stmts.append(
             _expr_stmt(
@@ -521,6 +582,7 @@ class Translator:
         owner = value.owner
         if _op_type_name(owner) != "arith.constant":
             return None
+        assert not isinstance(owner, ir.Block)
         attr = owner.attributes.get("value")
         if isinstance(attr, ir.IntegerAttr):
             return attr.value

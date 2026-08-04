@@ -38,9 +38,11 @@ def _ct_call(fn: str, *args: ast.expr, **kwargs: ast.expr) -> ast.Call:
 
 def _mlir_dtype_to_ct(dtype: str) -> ast.expr:
     mapping = {
+        "index": "int64",
         "f16": "float16",
         "f32": "float32",
         "f64": "float64",
+        "i1": "bool",
         "i8": "int8",
         "i16": "int16",
         "i32": "int32",
@@ -81,13 +83,13 @@ class Translator:
             ast.Import(names=[ast.alias(name="cuda.tile", asname="ct")]),
         ]
         for op in _module_top_ops(module):
-            if _op_type_name(op) == "func.func":
-                body.append(self._func(op))
+            if _op_type_name(op) == "htile.kernel":
+                body.append(self._htile_kernel(op))
         mod = ast.Module(body=body, type_ignores=[])
         ast.fix_missing_locations(mod)
         return mod
 
-    def _func(self, op: ir.OpView) -> ast.FunctionDef:
+    def _htile_kernel(self, op: ir.OpView) -> ast.FunctionDef:
         entry = op.regions[0].blocks[0]
         kernel_name = _func_sym_name(op)
 
@@ -95,15 +97,7 @@ class Translator:
         for arg in entry.arguments:
             params.append(ast.arg(arg=self._bind(arg, "arr"), annotation=None))
 
-        pre_stmts: list[ast.stmt] = []
-        kernel_stmts: list[ast.stmt] = []
-        for child_op in entry.operations:
-            if _op_type_name(child_op) == "arith.constant":
-                pre_stmts.extend(self._arith_constant(child_op))
-            elif _op_type_name(child_op) == "gpu.launch":
-                kernel_stmts = self._gpu_launch(child_op)
-
-        body = pre_stmts + kernel_stmts or [ast.Pass()]
+        body = self._block_ops(entry) or [ast.Pass()]
         arguments = ast.arguments(
             posonlyargs=[],
             args=params,
@@ -113,32 +107,10 @@ class Translator:
             kwarg=None,
             defaults=[],
         )
+        attr_kernel: list[ast.expr] = [_ct("kernel")]
         return ast.FunctionDef(
-            name=kernel_name,
-            args=arguments,
-            body=body,  # type: ignore
-            decorator_list=[_ct("kernel")],
-            returns=None,
-            lineno=0,
-            col_offset=0,
+            name=kernel_name, args=arguments, body=body, decorator_list=attr_kernel, type_params=[]
         )
-
-    # --- gpu.launch -> kernel body ---
-
-    def _gpu_launch(self, op: ir.OpView) -> list[ast.stmt]:
-        body_block = op.regions[0].blocks[0]
-        args = list(body_block.arguments)
-        stmts: list[ast.stmt] = []
-
-        bid_names = ["bid_m", "bid_h", "bid_b"]
-        for arg, bid, axis in zip(args[:3], bid_names, [0, 1, 2]):
-            self._names[arg] = bid
-            stmts.append(_assign(bid, _ct_call("bid", _const(axis))))
-        for arg in args[3:]:
-            self._names[arg] = "_"
-
-        stmts.extend(self._block_ops(body_block))
-        return stmts
 
     # --- block and op dispatch ---
 
@@ -157,12 +129,19 @@ class Translator:
             "arith.mulf": lambda o: self._binop(o, ast.Mult()),
             "arith.subf": lambda o: self._binop(o, ast.Sub()),
             "arith.divf": lambda o: self._binop(o, ast.Div()),
+            "arith.maxsi": lambda o: self._ct_binop(o, "maximum"),
+            "arith.minsi": lambda o: self._ct_binop(o, "minimum"),
             "arith.maximumf": lambda o: self._ct_binop(o, "maximum"),
+            "arith.index_cast": self._arith_index_cast,
+            "arith.cmpi": self._arith_cmpi,
+            "arith.select": self._arith_select,
             "arith.truncf": self._arith_truncf,
             "math.exp2": lambda o: self._ct_unary(o, "exp2"),
+            "htile.program_id": self._htile_program_id,
             "htile.load": self._htile_load,
             "htile.store": self._htile_store,
             "htile.full": self._htile_full,
+            "htile.arange": self._htile_arange,
             "htile.dot": self._htile_dot,
             "htile.reduce": self._htile_reduce,
             "htile.permute": self._htile_permute,
@@ -171,13 +150,12 @@ class Translator:
             "scf.for": self._scf_for,
             "scf.yield": self._scf_yield,
             "tensor.empty": lambda o: [],
-            "gpu.terminator": lambda o: [],
-            "func.return": lambda o: [],
+            "htile.return": lambda o: [],
             "linalg.yield": lambda o: [],
         }
         handler = dispatch.get(_op_type_name(op))
         if handler is None:
-            return [_expr_stmt(_const(f"# TODO: {_op_type_name(op)}"))]
+            raise NotImplementedError(f"unsupported op: {_op_type_name(op)}")
         return handler(op)
 
     # --- arithmetic ops ---
@@ -185,9 +163,7 @@ class Translator:
     def _arith_constant(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "c")
         attr = op.attributes.get("value")
-        if isinstance(attr, ir.IntegerAttr):
-            val = attr.value
-        elif isinstance(attr, ir.FloatAttr):
+        if isinstance(attr, (ir.IntegerAttr, ir.FloatAttr)):
             val = attr.value
         else:
             raise NotImplementedError(f"unsupported arith.constant value attr: {attr}")
@@ -219,6 +195,55 @@ class Translator:
         name = self._bind(op.results[0], "v")
         return [_assign(name, _ct_call(fn, self._expr(op.operands[0])))]
 
+    def _arith_index_cast(self, op: ir.OpView) -> list[ast.stmt]:
+        self._names[op.results[0]] = self._get(op.operands[0])
+        return []
+
+    def _arith_cmpi(self, op: ir.OpView) -> list[ast.stmt]:
+        predicate_attr = op.attributes.get("predicate")
+        assert predicate_attr is not None, "arith.cmpi missing 'predicate' attribute"
+        predicate = ir.IntegerAttr(predicate_attr).value
+        predicate_to_op = {
+            0: ast.Eq,
+            1: ast.NotEq,
+            2: ast.Lt,
+            3: ast.LtE,
+            4: ast.Gt,
+            5: ast.GtE,
+            6: ast.Lt,
+            7: ast.LtE,
+            8: ast.Gt,
+            9: ast.GtE,
+        }
+        cmp_op = predicate_to_op.get(predicate)
+        if cmp_op is None:
+            raise NotImplementedError(f"unsupported arith.cmpi predicate: {predicate}")
+        name = self._bind(op.results[0], "cmp")
+        return [
+            _assign(
+                name,
+                ast.Compare(
+                    left=self._expr(op.operands[0]),
+                    ops=[cmp_op()],
+                    comparators=[self._expr(op.operands[1])],
+                ),
+            )
+        ]
+
+    def _arith_select(self, op: ir.OpView) -> list[ast.stmt]:
+        name = self._bind(op.results[0], "sel")
+        return [
+            _assign(
+                name,
+                _ct_call(
+                    "where",
+                    self._expr(op.operands[0]),
+                    self._expr(op.operands[1]),
+                    self._expr(op.operands[2]),
+                ),
+            )
+        ]
+
     def _arith_truncf(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
         _, dtype = _tensor_shape(op.results[0].type)
@@ -230,6 +255,11 @@ class Translator:
         ]
 
     # --- htile ops ---
+
+    def _htile_program_id(self, op: ir.OpView) -> list[ast.stmt]:
+        dimension = ir.IntegerAttr(op.attributes["dimension"]).value
+        name = self._bind(op.results[0], "bid")
+        return [_assign(name, _ct_call("bid", _const(dimension)))]
 
     def _htile_load(self, op: ir.OpView) -> list[ast.stmt]:
         mem_shape, _ = _memref_shape(op.operands[0].type)
@@ -320,6 +350,23 @@ class Translator:
                     _tuple(*[_const(s) for s in shape]),
                     self._expr(op.operands[0]),
                     dtype=_mlir_dtype_to_ct(dtype),
+                ),
+            )
+        ]
+
+    def _htile_arange(self, op: ir.OpView) -> list[ast.stmt]:
+        name = self._bind(op.results[0], "range")
+        start = self._expr(op.operands[0])
+        size = ast.BinOp(
+            left=self._expr(op.operands[1]), op=ast.Sub(), right=start
+        )
+        return [
+            _assign(
+                name,
+                ast.BinOp(
+                    left=_ct_call("arange", size, dtype=_ct("int64")),
+                    op=ast.Add(),
+                    right=start,
                 ),
             )
         ]

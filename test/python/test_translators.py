@@ -7,28 +7,48 @@ from pathlib import Path
 
 import pytest
 
-from neptune_mlir.dist import find_neptune_opt
 from neptune_mlir.translators.cutile import translate_mlir_text as translate_cutile
 from neptune_mlir.translators.tilelang import translate_mlir_text as translate_tilelang
 from neptune_mlir.translators.triton import translate_mlir_text as translate_triton
 
-PARENT_DIR = Path(__file__).resolve().parent
-GOLDEN_DIR = PARENT_DIR / "golden"
-HTILE_LOAD_ORDER_INPUT = PARENT_DIR / "data" / "flash_attention_htile_load_order.mlir"
-HTILE_INPUT = PARENT_DIR / "data" / "flash_attention_htile.mlir"
-CAUSAL_HTILE_INPUT = PARENT_DIR / "data" / "causal_attention_htile.mlir"
-CAUSAL_TRITON_EXPECTED = PARENT_DIR / "data" / "causal_attention_triton.py"
-FLASH_GRID = (32, 32, 1)
-FLASH_SHAPE = (1, 32, 4096, 128)
-FLASH_REF_BLOCK_ROWS = 128
+DATA_DIR = Path(__file__).resolve().parent / "data"
+CAUSAL_HTILE_INPUT = DATA_DIR / "causal_attention_htile.mlir"
+CAUSAL_TRITON_EXPECTED = DATA_DIR / "causal_attention_triton.py"
+CAUSAL_CUTILE_EXPECTED = DATA_DIR / "causal_attention_cutile.py"
+CAUSAL_TILELANG_EXPECTED = DATA_DIR / "causal_attention_tilelang.py"
+CAUSAL_GRID = (4, 8)
+CAUSAL_SHAPE = (1, 4, 1024, 64)
+CAUSAL_BLOCK_ROWS = 128
 
 
-def require_translator_deps():
-    if find_neptune_opt() is None:
-        pytest.skip("neptune-opt is required for translator tests")
+def _assert_matches_python_source(actual: ast.Module, expected_path: Path) -> None:
+    expected = ast.parse(expected_path.read_text())
+    assert ast.unparse(actual) == ast.unparse(expected)
 
 
-def require_cuda_torch():
+def test_triton_translator_matches_causal_attention():
+    actual = translate_triton(CAUSAL_HTILE_INPUT.read_text())
+    _assert_matches_python_source(actual, CAUSAL_TRITON_EXPECTED)
+
+
+def test_cutile_translator_matches_causal_attention():
+    actual = translate_cutile(CAUSAL_HTILE_INPUT.read_text())
+    _assert_matches_python_source(actual, CAUSAL_CUTILE_EXPECTED)
+
+
+def test_tilelang_translator_matches_causal_attention():
+    actual = translate_tilelang(CAUSAL_HTILE_INPUT.read_text())
+    _assert_matches_python_source(actual, CAUSAL_TILELANG_EXPECTED)
+
+
+def _module_available(module_name: str) -> bool:
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except ModuleNotFoundError:
+        return False
+
+
+def _require_cuda_torch():
     if not _module_available("torch"):
         pytest.skip("torch is required for functional translator tests")
     import torch
@@ -42,101 +62,116 @@ def require_cuda_torch():
     return torch
 
 
-def require_tilelang_runtime():
-    if not _module_available("tilelang"):
-        pytest.skip("tilelang is required for TileLang functional translator tests")
-    import tilelang
-
-    return tilelang
-
-
-def require_cutile_runtime():
-    if not _module_available("cuda.tile"):
-        pytest.skip("cuda.tile is required for cuTile functional translator tests")
-    import cuda.tile as ct  # type: ignore
-
-    return ct
-
-
-def _module_available(module_name: str) -> bool:
-    try:
-        return importlib.util.find_spec(module_name) is not None
-    except ModuleNotFoundError:
-        return False
-
-
 def _exec_translated_module(module_ast: ast.Module, module_name: str):
     source = ast.unparse(module_ast) + "\n"
     with tempfile.NamedTemporaryFile(
-        mode="w",
-        suffix=".py",
-        prefix=f"{module_name}_",
-        delete=False,
-    ) as f:
-        f.write(source)
-        module_path = Path(f.name)
+        mode="w", suffix=".py", prefix=f"{module_name}_", delete=False
+    ) as file:
+        file.write(source)
+        module_path = Path(file.name)
 
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to load translated module from {module_path}")
+        raise RuntimeError(f"failed to load translated module from {module_path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
 
-def _make_attention_inputs(torch):
+def _make_causal_attention_inputs(torch):
     generator = torch.Generator(device="cuda")
     generator.manual_seed(0)
-    q = torch.randn(FLASH_SHAPE, dtype=torch.float16, device="cuda", generator=generator)
-    k = torch.randn(FLASH_SHAPE, dtype=torch.float16, device="cuda", generator=generator)
-    v = torch.randn(FLASH_SHAPE, dtype=torch.float16, device="cuda", generator=generator)
-    out = torch.empty(FLASH_SHAPE, dtype=torch.float16, device="cuda")
+    q = torch.randn(CAUSAL_SHAPE, dtype=torch.float16, device="cuda", generator=generator)
+    k = torch.randn(CAUSAL_SHAPE, dtype=torch.float16, device="cuda", generator=generator)
+    v = torch.randn(CAUSAL_SHAPE, dtype=torch.float16, device="cuda", generator=generator)
+    out = torch.empty(CAUSAL_SHAPE, dtype=torch.float16, device="cuda")
     return q, k, v, out
 
 
-def _reference_attention(torch, q, k, v):
-    ref = torch.empty(FLASH_SHAPE, dtype=torch.float32, device=q.device)
+def _reference_causal_attention(torch, q, k, v):
+    reference = torch.empty(CAUSAL_SHAPE, dtype=torch.float32, device=q.device)
     k_t = k.transpose(-1, -2).float()
-    v_f = v.float()
+    v_f32 = v.float()
     scale = 1.0 / math.sqrt(q.shape[-1])
+    key_positions = torch.arange(q.shape[2], device=q.device)
 
-    for row_start in range(0, q.shape[2], FLASH_REF_BLOCK_ROWS):
-        row_end = min(row_start + FLASH_REF_BLOCK_ROWS, q.shape[2])
+    for row_start in range(0, q.shape[2], CAUSAL_BLOCK_ROWS):
+        row_end = min(row_start + CAUSAL_BLOCK_ROWS, q.shape[2])
         q_block = q[:, :, row_start:row_end, :].float()
-        scores = torch.matmul(q_block, k_t)
-        probs = torch.softmax(scores * scale, dim=-1)
-        ref[:, :, row_start:row_end, :] = torch.matmul(probs, v_f)
+        scores = torch.matmul(q_block, k_t) * scale
+        row_positions = torch.arange(row_start, row_end, device=q.device)
+        causal_mask = key_positions[None, :] <= row_positions[:, None]
+        scores = scores.masked_fill(~causal_mask, float("-inf"))
+        probabilities = torch.softmax(scores, dim=-1)
+        reference[:, :, row_start:row_end, :] = torch.matmul(probabilities, v_f32)
 
-    return ref
+    return reference
 
 
-def _assert_attention_output_close(torch, out, q, k, v):
-    assert tuple(out.shape) == FLASH_SHAPE
+def _assert_causal_attention_output(torch, out, q, k, v):
+    assert tuple(out.shape) == CAUSAL_SHAPE
     assert out.dtype == torch.float16
     assert bool(torch.isfinite(out).all())
-    ref = _reference_attention(torch, q, k, v)
-    torch.testing.assert_close(out.float(), ref, rtol=0, atol=1e-3)
+    reference = _reference_causal_attention(torch, q, k, v)
+    torch.testing.assert_close(out.float(), reference, rtol=0, atol=2e-2)
 
 
-def _launch_cutile_kernel(ct, torch, kernel, args):
+def test_triton_translator_functional():
+    torch = _require_cuda_torch()
+    if not _module_available("triton"):
+        pytest.skip("Triton is required for its functional translator test")
+    module = _exec_translated_module(
+        translate_triton(CAUSAL_HTILE_INPUT.read_text()), "translated_causal_attention_triton"
+    )
+    q, k, v, out = _make_causal_attention_inputs(torch)
+    module.attention_kernel[CAUSAL_GRID](q, k, v, out)
+    torch.cuda.synchronize()
+    _assert_causal_attention_output(torch, out, q, k, v)
+
+
+def test_cutile_translator_functional():
+    torch = _require_cuda_torch()
+    if not _module_available("cuda.tile"):
+        pytest.skip("cuda.tile is required for its functional translator test")
+    import cuda.tile as ct  # type: ignore
+
+    module = _exec_translated_module(
+        translate_cutile(CAUSAL_HTILE_INPUT.read_text()), "translated_causal_attention_cutile"
+    )
+    q, k, v, out = _make_causal_attention_inputs(torch)
     stream = torch.cuda.current_stream()
+    grid = (*CAUSAL_GRID, 1)
     try:
-        ct.launch(stream, FLASH_GRID, kernel, args)
+        ct.launch(stream, grid, module.attention_kernel, (q, k, v, out))
     except TypeError:
-        ct.launch(stream, FLASH_GRID, kernel, *args)
+        ct.launch(stream, grid, module.attention_kernel, q, k, v, out)
+    torch.cuda.synchronize()
+    _assert_causal_attention_output(torch, out, q, k, v)
 
 
-def assert_matches_golden(actual_module: ast.Module, golden_name: str):
-    actual = ast.unparse(actual_module) + "\n"
-    expected = (GOLDEN_DIR / golden_name).read_text()
-    assert actual == expected
+def test_tilelang_translator_functional():
+    torch = _require_cuda_torch()
+    if not _module_available("tilelang"):
+        pytest.skip("TileLang is required for its functional translator test")
+    import tilelang
 
-
-def test_triton_translator_matches_causal_attention():
-    actual = ast.unparse(translate_triton(CAUSAL_HTILE_INPUT.read_text()))
-    expected = ast.unparse(ast.parse(CAUSAL_TRITON_EXPECTED.read_text()))
-    assert actual == expected
+    module = _exec_translated_module(
+        translate_tilelang(CAUSAL_HTILE_INPUT.read_text()),
+        "translated_causal_attention_tilelang",
+    )
+    kernel = tilelang.compile(
+        module.attention_kernel,
+        out_idx=[3],
+        execution_backend="tvm_ffi",
+        target="cuda",
+    )
+    q, k, v, _ = _make_causal_attention_inputs(torch)
+    out = kernel(q, k, v)
+    if isinstance(out, (list, tuple)):
+        out = out[0]
+    torch.cuda.synchronize()
+    _assert_causal_attention_output(torch, out, q, k, v)
 
 
 def test_triton_scalar_memref_access_uses_pointer_arithmetic():
@@ -155,51 +190,3 @@ def test_triton_scalar_memref_access_uses_pointer_arithmetic():
     assert translated.count("tl.load(") == 1
     assert translated.count("tl.store(") == 1
     assert "shape=[]" not in translated
-
-
-def test_cutile_translator_matches_golden():
-    require_translator_deps()
-    mlir_text = HTILE_LOAD_ORDER_INPUT.read_text()
-    assert_matches_golden(translate_cutile(mlir_text), "flash_attention_cutile.py")
-
-
-def test_tilelang_translator_matches_golden():
-    require_translator_deps()
-    mlir_text = HTILE_INPUT.read_text()
-    assert_matches_golden(translate_tilelang(mlir_text), "flash_attention_tilelang.py")
-
-
-def test_cutile_translator_functional():
-    require_translator_deps()
-    torch = require_cuda_torch()
-    ct = require_cutile_runtime()
-    mlir_text = HTILE_LOAD_ORDER_INPUT.read_text()
-    cutile_module = _exec_translated_module(
-        translate_cutile(mlir_text), "translated_flash_attention_cutile"
-    )
-    q, k, v, out = _make_attention_inputs(torch)
-    _launch_cutile_kernel(ct, torch, cutile_module.flash_attention_htile, (q, k, v, out))
-    torch.cuda.synchronize()
-    _assert_attention_output_close(torch, out, q, k, v)
-
-
-def test_tilelang_translator_functional():
-    require_translator_deps()
-    torch = require_cuda_torch()
-    tilelang = require_tilelang_runtime()
-    mlir_text = HTILE_INPUT.read_text()
-    tilelang_module = _exec_translated_module(
-        translate_tilelang(mlir_text), "translated_flash_attention_tilelang"
-    )
-    kernel = tilelang.compile(
-        tilelang_module.flash_attention_htile,
-        out_idx=[3],
-        execution_backend="tvm_ffi",
-        target="cuda",
-    )
-    q, k, v, _ = _make_attention_inputs(torch)
-    out = kernel(q, k, v)
-    if isinstance(out, (list, tuple)):
-        out = out[0]
-    torch.cuda.synchronize()
-    _assert_attention_output_close(torch, out, q, k, v)

@@ -90,13 +90,7 @@ class Translator:
             defaults=[],
         )
         return ast.FunctionDef(
-            name=kernel_name,
-            args=arguments,
-            body=body,  # type: ignore
-            decorator_list=[decorator],
-            returns=None,
-            lineno=0,
-            col_offset=0,
+            name=kernel_name, args=arguments, body=body, decorator_list=[decorator], type_params=[]
         )
 
     # --- block and op dispatch ---

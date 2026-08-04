@@ -79,6 +79,7 @@ def _mlir_dtype_to_tl_str(dtype: str) -> str:
         "f16": "float16",
         "f32": "float32",
         "f64": "float64",
+        "i1": "bool",
         "i8": "int8",
         "i16": "int16",
         "i32": "int32",
@@ -194,7 +195,7 @@ def parse_mlir_module(path: str, pass_pipeline: str | None = None) -> ir.Module:
         cmd += ["--mlir-print-op-generic", path]
     else:
         cmd += ["--mlir-print-op-generic", "--cse", "--canonicalize", path]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         stderr = result.stderr.strip()
         stdout = result.stdout.strip()
