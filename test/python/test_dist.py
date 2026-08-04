@@ -39,6 +39,6 @@ def test_register_htile_dialect_parses_custom_form_htile() -> None:
     ctx.allow_unregistered_dialects = True
     with ctx:
         dist.register_dialects(ctx)
-        module = ir.Module.parse(Path("test/python/data/flash_attention_htile.mlir").read_text())
-
-    assert next(iter(module.body.operations)).name.value == "flash_attention_htile"
+        module = ir.Module.parse(Path("test/python/data/causal_attention_htile.mlir").read_text())
+    op_names = [op.operation.name for op in module.body.operations]
+    assert op_names == ["func.func", "htile.kernel"]
