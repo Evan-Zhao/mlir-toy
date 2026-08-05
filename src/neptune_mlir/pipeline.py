@@ -1,9 +1,14 @@
 """Python orchestration for Neptune MLIR lowering pipelines."""
 
 import ast
+import importlib.util
+import inspect
+import os
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -15,13 +20,14 @@ from .schedules import (
     materialize_attention_schedule,
 )
 
-ATTENTION_TO_TRITON_INPUT_PIPELINE_BODY = (
-    "transform-interpreter,"
-    "lower-affine,"
-    "htile-dot-transpose-to-load-order,"
-    "cse,"
-    "canonicalize"
-)
+CodegenTarget = Literal["triton", "tilelang", "cutile"]
+
+
+@dataclass(frozen=True)
+class KernelArgument:
+    shape: tuple[int, ...]
+    dtype: str
+
 
 _VARIANT_TO_SCHEDULE = {
     AttentionVariant.GLOBAL_ATTN: AttentionSchedule.GLOBAL_ATTN,
@@ -93,23 +99,16 @@ def export_attention_mlir(
     return result.stdout
 
 
-def run_neptune_mlir_opt(input_mlir: str, pass_pipeline: str) -> str:
-    with tempfile.TemporaryDirectory(prefix="neptune_mlir_") as tmp_dir:
-        input_path = Path(tmp_dir) / "input.mlir"
-        input_path.write_text(input_mlir)
-        return _run_neptune_opt_file(input_path, pass_pipeline)
-
-
-def attention_to_triton_input_pass_pipeline(schedule_path: Path) -> str:
+def attention_to_htile_pass_pipeline(schedule_path: Path) -> str:
     return (
         "builtin.module("
         f"transform-preload-library{{transform-library-paths={schedule_path.as_posix()}}},"
-        f"{ATTENTION_TO_TRITON_INPUT_PIPELINE_BODY}"
+        f"transform-interpreter,lower-affine,htile-dot-transpose-to-load-order,cse,canonicalize"
         ")"
     )
 
 
-def lower_attention_linalg_to_triton_input_mlir(
+def lower_attention_linalg_to_htile_mlir(
     input_mlir: str,
     schedule: AttentionSchedule | str,
     tile_config: AttentionTileConfig | None = None,
@@ -121,11 +120,11 @@ def lower_attention_linalg_to_triton_input_mlir(
         schedule_path = tmp_path / "schedule.mlir"
         input_path.write_text(input_mlir)
         schedule_path.write_text(schedule_mlir)
-        pass_pipeline = attention_to_triton_input_pass_pipeline(schedule_path)
+        pass_pipeline = attention_to_htile_pass_pipeline(schedule_path)
         return _run_neptune_opt_file(input_path, pass_pipeline)
 
 
-def export_attention_to_triton_input_mlir(
+def export_attention_to_htile_mlir(
     *,
     variant: AttentionVariant | str,
     batch: int = 1,
@@ -153,18 +152,169 @@ def export_attention_to_triton_input_mlir(
         window_size=window_size,
         func_name=func_name,
     )
-    return lower_attention_linalg_to_triton_input_mlir(input_mlir, schedule, tile_config)
+    return lower_attention_linalg_to_htile_mlir(input_mlir, schedule, tile_config)
 
 
-def lower_attention_linalg_to_triton_ast(
+def translate_htile_to_ast(input_mlir: str, codegen_target: CodegenTarget) -> ast.Module:
+    if codegen_target == "triton":
+        from .translators.triton import translate_mlir_text
+    elif codegen_target == "tilelang":
+        from .translators.tilelang import translate_mlir_text
+    elif codegen_target == "cutile":
+        from .translators.cutile import translate_mlir_text
+    else:
+        raise ValueError(f"unknown codegen target: {codegen_target}")
+
+    return translate_mlir_text(input_mlir)
+
+
+def lower_attention_linalg_to_ast(
     input_mlir: str,
     schedule: AttentionSchedule | str,
+    codegen_target: CodegenTarget,
     tile_config: AttentionTileConfig | None = None,
 ) -> ast.Module:
-    from .translators.triton import translate_mlir_text
+    lowered = lower_attention_linalg_to_htile_mlir(input_mlir, schedule, tile_config)
+    return translate_htile_to_ast(lowered, codegen_target)
 
-    lowered = lower_attention_linalg_to_triton_input_mlir(input_mlir, schedule, tile_config)
-    return translate_mlir_text(lowered)
+
+def get_htile_kernel_arguments(input_mlir: str) -> tuple[KernelArgument, ...]:
+    """Return the static memref signature of the single outlined HTile kernel."""
+    from mlir import ir
+
+    from .translators.common import parse_mlir_module_from_text
+
+    module = parse_mlir_module_from_text(input_mlir)
+    kernels = [op for op in module.body.operations if op.operation.name == "htile.kernel"]
+    if len(kernels) != 1:
+        raise ValueError(f"expected one htile.kernel, found {len(kernels)}")
+
+    arguments = []
+    for argument in kernels[0].regions[0].blocks[0].arguments:
+        memref_type = ir.MemRefType(argument.type)
+        if any(extent < 0 for extent in memref_type.shape):
+            raise ValueError("compiled backend targets require static kernel argument shapes")
+        arguments.append(KernelArgument(tuple(memref_type.shape), str(memref_type.element_type)))
+    return tuple(arguments)
+
+
+@contextmanager
+def _import_generated_source(source: str, module_prefix: str):
+    module_name = f"{module_prefix}_{abs(hash(source))}"
+    with tempfile.TemporaryDirectory(prefix=f"neptune_{module_prefix}_") as temp_dir:
+        module_path = Path(temp_dir) / f"{module_name}.py"
+        module_path.write_text(source)
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"failed to load generated module from {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+            yield module
+        finally:
+            sys.modules.pop(module_name, None)
+
+
+def _torch_dtype(torch, dtype: str):
+    mapping = {
+        "f8E4M3FN": "float8_e4m3fn",
+        "f16": "float16",
+        "f32": "float32",
+        "f64": "float64",
+        "i8": "int8",
+        "i16": "int16",
+        "i32": "int32",
+        "i64": "int64",
+    }
+    name = mapping.get(dtype)
+    if name is None or not hasattr(torch, name):
+        raise ValueError(f"unsupported Torch kernel argument dtype: {dtype}")
+    return getattr(torch, name)
+
+
+def compile_triton_source_to_ptx(source: str, kernel_arguments: tuple[KernelArgument, ...]) -> str:
+    """Compile generated Triton source for the active CUDA target and return PTX."""
+    try:
+        import torch
+        import triton  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError("Triton and PyTorch are required for Triton PTX compilation") from exc
+    if torch.version.cuda is None or not torch.cuda.is_available():
+        raise RuntimeError("Triton PTX compilation requires an Nvidia CUDA device")
+
+    with _import_generated_source(source, "triton_compile") as module:
+        kernel = module.attention_kernel
+        parameter_count = len(inspect.signature(kernel.fn).parameters)
+        if parameter_count != len(kernel_arguments):
+            raise ValueError(
+                f"kernel expects {parameter_count} arguments, got {len(kernel_arguments)}"
+            )
+        args = [
+            torch.empty(1, dtype=_torch_dtype(torch, argument.dtype), device="cuda")
+            for argument in kernel_arguments
+        ]
+        compiled = kernel.warmup(*args, grid=(1, 1, 1))
+        ptx = compiled.asm.get("ptx")
+        if not isinstance(ptx, str):
+            raise RuntimeError("Triton compilation did not produce PTX")  # noqa: TRY004
+        return ptx
+
+
+def compile_cutile_source(
+    source: str,
+    kernel_arguments: tuple[KernelArgument, ...],
+    grid: tuple[int, int, int] = (1, 1, 1),
+) -> None:
+    """Compile generated cuTile source by launching it once on the active CUDA device."""
+    try:
+        import cuda.tile as ct  # type: ignore
+        import torch
+    except ImportError as exc:
+        raise RuntimeError("cuTile and PyTorch are required for cuTile compilation") from exc
+    if torch.version.cuda is None or not torch.cuda.is_available():
+        raise RuntimeError("cuTile compilation requires an Nvidia CUDA device")
+
+    with _import_generated_source(source, "cutile_compile") as module:
+        args = [
+            torch.empty(
+                argument.shape,
+                dtype=_torch_dtype(torch, argument.dtype),
+                device="cuda",
+            )
+            for argument in kernel_arguments
+        ]
+        stream = torch.cuda.current_stream()
+        ct.launch(stream, grid, module.attention_kernel, tuple(args))
+        torch.cuda.synchronize()
+
+
+def compile_tilelang_source_to_cuda(source: str, output_index: int) -> str:
+    """Compile generated TileLang source and return its lowered CUDA C++ kernel."""
+    try:
+        import tilelang
+    except ImportError as exc:
+        raise RuntimeError("TileLang is required for TileLang CUDA generation") from exc
+
+    previous_print_setting = os.environ.get("TILELANG_PRINT_ON_COMPILATION")
+    os.environ["TILELANG_PRINT_ON_COMPILATION"] = "0"
+    try:
+        with _import_generated_source(source, "tilelang_compile") as module:
+            kernel = tilelang.compile(
+                module.attention_kernel,
+                out_idx=[output_index],
+                execution_backend="tvm_ffi",
+                target="cuda",
+            )
+            cuda_source = kernel.kernel_source
+            if not isinstance(cuda_source, str) or not cuda_source:
+                raise RuntimeError("TileLang compilation did not produce CUDA source")
+            return cuda_source
+    finally:
+        if previous_print_setting is None:
+            os.environ.pop("TILELANG_PRINT_ON_COMPILATION", None)
+        else:
+            os.environ["TILELANG_PRINT_ON_COMPILATION"] = previous_print_setting
 
 
 def _coerce_attention_variant(variant):

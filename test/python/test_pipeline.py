@@ -1,5 +1,4 @@
 import ast
-import tempfile
 from itertools import product
 from pathlib import Path
 
@@ -7,9 +6,14 @@ import pytest
 
 from neptune_mlir.operator.variants import AttentionVariant
 from neptune_mlir.pipeline import (
-    attention_to_triton_input_pass_pipeline,
+    attention_to_htile_pass_pipeline,
+    compile_cutile_source,
+    compile_tilelang_source_to_cuda,
+    compile_triton_source_to_ptx,
     export_attention_mlir,
-    export_attention_to_triton_input_mlir,
+    export_attention_to_htile_mlir,
+    get_htile_kernel_arguments,
+    translate_htile_to_ast,
 )
 from neptune_mlir.schedules import AttentionTileConfig
 
@@ -162,10 +166,10 @@ def test_export_fp8_attention_preserves_quantized_kv_inputs() -> None:
         (AttentionVariant.GLOBAL_GQA, {"q_heads": 4, "kv_heads": 2}),
     ],
 )
-def test_export_attention_to_triton_input_mlir(variant, kwargs) -> None:
+def test_export_attention_to_htile_mlir(variant, kwargs) -> None:
     require_export_deps()
 
-    lowered = export_attention_to_triton_input_mlir(
+    lowered = export_attention_to_htile_mlir(
         variant=variant, seq_len=128, head_dim=64, **kwargs
     )
 
@@ -181,7 +185,7 @@ def test_export_attention_to_triton_input_mlir(variant, kwargs) -> None:
 def test_custom_tile_config_reaches_lowered_loop_bounds() -> None:
     require_export_deps()
 
-    lowered = export_attention_to_triton_input_mlir(
+    lowered = export_attention_to_htile_mlir(
         variant=AttentionVariant.GLOBAL_ATTN,
         q_heads=2,
         seq_len=128,
@@ -195,15 +199,19 @@ def test_custom_tile_config_reaches_lowered_loop_bounds() -> None:
 
 
 @pytest.fixture(scope="module", params=TRANSLATOR_INPUT_CASES)
-def lowered_triton_case(request):
-    """Lower one attention case once for source checks and optional compilation."""
-    from neptune_mlir.translators.triton import translate_mlir_text
-
+def lowered_attention_case(request):
+    """Lower one attention case once before translating it to each backend."""
     require_export_deps()
-    variant, kwargs, input_dtypes = request.param
-    lowered = export_attention_to_triton_input_mlir(variant=variant, **kwargs)
-    source = ast.unparse(translate_mlir_text(lowered)) + "\n"
-    return source, input_dtypes
+    variant, kwargs, _ = request.param
+    lowered = export_attention_to_htile_mlir(variant=variant, **kwargs)
+    return lowered, get_htile_kernel_arguments(lowered)
+
+
+@pytest.fixture(scope="module", params=("triton", "cutile", "tilelang"))
+def translated_attention_case(request, lowered_attention_case):
+    lowered, kernel_arguments = lowered_attention_case
+    module = translate_htile_to_ast(lowered, request.param)
+    return request.param, ast.unparse(module) + "\n", kernel_arguments
 
 
 def require_nvidia_triton():
@@ -229,48 +237,63 @@ def require_nvidia_triton():
     return torch
 
 
-def compile_triton_source(source: str, input_dtypes: tuple[str, ...], torch) -> None:
-    """Import generated source and force Triton to compile its attention kernel."""
+def require_nvidia_python_backend(module_name: str):
     import importlib.util
-    import inspect
-    import sys
 
-    module_name = f"compiled_attention_{abs(hash(source))}"
-    with tempfile.TemporaryDirectory(prefix="neptune_triton_compile_") as temp_dir:
-        module_path = Path(temp_dir) / f"{module_name}.py"
-        module_path.write_text(source)
-        spec = importlib.util.spec_from_file_location(module_name, module_path)
-        if spec is None or spec.loader is None:
-            raise RuntimeError(f"Failed to load generated Triton module from {module_path}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        try:
-            spec.loader.exec_module(module)
-            kernel = module.attention_kernel
-            parameter_count = len(inspect.signature(kernel.fn).parameters)
-            assert parameter_count == len(input_dtypes)
-            args = [
-                torch.empty(1, dtype=getattr(torch, dtype), device="cuda") for dtype in input_dtypes
-            ]
-            kernel.warmup(*args, grid=(1, 1, 1))
-        finally:
-            sys.modules.pop(module_name, None)
+    try:
+        available = importlib.util.find_spec(module_name) is not None
+    except ModuleNotFoundError:
+        available = False
+    if not available:
+        pytest.skip(f"{module_name} is required for its compilation test")
+    if importlib.util.find_spec("torch") is None:
+        pytest.skip("PyTorch is required for backend compilation tests")
+
+    import torch
+
+    if torch.version.cuda is None or not torch.cuda.is_available():
+        pytest.skip("An Nvidia GPU is required for backend compilation tests")
+    try:
+        torch.cuda.init()
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"CUDA initialization failed: {exc}")
+    return torch
 
 
-def test_attention_lowering_pipeline(lowered_triton_case) -> None:
-    source, _ = lowered_triton_case
-    assert "@triton.jit" in source
+def test_attention_lowering_pipeline(translated_attention_case) -> None:
+    codegen_target, source, _ = translated_attention_case
+    expected_decorators = {
+        "triton": "@triton.jit",
+        "cutile": "@ct.kernel",
+        "tilelang": "@T.prim_func",
+    }
+    assert expected_decorators[codegen_target] in source
     assert "def attention_kernel" in source
 
 
-def test_attention_lowering_and_triton_compilation(lowered_triton_case) -> None:
-    source, input_dtypes = lowered_triton_case
-    torch = require_nvidia_triton()
-    compile_triton_source(source, input_dtypes, torch)
+def test_attention_lowering_and_backend_compilation(translated_attention_case) -> None:
+    codegen_target, source, kernel_arguments = translated_attention_case
+    if codegen_target == "triton":
+        require_nvidia_triton()
+        ptx = compile_triton_source_to_ptx(source, kernel_arguments)
+        assert ".version" in ptx
+    elif codegen_target == "cutile":
+        torch = require_nvidia_python_backend("cuda.tile")
+        if any(argument.dtype.startswith("f8") for argument in kernel_arguments):
+            major, _ = torch.cuda.get_device_capability()
+            if major < 10:
+                pytest.skip("cuTile FP8 compilation requires an sm100 or newer GPU")
+        compile_cutile_source(source, kernel_arguments)
+    else:
+        require_nvidia_python_backend("tilelang")
+        cuda_source = compile_tilelang_source_to_cuda(
+            source, output_index=len(kernel_arguments) - 1
+        )
+        assert "__global__" in cuda_source
 
 
 def test_attention_pass_pipeline_embeds_schedule_preload() -> None:
-    pipeline = attention_to_triton_input_pass_pipeline(Path("/tmp/schedule.mlir"))
+    pipeline = attention_to_htile_pass_pipeline(Path("/tmp/schedule.mlir"))
 
     assert pipeline.startswith("builtin.module(transform-preload-library")
     assert "transform-library-paths=/tmp/schedule.mlir" in pipeline

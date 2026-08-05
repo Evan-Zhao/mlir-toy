@@ -39,6 +39,7 @@ def _ct_call(fn: str, *args: ast.expr, **kwargs: ast.expr) -> ast.Call:
 def _mlir_dtype_to_ct(dtype: str) -> ast.expr:
     mapping = {
         "index": "int64",
+        "f8E4M3FN": "float8_e4m3fn",
         "f16": "float16",
         "f32": "float32",
         "f64": "float64",
@@ -125,6 +126,10 @@ class Translator:
             "arith.constant": self._arith_constant,
             "arith.muli": lambda o: self._binop(o, ast.Mult()),
             "arith.addi": lambda o: self._binop(o, ast.Add()),
+            "arith.subi": lambda o: self._binop(o, ast.Sub()),
+            "arith.divui": lambda o: self._binop(o, ast.FloorDiv()),
+            "arith.remui": lambda o: self._binop(o, ast.Mod()),
+            "arith.andi": lambda o: self._binop(o, ast.BitAnd()),
             "arith.addf": lambda o: self._binop(o, ast.Add()),
             "arith.mulf": lambda o: self._binop(o, ast.Mult()),
             "arith.subf": lambda o: self._binop(o, ast.Sub()),
@@ -135,6 +140,8 @@ class Translator:
             "arith.index_cast": self._arith_index_cast,
             "arith.cmpi": self._arith_cmpi,
             "arith.select": self._arith_select,
+            "arith.sitofp": self._arith_truncf,
+            "arith.extf": self._arith_truncf,
             "arith.truncf": self._arith_truncf,
             "math.exp2": lambda o: self._ct_unary(o, "exp2"),
             "htile.program_id": self._htile_program_id,

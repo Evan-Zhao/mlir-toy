@@ -1,14 +1,28 @@
-#!/usr/bin/env python3
 """Export built-in attention variants at different compiler pipeline stages."""
 
 import argparse
 import ast
 
 from neptune_mlir.operator.variants import VARIANTS, AttentionVariant
-from neptune_mlir.pipeline import export_attention_mlir, export_attention_to_triton_input_mlir
+from neptune_mlir.pipeline import (
+    compile_tilelang_source_to_cuda,
+    compile_triton_source_to_ptx,
+    export_attention_mlir,
+    export_attention_to_htile_mlir,
+    get_htile_kernel_arguments,
+)
 from neptune_mlir.schedules import AttentionTileConfig
 
-STAGES = ("stablehlo", "linalg", "htile", "triton", "tilelang", "cutile")
+STAGES = (
+    "stablehlo",
+    "linalg",
+    "htile",
+    "triton",
+    "triton-ptx",
+    "tilelang",
+    "tilelang-cuda",
+    "cutile",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -70,17 +84,26 @@ def export_at_stage(args: argparse.Namespace) -> str:
         return export_attention_mlir(**common_args, output_type=args.stage)
 
     tile_config = AttentionTileConfig(block_m=args.block_m, block_n=args.block_n)
-    lowered = export_attention_to_triton_input_mlir(**common_args, tile_config=tile_config)
+    lowered = export_attention_to_htile_mlir(**common_args, tile_config=tile_config)
     if args.stage == "htile":
         return lowered
 
-    if args.stage == "triton":
+    if args.stage.startswith("triton"):
         from neptune_mlir.translators.triton import translate_mlir_text
-    elif args.stage == "tilelang":
+    elif args.stage.startswith("tilelang"):
         from neptune_mlir.translators.tilelang import translate_mlir_text
     else:
         from neptune_mlir.translators.cutile import translate_mlir_text
-    return ast.unparse(translate_mlir_text(lowered)) + "\n"
+    source = ast.unparse(translate_mlir_text(lowered)) + "\n"
+
+    if args.stage in {"triton", "tilelang", "cutile"}:
+        return source
+
+    kernel_arguments = get_htile_kernel_arguments(lowered)
+    if args.stage == "triton-ptx":
+        return compile_triton_source_to_ptx(source, kernel_arguments)
+    output_index = len(kernel_arguments) - 1
+    return compile_tilelang_source_to_cuda(source, output_index)
 
 
 def main() -> None:

@@ -76,6 +76,7 @@ def _store_subscript(value: ast.expr, indices: list[ast.expr]) -> ast.Subscript:
 def _mlir_dtype_to_tl_str(dtype: str) -> str:
     mapping = {
         "index": "int64",
+        "f8E4M3FN": "float8_e4m3fn",
         "f16": "float16",
         "f32": "float32",
         "f64": "float64",

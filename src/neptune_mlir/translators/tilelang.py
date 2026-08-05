@@ -45,6 +45,7 @@ class Translator:
         self._counter = 0
         self._broadcasts: dict[ir.Value, BroadcastInfo] = {}
         self._transposed_tiles: set[ir.Value] = set()
+        self._scalar_tiles: set[ir.Value] = set()
         self._yield_dests: list[list[str]] = []
 
     def _fresh(self, hint="v") -> str:
@@ -149,13 +150,18 @@ class Translator:
         if op_name == "scf.for":
             allocs.extend(self._collect_allocs(op.regions[0].blocks[0]))
             return allocs
-        if op_name in {"htile.broadcast", "tensor.empty", "htile.copy"}:
+        if op_name in {"htile.broadcast", "htile.permute", "tensor.empty", "htile.copy"}:
             return allocs
 
         for result in op.results:
             if _is_ranked_tensor_type(result.type):
-                name = self._bind(result, self._result_hint(op_name))
                 shape, dtype = _tensor_shape(result.type)
+                if op_name == "htile.load" and not shape:
+                    continue
+                if op_name == "htile.load":
+                    dimension_order = _dimension_order(op, len(shape))
+                    shape = [shape[dim] for dim in dimension_order]
+                name = self._bind(result, self._result_hint(op_name))
                 alloc_fn = (
                     "alloc_shared"
                     if op_name == "htile.load" or self._is_shared(result.type)
@@ -197,6 +203,10 @@ class Translator:
             "arith.constant": self._arith_constant,
             "arith.muli": lambda o: self._elementwise_binop(o, ast.Mult()),
             "arith.addi": lambda o: self._elementwise_binop(o, ast.Add()),
+            "arith.subi": lambda o: self._elementwise_binop(o, ast.Sub()),
+            "arith.divui": lambda o: self._elementwise_binop(o, ast.FloorDiv()),
+            "arith.remui": lambda o: self._elementwise_binop(o, ast.Mod()),
+            "arith.andi": lambda o: self._elementwise_binop(o, ast.BitAnd()),
             "arith.addf": lambda o: self._elementwise_binop(o, ast.Add()),
             "arith.mulf": lambda o: self._elementwise_binop(o, ast.Mult()),
             "arith.subf": lambda o: self._elementwise_binop(o, ast.Sub()),
@@ -207,6 +217,8 @@ class Translator:
             "arith.index_cast": self._arith_index_cast,
             "arith.cmpi": self._arith_cmpi,
             "arith.select": self._arith_select,
+            "arith.sitofp": self._arith_truncf,
+            "arith.extf": self._arith_truncf,
             "arith.truncf": self._arith_truncf,
             "math.exp2": self._math_exp2,
             "htile.program_id": lambda o: [],
@@ -216,6 +228,7 @@ class Translator:
             "htile.arange": self._htile_arange,
             "htile.dot": self._htile_dot,
             "htile.reduce": self._htile_reduce,
+            "htile.permute": self._htile_permute,
             "htile.copy": self._htile_copy,
             "htile.broadcast": self._htile_broadcast,
             "scf.for": self._scf_for,
@@ -392,6 +405,8 @@ class Translator:
             info = self._broadcasts[value]
             src_indices = [idx for dim, idx in enumerate(indices) if dim not in info.dimensions]
             return self._value_at(info.source, src_indices)
+        if value in self._scalar_tiles:
+            return self._expr(value)
         if _is_ranked_tensor_type(value.type):
             return _subscript(self._expr(value), indices)
         return self._expr(value)
@@ -400,14 +415,22 @@ class Translator:
 
     def _htile_load(self, op: ir.OpView) -> list[ast.stmt]:
         shape, _ = _tensor_shape(op.results[0].type)
+        if not shape:
+            self._scalar_tiles.add(op.results[0])
+            name = self._bind(op.results[0], "scalar")
+            src = self._mem_region(op.operands[0], list(op.operands[1:]), op.results[0])
+            return [_assign(name, src)]
         dimension_order = _dimension_order(op, len(shape))
+        physical_shape = [shape[dim] for dim in dimension_order]
         if dimension_order != list(range(len(shape))):
             if dimension_order != [1, 0]:
                 raise NotImplementedError(
                     f"unsupported TileLang load dimension_order: {dimension_order}"
                 )
             self._transposed_tiles.add(op.results[0])
-        src = self._mem_region(op.operands[0], list(op.operands[1:]), op.results[0])
+        src = self._mem_region(
+            op.operands[0], list(op.operands[1:]), op.results[0], tile_shape=physical_shape
+        )
         return [_expr_stmt(_T_call("copy", src, self._expr(op.results[0])))]
 
     def _htile_store(self, op: ir.OpView) -> list[ast.stmt]:
@@ -468,6 +491,14 @@ class Translator:
                 )
             )
         ]
+
+    def _htile_permute(self, op: ir.OpView) -> list[ast.stmt]:
+        permutation = _parse_dense_i64_array(op.attributes.get("permutation"))
+        if permutation != [1, 0]:
+            raise NotImplementedError(f"unsupported TileLang permutation: {permutation}")
+        self._names[op.results[0]] = self._get(op.operands[0])
+        self._transposed_tiles.add(op.results[0])
+        return []
 
     def _htile_copy(self, op: ir.OpView) -> list[ast.stmt]:
         self._names[op.results[0]] = self._get(op.operands[0])
@@ -543,9 +574,14 @@ class Translator:
     # --- helpers ---
 
     def _mem_region(
-        self, memref: ir.Value, offsets: list[ir.Value], tile_value: ir.Value
+        self,
+        memref: ir.Value,
+        offsets: list[ir.Value],
+        tile_value: ir.Value,
+        tile_shape: list[int] | None = None,
     ) -> ast.Subscript:
-        tile_shape, _ = _tensor_shape(tile_value.type)
+        if tile_shape is None:
+            tile_shape, _ = _tensor_shape(tile_value.type)
         mem_shape, _ = _memref_shape(memref.type)
         batch_dims = len(mem_shape) - len(tile_shape)
         indices: list[ast.expr] = []
