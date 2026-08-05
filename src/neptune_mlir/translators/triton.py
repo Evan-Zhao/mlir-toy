@@ -4,57 +4,16 @@ import ast
 
 from mlir import ir
 
-from .common import (
-    _assign,
-    _call,
-    _const,
-    _dimension_order,
-    _func_sym_name,
-    _is_ranked_tensor_type,
-    _list,
-    _memref_shape,
-    _mlir_dtype_to_tl,
-    _module_top_ops,
-    _name,
-    _op_type_name,
-    _reject_dot_transpose_attrs,
-    _tensor_shape,
-    _tl,
-    _tl_call,
-    _tuple,
-    parse_mlir_module_from_text,
-)
+from . import common as shared
 
 
-class Translator:
+class Translator(shared.BaseTranslator):
     def __init__(self):
-        # Keys are mlir.ir.Value objects (hash by underlying C++ pointer).
-        self._names: dict[ir.Value, str] = {}
-        self._counter = 0
+        super().__init__()
         self._for_output_names: list[list[str]] = []
 
-    def _fresh(self, hint="v") -> str:
-        n = f"{hint}_{self._counter}"
-        self._counter += 1
-        return n
-
-    def _bind(self, value: ir.Value, hint="v") -> str:
-        name = self._fresh(hint)
-        self._names[value] = name
-        return name
-
-    def _get(self, value: ir.Value) -> str:
-        if value not in self._names:
-            raise KeyError(f"Unbound SSA value: {value}")
-        return self._names[value]
-
-    def _expr(self, value: ir.Value) -> ast.expr:
-        return _name(self._get(value))
-
-    # --- module entry ---
-
-    def translate(self, module: ir.Module) -> ast.Module:
-        body: list[ast.stmt] = [
+    def _module_prelude(self) -> list[ast.stmt]:
+        return [
             ast.Import(names=[ast.alias(name="triton")]),
             ast.ImportFrom(
                 module="triton",
@@ -62,16 +21,10 @@ class Translator:
                 level=0,
             ),
         ]
-        for op in _module_top_ops(module):
-            if _op_type_name(op) == "htile.kernel":
-                body.append(self._htile_kernel(op))
-        mod = ast.Module(body=body, type_ignores=[])
-        ast.fix_missing_locations(mod)
-        return mod
 
     def _htile_kernel(self, op: ir.OpView) -> ast.FunctionDef:
         entry = op.regions[0].blocks[0]
-        kernel_name = _func_sym_name(op)
+        kernel_name = shared._func_sym_name(op)
 
         params: list[ast.arg] = []
         for arg in entry.arguments:
@@ -79,7 +32,7 @@ class Translator:
             params.append(ast.arg(arg=pname, annotation=None))
 
         body = self._block_ops(entry) or [ast.Pass()]
-        decorator = ast.Attribute(value=_name("triton"), attr="jit", ctx=ast.Load())
+        decorator = ast.Attribute(value=shared._name("triton"), attr="jit", ctx=ast.Load())
         arguments = ast.arguments(
             posonlyargs=[],
             args=params,
@@ -93,99 +46,64 @@ class Translator:
             name=kernel_name, args=arguments, body=body, decorator_list=[decorator], type_params=[]
         )
 
-    # --- block and op dispatch ---
-
-    def _block_ops(self, block: ir.Block) -> list[ast.stmt]:
-        stmts = []
-        for op in block.operations:
-            stmts.extend(self._op(op))
-        return stmts
-
-    def _op(self, op: ir.OpView) -> list[ast.stmt]:
-        dispatch = {
-            "arith.constant": self._arith_constant,
-            "arith.muli": lambda o: self._binop(o, ast.Mult()),
-            "arith.addi": lambda o: self._binop(o, ast.Add()),
-            "arith.subi": lambda o: self._binop(o, ast.Sub()),
-            "arith.divui": lambda o: self._binop(o, ast.FloorDiv()),
-            "arith.remui": lambda o: self._binop(o, ast.Mod()),
-            "arith.andi": lambda o: self._binop(o, ast.BitAnd()),
-            "arith.addf": lambda o: self._binop(o, ast.Add()),
-            "arith.mulf": lambda o: self._binop(o, ast.Mult()),
-            "arith.subf": lambda o: self._binop(o, ast.Sub()),
-            "arith.divf": lambda o: self._binop(o, ast.Div()),
-            "arith.maxsi": lambda o: self._scalar_call_binop(o, "max"),
-            "arith.minsi": lambda o: self._scalar_call_binop(o, "min"),
-            "arith.maximumf": lambda o: self._tl_binop(o, "maximum"),
-            "arith.index_cast": self._arith_index_cast,
-            "arith.cmpi": self._arith_cmpi,
-            "arith.select": self._arith_select,
-            "arith.sitofp": self._arith_cast,
-            "arith.extf": self._arith_cast,
-            "arith.truncf": self._arith_cast,
-            "math.exp2": lambda o: self._tl_unary(o, "exp2"),
-            "htile.program_id": self._htile_program_id,
-            "htile.load": self._htile_load,
-            "htile.store": self._htile_store,
-            "htile.full": self._htile_full,
-            "htile.arange": self._htile_arange,
-            "htile.dot": self._htile_dot,
-            "htile.reduce": self._htile_reduce,
-            "htile.permute": self._htile_permute,
-            "htile.copy": self._htile_copy,
-            "htile.broadcast": self._htile_broadcast,
-            "scf.for": self._scf_for,
-            "scf.yield": self._scf_yield,
-            "tensor.empty": lambda o: [],
-            "htile.return": lambda o: [],
-            "linalg.yield": lambda o: [],
-        }
-        handler = dispatch.get(_op_type_name(op))
-        if handler is None:
-            raise NotImplementedError(f"unsupported op: {_op_type_name(op)}")
-        return handler(op)
-
     # --- arith ops ---
 
     def _arith_constant(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "c")
-        attr = op.attributes.get("value")
-        if isinstance(attr, (ir.IntegerAttr, ir.FloatAttr)):
-            val = attr.value
-        else:
-            raise NotImplementedError(f"unsupported arith.constant value attr: {attr}")
+        val = shared._decode_constant(op)
         return [
             ast.AnnAssign(
-                target=_name(name, ast.Store()),
-                annotation=_tl("constexpr"),
-                value=_const(val),
+                target=shared._name(name, ast.Store()),
+                annotation=shared._tl("constexpr"),
+                value=shared._const(val),
                 simple=1,
             )
         ]
 
-    def _binop(self, op: ir.OpView, py_op: ast.operator) -> list[ast.stmt]:
+    def _binary_op(self, op: ir.OpView, py_op: ast.operator) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
         lhs = self._expr(op.operands[0])
         rhs = self._expr(op.operands[1])
-        return [_assign(name, ast.BinOp(left=lhs, op=py_op, right=rhs))]
+        return [shared._assign(name, ast.BinOp(left=lhs, op=py_op, right=rhs))]
 
     def _tl_binop(self, op: ir.OpView, fn: str) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
-        return [_assign(name, _tl_call(fn, self._expr(op.operands[0]), self._expr(op.operands[1])))]
+        return [
+            shared._assign(
+                name, shared._tl_call(fn, self._expr(op.operands[0]), self._expr(op.operands[1]))
+            )
+        ]
 
     def _scalar_call_binop(self, op: ir.OpView, fn: str) -> list[ast.stmt]:
-        if _is_ranked_tensor_type(op.results[0].type) or any(
-            _is_ranked_tensor_type(operand.type) for operand in op.operands
+        if shared._is_ranked_tensor_type(op.results[0].type) or any(
+            shared._is_ranked_tensor_type(operand.type) for operand in op.operands
         ):
-            raise NotImplementedError(f"unsupported tensor {_op_type_name(op)}")
+            raise NotImplementedError(f"unsupported tensor {shared._op_type_name(op)}")
         name = self._bind(op.results[0], "v")
         return [
-            _assign(name, _call(_name(fn), self._expr(op.operands[0]), self._expr(op.operands[1])))
+            shared._assign(
+                name,
+                shared._call(
+                    shared._name(fn), self._expr(op.operands[0]), self._expr(op.operands[1])
+                ),
+            )
         ]
 
     def _tl_unary(self, op: ir.OpView, fn: str) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
-        return [_assign(name, _tl_call(fn, self._expr(op.operands[0])))]
+        return [shared._assign(name, shared._tl_call(fn, self._expr(op.operands[0])))]
+
+    def _arith_maxsi(self, op: ir.OpView) -> list[ast.stmt]:
+        return self._scalar_call_binop(op, "max")
+
+    def _arith_minsi(self, op: ir.OpView) -> list[ast.stmt]:
+        return self._scalar_call_binop(op, "min")
+
+    def _arith_maximumf(self, op: ir.OpView) -> list[ast.stmt]:
+        return self._tl_binop(op, "maximum")
+
+    def _math_exp2(self, op: ir.OpView) -> list[ast.stmt]:
+        return self._tl_unary(op, "exp2")
 
     def _arith_index_cast(self, op: ir.OpView) -> list[ast.stmt]:
         self._names[op.results[0]] = self._get(op.operands[0])
@@ -193,30 +111,13 @@ class Translator:
 
     def _arith_cmpi(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "cmp")
-        predicate_attr = op.attributes.get("predicate")
-        assert predicate_attr is not None, "arith.cmpi missing 'predicate' attribute"
-        predicate = ir.IntegerAttr(predicate_attr).value
-        predicate_to_op = {
-            0: ast.Eq,
-            1: ast.NotEq,
-            2: ast.Lt,
-            3: ast.LtE,
-            4: ast.Gt,
-            5: ast.GtE,
-            6: ast.Lt,
-            7: ast.LtE,
-            8: ast.Gt,
-            9: ast.GtE,
-        }
-        cmp_op = predicate_to_op.get(predicate)
-        if cmp_op is None:
-            raise NotImplementedError(f"unsupported arith.cmpi predicate: {predicate}")
+        cmp_op = shared._decode_cmp_predicate(op)
         return [
-            _assign(
+            shared._assign(
                 name,
                 ast.Compare(
                     left=self._expr(op.operands[0]),
-                    ops=[cmp_op()],
+                    ops=[cmp_op],
                     comparators=[self._expr(op.operands[1])],
                 ),
             )
@@ -225,17 +126,19 @@ class Translator:
     def _arith_select(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "sel")
         cond, true_val, false_val = map(self._expr, op.operands)
-        return [_assign(name, _tl_call("where", cond, true_val, false_val))]
+        return [shared._assign(name, shared._tl_call("where", cond, true_val, false_val))]
 
     def _arith_cast(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
-        _, dtype = _tensor_shape(op.results[0].type)
+        _, dtype = shared._tensor_shape(op.results[0].type)
         if not dtype:
             dtype = str(op.results[0].type)
         return [
-            _assign(
+            shared._assign(
                 name,
-                _tl_call("cast", self._expr(op.operands[0]), _mlir_dtype_to_tl(dtype)),
+                shared._tl_call(
+                    "cast", self._expr(op.operands[0]), shared._mlir_dtype_to_tl(dtype)
+                ),
             )
         ]
 
@@ -244,24 +147,25 @@ class Translator:
     def _htile_program_id(self, op: ir.OpView) -> list[ast.stmt]:
         dimension = ir.IntegerAttr(op.attributes["dimension"]).value
         name = self._bind(op.results[0], "pid")
-        return [_assign(name, _tl_call("program_id", _const(dimension)))]
+        return [shared._assign(name, shared._tl_call("program_id", shared._const(dimension)))]
 
     def _htile_load(self, op: ir.OpView) -> list[ast.stmt]:
-        mem_shape, _ = _memref_shape(op.operands[0].type)
-        tile_shape, _ = _tensor_shape(op.results[0].type)
-        indices = list(op.operands[1:])
+        spec = shared._decode_load(op)
+        mem_shape = spec.memref_shape
+        tile_shape = spec.tile_shape
+        indices = spec.offsets
 
         # Scalar (0D) loads cannot use block pointer. Load directly.
         if not tile_shape:
             stmts, ptr = self._scalar_memref_ptr(op.operands[0], indices, mem_shape)
             tile = self._bind(op.results[0], "tile")
-            stmts.append(_assign(tile, _tl_call("load", ptr)))
+            stmts.append(shared._assign(tile, shared._tl_call("load", ptr)))
             return stmts
 
         stmts, base_ptr, tile_indices, tile_strides = self._fold_batch_dims(
             op.operands[0], indices, mem_shape, tile_shape
         )
-        dimension_order = _dimension_order(op, len(tile_shape))
+        dimension_order = spec.dimension_order
         mem_tile_shape = mem_shape[-len(tile_shape) :]
         logical_shape = [mem_tile_shape[i] for i in dimension_order]
         logical_strides = [tile_strides[i] for i in dimension_order]
@@ -270,32 +174,34 @@ class Translator:
 
         bp = self._fresh("bp")
         stmts.append(
-            _assign(
+            shared._assign(
                 bp,
-                _call(
-                    _tl("make_block_ptr"),
+                shared._call(
+                    shared._tl("make_block_ptr"),
                     base=base_ptr,
-                    shape=_list(*[_const(s) for s in logical_shape]),
-                    strides=_list(*[_const(s) for s in logical_strides]),
-                    offsets=_list(*[self._expr(i) for i in logical_offsets[: len(tile_shape)]]),
-                    block_shape=_list(*[_const(s) for s in tile_shape]),
-                    order=_list(*[_const(i) for i in block_ptr_order]),
+                    shape=shared._list(*[shared._const(s) for s in logical_shape]),
+                    strides=shared._list(*[shared._const(s) for s in logical_strides]),
+                    offsets=shared._list(
+                        *[self._expr(i) for i in logical_offsets[: len(tile_shape)]]
+                    ),
+                    block_shape=shared._list(*[shared._const(s) for s in tile_shape]),
+                    order=shared._list(*[shared._const(i) for i in block_ptr_order]),
                 ),
             )
         )
         tile = self._bind(op.results[0], "tile")
-        stmts.append(_assign(tile, _tl_call("load", _name(bp))))
+        stmts.append(shared._assign(tile, shared._tl_call("load", shared._name(bp))))
         return stmts
 
     def _htile_store(self, op: ir.OpView) -> list[ast.stmt]:
         tile_val = op.operands[0]
-        mem_shape, _ = _memref_shape(op.operands[1].type)
-        tile_shape, _ = _tensor_shape(op.operands[0].type)
+        mem_shape, _ = shared._memref_shape(op.operands[1].type)
+        tile_shape, _ = shared._tensor_shape(op.operands[0].type)
         indices = list(op.operands[2:])
 
         if not tile_shape:
             stmts, ptr = self._scalar_memref_ptr(op.operands[1], indices, mem_shape)
-            stmts.append(ast.Expr(value=_tl_call("store", ptr, self._expr(tile_val))))
+            stmts.append(ast.Expr(value=shared._tl_call("store", ptr, self._expr(tile_val))))
             return stmts
 
         stmts, base_ptr, tile_indices, tile_strides = self._fold_batch_dims(
@@ -303,20 +209,24 @@ class Translator:
         )
         bp = self._fresh("bp")
         stmts.append(
-            _assign(
+            shared._assign(
                 bp,
-                _call(
-                    _tl("make_block_ptr"),
+                shared._call(
+                    shared._tl("make_block_ptr"),
                     base=base_ptr,
-                    shape=_list(*[_const(s) for s in mem_shape[-2:]]),
-                    strides=_list(*[_const(s) for s in tile_strides]),
-                    offsets=_list(*[self._expr(i) for i in tile_indices[: len(tile_shape)]]),
-                    block_shape=_list(*[_const(s) for s in tile_shape]),
-                    order=_list(*[_const(i) for i in reversed(range(len(tile_shape)))]),
+                    shape=shared._list(*[shared._const(s) for s in mem_shape[-2:]]),
+                    strides=shared._list(*[shared._const(s) for s in tile_strides]),
+                    offsets=shared._list(*[self._expr(i) for i in tile_indices[: len(tile_shape)]]),
+                    block_shape=shared._list(*[shared._const(s) for s in tile_shape]),
+                    order=shared._list(
+                        *[shared._const(i) for i in reversed(range(len(tile_shape)))]
+                    ),
                 ),
             )
         )
-        stmts.append(ast.Expr(value=_tl_call("store", _name(bp), self._expr(tile_val))))
+        stmts.append(
+            ast.Expr(value=shared._tl_call("store", shared._name(bp), self._expr(tile_val)))
+        )
         return stmts
 
     def _scalar_memref_ptr(
@@ -331,14 +241,16 @@ class Translator:
         for i in range(len(mem_shape) - 2, -1, -1):
             strides[i] = strides[i + 1] * mem_shape[i + 1]
 
-        offset: ast.expr = _const(0)
+        offset: ast.expr = shared._const(0)
         for index, stride in zip(indices, strides):
-            term = ast.BinOp(left=self._expr(index), op=ast.Mult(), right=_const(stride))
+            term = ast.BinOp(left=self._expr(index), op=ast.Mult(), right=shared._const(stride))
             offset = ast.BinOp(left=offset, op=ast.Add(), right=term)
 
         ptr = self._fresh("ptr")
-        stmt = _assign(ptr, ast.BinOp(left=self._expr(memref_val), op=ast.Add(), right=offset))
-        return [stmt], _name(ptr)
+        stmt = shared._assign(
+            ptr, ast.BinOp(left=self._expr(memref_val), op=ast.Add(), right=offset)
+        )
+        return [stmt], shared._name(ptr)
 
     def _fold_batch_dims(
         self,
@@ -358,29 +270,29 @@ class Translator:
             for i in range(len(mem_shape) - 2, -1, -1):
                 strides[i] = strides[i + 1] * mem_shape[i + 1]
             batch_dims = len(mem_shape) - 2
-            offset: ast.expr = _const(0)
+            offset: ast.expr = shared._const(0)
             for i in range(batch_dims):
                 term = ast.BinOp(
-                    left=self._expr(indices[i]), op=ast.Mult(), right=_const(strides[i])
+                    left=self._expr(indices[i]), op=ast.Mult(), right=shared._const(strides[i])
                 )
                 offset = ast.BinOp(left=offset, op=ast.Add(), right=term)
             ptr = self._fresh("ptr")
-            stmts.append(_assign(ptr, ast.BinOp(left=base_ptr, op=ast.Add(), right=offset)))
-            base_ptr = _name(ptr)
+            stmts.append(shared._assign(ptr, ast.BinOp(left=base_ptr, op=ast.Add(), right=offset)))
+            base_ptr = shared._name(ptr)
             return stmts, base_ptr, indices[batch_dims:], strides[batch_dims:]
         return stmts, base_ptr, indices, [1] * len(tile_shape)
 
     def _htile_full(self, op: ir.OpView) -> list[ast.stmt]:
-        shape, dtype = _tensor_shape(op.results[0].type)
+        shape, dtype = shared._tensor_shape(op.results[0].type)
         name = self._bind(op.results[0], "tile")
         return [
-            _assign(
+            shared._assign(
                 name,
-                _tl_call(
+                shared._tl_call(
                     "full",
-                    _tuple(*[_const(extent) for extent in shape]),
+                    shared._tuple(*[shared._const(extent) for extent in shape]),
                     self._expr(op.operands[0]),
-                    _mlir_dtype_to_tl(dtype),
+                    shared._mlir_dtype_to_tl(dtype),
                 ),
             )
         ]
@@ -388,58 +300,60 @@ class Translator:
     def _htile_arange(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "range")
         return [
-            _assign(
-                name, _tl_call("arange", self._expr(op.operands[0]), self._expr(op.operands[1]))
+            shared._assign(
+                name,
+                shared._tl_call("arange", self._expr(op.operands[0]), self._expr(op.operands[1])),
             )
         ]
 
     def _htile_dot(self, op: ir.OpView) -> list[ast.stmt]:
-        _reject_dot_transpose_attrs(op, "Triton")
+        shared._reject_dot_transpose_attrs(op, "Triton")
+        spec = shared._decode_dot(op)
         name = self._bind(op.results[0], "tile")
-        lhs = self._expr(op.operands[0])
-        rhs = self._expr(op.operands[1])
-        _, lhs_dtype = _tensor_shape(op.operands[0].type)
-        _, rhs_dtype = _tensor_shape(op.operands[1].type)
+        lhs = self._expr(spec.lhs)
+        rhs = self._expr(spec.rhs)
+        _, lhs_dtype = shared._tensor_shape(spec.lhs.type)
+        _, rhs_dtype = shared._tensor_shape(spec.rhs.type)
         lhs_is_fp8, rhs_is_fp8 = lhs_dtype == "f8", rhs_dtype == "f8"
         if lhs_is_fp8 != rhs_is_fp8:
             raise NotImplementedError(
                 "Triton does not support mixed FP8/non-FP8 htile.dot operands; "
                 f"got {lhs_dtype} x {rhs_dtype}. Dequantize FP8 operands before htile.dot."
             )
-        acc = self._expr(op.operands[2]) if len(op.operands) > 2 else None
-        call = _tl_call("dot", lhs, rhs) if acc is None else _tl_call("dot", lhs, rhs, acc)
-        return [_assign(name, call)]
+        acc = self._expr(spec.accumulator) if spec.accumulator is not None else None
+        call = (
+            shared._tl_call("dot", lhs, rhs)
+            if acc is None
+            else shared._tl_call("dot", lhs, rhs, acc)
+        )
+        return [shared._assign(name, call)]
 
     def _htile_reduce(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "red")
-        axis_attr = op.attributes.get("axis")
-        kind_attr = op.attributes.get("kind")
-        axis = ir.IntegerAttr(axis_attr).value if axis_attr else 1
-        kind = ir.StringAttr(kind_attr).value if kind_attr else "sum"
-        fn = "max" if kind == "max" else "sum"
+        spec = shared._decode_reduction(op)
+        fn = "max" if spec.kind == "max" else "sum"
         return [
-            _assign(
+            shared._assign(
                 name,
-                _tl_call(
+                shared._tl_call(
                     fn,
-                    self._expr(op.operands[0]),
-                    _const(axis),
-                    keep_dims=_const(False),
+                    self._expr(spec.value),
+                    shared._const(spec.axis),
+                    keep_dims=shared._const(False),
                 ),
             )
         ]
 
     def _htile_permute(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "tile")
-        perm_attr = op.attributes.get("permutation")
-        perm = list(ir.DenseI64ArrayAttr(perm_attr)) if perm_attr else [1, 0]
+        perm = shared._decode_permutation(op)
         return [
-            _assign(
+            shared._assign(
                 name,
-                _tl_call(
+                shared._tl_call(
                     "permute",
                     self._expr(op.operands[0]),
-                    _list(*[_const(p) for p in perm]),
+                    shared._list(*[shared._const(p) for p in perm]),
                 ),
             )
         ]
@@ -453,30 +367,28 @@ class Translator:
 
     def _htile_broadcast(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "bcast")
-        src = self._expr(op.operands[0])
-        dims_attr = op.attributes.get("dimensions")
-        dims = list(ir.DenseI64ArrayAttr(dims_attr)) if dims_attr else [1]
-        shape, _ = _tensor_shape(op.results[0].type)
-        rank_out = len(shape)
+        spec = shared._decode_broadcast(op)
+        src = self._expr(spec.source)
+        rank_out = len(spec.result_shape)
 
         indices: list[ast.expr] = []
         for out_dim in range(rank_out):
-            indices.append(_const(None) if out_dim in dims else ast.Slice())
+            indices.append(shared._const(None) if out_dim in spec.dimensions else ast.Slice())
 
         idx = ast.Tuple(elts=indices, ctx=ast.Load()) if len(indices) > 1 else indices[0]
-        return [_assign(name, ast.Subscript(value=src, slice=idx, ctx=ast.Load()))]
+        return [shared._assign(name, ast.Subscript(value=src, slice=idx, ctx=ast.Load()))]
 
     # --- scf.for ---
 
     def _scf_for(self, op: ir.OpView) -> list[ast.stmt]:
-        lb = self._expr(op.operands[0])
-        ub = self._expr(op.operands[1])
-        step = self._expr(op.operands[2])
-
-        body_block = op.regions[0].blocks[0]
-        loop_var = body_block.arguments[0]
-        iter_bargs = list(body_block.arguments[1:])
-        iter_inits = list(op.operands[3:])
+        spec = shared._decode_for(op)
+        lb = self._expr(spec.lower_bound)
+        ub = self._expr(spec.upper_bound)
+        step = self._expr(spec.step)
+        body_block = spec.body
+        loop_var = spec.induction_variable
+        iter_bargs = spec.iter_arguments
+        iter_inits = spec.iter_initializers
 
         pre: list[ast.stmt] = []
         out_names: list[str] = []
@@ -484,7 +396,7 @@ class Translator:
             out = self._fresh("acc")
             out_names.append(out)
             self._names[barg] = out
-            pre.append(_assign(out, self._expr(init_val)))
+            pre.append(shared._assign(out, self._expr(init_val)))
 
         for res, out in zip(op.results, out_names):
             self._names[res] = out
@@ -498,7 +410,7 @@ class Translator:
 
         for_stmt = ast.For(
             target=ast.Name(id=lv, ctx=ast.Store()),
-            iter=_call(_name("range"), lb, ub, step),
+            iter=shared._call(shared._name("range"), lb, ub, step),
             body=body_stmts,  # type: ignore
             orelse=[],
             lineno=0,
@@ -514,10 +426,10 @@ class Translator:
         for out, val in zip(out_names, op.operands):
             val_name = self._get(val)
             if val_name != out:
-                stmts.append(_assign(out, _name(val_name)))
+                stmts.append(shared._assign(out, shared._name(val_name)))
         return stmts
 
 
 def translate_mlir_text(text: str) -> ast.Module:
     """Parse translator-ready MLIR text and return a Python ast.Module."""
-    return Translator().translate(parse_mlir_module_from_text(text))
+    return shared.translate_text_with(text, Translator)

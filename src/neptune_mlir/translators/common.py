@@ -2,6 +2,9 @@
 
 import ast
 import subprocess
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import ClassVar
 
 from mlir import ir
 
@@ -73,26 +76,32 @@ def _store_subscript(value: ast.expr, indices: list[ast.expr]) -> ast.Subscript:
     return sub
 
 
-def _mlir_dtype_to_tl_str(dtype: str) -> str:
-    mapping = {
-        "index": "int64",
-        "f8E4M3FN": "float8_e4m3fn",
-        "f16": "float16",
-        "f32": "float32",
-        "f64": "float64",
-        "i1": "bool",
-        "i8": "int8",
-        "i16": "int16",
-        "i32": "int32",
-        "i64": "int64",
-    }
-    if dtype not in mapping:
+_MLIR_DTYPE_NAMES = {
+    "index": "int64",
+    "f8E4M3FN": "float8_e4m3fn",
+    "f16": "float16",
+    "f32": "float32",
+    "f64": "float64",
+    "i1": "bool",
+    "i8": "int8",
+    "i16": "int16",
+    "i32": "int32",
+    "i64": "int64",
+}
+
+
+def _mlir_dtype_name(dtype: str) -> str:
+    if dtype not in _MLIR_DTYPE_NAMES:
         raise NotImplementedError(f"unsupported MLIR dtype: {dtype}")
-    return mapping[dtype]
+    return _MLIR_DTYPE_NAMES[dtype]
+
+
+def _mlir_dtype_to_tl_str(dtype: str) -> str:
+    return _mlir_dtype_name(dtype)
 
 
 def _mlir_dtype_to_tl(dtype: str) -> ast.expr:
-    return _tl(_mlir_dtype_to_tl_str(dtype))
+    return _tl(_mlir_dtype_name(dtype))
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +190,245 @@ def _reject_dot_transpose_attrs(op: ir.OpView, backend: str) -> None:
     )
 
 
+@dataclass(frozen=True)
+class ReductionSpec:
+    value: ir.Value
+    axis: int
+    kind: str
+
+
+@dataclass(frozen=True)
+class DotSpec:
+    lhs: ir.Value
+    rhs: ir.Value
+    accumulator: ir.Value | None
+    result_shape: list[int]
+    result_dtype: str
+    transpose_a: bool
+    transpose_b: bool
+
+
+@dataclass(frozen=True)
+class BroadcastSpec:
+    source: ir.Value
+    dimensions: list[int]
+    result_shape: list[int]
+
+
+@dataclass(frozen=True)
+class LoadSpec:
+    memref: ir.Value
+    offsets: list[ir.Value]
+    memref_shape: list[int]
+    tile_shape: list[int]
+    dimension_order: list[int]
+
+
+@dataclass(frozen=True)
+class ForSpec:
+    lower_bound: ir.Value
+    upper_bound: ir.Value
+    step: ir.Value
+    body: ir.Block
+    induction_variable: ir.Value
+    iter_arguments: list[ir.Value]
+    iter_initializers: list[ir.Value]
+
+
+def _decode_constant(op: ir.OpView) -> int | float:
+    attr = op.attributes.get("value")
+    if isinstance(attr, (ir.IntegerAttr, ir.FloatAttr)):
+        return attr.value
+    raise NotImplementedError(f"unsupported arith.constant value attr: {attr}")
+
+
+def _decode_cmp_predicate(op: ir.OpView) -> ast.cmpop:
+    attr = op.attributes.get("predicate")
+    if attr is None:
+        raise ValueError("arith.cmpi missing 'predicate' attribute")
+    predicate_to_op: dict[int, type[ast.cmpop]] = {
+        0: ast.Eq,
+        1: ast.NotEq,
+        2: ast.Lt,
+        3: ast.LtE,
+        4: ast.Gt,
+        5: ast.GtE,
+        6: ast.Lt,
+        7: ast.LtE,
+        8: ast.Gt,
+        9: ast.GtE,
+    }
+    predicate = ir.IntegerAttr(attr).value
+    cmp_op = predicate_to_op.get(predicate)
+    if cmp_op is None:
+        raise NotImplementedError(f"unsupported arith.cmpi predicate: {predicate}")
+    return cmp_op()
+
+
+def _decode_reduction(op: ir.OpView) -> ReductionSpec:
+    axis_attr = op.attributes.get("axis")
+    kind_attr = op.attributes.get("kind")
+    return ReductionSpec(
+        value=op.operands[0],
+        axis=ir.IntegerAttr(axis_attr).value if axis_attr else 1,
+        kind=ir.StringAttr(kind_attr).value if kind_attr else "sum",
+    )
+
+
+def _decode_dot(op: ir.OpView) -> DotSpec:
+    shape, dtype = _tensor_shape(op.results[0].type)
+    return DotSpec(
+        lhs=op.operands[0],
+        rhs=op.operands[1],
+        accumulator=op.operands[2] if len(op.operands) > 2 else None,
+        result_shape=shape,
+        result_dtype=dtype,
+        transpose_a=op.attributes.get("transpose_a") is not None,
+        transpose_b=op.attributes.get("transpose_b") is not None,
+    )
+
+
+def _decode_broadcast(op: ir.OpView) -> BroadcastSpec:
+    attr = op.attributes.get("dimensions")
+    dimensions = _parse_dense_i64_array(attr) if attr else [1]
+    shape, _ = _tensor_shape(op.results[0].type)
+    return BroadcastSpec(op.operands[0], dimensions, shape)
+
+
+def _decode_permutation(op: ir.OpView) -> list[int]:
+    attr = op.attributes.get("permutation")
+    return _parse_dense_i64_array(attr) if attr else [1, 0]
+
+
+def _decode_load(op: ir.OpView) -> LoadSpec:
+    memref_shape, _ = _memref_shape(op.operands[0].type)
+    tile_shape, _ = _tensor_shape(op.results[0].type)
+    return LoadSpec(
+        memref=op.operands[0],
+        offsets=list(op.operands[1:]),
+        memref_shape=memref_shape,
+        tile_shape=tile_shape,
+        dimension_order=_dimension_order(op, len(tile_shape)),
+    )
+
+
+def _decode_for(op: ir.OpView) -> ForSpec:
+    body = op.regions[0].blocks[0]
+    return ForSpec(
+        lower_bound=op.operands[0],
+        upper_bound=op.operands[1],
+        step=op.operands[2],
+        body=body,
+        induction_variable=body.arguments[0],
+        iter_arguments=list(body.arguments[1:]),
+        iter_initializers=list(op.operands[3:]),
+    )
+
+
+class BaseTranslator(ABC):
+    """Shared SSA bookkeeping, traversal, and operation dispatch."""
+
+    _BINARY_OPS: ClassVar[dict[str, type[ast.operator]]] = {
+        "arith.muli": ast.Mult,
+        "arith.addi": ast.Add,
+        "arith.subi": ast.Sub,
+        "arith.divui": ast.FloorDiv,
+        "arith.remui": ast.Mod,
+        "arith.andi": ast.BitAnd,
+        "arith.addf": ast.Add,
+        "arith.mulf": ast.Mult,
+        "arith.subf": ast.Sub,
+        "arith.divf": ast.Div,
+    }
+    _OP_METHODS: ClassVar[dict[str, str]] = {
+        "arith.constant": "_arith_constant",
+        "arith.maxsi": "_arith_maxsi",
+        "arith.minsi": "_arith_minsi",
+        "arith.maximumf": "_arith_maximumf",
+        "arith.index_cast": "_arith_index_cast",
+        "arith.cmpi": "_arith_cmpi",
+        "arith.select": "_arith_select",
+        "arith.sitofp": "_arith_cast",
+        "arith.extf": "_arith_cast",
+        "arith.truncf": "_arith_cast",
+        "math.exp2": "_math_exp2",
+        "htile.program_id": "_htile_program_id",
+        "htile.load": "_htile_load",
+        "htile.store": "_htile_store",
+        "htile.full": "_htile_full",
+        "htile.arange": "_htile_arange",
+        "htile.dot": "_htile_dot",
+        "htile.reduce": "_htile_reduce",
+        "htile.permute": "_htile_permute",
+        "htile.copy": "_htile_copy",
+        "htile.broadcast": "_htile_broadcast",
+        "scf.for": "_scf_for",
+        "scf.yield": "_scf_yield",
+    }
+    _IGNORED_OPS: ClassVar[set[str]] = {"tensor.empty", "htile.return", "linalg.yield"}
+
+    def __init__(self):
+        self._names: dict[ir.Value, str] = {}
+        self._counter = 0
+
+    def _fresh(self, hint: str = "v") -> str:
+        name = f"{hint}_{self._counter}"
+        self._counter += 1
+        return name
+
+    def _bind(self, value: ir.Value, hint: str = "v") -> str:
+        name = self._fresh(hint)
+        self._names[value] = name
+        return name
+
+    def _get(self, value: ir.Value) -> str:
+        if value not in self._names:
+            raise KeyError(f"Unbound SSA value: {value}")
+        return self._names[value]
+
+    def _expr(self, value: ir.Value) -> ast.expr:
+        return _name(self._get(value))
+
+    def translate(self, module: ir.Module) -> ast.Module:
+        body = self._module_prelude()
+        for op in _module_top_ops(module):
+            if _op_type_name(op) == "htile.kernel":
+                body.append(self._htile_kernel(op))
+        result = ast.Module(body=body, type_ignores=[])
+        ast.fix_missing_locations(result)
+        return result
+
+    @abstractmethod
+    def _module_prelude(self) -> list[ast.stmt]:
+        """Return imports and other statements emitted before translated kernels."""
+
+    @abstractmethod
+    def _htile_kernel(self, op: ir.OpView) -> ast.FunctionDef:
+        """Translate one top-level htile.kernel operation."""
+
+    @abstractmethod
+    def _binary_op(self, op: ir.OpView, py_op: ast.operator) -> list[ast.stmt]:
+        """Translate an arithmetic operation represented by a Python binary operator."""
+
+    def _block_ops(self, block: ir.Block) -> list[ast.stmt]:
+        statements: list[ast.stmt] = []
+        for op in block.operations:
+            statements.extend(self._op(op))
+        return statements
+
+    def _op(self, op: ir.OpView) -> list[ast.stmt]:
+        op_name = _op_type_name(op)
+        binary_op = self._BINARY_OPS.get(op_name)
+        if binary_op is not None:
+            return self._binary_op(op, binary_op())
+        if op_name in self._IGNORED_OPS:
+            return []
+        method_name = self._OP_METHODS.get(op_name)
+        if method_name is None:
+            raise NotImplementedError(f"unsupported op: {op_name}")
+        return getattr(self, method_name)(op)
+
+
 def parse_mlir_module(path: str, pass_pipeline: str | None = None) -> ir.Module:
     """Run neptune-opt on *path* and parse the generic-form MLIR module."""
     from ..dist import find_neptune_opt
@@ -227,9 +475,12 @@ def _register_neptune_dialects(ctx: ir.Context) -> None:
 
 def translate_file_with(
     path: str,
-    translator_cls: type,
+    translator_cls: type[BaseTranslator],
     pass_pipeline: str | None = None,
 ) -> ast.Module:
     module = parse_mlir_module(path, pass_pipeline)
-    translator = translator_cls()
-    return translator.translate(module)
+    return translator_cls().translate(module)
+
+
+def translate_text_with(text: str, translator_cls: type[BaseTranslator]) -> ast.Module:
+    return translator_cls().translate(parse_mlir_module_from_text(text))
