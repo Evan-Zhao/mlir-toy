@@ -184,7 +184,7 @@ module attributes {transform.with_named_sequence} {
 // CHECK: %[[LIVE_LOOP:.*]]:3 = scf.for %{{.*}} = %[[LIVE_LOWER]] to %[[LIVE_UPPER]] step %c1 iter_args(%{{.*}}, %{{.*}}, %{{.*}})
 // CHECK: htile.load %arg0
 // CHECK: htile.load %arg1
-// CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} {transpose_b} : tensor<64x64xf16>, tensor<64x64xf16>, tensor<64x64xf32> -> tensor<64x64xf32>
+// CHECK: htile.dot %{{.*}}, %{{.*}} {transpose_b} : tensor<64x64xf16>, tensor<64x64xf16> -> tensor<64x64xf32>
 // CHECK: htile.reduce %{{.*}} axis 1 kind "max" : tensor<64x64xf32> -> tensor<64xf32>
 // CHECK: math.exp2
 // CHECK: htile.reduce %{{.*}} axis 1 kind "sum" : tensor<64x64xf32> -> tensor<64xf32>
@@ -197,7 +197,7 @@ module attributes {transform.with_named_sequence} {
 // CHECK: %[[MIXED_LOOP:.*]]:3 = scf.for %{{.*}} = %[[LIVE_UPPER]] to %[[DEAD_BOUND]] step %c1 iter_args(%{{.*}} = %[[LIVE_LOOP]]#0, %{{.*}} = %[[LIVE_LOOP]]#1, %{{.*}} = %[[LIVE_LOOP]]#2)
 // CHECK: htile.load %arg0
 // CHECK: htile.load %arg1
-// CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} {transpose_b} : tensor<64x64xf16>, tensor<64x64xf16>, tensor<64x64xf32> -> tensor<64x64xf32>
+// CHECK: htile.dot %{{.*}}, %{{.*}} {transpose_b} : tensor<64x64xf16>, tensor<64x64xf16> -> tensor<64x64xf32>
 // CHECK: htile.arange %c0 to %c64 : tensor<64xindex>
 // CHECK: htile.broadcast %{{.*}} dimensions = [1] : tensor<64xindex> -> tensor<64x64xindex>
 // CHECK: arith.subi

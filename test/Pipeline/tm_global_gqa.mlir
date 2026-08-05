@@ -149,7 +149,7 @@ module attributes {transform.with_named_sequence} {
 // CHECK: affine.apply
 // CHECK: htile.load %arg0
 // CHECK: htile.load %arg1
-// CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} {transpose_b} : tensor<128x64xf16>, tensor<64x64xf16>, tensor<128x64xf32> -> tensor<128x64xf32>
+// CHECK: htile.dot %{{.*}}, %{{.*}} {transpose_b} : tensor<128x64xf16>, tensor<64x64xf16> -> tensor<128x64xf32>
 // CHECK: htile.reduce %{{.*}} axis 1 kind "max" : tensor<128x64xf32> -> tensor<128xf32>
 // CHECK: htile.broadcast %{{.*}} dimensions = [1] : tensor<128xf32> -> tensor<128x64xf32>
 // CHECK: math.exp2 %{{.*}} : tensor<128x64xf32>

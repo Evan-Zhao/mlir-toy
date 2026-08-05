@@ -56,6 +56,28 @@ module attributes {transform.with_named_sequence} {
     return %0 : tensor<4x2xf32>
   }
 
+  // CHECK-LABEL: func.func @matmul_zero_init(
+  func.func @matmul_zero_init(
+      %lhs: tensor<4x8xf32>, %rhs: tensor<8x2xf32>) -> tensor<4x2xf32> {
+    %empty = tensor.empty() : tensor<4x2xf32>
+    %zero = arith.constant 0.0 : f32
+    %init = linalg.fill ins(%zero : f32) outs(%empty : tensor<4x2xf32>)
+        -> tensor<4x2xf32>
+    // CHECK-NOT: htile.full
+    // CHECK: htile.dot %arg0, %arg1 : tensor<4x8xf32>, tensor<8x2xf32> -> tensor<4x2xf32>
+    %0 = linalg.generic {
+        indexing_maps = [#mat_lhs, #mat_rhs, #mat_out],
+        iterator_types = ["parallel", "parallel", "reduction"]}
+        ins(%lhs, %rhs : tensor<4x8xf32>, tensor<8x2xf32>)
+        outs(%init : tensor<4x2xf32>) {
+    ^bb0(%in_lhs: f32, %in_rhs: f32, %out: f32):
+      %mul = arith.mulf %in_lhs, %in_rhs : f32
+      %add = arith.addf %out, %mul : f32
+      linalg.yield %add : f32
+    } -> tensor<4x2xf32>
+    return %0 : tensor<4x2xf32>
+  }
+
   // CHECK-LABEL: func.func @row_max(
   func.func @row_max(%input: tensor<4x8xf32>, %init: tensor<4xf32>) -> tensor<4xf32> {
     // CHECK: %[[REDUCE:.+]] = htile.reduce %arg0 axis 1 kind "max"

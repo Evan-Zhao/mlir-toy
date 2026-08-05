@@ -182,7 +182,7 @@ module attributes {transform.with_named_sequence} {
 // CHECK: %[[LIVE:.+]]:3 = scf.for %[[J_TILE:.*]] = %c0 to %[[CAPPED_BOUND]] step %c1 iter_args(
 // CHECK: htile.load %arg0
 // CHECK: htile.load %arg1
-// CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} {transpose_b} : tensor<64x64xf16>, tensor<64x64xf16>, tensor<64x64xf32> -> tensor<64x64xf32>
+// CHECK: htile.dot %{{.*}}, %{{.*}} {transpose_b} : tensor<64x64xf16>, tensor<64x64xf16> -> tensor<64x64xf32>
 // CHECK: htile.load %arg3
 // CHECK: arith.muli %{{.*}}, %{{.*}} {{.*}} : index
 // CHECK: arith.muli %{{.*}}, %{{.*}} {{.*}} : index
@@ -213,7 +213,7 @@ module attributes {transform.with_named_sequence} {
 // CHECK: %[[MIXED:.+]]:3 = scf.for %{{.*}} = %[[CAPPED_BOUND]] to %[[DEAD_BOUND]] step %c1 iter_args(%{{.*}} = %[[LIVE]]#0, %{{.*}} = %[[LIVE]]#1, %{{.*}} = %[[LIVE]]#2)
 // CHECK: htile.load %arg0
 // CHECK: htile.load %arg1
-// CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} {transpose_b} : tensor<64x64xf16>, tensor<64x64xf16>, tensor<64x64xf32> -> tensor<64x64xf32>
+// CHECK: htile.dot %{{.*}}, %{{.*}} {transpose_b} : tensor<64x64xf16>, tensor<64x64xf16> -> tensor<64x64xf32>
 // CHECK: htile.load %arg3
 // CHECK: htile.broadcast %{{.*}} dimensions = [0, 1] : tensor<f32> -> tensor<64x64xf32>
 // CHECK: arith.subf %{{.*}}, %{{.*}} : tensor<64x64xf32>

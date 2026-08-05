@@ -371,6 +371,25 @@ LogicalResult rewriteBroadcast(RewriterBase &rewriter, linalg::BroadcastOp op) {
   return success();
 }
 
+bool isConstantZero(Value value) {
+  Attribute attr;
+  if (!matchPattern(value, m_Constant(&attr)))
+    return false;
+  if (auto floatAttr = dyn_cast<FloatAttr>(attr))
+    return floatAttr.getValue().isZero();
+  if (auto integerAttr = dyn_cast<IntegerAttr>(attr))
+    return integerAttr.getValue().isZero();
+  return false;
+}
+
+bool isZeroContractionInit(Value value) {
+  if (auto full = value.getDefiningOp<htile::FullOp>())
+    return isConstantZero(full.getValue());
+  if (auto fill = value.getDefiningOp<linalg::FillOp>())
+    return isConstantZero(fill.getInputs().front());
+  return false;
+}
+
 LogicalResult rewriteContraction(RewriterBase &rewriter, linalg::GenericOp op) {
   if (!isSingleResultTensorGeneric(op) || op.getInputs().size() != 2)
     return failure();
@@ -436,10 +455,17 @@ LogicalResult rewriteContraction(RewriterBase &rewriter, linalg::GenericOp op) {
   rewriter.setInsertionPoint(op);
   auto lhsAttr = transposeA ? rewriter.getUnitAttr() : UnitAttr{},
        rhsAttr = transposeB ? rewriter.getUnitAttr() : UnitAttr{};
-  auto dot =
-      htile::DotOp::create(rewriter, op.getLoc(), op.getResult(0).getType(), op.getInputs()[0],
-                           op.getInputs()[1], op.getDpsInits()[0], lhsAttr, rhsAttr, StringAttr{});
+  Value init = op.getDpsInits()[0];
+  bool omitAccumulator = isZeroContractionInit(init);
+  Value accumulator = omitAccumulator ? Value{} : init;
+  auto dot = htile::DotOp::create(rewriter, op.getLoc(), op.getResult(0).getType(),
+                                  op.getInputs()[0], op.getInputs()[1], accumulator, lhsAttr,
+                                  rhsAttr, StringAttr{});
   rewriter.replaceOp(op, dot.getResult());
+  if (omitAccumulator) {
+    if (auto full = init.getDefiningOp<htile::FullOp>(); full && full->use_empty())
+      rewriter.eraseOp(full);
+  }
   return success();
 }
 

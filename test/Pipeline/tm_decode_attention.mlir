@@ -136,7 +136,7 @@ module attributes {transform.with_named_sequence} {
 // CHECK: htile.program_id 1
 // CHECK: htile.load %arg0
 // CHECK: htile.load %arg1
-// CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} {transpose_b}
+// CHECK: htile.dot %{{.*}}, %{{.*}} {transpose_b}
 // CHECK: htile.load %arg3
 // CHECK: htile.reduce %{{.*}} axis 0 kind "max" : tensor<64xf32> -> tensor<f32>
 // CHECK: math.exp2

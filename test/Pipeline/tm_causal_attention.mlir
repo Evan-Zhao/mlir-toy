@@ -167,7 +167,7 @@ module attributes {transform.with_named_sequence} {
 // CHECK: %[[MIXED:.+]]:3 = scf.for %{{.*}} = %[[CAPPED_BOUND]] to %[[DEAD_BOUND]] step %c1 iter_args(%{{.*}} = %[[LIVE]]#0, %{{.*}} = %[[LIVE]]#1, %{{.*}} = %[[LIVE]]#2) -> (tensor<128xf32>, tensor<128xf32>, tensor<128x64xf32>)
 // CHECK: htile.load %arg0
 // CHECK: htile.load %arg1
-// CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} {transpose_b}
+// CHECK: htile.dot %{{.*}}, %{{.*}} {transpose_b}
 // CHECK: htile.arange %c0 to %c128 : tensor<128xindex>
 // CHECK: htile.broadcast %{{.*}} dimensions = [1] : tensor<128xindex> -> tensor<128x64xindex>
 // CHECK: htile.full %{{.*}} : index -> tensor<128x64xindex>
