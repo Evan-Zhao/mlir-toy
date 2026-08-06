@@ -114,6 +114,27 @@ def TASinkRightMulAfterMatmulPatternsOp
   let assemblyFormat = "attr-dict";
 }
 
+def TASinkScaleAfterMaxPatternsOp
+    : Op<Transform_Dialect, "apply_patterns.ta.sink_scale_after_max",
+         [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
+  let summary = "Collect TA rewrites that move a positive scale after a max reduction";
+
+  let description = [{
+    Collects PDLL-authored TA patterns for the rewrite:
+
+    ```
+      max_axes(c * x) -> c * max_axes(x)
+    ```
+
+    The axisless scale `c` must be a finite positive floating-point constant.
+    Both operand orders of `ta.mul` are supported. The patterns preserve the
+    matched max reducer kind, axes, and import-group attributes. Apply this
+    descriptor separately from pattern sets that move scales into max reductions.
+  }];
+
+  let assemblyFormat = "attr-dict";
+}
+
 def TAExpToExp2PatternsOp : Op<Transform_Dialect, "apply_patterns.ta.exp_to_exp2",
                                [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
   let summary = "Collect TA algebraic rewrite patterns for exp-to-exp2";

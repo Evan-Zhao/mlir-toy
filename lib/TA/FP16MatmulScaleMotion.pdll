@@ -1,0 +1,120 @@
+#include "TA/TAOps.td"
+
+Constraint ValueAxesDisjointFromReduction(value: Value, reductionAxes: Attr) [{
+  auto valueType = dyn_cast<ta::ExprType>(value.getType());
+  auto reducedAxes = dyn_cast<ta::AxesAttr>(reductionAxes);
+  if (!valueType || !reducedAxes)
+    return failure();
+
+  for (Attribute valueAxis : valueType.getAxes().getAxes()) {
+    auto valueAxisAttr = cast<ta::AxisAttr>(valueAxis);
+    for (Attribute reducedAxis : reducedAxes.getAxes()) {
+      auto reducedAxisAttr = cast<ta::AxisAttr>(reducedAxis);
+      if (valueAxisAttr.getName() == reducedAxisAttr.getName())
+        return failure();
+    }
+  }
+  return success();
+}];
+
+Constraint AddReduceKind(kind: Attr) [{
+  auto reduceKind = dyn_cast<ta::ReduceKindAttr>(kind);
+  return success(reduceKind && reduceKind.getValue() == ta::ReduceKind::Add);
+}];
+
+Constraint FloatToF32Cast(source: Value, widened: Value) [{
+  auto sourceType = dyn_cast<ta::ExprType>(source.getType());
+  auto widenedType = dyn_cast<ta::ExprType>(widened.getType());
+  return success(sourceType && widenedType &&
+                 isa<FloatType>(sourceType.getElementType()) &&
+                 widenedType.getElementType().isF32());
+}];
+
+Constraint F32F16F32CastChain(source: Value, narrowed: Value, widened: Value) [{
+  auto sourceType = dyn_cast<ta::ExprType>(source.getType());
+  auto narrowedType = dyn_cast<ta::ExprType>(narrowed.getType());
+  auto widenedType = dyn_cast<ta::ExprType>(widened.getType());
+  return success(sourceType && narrowedType && widenedType &&
+                 sourceType.getElementType().isF32() &&
+                 narrowedType.getElementType().isF16() &&
+                 widenedType.getElementType().isF32());
+}];
+
+Rewrite RoundThroughF16(input: Value, narrowGroup: Attr, widenGroup: Attr) -> Value [{
+  auto inputType = dyn_cast<ta::ExprType>(input.getType());
+  if (!inputType || !isa<FloatType>(inputType.getElementType()))
+    return Value();
+
+  auto narrowType = ta::ExprType::get(rewriter.getContext(), rewriter.getF16Type(),
+                                      inputType.getAxes());
+  auto narrow = ta::CastOp::create(rewriter, input.getLoc(), narrowType, input);
+  narrow->setAttr("ta.import_group", narrowGroup);
+  auto wideType = ta::ExprType::get(rewriter.getContext(), rewriter.getF32Type(),
+                                    inputType.getAxes());
+  auto wide = ta::CastOp::create(rewriter, input.getLoc(), wideType, narrow);
+  wide->setAttr("ta.import_group", widenGroup);
+  return wide.getResult();
+}];
+
+// sum(f32(f16(lhs / denom)) * rhs) => sum(f32(f16(lhs)) * rhs) / denom
+Pattern SinkLeftDivThroughF16AfterMatmul {
+  let div = op<ta.div>(lhs: Value, denom: Value) {"ta.import_group" = srcDiv: Attr};
+  let narrowed = op<ta.cast>(div) {"ta.import_group" = srcNarrow: Attr} -> (narrowType: Type);
+  let widened = op<ta.cast>(narrowed) {"ta.import_group" = srcWiden: Attr} -> (wideType: Type);
+  let mul = op<ta.mul>(widened, rhs: Value) {"ta.import_group" = srcMul: Attr};
+  let reduce = op<ta.reduce>(mul) {kind = kind: Attr, axes = axes: Attr, "ta.import_group" = srcReduce: Attr} -> (resultType: Type);
+  F32F16F32CastChain(div, narrowed, widened);
+  ValueAxesDisjointFromReduction(denom, axes);
+  AddReduceKind(kind);
+
+  rewrite reduce with {
+    let newWide = RoundThroughF16(lhs, srcNarrow, srcWiden);
+    let newMul = op<ta.mul>(newWide, rhs) {"ta.import_group" = srcMul};
+    let newReduce = op<ta.reduce>(newMul) {kind = kind, axes = axes, "ta.import_group" = srcReduce} -> (resultType);
+    replace reduce with op<ta.div>(newReduce, denom) {"ta.import_group" = srcDiv};
+  };
+}
+
+// sum(lhs * f32(f16(rhs / denom))) => sum(lhs * f32(f16(rhs))) / denom
+Pattern SinkRightDivThroughF16AfterMatmul {
+  let div = op<ta.div>(rhs: Value, denom: Value) {"ta.import_group" = srcDiv: Attr};
+  let narrowed = op<ta.cast>(div) {"ta.import_group" = srcNarrow: Attr} -> (narrowType: Type);
+  let widened = op<ta.cast>(narrowed) {"ta.import_group" = srcWiden: Attr} -> (wideType: Type);
+  let mul = op<ta.mul>(lhs: Value, widened) {"ta.import_group" = srcMul: Attr};
+  let reduce = op<ta.reduce>(mul) {kind = kind: Attr, axes = axes: Attr, "ta.import_group" = srcReduce: Attr} -> (resultType: Type);
+  F32F16F32CastChain(div, narrowed, widened);
+  ValueAxesDisjointFromReduction(denom, axes);
+  AddReduceKind(kind);
+
+  rewrite reduce with {
+    let newWide = RoundThroughF16(rhs, srcNarrow, srcWiden);
+    let newMul = op<ta.mul>(lhs, newWide) {"ta.import_group" = srcMul};
+    let newReduce = op<ta.reduce>(newMul) {kind = kind, axes = axes, "ta.import_group" = srcReduce} -> (resultType);
+    replace reduce with op<ta.div>(newReduce, denom) {"ta.import_group" = srcDiv};
+  };
+}
+
+// sum(lhs * f32(f16(f32(rhs) * factor)))
+//   => sum(lhs * f32(f16(rhs))) * factor
+//
+// Match the dequantization cast as part of the rewrite so the replacement does
+// not retain the redundant rhs -> f32 -> f16 round trip.
+Pattern SinkRightMulWithPreWidenThroughF16AfterMatmul with benefit(2) {
+  let rhsF32 = op<ta.cast>(rhs: Value) {"ta.import_group" = srcRhsWiden: Attr} -> (rhsF32Type: Type);
+  let scaled = op<ta.mul>(rhsF32, factor: Value) {"ta.import_group" = srcScaled: Attr};
+  let narrowed = op<ta.cast>(scaled) {"ta.import_group" = srcNarrow: Attr} -> (narrowType: Type);
+  let widened = op<ta.cast>(narrowed) {"ta.import_group" = srcWiden: Attr} -> (wideType: Type);
+  let outer = op<ta.mul>(lhs: Value, widened) {"ta.import_group" = srcOuter: Attr};
+  let reduce = op<ta.reduce>(outer) {kind = kind: Attr, axes = axes: Attr, "ta.import_group" = srcReduce: Attr} -> (resultType: Type);
+  FloatToF32Cast(rhs, rhsF32);
+  F32F16F32CastChain(scaled, narrowed, widened);
+  ValueAxesDisjointFromReduction(factor, axes);
+  AddReduceKind(kind);
+
+  rewrite reduce with {
+    let roundedRhs = RoundThroughF16(rhs, srcNarrow, srcWiden);
+    let newMul = op<ta.mul>(lhs, roundedRhs) {"ta.import_group" = srcOuter};
+    let newReduce = op<ta.reduce>(newMul) {kind = kind, axes = axes, "ta.import_group" = srcReduce} -> (resultType);
+    replace reduce with op<ta.mul>(newReduce, factor) {"ta.import_group" = srcScaled};
+  };
+}

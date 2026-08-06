@@ -9,17 +9,17 @@
 
 using namespace mlir;
 
+namespace ta_fp16_matmul_scale_motion_pdl {
+using namespace mlir;
+
+#include "FP16MatmulScaleMotion.cpp.inc"
+} // namespace ta_fp16_matmul_scale_motion_pdl
+
 namespace ta_mul_scale_motion_pdl {
 using namespace mlir;
-
+using llvm::APFloat;
 #include "MulScaleMotion.cpp.inc"
 } // namespace ta_mul_scale_motion_pdl
-
-namespace ta_exp_to_exp2_pdl {
-using namespace mlir;
-using llvm::APFloat;
-#include "ExpToExp2.cpp.inc"
-} // namespace ta_exp_to_exp2_pdl
 
 namespace mlir::transform {
 
@@ -253,17 +253,32 @@ DiagnosedSilenceableFailure TAToLinalgOp::apply(TransformRewriter &rewriter,
 }
 
 void TASinkDivAfterMatmulPatternsOp::populatePatterns(RewritePatternSet &patterns) {
-  patterns.add<ta_mul_scale_motion_pdl::SinkLeftDivThroughF16AfterMatmul>(patterns.getContext());
-  patterns.add<ta_mul_scale_motion_pdl::SinkRightDivThroughF16AfterMatmul>(patterns.getContext());
+  patterns.add<ta_fp16_matmul_scale_motion_pdl::SinkLeftDivThroughF16AfterMatmul>(
+      patterns.getContext());
+  patterns.add<ta_fp16_matmul_scale_motion_pdl::SinkRightDivThroughF16AfterMatmul>(
+      patterns.getContext());
 }
 
 void TASinkRightMulAfterMatmulPatternsOp::populatePatterns(RewritePatternSet &patterns) {
-  patterns.add<ta_mul_scale_motion_pdl::SinkRightMulWithPreWidenThroughF16AfterMatmul>(
+  patterns.add<ta_fp16_matmul_scale_motion_pdl::SinkRightMulWithPreWidenThroughF16AfterMatmul>(
+      patterns.getContext());
+}
+
+void TASinkScaleAfterMaxPatternsOp::populatePatterns(RewritePatternSet &patterns) {
+  patterns.add<ta_mul_scale_motion_pdl::SinkLeftPositiveScaleAfterMaxReduce>(
+      patterns.getContext());
+  patterns.add<ta_mul_scale_motion_pdl::SinkRightPositiveScaleAfterMaxReduce>(
       patterns.getContext());
 }
 
 void TAExpToExp2PatternsOp::populatePatterns(RewritePatternSet &patterns) {
-  ta_exp_to_exp2_pdl::populateGeneratedPDLLPatterns(patterns);
+  patterns.add<ta_mul_scale_motion_pdl::ExpToExp2IntroduceLog2E,
+               ta_mul_scale_motion_pdl::DistributeConstantMulOverAdd,
+               ta_mul_scale_motion_pdl::DistributeConstantMulOverSub,
+               ta_mul_scale_motion_pdl::PushMulScaleThroughSelect,
+               ta_mul_scale_motion_pdl::HoistPositiveScaleBeforeMaxReduce,
+               ta_mul_scale_motion_pdl::ReassociateLeftNestedConstantMul,
+               ta_mul_scale_motion_pdl::ReassociateRightNestedConstantMul>(patterns.getContext());
   ta::MulOp::getCanonicalizationPatterns(patterns, patterns.getContext());
   ta::MaximumOp::getCanonicalizationPatterns(patterns, patterns.getContext());
   ta::MinimumOp::getCanonicalizationPatterns(patterns, patterns.getContext());

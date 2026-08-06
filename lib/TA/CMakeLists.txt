@@ -32,14 +32,14 @@ set(LLVM_TARGET_DEFINITIONS "${PROJECT_SOURCE_DIR}/include/TA/TAPasses.td")
 mlir_tablegen(TAPasses.h.inc -gen-pass-decls -name TA)
 add_public_tablegen_target(TAPassesIncGen)
 
+add_mlir_pdll_library(TAFP16MatmulScaleMotionPDLL
+  FP16MatmulScaleMotion.pdll
+  FP16MatmulScaleMotion.cpp.inc
+)
+
 add_mlir_pdll_library(TAMulScaleMotionPDLL
   MulScaleMotion.pdll
   MulScaleMotion.cpp.inc
-)
-
-add_mlir_pdll_library(TAExpToExp2PDLL
-  ExpToExp2.pdll
-  ExpToExp2.cpp.inc
 )
 
 add_library(NeptuneTA STATIC
@@ -56,8 +56,8 @@ add_dependencies(NeptuneTA
   TATypesIncGen
   TAPassesIncGen
   TATransformOpsIncGen
+  TAFP16MatmulScaleMotionPDLL
   TAMulScaleMotionPDLL
-  TAExpToExp2PDLL
 )
 setup_mlir_target(NeptuneTA)
 target_link_libraries(NeptuneTA PUBLIC
