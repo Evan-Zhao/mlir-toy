@@ -171,14 +171,14 @@ FailureOr<json::Value> serializeMLIRExprValueToJSON(Value value, SerializationSt
     return failure();
 
   Operation *def = result.getDefiningOp();
+  // Constants may be hoisted above the linalg operation whose scalar region is being solved.
+  if (auto constantOp = dyn_cast_or_null<arith::ConstantOp>(def))
+    return buildConstantExpr(constantOp);
   if (!isNestedUnderScope(def, state.scope)) {
     if (def)
       def->emitError("expression walk escaped the requested scope");
     return failure();
   }
-
-  if (auto constantOp = dyn_cast<arith::ConstantOp>(def))
-    return buildConstantExpr(constantOp);
   if (auto addf = dyn_cast<arith::AddFOp>(def))
     return buildBinaryExpr("add", addf, state);
   if (auto subf = dyn_cast<arith::SubFOp>(def))

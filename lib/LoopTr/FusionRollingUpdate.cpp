@@ -113,9 +113,22 @@ DiagnosedSilenceableFailure FusionCloneFuseElemwiseOp::apply(transform::Transfor
           "expected every op to be an elementwise linalg.map or linalg.generic with one result");
 
     rewriter.setInsertionPoint(elemwiseOp);
-    auto newElemwiseOp = rewriter.clone(*elemwiseOp, mapping);
+    // Operation::clone adds mappings for cloned regions and results. Keep those temporary entries
+    // out of the persistent sidecar map because newElemwiseOp is erased below.
+    IRMapping cloneMapping = mapping;
+    auto newElemwiseOp = rewriter.clone(*elemwiseOp, cloneMapping);
     if (failed(recursiveMoveOperandsBeforeOp(*newElemwiseOp, rewriter, *outerLoop)))
       BAIL_AND_POINT("failed to move operands before the outer loop");
+
+    // Fusing a sidecar replaces the outer loop. Remember how existing mappings relate to the
+    // current loop so they can be refreshed before the next sidecar is cloned.
+    SmallVector<std::pair<Value, unsigned>> mappingsToRefresh;
+    for (auto [source, target] : mapping.getValueMap()) {
+      auto result = dyn_cast<OpResult>(target);
+      if (!result || result.getOwner() != outerLoop.getOperation())
+        BAIL_AND_POINT("expected every mapped sidecar value to be a result of the outer loop");
+      mappingsToRefresh.emplace_back(source, result.getResultNumber());
+    }
 
     auto fuseResult =
         tileAndFuseConsumerIntoDoubleLoops(rewriter, outerLoop, innerLoop, *newElemwiseOp);
@@ -123,6 +136,11 @@ DiagnosedSilenceableFailure FusionCloneFuseElemwiseOp::apply(transform::Transfor
       BAIL_AND_POINT("failed to fuse consumer into double loops");
     auto [outerFusedOp, innerFusedOp] = *fuseResult;
 
+    for (auto [source, resultNumber] : mappingsToRefresh) {
+      if (resultNumber >= outerLoop.getNumResults())
+        BAIL_AND_POINT("fused outer loop dropped an existing sidecar result");
+      mapping.map(source, outerLoop.getResult(resultNumber));
+    }
     auto newLoopResults = outerLoop->getResults().take_back(elemwiseOp->getNumResults());
     for (auto [oldResult, newLoopResult] :
          llvm::zip_equal(elemwiseOp->getResults(), newLoopResults)) {
