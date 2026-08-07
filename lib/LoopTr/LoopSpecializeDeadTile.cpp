@@ -1093,8 +1093,9 @@ FailureOr<AffineInterval> deriveLiveInterval(linalg::GenericOp generic, scf::For
   return getIvIntervalFromRelations(relations, loop.getInductionVar());
 }
 
-bool deadIterationPreservesLoopState(scf::ForOp loop,
-                                     const DenseMap<Value, AbstractValue> &states) {
+std::optional<unsigned>
+findLoopResultNotProvenPreservedByDeadIteration(scf::ForOp loop,
+                                                const DenseMap<Value, AbstractValue> &states) {
   auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
   for (auto [yieldedIdx, yieldedAndIterArg] :
        llvm::enumerate(llvm::zip_equal(yield.getOperands(), loop.getRegionIterArgs()))) {
@@ -1123,10 +1124,10 @@ bool deadIterationPreservesLoopState(scf::ForOp loop,
         printAbstractValue(llvm::dbgs(), yieldedState);
         llvm::dbgs() << "\n";
       });
-      return false;
+      return yieldedIdx;
     }
   }
-  return true;
+  return std::nullopt;
 }
 
 LogicalResult canSpecializeFullyLiveProducer(linalg::GenericOp producer,
@@ -1203,7 +1204,13 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
 
   DenseMap<Value, AbstractValue> states;
   analyzeLoopDeadPropagation(loop, producer, getDeadValue(), states);
-  bool canTruncateDeadSuffix = deadIterationPreservesLoopState(loop, states);
+  std::optional<unsigned> unprovenResult =
+      findLoopResultNotProvenPreservedByDeadIteration(loop, states);
+  bool canTruncateDeadSuffix = !unprovenResult;
+  if (unprovenResult)
+    getOperation()->emitRemark() << "dead-tile propagation could not prove loop-carried result #"
+                                 << *unprovenResult
+                                 << " is unchanged; the fully-dead suffix will not be truncated";
   if (failed(canSpecializeFullyLiveProducer(producer, *match)))
     BAIL("expected producer live value to come from an input with the same indexing as the output");
 

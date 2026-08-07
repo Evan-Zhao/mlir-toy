@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter | FileCheck %s
+// RUN: neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
 
 !any = !transform.any_op
 
@@ -14,6 +14,8 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 
+  // CHECK: remark: dead-tile propagation could not prove loop-carried result #0 is unchanged;
+  // CHECK-SAME: the fully-dead suffix will not be truncated
   // CHECK-LABEL: func.func @dead_tile(
   // CHECK: arith.maxsi
   // CHECK: arith.minsi

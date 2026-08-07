@@ -381,6 +381,10 @@ def LoopSpecializeDeadTileOp
     If omitted or empty, the producer is inferred as the unique dead-select
     `linalg.generic` nested in `loop`. If no such producer is found, the op is
     a no-op and returns empty handles. If more than one is found, the op fails.
+
+    If dead-value propagation cannot prove that a fully-dead iteration preserves
+    every loop-carried result, the mixed loop retains the original upper bound.
+    The transform emits a remark identifying the first unproven result.
   }];
 
   let arguments = (ins Optional<TransformHandleTypeInterface>:$producer_op,
