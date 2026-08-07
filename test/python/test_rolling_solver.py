@@ -70,6 +70,17 @@ def test_attention_row_sum_repair() -> None:
     _assert_equiv(h_expr, T * sp.exp(row_max - row_max_next))
 
 
+def test_attention_scaled_row_max_repair() -> None:
+    score, row_max = sp.symbols("score row_max", real=True)
+    row_max_next = sp.Symbol("row_max'", real=True)
+    scale = sp.Float("0.127517432")
+
+    h_expr = sympy_solve_rolling_updater(
+        FADD, 2 ** (scale * (score - row_max)), {row_max: row_max_next}, [score], T
+    )
+    _assert_equiv(h_expr, T * 2 ** (scale * (row_max - row_max_next)))
+
+
 def test_attention_output_repair_from_row_sum() -> None:
     prob_num, value, row_sum = sp.symbols("prob_num value row_sum", real=True)
     row_sum_next = sp.Symbol("row_sum'", real=True)

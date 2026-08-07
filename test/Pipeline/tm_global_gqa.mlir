@@ -24,6 +24,11 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.ta.exp_to_exp2
       transform.apply_patterns.ta.sink_div_after_matmul
     } : !any
+    // Rewrite `max(QK^T * k)` as `max(QK^T) * k` while keeping the inverse
+    // exp-to-exp2 scale motion out of the same greedy pattern set.
+    transform.apply_patterns to %func {
+      transform.apply_patterns.ta.sink_scale_after_max
+    } : !any
     transform.apply_cse to %func : !any
     %bmm0 = transform.collect_matching @match_4d_matmul_transb in %func : (!any) -> !any
     transform.ta.to_linalg %func : !any
@@ -144,13 +149,16 @@ module attributes {transform.with_named_sequence} {
 // CHECK-NOT: scf.forall
 // CHECK: htile.full %{{.*}} : f32 -> tensor<128xf32>
 // CHECK: htile.full %{{.*}} : f32 -> tensor<128x64xf32>
-// CHECK: %{{.*}}:3 = scf.for %{{.*}} = %c0 to %c16 step %c1 iter_args(
+// CHECK: %{{.*}}:5 = scf.for %{{.*}} = %c0 to %c16 step %c1 iter_args(
+// CHECK-SAME: -> (tensor<128xf32>, tensor<128xf32>, tensor<128xf32>,
+// CHECK-SAME: tensor<128xf32>, tensor<128x64xf32>)
 // CHECK: affine.apply
 // CHECK: affine.apply
 // CHECK: htile.load %arg0
 // CHECK: htile.load %arg1
-// CHECK: htile.dot %{{.*}}, %{{.*}} {transpose_b} : tensor<128x64xf16>, tensor<64x64xf16> -> tensor<128x64xf32>
-// CHECK: htile.reduce %{{.*}} axis 1 kind "max" : tensor<128x64xf32> -> tensor<128xf32>
+// CHECK: %[[RAW_SCORES:.+]] = htile.dot %{{.*}}, %{{.*}} {transpose_b} : tensor<128x64xf16>, tensor<64x64xf16> -> tensor<128x64xf32>
+// CHECK: htile.reduce %[[RAW_SCORES]] axis 1 kind "max" : tensor<128x64xf32> -> tensor<128xf32>
+// CHECK: arith.mulf %[[RAW_SCORES]], %{{.*}} : tensor<128x64xf32>
 // CHECK: htile.broadcast %{{.*}} dimensions = [1] : tensor<128xf32> -> tensor<128x64xf32>
 // CHECK: math.exp2 %{{.*}} : tensor<128x64xf32>
 // CHECK: htile.reduce %{{.*}} axis 1 kind "sum" : tensor<128x64xf32> -> tensor<128xf32>
