@@ -3,7 +3,9 @@
 This note records attention operator features that are useful targets for the Neptune attention
 pipeline. The goal is to organize the roadmap around operator behavior rather than kernel schedules.
 Scheduling techniques such as rolling update, SplitK, persistent decode, or work queues
-are tracked separately, even when a feature strongly motivates a particular schedule.
+are tracked separately, even when a feature strongly motivates a particular schedule. Measured
+kernel improvements are collected in the
+[attention optimization roadmap](attention-optimization-roadmap.md).
 
 A concrete attention variant is usually a composition of several axes: for example,
 paged KV-cache decode with GQA, RoPE, causal masking, FP8 K/V, and cache append.
