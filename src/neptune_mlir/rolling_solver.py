@@ -126,8 +126,18 @@ def _partial_inverse_by_substitution(
         synthetic_c = sp.Dummy("c_sub", real=True)
         substituted_g = cast(Expr, g_expr.xreplace({c_expr: synthetic_c}))
         try:
-            solutions = sp.solve(sp.Eq(substituted_g, t), synthetic_c)
+            solution_set = sp.solveset(sp.Eq(substituted_g, t), synthetic_c, domain=sp.S.Reals)
         except NotImplementedError:
+            continue
+        if isinstance(solution_set, sp.FiniteSet):
+            solutions = solution_set
+        elif isinstance(solution_set, sp.Intersection):
+            finite_sets = [part for part in solution_set.args if isinstance(part, sp.FiniteSet)]
+            other_sets = [part for part in solution_set.args if not isinstance(part, sp.FiniteSet)]
+            if len(finite_sets) != 1 or any(part != sp.S.Reals for part in other_sets):
+                continue
+            solutions = finite_sets[0]
+        else:
             continue
         for solution in solutions:
             yield {c_expr: cast(Expr, solution)}
