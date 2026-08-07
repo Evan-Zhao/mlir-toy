@@ -383,7 +383,7 @@ def LoopSpecializeDeadTileOp
     a no-op and returns empty handles. If more than one is found, the op fails.
 
     If dead-value propagation cannot prove that a fully-dead iteration preserves
-    every loop-carried result, the mixed loop retains the original upper bound.
+    every used loop-carried result, the mixed loop retains the original upper bound.
     The transform emits a remark identifying the first unproven result.
   }];
 

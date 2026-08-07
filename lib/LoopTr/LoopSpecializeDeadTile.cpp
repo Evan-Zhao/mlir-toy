@@ -301,11 +301,21 @@ struct AbstractValueData {
     });
   }
 
+  bool isFinitePositiveFloat() const {
+    return mapConstAttribute([](Attribute attr) {
+      auto floatAttr = dyn_cast<FloatAttr>(attr);
+      return floatAttr && floatAttr.getValue().isFinite() &&
+             !floatAttr.getValue().isNegative() && !floatAttr.getValue().isZero();
+    });
+  }
+
   bool bitwiseEqualToAttr(Attribute rhs) const {
     return mapConstAttribute([&](Attribute attr) { return attrsEqualByValue(attr, rhs); });
   }
 
   bool equals(const AbstractValueData &rhs) const {
+    if (!isKnown() || !rhs.isKnown())
+      return false;
     auto rhsAttr = rhs.getConstantAttr();
     if (rhsAttr && bitwiseEqualToAttr(*rhsAttr))
       return true;
@@ -762,6 +772,10 @@ ScalarExprState evaluateScalarValue(Value value, DenseMap<Value, ScalarExprState
       return lhs;
     if (rhs.isConstZero() || lhs.isConstOne())
       return rhs;
+    if (lhs.isNegativeInfinity() && rhs.isFinitePositiveFloat())
+      return lhs;
+    if (rhs.isNegativeInfinity() && lhs.isFinitePositiveFloat())
+      return rhs;
     return ScalarExprState::getUnknown();
   };
   auto foldDiv = [&](ScalarExprState lhs, ScalarExprState rhs, Type resultTy) {
@@ -801,6 +815,30 @@ ScalarExprState evaluateScalarValue(Value value, DenseMap<Value, ScalarExprState
         APFloat::opInvalidOp)
       return ScalarExprState::getUnknown();
     return ScalarExprState::getConstant(FloatAttr::get(resultType, result));
+  };
+  auto foldSubF = [&](arith::SubFOp subf) -> ScalarExprState {
+    ScalarExprState lhs = evaluate(subf.getLhs()), rhs = evaluate(subf.getRhs());
+    ScalarExprState folded = foldSub(lhs, rhs, subf.getResult().getType());
+    if (folded.isKnown())
+      return folded;
+
+    // `%old * c - %new * c -> 0` when propagation proves `%old == %new`.
+    auto lhsMul = subf.getLhs().getDefiningOp<arith::MulFOp>();
+    auto rhsMul = subf.getRhs().getDefiningOp<arith::MulFOp>();
+    if (!lhsMul || !rhsMul)
+      return ScalarExprState::getUnknown();
+    auto equivalent = [&](Value lhsValue, Value rhsValue) {
+      if (lhsValue == rhsValue)
+        return true;
+      return evaluate(lhsValue).equals(evaluate(rhsValue));
+    };
+    bool sameOrder = equivalent(lhsMul.getLhs(), rhsMul.getLhs()) &&
+                     equivalent(lhsMul.getRhs(), rhsMul.getRhs());
+    bool swappedOrder = equivalent(lhsMul.getLhs(), rhsMul.getRhs()) &&
+                        equivalent(lhsMul.getRhs(), rhsMul.getLhs());
+    if (sameOrder || swappedOrder)
+      return ScalarExprState::getConstantOfType(subf.getResult().getType(), 0);
+    return ScalarExprState::getUnknown();
   };
   // Recognize the rolling-update idiom `(x * y) * (1 / y) -> x` (and swapped
   // operands). Plain recursive evaluation loses the reciprocal structure
@@ -862,7 +900,8 @@ ScalarExprState evaluateScalarValue(Value value, DenseMap<Value, ScalarExprState
                                .Case<arith::ExtFOp, arith::TruncFOp>(foldFloatCast)
                                .Case<math::ExpOp, math::Exp2Op>(foldExpOp)
                                .Case<arith::AddFOp, arith::AddIOp>(CASE_BIN_OP(foldAdd))
-                               .Case<arith::SubFOp, arith::SubIOp>(CASE_BIN_OP(foldSub))
+                               .Case<arith::SubFOp>(foldSubF)
+                               .Case<arith::SubIOp>(CASE_BIN_OP(foldSub))
                                .Case<arith::MulFOp>(foldMulF)
                                .Case<arith::MulIOp>(CASE_BIN_OP(foldMul))
                                .Case<arith::DivFOp>(CASE_BIN_OP(foldDiv))
@@ -1099,6 +1138,10 @@ findLoopResultNotProvenPreservedByDeadIteration(scf::ForOp loop,
   auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
   for (auto [yieldedIdx, yieldedAndIterArg] :
        llvm::enumerate(llvm::zip_equal(yield.getOperands(), loop.getRegionIterArgs()))) {
+    // A dead suffix may change an unobserved loop result without changing program semantics.
+    if (loop.getResult(yieldedIdx).use_empty())
+      continue;
+
     auto [yielded, iterArg] = yieldedAndIterArg;
     AbstractValue yieldedState = getKnownState(yielded, states);
     std::optional<Value> equivalent = yieldedState.getEquivalentValue();
