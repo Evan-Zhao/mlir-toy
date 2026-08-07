@@ -123,10 +123,13 @@ def TASinkScaleAfterMaxPatternsOp
     Collects PDLL-authored TA patterns for the rewrite:
 
     ```
-      max_axes(c * x) -> c * max_axes(x)
+      select(p, c * x, -inf)           -> c * select(p, x, -inf)
+      max_axes(c * x)                  -> c * max_axes(x)
+      max_axes(select(p, c * x, -inf)) -> c * max_axes(select(p, x, -inf))
     ```
 
-    The axisless scale `c` must be a finite positive floating-point constant.
+    The masked form is obtained by composing the first two rewrites. The axisless scale `c`
+    must be a finite positive floating-point constant.
     Both operand orders of `ta.mul` are supported. The patterns preserve the
     matched max reducer kind, axes, and import-group attributes. Apply this
     descriptor separately from pattern sets that move scales into max reductions.

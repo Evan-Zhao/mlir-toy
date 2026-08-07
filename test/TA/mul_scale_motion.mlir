@@ -129,6 +129,99 @@ module attributes {transform.with_named_sequence} {
     return %out : tensor<2xf32>
   }
 
+  // CHECK-LABEL: func.func @sink_left_positive_scale_after_masked_select(
+  func.func @sink_left_positive_scale_after_masked_select(
+      %input: tensor<2x3xf32>, %pred: tensor<2x3xi1>) -> tensor<2xf32> {
+    %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3) {
+      // CHECK: %[[INPUT:.+]] = ta.at
+      %x = ta.at %input[%i, %j]
+          : tensor<2x3xf32> -> !ta.expr<f32, [i, j]>
+      // CHECK: %[[PRED:.+]] = ta.at
+      %p = ta.at %pred[%i, %j]
+          : tensor<2x3xi1> -> !ta.expr<i1, [i, j]>
+      // CHECK: %[[NEG_INF:.+]] = ta.constant 0xFF800000
+      %neg_inf = ta.constant 0xFF800000 : f32 : !ta.expr<f32, []>
+      // CHECK: %[[SCALE:.+]] = ta.constant 5.000000e-01
+      %scale = ta.constant 5.000000e-01 : f32 : !ta.expr<f32, []>
+      %scaled = ta.mul %scale, %x {ta.import_group = 5 : i64}
+          : (!ta.expr<f32, []>, !ta.expr<f32, [i, j]>) -> !ta.expr<f32, [i, j]>
+      %masked = ta.select %p, %scaled, %neg_inf {ta.import_group = 6 : i64}
+          : (!ta.expr<i1, [i, j]>, !ta.expr<f32, [i, j]>, !ta.expr<f32, []>)
+         -> !ta.expr<f32, [i, j]>
+      // CHECK: %[[MASKED:.+]] = ta.select %[[PRED]], %[[INPUT]], %[[NEG_INF]]
+      // CHECK: %[[MAX:.+]] = ta.reduce <max> %[[MASKED]]
+      // CHECK-NEXT: %[[RESULT:.+]] = ta.mul %[[SCALE]], %[[MAX]]
+      %max = ta.reduce #ta.reduce_kind<max> %masked
+          {axes = #ta.axes<j>, ta.import_group = 7 : i64}
+          : !ta.expr<f32, [i, j]> -> !ta.expr<f32, [i]>
+      // CHECK: ta.yield %[[RESULT]]
+      ta.yield %max : !ta.expr<f32, [i]>
+    } : () -> tensor<2xf32>
+    return %out : tensor<2xf32>
+  }
+
+  // CHECK-LABEL: func.func @sink_right_positive_scale_after_masked_select(
+  func.func @sink_right_positive_scale_after_masked_select(
+      %input: tensor<2x3xf32>, %pred: tensor<2x3xi1>) -> tensor<2xf32> {
+    %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3) {
+      // CHECK: %[[INPUT:.+]] = ta.at
+      %x = ta.at %input[%i, %j]
+          : tensor<2x3xf32> -> !ta.expr<f32, [i, j]>
+      // CHECK: %[[PRED:.+]] = ta.at
+      %p = ta.at %pred[%i, %j]
+          : tensor<2x3xi1> -> !ta.expr<i1, [i, j]>
+      // CHECK: %[[NEG_INF:.+]] = ta.constant 0xFF800000
+      %neg_inf = ta.constant 0xFF800000 : f32 : !ta.expr<f32, []>
+      // CHECK: %[[SCALE:.+]] = ta.constant 5.000000e-01
+      %scale = ta.constant 5.000000e-01 : f32 : !ta.expr<f32, []>
+      %scaled = ta.mul %x, %scale {ta.import_group = 8 : i64}
+          : (!ta.expr<f32, [i, j]>, !ta.expr<f32, []>) -> !ta.expr<f32, [i, j]>
+      %masked = ta.select %p, %scaled, %neg_inf {ta.import_group = 9 : i64}
+          : (!ta.expr<i1, [i, j]>, !ta.expr<f32, [i, j]>, !ta.expr<f32, []>)
+         -> !ta.expr<f32, [i, j]>
+      // CHECK: %[[MASKED:.+]] = ta.select %[[PRED]], %[[INPUT]], %[[NEG_INF]]
+      // CHECK: %[[MAX:.+]] = ta.reduce <max> %[[MASKED]]
+      // CHECK-NEXT: %[[RESULT:.+]] = ta.mul %[[MAX]], %[[SCALE]]
+      %max = ta.reduce #ta.reduce_kind<max> %masked
+          {axes = #ta.axes<j>, ta.import_group = 10 : i64}
+          : !ta.expr<f32, [i, j]> -> !ta.expr<f32, [i]>
+      // CHECK: ta.yield %[[RESULT]]
+      ta.yield %max : !ta.expr<f32, [i]>
+    } : () -> tensor<2xf32>
+    return %out : tensor<2xf32>
+  }
+
+  // CHECK-LABEL: func.func @do_not_sink_scale_after_masked_max_with_finite_fill(
+  func.func @do_not_sink_scale_after_masked_max_with_finite_fill(
+      %input: tensor<2x3xf32>, %pred: tensor<2x3xi1>) -> tensor<2xf32> {
+    %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3) {
+      // CHECK: %[[INPUT:.+]] = ta.at
+      %x = ta.at %input[%i, %j]
+          : tensor<2x3xf32> -> !ta.expr<f32, [i, j]>
+      // CHECK: %[[PRED:.+]] = ta.at
+      %p = ta.at %pred[%i, %j]
+          : tensor<2x3xi1> -> !ta.expr<i1, [i, j]>
+      // CHECK: %[[FILL:.+]] = ta.constant -1.000000e+03
+      %fill = ta.constant -1.000000e+03 : f32 : !ta.expr<f32, []>
+      // CHECK: %[[SCALE:.+]] = ta.constant 5.000000e-01
+      %scale = ta.constant 5.000000e-01 : f32 : !ta.expr<f32, []>
+      // CHECK: %[[SCALED:.+]] = ta.mul %[[SCALE]], %[[INPUT]]
+      %scaled = ta.mul %scale, %x {ta.import_group = 11 : i64}
+          : (!ta.expr<f32, []>, !ta.expr<f32, [i, j]>) -> !ta.expr<f32, [i, j]>
+      // CHECK: %[[MASKED:.+]] = ta.select %[[PRED]], %[[SCALED]], %[[FILL]]
+      %masked = ta.select %p, %scaled, %fill {ta.import_group = 12 : i64}
+          : (!ta.expr<i1, [i, j]>, !ta.expr<f32, [i, j]>, !ta.expr<f32, []>)
+         -> !ta.expr<f32, [i, j]>
+      // CHECK: %[[MAX:.+]] = ta.reduce <max> %[[MASKED]]
+      %max = ta.reduce #ta.reduce_kind<max> %masked
+          {axes = #ta.axes<j>, ta.import_group = 13 : i64}
+          : !ta.expr<f32, [i, j]> -> !ta.expr<f32, [i]>
+      // CHECK: ta.yield %[[MAX]]
+      ta.yield %max : !ta.expr<f32, [i]>
+    } : () -> tensor<2xf32>
+    return %out : tensor<2xf32>
+  }
+
   // CHECK-LABEL: func.func @do_not_sink_negative_scale_after_max_reduce(
   func.func @do_not_sink_negative_scale_after_max_reduce(%input: tensor<2x3xf32>) -> tensor<2xf32> {
     %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3) {
