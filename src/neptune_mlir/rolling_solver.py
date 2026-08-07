@@ -1,13 +1,15 @@
 import json
 import sys
 import traceback
-from typing import Any, Iterable, Mapping, cast
+from collections.abc import Iterable, Mapping
+from typing import Any, cast
 
 import sympy as sp
 from sympy import Expr, Symbol
 
 JsonExpr = dict[str, Any]
-Subs = dict[Symbol, Expr]
+XReplace = dict[Expr, Expr]
+SymbolSubst = dict[Symbol, Expr]
 
 
 def _prime_symbol(symbol: Symbol) -> Symbol:
@@ -17,7 +19,7 @@ def _prime_symbol(symbol: Symbol) -> Symbol:
 def _free_vars_symbols(expr: sp.Basic) -> set[Symbol]:
     def assert_symbol(sym: sp.Basic) -> Symbol:
         if not isinstance(sym, Symbol):
-            raise ValueError(f"expected symbol, got {sym} in {expr}")
+            raise TypeError(f"expected symbol, got {sym} in {expr}")
         return sym
 
     return {assert_symbol(sym) for sym in expr.free_symbols}
@@ -112,7 +114,7 @@ def _prove_repair_term_distribute(h_expr: Expr, f_expr: Expr, acc: Symbol) -> bo
 
 def _partial_inverse_by_substitution(
     g_expr: Expr, c_vars: list[Symbol], t: Symbol
-) -> Iterable[Subs]:
+) -> Iterable[XReplace]:
     """Invert `t = g(R, C)` by finding change-of-variable candidates: each candidate is a
     subexpression `e(C)` that depends only on C variables, which we can replace with a fresh variable `c'`.
 
@@ -128,7 +130,7 @@ def _partial_inverse_by_substitution(
         except NotImplementedError:
             continue
         for solution in solutions:
-            yield {c_expr: solution}
+            yield {c_expr: cast(Expr, solution)}
 
 
 def _candidate_c_subexpressions(g_expr: Expr, c_vars: list[Symbol]) -> list[Expr]:
@@ -151,12 +153,8 @@ def _candidate_c_subexpressions(g_expr: Expr, c_vars: list[Symbol]) -> list[Expr
     return sorted(candidates, key=size, reverse=True)
 
 
-def _is_homogeneous_scaling_in_t(expr: Expr, t: Symbol) -> bool:
-    return t in expr.free_symbols and t not in sp.simplify(expr / t).free_symbols
-
-
 def _prove_eq(lhs: sp.Expr, rhs: sp.Expr) -> bool:
-    diff = sp.simplify(cast(Expr, lhs - rhs))
+    diff = sp.simplify(sp.Add(lhs, -rhs))
     if diff == 0 or diff.is_zero is True:
         return True
     if diff.is_zero is False:
@@ -167,14 +165,14 @@ def _prove_eq(lhs: sp.Expr, rhs: sp.Expr) -> bool:
 def _expr_type(expr: JsonExpr) -> str:
     type_value = expr.get("type")
     if not isinstance(type_value, str):
-        raise ValueError(f"expected expression node to have string type: {expr}")
+        raise TypeError(f"expected expression node to have string type: {expr}")
     return type_value
 
 
 def _expr_args(expr: JsonExpr, expected: int | None = None) -> list[JsonExpr]:
     args = expr.get("args")
     if not isinstance(args, list):
-        raise ValueError(f"expected expression node to have list args: {expr}")
+        raise TypeError(f"expected expression node to have list args: {expr}")
     if expected is not None and len(args) != expected:
         raise ValueError(f"expected {expected} args for {expr.get('op')}, got {len(args)}: {expr}")
     return [cast(JsonExpr, arg) for arg in args]
@@ -183,7 +181,7 @@ def _expr_args(expr: JsonExpr, expected: int | None = None) -> list[JsonExpr]:
 def _json_expr_to_sympy(expr: JsonExpr, symtab: dict[str, Symbol]) -> Expr:
     op = expr.get("op")
     if not isinstance(op, str):
-        raise ValueError(f"expected expression node to have string op: {expr}")
+        raise TypeError(f"expected expression node to have string op: {expr}")
 
     if op == "var":
         name = expr.get("name")
@@ -205,12 +203,12 @@ def _json_expr_to_sympy(expr: JsonExpr, symtab: dict[str, Symbol]) -> Expr:
         lhs = _json_expr_to_sympy(lhs_expr, symtab)
         rhs = _json_expr_to_sympy(rhs_expr, symtab)
         if op == "add":
-            return cast(Expr, lhs + rhs)
+            return cast(Expr, sp.Add(lhs, rhs))
         if op == "sub":
-            return cast(Expr, lhs - rhs)
+            return cast(Expr, sp.Add(lhs, -rhs))
         if op == "mul":
-            return cast(Expr, lhs * rhs)
-        return cast(Expr, lhs / rhs)
+            return cast(Expr, sp.Mul(lhs, rhs))
+        return cast(Expr, sp.Mul(lhs, sp.Pow(rhs, -1)))
 
     if op in {"exp", "exp2", "log", "sqrt", "rsqrt", "abs"}:
         (arg_expr,) = _expr_args(expr, 1)
@@ -218,13 +216,13 @@ def _json_expr_to_sympy(expr: JsonExpr, symtab: dict[str, Symbol]) -> Expr:
         if op == "exp":
             return cast(Expr, sp.exp(arg))
         if op == "exp2":
-            return cast(Expr, 2**arg)
+            return cast(Expr, sp.Pow(2, arg))
         if op == "log":
             return cast(Expr, sp.log(arg))
         if op == "sqrt":
             return cast(Expr, sp.sqrt(arg))
         if op == "rsqrt":
-            return cast(Expr, 1 / sp.sqrt(arg))
+            return cast(Expr, sp.Pow(arg, -1 / 2))
         return cast(Expr, sp.Abs(arg))
 
     if op == "pow":
@@ -344,6 +342,7 @@ def _sympy_to_json_expr(expr: sp.Expr, dtype: str) -> JsonExpr:
 
 def _split_negative_term(expr: Expr) -> tuple[bool, Expr]:
     coeff, terms = expr.as_coeff_mul()
+    coeff = int(coeff)
     if coeff == -1:
         return True, sp.Mul(*terms)
     if coeff < 0:
@@ -357,7 +356,7 @@ PROTOCOL_VERSION = 1
 def _require_request_field(request: dict[str, Any], name: str, expected_type: type) -> Any:
     value = request.get(name)
     if not isinstance(value, expected_type):
-        raise ValueError(f"request field {name!r} must be {expected_type.__name__}")
+        raise TypeError(f"request field {name!r} must be {expected_type.__name__}")
     return value
 
 
@@ -383,9 +382,9 @@ def main() -> int:
     try:
         request = json.load(sys.stdin)
         if not isinstance(request, dict):
-            raise ValueError("rolling-solver request must be a JSON object")
+            raise TypeError("rolling-solver request must be a JSON object")
         response = process_request(request)
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001
         traceback.print_exc(file=sys.stderr)
         response = {
             "protocol_version": PROTOCOL_VERSION,
