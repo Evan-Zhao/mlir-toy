@@ -269,6 +269,10 @@ void TASinkScaleAfterMaxPatternsOp::populatePatterns(RewritePatternSet &patterns
       patterns.getContext());
   patterns.add<ta_mul_scale_motion_pdl::SinkRightPositiveScaleAfterMaxReduce>(
       patterns.getContext());
+  patterns.add<ta_mul_scale_motion_pdl::SinkLeftPositiveScaleAfterMaskedSelect>(
+      patterns.getContext());
+  patterns.add<ta_mul_scale_motion_pdl::SinkRightPositiveScaleAfterMaskedSelect>(
+      patterns.getContext());
 }
 
 void TAExpToExp2PatternsOp::populatePatterns(RewritePatternSet &patterns) {

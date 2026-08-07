@@ -1,5 +1,6 @@
 // RUN: neptune-opt --transform-interpreter %s 2>&1 | FileCheck %s
 
+// CHECK-NOT: dead-tile propagation could not prove
 // CHECK-LABEL: func.func @attention(%arg0: tensor<1x4x1024x64xf16>, %arg1: tensor<1x4x1024x64xf8E4M3FN>, %arg2: tensor<1x4x1024x64xf8E4M3FN>, %arg3: tensor<1x4x1x1xf32>, %arg4: tensor<1x4x1x1xf32>) -> tensor<1x4x1024x64xf16>
 // CHECK-DAG: %[[Q:.+]] = bufferization.to_buffer %arg0 read_only
 // CHECK-DAG: %[[K:.+]] = bufferization.to_buffer %arg1 read_only
@@ -28,12 +29,18 @@
 // CHECK: %[[LIVE_BOUND_RAW:.+]] = affine.apply
 // CHECK: %[[LIVE_BOUND_MAX:.+]] = arith.maxsi %[[LIVE_BOUND_RAW]], %c0 : index
 // CHECK: %[[LIVE_BOUND:.+]] = arith.minsi %[[LIVE_BOUND_MAX]], %c16 : index
-// CHECK: %[[LIVE_LOOP:.+]]:3 = scf.for %{{.*}} = %c0 to %[[LIVE_BOUND]] step %c1 iter_args(
+// CHECK: %[[LIVE_LOOP:.+]]:5 = scf.for %{{.*}} = %c0 to %[[LIVE_BOUND]] step %c1 iter_args(
 // CHECK: scf.yield
 // CHECK: %[[DEAD_BOUND_RAW:.+]] = affine.apply
 // CHECK: %[[DEAD_BOUND_MAX:.+]] = arith.maxsi %[[DEAD_BOUND_RAW]], %c0 : index
 // CHECK: %[[DEAD_BOUND:.+]] = arith.minsi %[[DEAD_BOUND_MAX]], %c16 : index
-// CHECK: %{{.*}}:3 = scf.for %{{.*}} = %[[LIVE_BOUND]] to %[[DEAD_BOUND]] step %c1 iter_args(%{{.*}} = %[[LIVE_LOOP]]#0, %{{.*}} = %[[LIVE_LOOP]]#1, %{{.*}} = %[[LIVE_LOOP]]#2)
+// CHECK: %{{.*}}:5 = scf.for %{{.*}} = %[[LIVE_BOUND]] to %[[DEAD_BOUND]] step %c1
+// CHECK-SAME: iter_args(%{{.*}} = %[[LIVE_LOOP]]#0, %{{.*}} = %[[LIVE_LOOP]]#1,
+// CHECK-SAME: %{{.*}} = %[[LIVE_LOOP]]#2, %{{.*}} = %[[LIVE_LOOP]]#3,
+// CHECK-SAME: %{{.*}} = %[[LIVE_LOOP]]#4)
+// CHECK: %[[MASKED_RAW:.+]] = arith.select %{{.*}}, %{{.*}}, %{{.*}} : tensor<128x64xi1>, tensor<128x64xf32>
+// CHECK: htile.reduce %[[MASKED_RAW]] axis 1 kind "max" : tensor<128x64xf32> -> tensor<128xf32>
+// CHECK: arith.mulf %[[MASKED_RAW]], %{{.*}} : tensor<128x64xf32>
 // CHECK: htile.store
 // CHECK: htile.return
 
@@ -53,6 +60,11 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.ta.exp_to_exp2
       transform.apply_patterns.ta.sink_div_after_matmul
       transform.apply_patterns.ta.sink_right_mul_after_matmul
+    } : !any
+    // Factor a positive scale out of masked scores, then move it after the max reduction.
+    // Keep this separate from exp-to-exp2's opposite scale-motion patterns.
+    transform.apply_patterns to %func {
+      transform.apply_patterns.ta.sink_scale_after_max
     } : !any
     transform.apply_cse to %func : !any
     %bmm0 = transform.collect_matching @match_4d_matmul_transb in %func : (!any) -> !any

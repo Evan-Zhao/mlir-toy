@@ -23,6 +23,20 @@ Constraint PositiveAxislessConstant(value: Value) [{
                  !floatValue.getValue().isNegative() && !floatValue.getValue().isZero());
 }];
 
+Constraint NegativeInfinityAxislessConstant(value: Value) [{
+  auto constant = value.getDefiningOp<ta::ConstantOp>();
+  if (!constant)
+    return failure();
+
+  auto expr = dyn_cast<ta::ExprType>(value.getType());
+  if (!expr || !expr.getAxes().getAxes().empty())
+    return failure();
+
+  auto floatValue = dyn_cast<FloatAttr>(constant.getValue());
+  return success(floatValue && floatValue.getValue().isInfinity() &&
+                 floatValue.getValue().isNegative());
+}];
+
 Constraint MaxReduceKind(kind: Attr) [{
   auto reduceKind = dyn_cast<ta::ReduceKindAttr>(kind);
   return success(reduceKind && reduceKind.getValue() == ta::ReduceKind::Max);
@@ -135,7 +149,7 @@ Pattern ReassociateRightNestedConstantMul {
   };
 }
 
-// The following two patterns are used in a different rewrite rule.
+// The following patterns are used in a different rewrite rule.
 
 // max_axes(c * x) => c * max_axes(x), for finite c > 0
 // This one is the opposite of HoistPositiveScaleBeforeMaxReduce.
@@ -161,5 +175,31 @@ Pattern SinkRightPositiveScaleAfterMaxReduce {
   rewrite reduce with {
     let rawMax = op<ta.reduce>(input) {kind = kind, axes = axes, "ta.import_group" = srcReduce} -> (resultType);
     replace reduce with op<ta.mul>(rawMax, constant) {"ta.import_group" = srcMul};
+  };
+}
+
+// select(p, c * x, -inf) => c * select(p, x, -inf)
+Pattern SinkLeftPositiveScaleAfterMaskedSelect {
+  let mul = op<ta.mul>(constant: Value, input: Value) {"ta.import_group" = srcMul: Attr};
+  let select = op<ta.select>(condition: Value, mul, negativeInfinity: Value) {"ta.import_group" = srcSelect: Attr};
+  PositiveAxislessConstant(constant);
+  NegativeInfinityAxislessConstant(negativeInfinity);
+
+  rewrite select with {
+    let rawMasked = op<ta.select>(condition, input, negativeInfinity) {"ta.import_group" = srcSelect};
+    replace select with op<ta.mul>(constant, rawMasked) {"ta.import_group" = srcMul};
+  };
+}
+
+// select(p, x * c, -inf) => select(p, x, -inf) * c
+Pattern SinkRightPositiveScaleAfterMaskedSelect {
+  let mul = op<ta.mul>(input: Value, constant: Value) {"ta.import_group" = srcMul: Attr};
+  let select = op<ta.select>(condition: Value, mul, negativeInfinity: Value) {"ta.import_group" = srcSelect: Attr};
+  PositiveAxislessConstant(constant);
+  NegativeInfinityAxislessConstant(negativeInfinity);
+
+  rewrite select with {
+    let rawMasked = op<ta.select>(condition, input, negativeInfinity) {"ta.import_group" = srcSelect};
+    replace select with op<ta.mul>(rawMasked, constant) {"ta.import_group" = srcMul};
   };
 }
