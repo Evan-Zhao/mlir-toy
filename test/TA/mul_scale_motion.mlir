@@ -39,6 +39,28 @@ module attributes {transform.with_named_sequence} {
     return %out : tensor<2x3xf32>
   }
 
+  // CHECK-LABEL: func.func @preserve_log2e_around_add(
+  func.func @preserve_log2e_around_add(
+      %lhs: tensor<2x3xf32>, %rhs: tensor<2x3xf32>) -> tensor<2x3xf32> {
+    %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3) {
+      %x = ta.at %lhs[%i, %j]
+          : tensor<2x3xf32> -> !ta.expr<f32, [i, j]>
+      %y = ta.at %rhs[%i, %j]
+          : tensor<2x3xf32> -> !ta.expr<f32, [i, j]>
+      // CHECK: %[[ADD:.+]] = ta.add
+      %sum = ta.add %x, %y {ta.import_group = 10 : i64}
+          : (!ta.expr<f32, [i, j]>, !ta.expr<f32, [i, j]>) -> !ta.expr<f32, [i, j]>
+      %exp = ta.exp %sum {ta.import_group = 11 : i64}
+          : (!ta.expr<f32, [i, j]>) -> !ta.expr<f32, [i, j]>
+      // CHECK: %[[LOG2E:.+]] = ta.constant 1.44269502 : f32
+      // CHECK: %[[SCALED_ADD:.+]] = ta.mul %[[LOG2E]], %[[ADD]]
+      // CHECK: %[[EXP2:.+]] = ta.exp2 %[[SCALED_ADD]]
+      // CHECK: ta.yield %[[EXP2]]
+      ta.yield %exp : !ta.expr<f32, [i, j]>
+    } : () -> tensor<2x3xf32>
+    return %out : tensor<2x3xf32>
+  }
+
   // CHECK-LABEL: func.func @hoist_positive_scale_before_masked_max_reduce(
   func.func @hoist_positive_scale_before_masked_max_reduce(%scores: tensor<2x3xf32>) -> tensor<2x3xf32> {
     %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3) {

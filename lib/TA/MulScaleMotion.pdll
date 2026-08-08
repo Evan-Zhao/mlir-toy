@@ -71,19 +71,6 @@ Pattern ExpToExp2IntroduceLog2E {
   };
 }
 
-// c * (x + y) => (c * x) + (c * y)
-Pattern DistributeConstantMulOverAdd {
-  let add = op<ta.add>(lhs: Value, rhs: Value) {"ta.import_group" = srcAdd: Attr};
-  let mul = op<ta.mul>(constant: Value, add) {"ta.import_group" = srcMul: Attr};
-  AxislessConstant(constant);
-
-  rewrite mul with {
-    let scaledLhs = op<ta.mul>(constant, lhs) {"ta.import_group" = srcMul};
-    let scaledRhs = op<ta.mul>(constant, rhs) {"ta.import_group" = srcMul};
-    replace mul with op<ta.add>(scaledLhs, scaledRhs) {"ta.import_group" = srcAdd};
-  };
-}
-
 // c * (x - y) => (c * x) - (c * y)
 Pattern DistributeConstantMulOverSub {
   let sub = op<ta.sub>(lhs: Value, rhs: Value) {"ta.import_group" = srcSub: Attr};

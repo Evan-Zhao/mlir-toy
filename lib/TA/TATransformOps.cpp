@@ -277,7 +277,6 @@ void TASinkScaleAfterMaxPatternsOp::populatePatterns(RewritePatternSet &patterns
 
 void TAExpToExp2PatternsOp::populatePatterns(RewritePatternSet &patterns) {
   patterns.add<ta_mul_scale_motion_pdl::ExpToExp2IntroduceLog2E,
-               ta_mul_scale_motion_pdl::DistributeConstantMulOverAdd,
                ta_mul_scale_motion_pdl::DistributeConstantMulOverSub,
                ta_mul_scale_motion_pdl::PushMulScaleThroughSelect,
                ta_mul_scale_motion_pdl::HoistPositiveScaleBeforeMaxReduce,

@@ -21,6 +21,11 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.ta.exp_to_exp2
       transform.apply_patterns.ta.sink_div_after_matmul
     } : !any
+    // Preserve log2(e) around the complete biased logit, then move it after max.
+    // Keep this separate from exp-to-exp2's opposite scale-motion patterns.
+    transform.apply_patterns to %func {
+      transform.apply_patterns.ta.sink_scale_after_max
+    } : !any
     transform.apply_cse to %func : !any
     %bmm0 = transform.collect_matching @match_4d_matmul_transb in %func : (!any) -> !any
     transform.ta.to_linalg %func : !any
@@ -151,6 +156,7 @@ module attributes {transform.with_named_sequence} {
   }
 }
 
+// CHECK-NOT: dead-tile propagation could not prove
 // CHECK-LABEL: func.func @attention(
 // CHECK-SAME: %arg0: tensor<1x4x1024x64xf16>, %arg1: tensor<1x4x1024x64xf16>, %arg2: tensor<1x4x1024x64xf16>, %arg3: tensor<4xf32>) -> tensor<1x4x1024x64xf16>
 // CHECK-NOT: tensor.empty() : tensor<4x1024x64xf32>
@@ -179,7 +185,7 @@ module attributes {transform.with_named_sequence} {
 // CHECK: htile.full %{{.*}} : f32 -> tensor<64x64xf32>
 // CHECK: %[[RAW_BOUND:.+]] = arith.maxsi %{{.*}}, %c0 : index
 // CHECK: %[[CAPPED_BOUND:.+]] = arith.minsi %[[RAW_BOUND]], %c16 : index
-// CHECK: %[[LIVE:.+]]:3 = scf.for %[[J_TILE:.*]] = %c0 to %[[CAPPED_BOUND]] step %c1 iter_args(
+// CHECK: %[[LIVE:.+]]:5 = scf.for %[[J_TILE:.*]] = %c0 to %[[CAPPED_BOUND]] step %c1 iter_args(
 // CHECK: htile.load %arg0
 // CHECK: htile.load %arg1
 // CHECK: htile.dot %{{.*}}, %{{.*}} {transpose_b} : tensor<64x64xf16>, tensor<64x64xf16> -> tensor<64x64xf32>
@@ -198,11 +204,10 @@ module attributes {transform.with_named_sequence} {
 // CHECK: arith.addi %{{.*}}, %{{.*}} : tensor<64x64xindex>
 // CHECK: arith.subf %{{.*}}, %{{.*}} : tensor<64x64xf32>
 // CHECK: arith.mulf %{{.*}}, %{{.*}} : tensor<64x64xf32>
-// CHECK: htile.full %{{.*}} : f32 -> tensor<64x64xf32>
-// CHECK: arith.mulf %{{.*}}, %{{.*}} : tensor<64x64xf32>
 // CHECK: %[[LIVE_SCORES:.+]] = arith.addf %{{.*}}, %{{.*}} : tensor<64x64xf32>
 // CHECK-NOT: arith.select
 // CHECK: htile.reduce %[[LIVE_SCORES]] axis 1 kind "max" : tensor<64x64xf32> -> tensor<64xf32>
+// CHECK: arith.mulf %[[LIVE_SCORES]], %{{.*}} : tensor<64x64xf32>
 // CHECK: math.exp2
 // CHECK: htile.reduce %{{.*}} axis 1 kind "sum" : tensor<64x64xf32> -> tensor<64xf32>
 // CHECK: htile.load %arg2
@@ -210,7 +215,9 @@ module attributes {transform.with_named_sequence} {
 // CHECK: %[[DEAD_BOUND_RAW:.+]] = affine.apply
 // CHECK: %[[DEAD_BOUND_MAX:.+]] = arith.maxsi %[[DEAD_BOUND_RAW]], %c0 : index
 // CHECK: %[[DEAD_BOUND:.+]] = arith.minsi %[[DEAD_BOUND_MAX]], %c16 : index
-// CHECK: %[[MIXED:.+]]:3 = scf.for %{{.*}} = %[[CAPPED_BOUND]] to %[[DEAD_BOUND]] step %c1 iter_args(%{{.*}} = %[[LIVE]]#0, %{{.*}} = %[[LIVE]]#1, %{{.*}} = %[[LIVE]]#2)
+// CHECK: %[[MIXED:.+]]:5 = scf.for %{{.*}} = %[[CAPPED_BOUND]] to %[[DEAD_BOUND]] step %c1
+// CHECK-SAME: iter_args(%{{.*}} = %[[LIVE]]#0, %{{.*}} = %[[LIVE]]#1,
+// CHECK-SAME: %{{.*}} = %[[LIVE]]#2, %{{.*}} = %[[LIVE]]#3, %{{.*}} = %[[LIVE]]#4)
 // CHECK: htile.load %arg0
 // CHECK: htile.load %arg1
 // CHECK: htile.dot %{{.*}}, %{{.*}} {transpose_b} : tensor<64x64xf16>, tensor<64x64xf16> -> tensor<64x64xf32>
@@ -218,12 +225,11 @@ module attributes {transform.with_named_sequence} {
 // CHECK: htile.broadcast %{{.*}} dimensions = [0, 1] : tensor<f32> -> tensor<64x64xf32>
 // CHECK: arith.subf %{{.*}}, %{{.*}} : tensor<64x64xf32>
 // CHECK: arith.mulf %{{.*}}, %{{.*}} : tensor<64x64xf32>
-// CHECK: htile.full %{{.*}} : f32 -> tensor<64x64xf32>
-// CHECK: arith.mulf %{{.*}}, %{{.*}} : tensor<64x64xf32>
-// CHECK: arith.addf %{{.*}}, %{{.*}} : tensor<64x64xf32>
+// CHECK: %[[MIXED_SCORES:.+]] = arith.addf %{{.*}}, %{{.*}} : tensor<64x64xf32>
 // CHECK: arith.cmpi sle, %{{.*}}, %{{.*}} : tensor<64x64xi64>
-// CHECK: arith.select %{{.*}}, %{{.*}}, %{{.*}} : tensor<64x64xi1>, tensor<64x64xf32>
-// CHECK: htile.reduce %{{.*}} axis 1 kind "max" : tensor<64x64xf32> -> tensor<64xf32>
+// CHECK: %[[MASKED_RAW:.+]] = arith.select %{{.*}}, %[[MIXED_SCORES]], %{{.*}} : tensor<64x64xi1>, tensor<64x64xf32>
+// CHECK: htile.reduce %[[MASKED_RAW]] axis 1 kind "max" : tensor<64x64xf32> -> tensor<64xf32>
+// CHECK: arith.mulf %[[MASKED_RAW]], %{{.*}} : tensor<64x64xf32>
 // CHECK: math.exp2
 // CHECK: htile.reduce %{{.*}} axis 1 kind "sum" : tensor<64x64xf32> -> tensor<64xf32>
 // CHECK: htile.load %arg2

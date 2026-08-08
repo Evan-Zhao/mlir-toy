@@ -154,6 +154,11 @@ def TAExpToExp2PatternsOp : Op<Transform_Dialect, "apply_patterns.ta.exp_to_exp2
     distribution through `ta.sub` and `ta.select`, movement through
     `ta.reduce <max>`, reassociation through `ta.mul`, and canonicalizations
     that fold scalar products and floating-point infinity identities.
+
+    The pattern set intentionally does not distribute through `ta.add`. It preserves
+    `log2(e) * (scores + bias)` rather than producing separately scaled terms. This keeps the
+    common scale visible for a later `apply_patterns.ta.sink_scale_after_max`, including for
+    biased logits such as ALiBi.
   }];
 
   let assemblyFormat = "attr-dict";
