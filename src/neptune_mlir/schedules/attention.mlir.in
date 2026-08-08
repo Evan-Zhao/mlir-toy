@@ -24,6 +24,11 @@ module attributes {transform.with_named_sequence} {
       // Replace `matmul(P_ij / s_i, V_jd)` with `matmul(P_ij, V_jd) / s_i`.
       transform.apply_patterns.ta.sink_div_after_matmul
     } : !any
+    // Factor a positive scale out of masked scores, then move it after the max reduction.
+    // Keep this separate from exp-to-exp2's opposite scale-motion patterns.
+    transform.apply_patterns to %func {
+      transform.apply_patterns.ta.sink_scale_after_max
+    } : !any
     transform.apply_cse to %func : !any
     // This is a special idiom: use einsum to match matmuls in `ta` dialect is easy.
     // Then the `to_linalg` translator keeps these handles alive even after the translation,
