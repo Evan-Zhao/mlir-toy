@@ -226,9 +226,9 @@ def HTile_GatherNdOp : Op<HTile_Dialect, "gather_nd"> {
 def HTile_LoadOp : Op<HTile_Dialect, "load", [AttrSizedOperandSegments]> {
   let summary = "load a tile from memory";
   let description = [{
-    Loads a tile from a memory-like source at the given scalar offsets. This
-    makes explicit the tile read semantics that Neptune currently represents
-    with TIR BufferRegion reads.
+    Loads a tile or scalar from a memory-like source at the given scalar
+    offsets. Inside an outlined `htile.kernel`, the source must be a memref.
+    Tensor sources may occur transiently before kernel outlining.
 
     An optional `mask` and `other` pair gives the load predicated semantics.
     For every result coordinate, a true mask element loads from the source and
@@ -243,7 +243,7 @@ def HTile_LoadOp : Op<HTile_Dialect, "load", [AttrSizedOperandSegments]> {
 
   let arguments = (ins AnyType:$source, Variadic<Index>:$offsets,
                        Optional<AnyRankedTensor>:$mask, Optional<AnyType>:$other);
-  let results = (outs AnyRankedTensor:$result);
+  let results = (outs AnyType:$result);
 
   let builders = [
     OpBuilder<(ins "::mlir::Type":$resultType, "::mlir::Value":$source,

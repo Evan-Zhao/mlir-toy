@@ -26,6 +26,17 @@ module {
 // -----
 
 module {
+  // CHECK-LABEL: htile.kernel @scalar_load
+  htile.kernel @scalar_load(%source : memref<16xi32>) {
+    %c0 = arith.constant 0 : index
+    // CHECK: htile.load %{{.*}}[%{{.*}}] : memref<16xi32> -> i32
+    %0 = htile.load %source[%c0] : memref<16xi32> -> i32
+    htile.return
+  }
+}
+
+// -----
+
 module {
   htile.kernel @load_from_tensor(%source : tensor<16x8xf32>) {
     %c0 = arith.constant 0 : index
