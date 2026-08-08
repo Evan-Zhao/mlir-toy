@@ -289,6 +289,37 @@ module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%module: !any) {
     %func = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
     %foralls = transform.structured.match ops{["scf.forall"]} in %func : (!any) -> !any
+    %launches, %kernels = transform.htile.outline_kernels %foralls
+        {kernel_names = ["extract_from_tensor"]} : (!any) -> (!any, !any)
+    transform.yield
+  }
+
+  func.func @extract_from_tensor(%input: tensor<16x8xi32>) {
+    scf.forall (%i) in (1) {
+      %c0 = arith.constant 0 : index
+      %scalar = tensor.extract %input[%i, %c0] : tensor<16x8xi32>
+      scf.forall.in_parallel {
+      }
+    }
+    return
+  }
+}
+
+// CHECK-LABEL: htile.kernel @extract_from_tensor
+// CHECK-SAME: %[[INPUT:.*]] : memref<16x8xi32>
+// CHECK-NOT: tensor.extract
+// CHECK: htile.load %[[INPUT]][%{{.*}}, %{{.*}}] : memref<16x8xi32> -> i32
+// CHECK-NOT: tensor.extract
+// CHECK: htile.return
+
+// -----
+
+!any = !transform.any_op
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !any) {
+    %func = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
+    %foralls = transform.structured.match ops{["scf.forall"]} in %func : (!any) -> !any
     // expected-error @below {{failed to validate selected scf.forall ops}}
     %launches, %kernels = transform.htile.outline_kernels %foralls
         {kernel_names = ["nested"]} : (!any) -> (!any, !any)

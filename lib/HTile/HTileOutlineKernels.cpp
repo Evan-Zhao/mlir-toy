@@ -108,6 +108,14 @@ LogicalResult materializeStoreForInsertSlice(RewriterBase &rewriter,
   return success();
 }
 
+Value materializeLoadForExtract(OpBuilder &builder, tensor::ExtractOp extract, Value buffer,
+                                bool emitHTileLoad) {
+  if (emitHTileLoad)
+    return htile::LoadOp::create(builder, extract.getLoc(), extract.getType(), buffer,
+                                 extract.getIndices());
+  return memref::LoadOp::create(builder, extract.getLoc(), buffer, extract.getIndices());
+}
+
 FailureOr<Value> materializeLoadForExtractSlice(OpBuilder &builder, tensor::ExtractSliceOp extract,
                                                 Value buffer, bool emitHTileLoad) {
   if (emitHTileLoad) {
@@ -219,6 +227,10 @@ FailureOr<bool> materializeLoadsForTensorUsers(RewriterBase &rewriter, OpOperand
     // Retarget that load instead of reading the entire tensor first.
     use.set(buffer);
     return FailureOr<bool>(false); // Op not erased
+  } else if (auto extract = dyn_cast<tensor::ExtractOp>(owner)) {
+    Value loaded = materializeLoadForExtract(rewriter, extract, buffer, emitHTileLoad);
+    rewriter.replaceOp(extract, loaded);
+    return FailureOr<bool>(true); // Op erased
   } else if (auto extract = dyn_cast<tensor::ExtractSliceOp>(owner)) {
     // If the use is a tensor.extract_slice, materialize a sliced read of the buffer.
     auto loaded = materializeLoadForExtractSlice(rewriter, extract, buffer, emitHTileLoad);
