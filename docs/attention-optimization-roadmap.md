@@ -73,7 +73,6 @@ The transformation reduces grid parallelism. At `S=4096`, the prototype regresse
 remaining batch, K/V-head, and query-tile grid is large enough. The selection policy is deferred to
 future schedule selection or autotuning work.
 
-
 ## 2. Normalize Causal Masks to Mixed-Loop-Local Coordinates
 
 **Status:** Measured with manual Triton prototypes; not implemented.
@@ -171,3 +170,93 @@ improvements.
 
 Using `BLOCK_M=64` reduced diagonal waste and was 28.3% faster at `S=1024`, but was 8.4% slower at
 `S=8192`. This remains a shape-dependent tile-selection decision rather than a causal-mask rewrite.
+
+## 3. Remove the Row-Constant Part of ALiBi After Tiling
+
+**Status:** Measured with manual Triton prototypes; not implemented.
+
+The generated ALiBi kernel constructs a two-dimensional bias tile from absolute query and key
+positions:
+
+```text
+query = query_tile_origin + row
+key   = key_tile_origin + col
+bias  = (key - query) * slope
+logit = dot * scale + bias
+```
+
+For a fixed query row, `-query * slope` is constant across the softmax reduction. Softmax is
+invariant to this row-wise translation:
+
+```text
+softmax_j(x_ij + key_j * slope - query_i * slope)
+  = softmax_j(x_ij + key_j * slope)
+```
+
+Dropping the full query position would make the remaining bias grow with the absolute sequence
+position. A tile-relative form keeps values smaller while eliminating the row dimension:
+
+```text
+bias = (key - query_tile_origin) * slope
+```
+
+This differs from the original bias by `row * slope`, which is still constant across each softmax
+row. The causal predicate must continue to use the original absolute query and key positions.
+
+### Measured Evidence
+
+Measurements used an RTX 6000 Ada, four warps, three stages, and `BLOCK_N=64`. The current kernels
+included positive-scale sinking after max and the revised exp-to-exp2 handling for biased logits.
+Timings are medians from repeated interleaved runs.
+
+| Shape | `BLOCK_M` | Existing bias | Tile-relative bias | Change |
+| --- | ---: | ---: | ---: | ---: |
+| `S=1024, D=64` | 64 | 23.40 us | 17.51 us | 25.2% faster |
+| `S=4096, D=64` | 128 | 91.69 us | 78.85 us | 14.0% faster |
+| `S=4096, D=128` | 128 | 190.78 us | 176.25 us | 7.6% faster |
+
+For `S=1024` and `D=64`, selected PTX instruction counts changed as follows:
+
+| Metric | Existing bias | Tile-relative bias |
+| --- | ---: | ---: |
+| `mul.f32` instructions | 132 | 100 |
+| `cvt.rn.f32.s64` instructions | 16 | 0 |
+| `sub.f32` instructions | 64 | 0 |
+| Local spill loads/stores | 0 / 0 | 0 / 0 |
+
+At `S=4096` and `D=64`, `mul.f32` decreased from 264 to 168, while the integer-to-float
+conversions and floating-point subtractions were again eliminated. The optimized kernels differed
+from the existing FP16 outputs by at most `9.77e-4`. For `S=1024`, both kernels had the same
+`9.77e-4` maximum error against a PyTorch reference and nearly identical mean error.
+
+### Required Compiler Work
+
+This is a softmax-invariance transformation, not a generally valid arithmetic canonicalization. A
+schedule-aware implementation should:
+
+1. Identify the ALiBi expression `(key - query) * slope` feeding the softmax logits.
+2. Apply the rewrite after query tiling, when `query_tile_origin` and the row offset are explicit.
+3. Prove that the removed term depends only on non-reduction axes and that the max state is internal
+   to the softmax update.
+4. Preserve the original absolute positions in causal or window predicates.
+5. Rewrite both the mask-free live loop and the masked mixed loop without changing dead-suffix
+   specialization.
+
+A more general formulation could hoist any row-only additive term through max and cancel it from
+centered logits:
+
+```text
+max_j(x_ij + r_i) = max_j(x_ij) + r_i
+(x_ij + r_i) - (max_j(x_ij) + r_i) = x_ij - max_j(x_ij)
+```
+
+The targeted ALiBi form is a smaller first implementation and preserves better numerical range than
+replacing the relative distance with the absolute key position.
+
+### Secondary Experiments
+
+After removing the row-constant term, precomputing `col * slope` outside the K/V loop and adding a
+scalar block offset improved timings by only about another 1%. Row-wise reciprocal normalization
+was slightly slower, and duplicate probability `exp2` expressions in generated Triton were already
+eliminated in PTX. Tile and warp changes remain shape-dependent autotuning decisions.
+>>>>>>> conflict 1 of 1 ends
