@@ -214,7 +214,12 @@ FailureOr<bool> materializeLoadsForTensorUsers(RewriterBase &rewriter, OpOperand
   Operation *owner = use.getOwner();
   OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPoint(owner);
-  if (auto extract = dyn_cast<tensor::ExtractSliceOp>(owner)) {
+  if (isa<htile::LoadOp>(owner) && use.getOperandNumber() == 0) {
+    // Another transform may have already materialized the desired tile load.
+    // Retarget that load instead of reading the entire tensor first.
+    use.set(buffer);
+    return FailureOr<bool>(false); // Op not erased
+  } else if (auto extract = dyn_cast<tensor::ExtractSliceOp>(owner)) {
     // If the use is a tensor.extract_slice, materialize a sliced read of the buffer.
     auto loaded = materializeLoadForExtractSlice(rewriter, extract, buffer, emitHTileLoad);
     if (failed(loaded))
@@ -377,8 +382,7 @@ getLoopIVsAndProgramBounds(RewriterBase &rewriter, scf::ForallOp forall) {
     }
     for (size_t index = collapsedDims; index < nDims; ++index) {
       size_t programDimension = index - collapsedDims + 1;
-      normalizedIds[index] =
-          htile::ProgramIdOp::create(rewriter, loc, indexType, programDimension);
+      normalizedIds[index] = htile::ProgramIdOp::create(rewriter, loc, indexType, programDimension);
     }
   }
 
