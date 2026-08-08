@@ -26,6 +26,19 @@ module {
 // -----
 
 module {
+module {
+  htile.kernel @load_from_tensor(%source : tensor<16x8xf32>) {
+    %c0 = arith.constant 0 : index
+    // expected-error@+1 {{requires source to be a memref inside an htile.kernel}}
+    %0 = htile.load %source[%c0, %c0]
+        : tensor<16x8xf32> -> tensor<4x8xf32>
+    htile.return
+  }
+}
+
+// -----
+
+module {
   // CHECK-LABEL: func.func @masked_parallel_insert_slice
   func.func @masked_parallel_insert_slice(
       %source: tensor<4x1x8xf32>, %mask: tensor<4x1x8xi1>,

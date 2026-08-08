@@ -63,6 +63,10 @@ mlir::LogicalResult LaunchFuncOp::verifySymbolUses(mlir::SymbolTableCollection &
 }
 
 mlir::LogicalResult LoadOp::verify() {
+  if (getOperation()->getParentOfType<KernelOp>() &&
+      !mlir::isa<mlir::MemRefType>(getSource().getType()))
+    return emitOpError("requires source to be a memref inside an htile.kernel");
+
   bool hasMask = static_cast<bool>(getMask());
   bool hasOther = static_cast<bool>(getOther());
   if (hasMask != hasOther)
