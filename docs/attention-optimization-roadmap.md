@@ -72,3 +72,102 @@ The transformation reduces grid parallelism. At `S=4096`, the prototype regresse
 127.40 us because only 64 fused CTAs remained. It should therefore be selected only when the
 remaining batch, K/V-head, and query-tile grid is large enough. The selection policy is deferred to
 future schedule selection or autotuning work.
+
+
+## 2. Normalize Causal Masks to Mixed-Loop-Local Coordinates
+
+**Status:** Measured with manual Triton prototypes; not implemented.
+
+Dead-tile specialization splits causal attention into a mask-free live prefix, a mixed diagonal
+suffix, and an omitted dead suffix. For `BLOCK_M=128` and `BLOCK_N=64`, every query tile has exactly
+two mixed K/V tiles. The mixed loop currently reconstructs global token positions before comparing
+them:
+
+```text
+query = query_block * 128 + row
+key   = key_block * 64 + col
+mask  = key <= query
+```
+
+The specialization has already proved that the mixed loop starts at
+`key_block = query_block * 2`. The same predicate can therefore use local coordinates:
+
+```text
+diagonal_offset = key_block - mixed_lower
+mask = diagonal_offset * 64 + col <= row
+```
+
+This removes tensor-wide i64 fills, global-position additions, and 64-bit comparisons from the two
+masked iterations. It does not change the matrix operations or memory pipeline.
+
+At `S=4096`, specialization already reduces the number of K/V block iterations per head from 2048
+to 1056. Only 64 of the remaining iterations, about 6.1%, evaluate a mask. The local predicate
+therefore targets a small but irreducible part of the current causal schedule.
+
+### Measured Evidence
+
+Measurements used an RTX 6000 Ada, `B=1`, `H=4`, `BLOCK_M=128`, `BLOCK_N=64`, four warps, and three
+stages. Timings are medians from interleaved runs.
+
+| Shape | Existing predicate | Local predicate | Change |
+| --- | ---: | ---: | ---: |
+| `S=1024, D=64` | 23.24 us | 22.81 us | 1.83% faster |
+| `S=4096, D=64` | 74.36 us | 72.96 us | 1.88% faster |
+| `S=8192, D=64` | 227.07 us | 223.82 us | 1.43% faster |
+| `S=4096, D=128` | 156.36 us | 155.05 us | 0.84% faster |
+
+For `S=4096` and `D=64`, PTX and resource usage changed as follows:
+
+| Metric | Existing predicate | Local predicate |
+| --- | ---: | ---: |
+| PTX lines | 3747 | 3405 |
+| PTX bytes | 164,146 | 154,410 |
+| PTX instruction lines | 2597 | 2249 |
+| `setp` instructions | 124 | 75 |
+| `selp` instructions | 122 | 72 |
+| PTX b64 virtual registers | 261 | 181 |
+| Registers per thread | 255 | 252 |
+| `mma.sync` instructions | 256 | 256 |
+| `cp.async` instructions | 48 | 48 |
+
+The local-coordinate prototype was bit-identical to the existing generated kernel. Narrowing only
+the global mask arithmetic from i64 to i32 also improved `S=4096` by 1.74%, but produced less PTX
+simplification and introduced a small stack frame. Local normalization is the preferred form.
+
+### Required Compiler Work
+
+`transform.loop.specialize_dead_tile` already owns the information needed for this rewrite: the
+matched comparison, the possible-live interval, the mixed-loop lower bound, and the affine
+relationship between the producer indices and loop IV. When cloning the masked producer into the
+mixed loop, it should:
+
+1. Prove that the query-tile origin equals the mixed-loop lower bound multiplied by `BLOCK_N`.
+2. Replace the global key and query expressions with an affine expression relative to the mixed
+   lower bound.
+3. Preserve the existing predicate when the origins, tile-size ratio, or integer range cannot be
+   proved.
+4. Keep fully-live producer bypass and dead-suffix truncation unchanged.
+
+A more general implementation may also normalize the two inequalities in a sliding-window mask,
+but causal comparison support is sufficient for the measured optimization.
+
+### Alternatives Tested
+
+Several other ways to specialize the two diagonal tiles regressed on the same `S=4096`, `D=64`
+case:
+
+| Experiment | Change |
+| --- | ---: |
+| Statically unroll the two mixed iterations | 5.38% slower |
+| Statically unroll after localizing the mask | 2.20% slower |
+| Replace the clamped upper bound with `mixed_lower + 2` | 3.48% slower |
+| Combine the two N=64 diagonal tiles into one N=128 tile | 18.46% slower |
+| Hoist the Q tile across the live and mixed loops | 2.12% slower |
+
+Static unrolling duplicated the loop body, weakened async pipelining, and introduced a stack frame.
+The N=128 diagonal tile produced a 240-byte stack frame and lost half of the `cp.async`
+instructions. These forms should not be pursued without corresponding pipeline and register-pressure
+improvements.
+
+Using `BLOCK_M=64` reduced diagonal waste and was 28.3% faster at `S=1024`, but was 8.4% slower at
+`S=8192`. This remains a shape-dependent tile-selection decision rather than a causal-mask rewrite.
