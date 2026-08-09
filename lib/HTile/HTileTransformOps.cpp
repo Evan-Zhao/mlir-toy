@@ -31,6 +31,53 @@ using namespace mlir;
 namespace mlir::transform {
 namespace {
 
+struct RewriteUnitDimExpandShapeAsUnsqueeze : public OpRewritePattern<tensor::ExpandShapeOp> {
+  using OpRewritePattern<tensor::ExpandShapeOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tensor::ExpandShapeOp expandOp,
+                                PatternRewriter &rewriter) const override {
+    RankedTensorType inputType = expandOp.getSrcType();
+    RankedTensorType resultType = expandOp.getResultType();
+    if (resultType.getRank() <= inputType.getRank())
+      return failure();
+
+    SmallVector<bool> mask(static_cast<size_t>(resultType.getRank()), true);
+    ArrayRef<int64_t> inputShape = inputType.getShape();
+    ArrayRef<int64_t> resultShape = resultType.getShape();
+    for (auto [inputDim, group] : llvm::enumerate(expandOp.getReassociationIndices())) {
+      std::optional<int64_t> carriedDim;
+      int64_t inputExtent = inputShape[inputDim];
+      for (int64_t resultDim : group) {
+        int64_t resultExtent = resultShape[resultDim];
+        bool carriesInput = inputExtent == ShapedType::kDynamic
+                                ? resultExtent == ShapedType::kDynamic
+                                : inputExtent != 1 && resultExtent == inputExtent;
+        if (!carriesInput) {
+          if (resultExtent != 1)
+            return failure();
+          continue;
+        }
+        if (carriedDim)
+          return failure();
+        carriedDim = resultDim;
+      }
+      if (!carriedDim) {
+        if (inputExtent != 1 || group.empty())
+          return failure();
+        carriedDim = group.front();
+      }
+      mask[static_cast<size_t>(*carriedDim)] = false;
+    }
+
+    if (inputType.getRank() == 0 &&
+        !llvm::all_of(resultShape, [](int64_t extent) { return extent == 1; }))
+      return failure();
+
+    rewriter.replaceOpWithNewOp<htile::UnsqueezeOp>(expandOp, resultType, expandOp.getSrc(), mask);
+    return success();
+  }
+};
+
 struct FoldRankReducingExtractOfExpandShape : public OpRewritePattern<tensor::ExtractSliceOp> {
   using OpRewritePattern<tensor::ExtractSliceOp>::OpRewritePattern;
 
@@ -458,9 +505,9 @@ LogicalResult rewriteContraction(RewriterBase &rewriter, linalg::GenericOp op) {
   Value init = op.getDpsInits()[0];
   bool omitAccumulator = isZeroContractionInit(init);
   Value accumulator = omitAccumulator ? Value{} : init;
-  auto dot = htile::DotOp::create(rewriter, op.getLoc(), op.getResult(0).getType(),
-                                  op.getInputs()[0], op.getInputs()[1], accumulator, lhsAttr,
-                                  rhsAttr, StringAttr{});
+  auto dot =
+      htile::DotOp::create(rewriter, op.getLoc(), op.getResult(0).getType(), op.getInputs()[0],
+                           op.getInputs()[1], accumulator, lhsAttr, rhsAttr, StringAttr{});
   rewriter.replaceOp(op, dot.getResult());
   if (omitAccumulator) {
     if (auto full = init.getDefiningOp<htile::FullOp>(); full && full->use_empty())
@@ -685,6 +732,11 @@ DiagnosedSilenceableFailure HTileLinalgToSemanticOp::applyToOne(TransformRewrite
         tensor::populateFoldTensorEmptyPatterns(patterns);
       })))
     BAIL("failed to apply tensor cleanup patterns");
+
+  if (failed(applyRewritesGreedily(rewriter, target, [&](RewritePatternSet &patterns) {
+        patterns.add<RewriteUnitDimExpandShapeAsUnsqueeze>(patterns.getContext());
+      })))
+    BAIL("failed to rewrite unit-dimension expansions");
 
   return DiagnosedSilenceableFailure::success();
 }

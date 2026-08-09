@@ -158,4 +158,18 @@ module attributes {transform.with_named_sequence} {
     %0 = linalg.fill ins(%value : f32) outs(%out : tensor<4x8xf32>) -> tensor<4x8xf32>
     return %0 : tensor<4x8xf32>
   }
+
+  // CHECK-LABEL: func.func @unit_dim_expand_shape(
+  func.func @unit_dim_expand_shape(%tile: tensor<4x8xf32>, %scalar: tensor<f32>)
+      -> (tensor<4x1x8xf32>, tensor<1xf32>) {
+    // CHECK: %[[TILE:.+]] = htile.unsqueeze %arg0 mask [false, true, false]
+    // CHECK-SAME: tensor<4x8xf32> -> tensor<4x1x8xf32>
+    // CHECK: %[[SCALAR:.+]] = htile.unsqueeze %arg1 mask [true]
+    // CHECK-SAME: tensor<f32> -> tensor<1xf32>
+    %expanded = tensor.expand_shape %tile [[0, 1], [2]] output_shape [4, 1, 8]
+        : tensor<4x8xf32> into tensor<4x1x8xf32>
+    %expanded_scalar = tensor.expand_shape %scalar [] output_shape [1]
+        : tensor<f32> into tensor<1xf32>
+    return %expanded, %expanded_scalar : tensor<4x1x8xf32>, tensor<1xf32>
+  }
 }
