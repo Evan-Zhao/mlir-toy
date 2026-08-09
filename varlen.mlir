@@ -108,6 +108,10 @@ module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo
     %live_loop, %mixed_loop = transform.loop.specialize_dead_tile in %j0_loop
         {dead_value = 0xFF800000 : f32} : (!any) -> (!any, !any)
     transform.apply_patterns to %func {
+      // Difference from dense attention (4): detensorize rank-0 tensors to scalars.
+      // This makes the program simpler and the HTile-lowered program work on Triton
+      // (otherwise we'll have indexing into tensor which doesn't work in Triton).
+      transform.apply_patterns.linalg.detensorize_rank_zero
       transform.apply_patterns.canonicalization
     } : !any
 

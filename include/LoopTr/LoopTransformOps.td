@@ -2,6 +2,30 @@ include "mlir/Dialect/Transform/IR/TransformDialect.td"
 include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
+def LinalgDetensorizeRankZeroPatternsOp
+    : Op<Transform_Dialect, "apply_patterns.linalg.detensorize_rank_zero",
+         [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
+  let summary = "Collect rank-zero tensor detensorization patterns";
+
+  let description = [{
+    Collects patterns that move computations out of rank-zero tensors and into
+    scalar SSA values. Rank-zero `linalg.generic` and elementwise `arith`
+    computations are scalarized, with `tensor.from_elements` retained only at
+    uses that still require a tensor value.
+
+    Rank-zero inputs to tiled `linalg.generic` operations become captured
+    scalars. Their now-unused input operands and indexing maps are removed. The
+    patterns also expose scalar accesses through rank-zero
+    `tensor.extract_slice` operations. Canonicalization can then fold
+    `tensor.extract(tensor.from_elements(...))` and remove dead tensor wrappers.
+
+    This pattern set is intended to run after tensor scheduling and before
+    consumers that expect scalar metadata computations.
+  }];
+
+  let assemblyFormat = "attr-dict";
+}
+
 def LinalgEraseUnusedOperandsAndResultsOp
     : Op<Transform_Dialect, "linalg.erase_unused_operands_and_results",
          [TransformOpInterface, TransformEachOpTrait,

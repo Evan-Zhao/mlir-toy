@@ -14,6 +14,7 @@ add_library(NeptuneLoopTransform STATIC
   FusionIntoLoop.cpp
   FusionSplitKUpdate.cpp
   FusionRollingUpdate.cpp
+  LinalgDetensorizeRankZero.cpp
   LinalgTransformOps.cpp
   LoopSpecializeDeadTile.cpp
   LoopTransformExtension.cpp
