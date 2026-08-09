@@ -5,6 +5,7 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/SymbolTable.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 #define GET_DIALECT_DEFS
@@ -157,6 +158,74 @@ mlir::Operation *MaskedParallelInsertSliceOp::getIteratingParent() {
   if (auto combiningOp = mlir::dyn_cast<mlir::InParallelOpInterface>(getOperation()->getParentOp()))
     return combiningOp->getParentOp();
   return nullptr;
+}
+
+mlir::LogicalResult UnsqueezeOp::verify() {
+  auto inputType = getInput().getType();
+  auto resultType = getResult().getType();
+  if (inputType.getElementType() != resultType.getElementType())
+    return emitOpError() << "requires input and result element types to match";
+
+  llvm::ArrayRef<bool> mask = getMask();
+  if (mask.size() != static_cast<size_t>(resultType.getRank()))
+    return emitOpError() << "requires one mask entry per result dimension";
+
+  int64_t inputDim = 0;
+  for (auto [resultDim, insert] : llvm::enumerate(mask)) {
+    int64_t resultExtent = resultType.getDimSize(static_cast<int64_t>(resultDim));
+    if (insert) {
+      if (resultExtent != 1)
+        return emitOpError() << "cannot insert result dimension " << resultDim << " with extent "
+                             << resultExtent;
+      continue;
+    }
+    if (inputDim >= inputType.getRank())
+      return emitOpError() << "requires input rank plus inserted dimensions to equal result rank";
+    int64_t inputExtent = inputType.getDimSize(inputDim);
+    if (inputExtent != mlir::ShapedType::kDynamic &&
+        resultExtent != mlir::ShapedType::kDynamic && inputExtent != resultExtent)
+      return emitOpError() << "input dimension " << inputDim << " has extent " << inputExtent
+                           << " but mapped result dimension " << resultDim << " has extent "
+                           << resultExtent;
+    ++inputDim;
+  }
+  if (inputDim != inputType.getRank())
+    return emitOpError() << "requires input rank plus inserted dimensions to equal result rank";
+  return mlir::success();
+}
+
+mlir::LogicalResult SqueezeOp::verify() {
+  auto inputType = getInput().getType();
+  auto resultType = getResult().getType();
+  if (inputType.getElementType() != resultType.getElementType())
+    return emitOpError() << "requires input and result element types to match";
+
+  llvm::ArrayRef<bool> mask = getMask();
+  if (mask.size() != static_cast<size_t>(inputType.getRank()))
+    return emitOpError() << "requires one mask entry per input dimension";
+
+  int64_t resultDim = 0;
+  for (auto [inputDim, remove] : llvm::enumerate(mask)) {
+    int64_t inputExtent = inputType.getDimSize(static_cast<int64_t>(inputDim));
+    if (remove) {
+      if (inputExtent != 1)
+        return emitOpError() << "cannot remove input dimension " << inputDim << " with extent "
+                             << inputExtent;
+      continue;
+    }
+    if (resultDim >= resultType.getRank())
+      return emitOpError() << "requires input rank minus removed dimensions to equal result rank";
+    int64_t resultExtent = resultType.getDimSize(resultDim);
+    if (inputExtent != mlir::ShapedType::kDynamic &&
+        resultExtent != mlir::ShapedType::kDynamic && inputExtent != resultExtent)
+      return emitOpError() << "input dimension " << inputDim << " has extent " << inputExtent
+                           << " but mapped result dimension " << resultDim << " has extent "
+                           << resultExtent;
+    ++resultDim;
+  }
+  if (resultDim != resultType.getRank())
+    return emitOpError() << "requires input rank minus removed dimensions to equal result rank";
+  return mlir::success();
 }
 
 mlir::LogicalResult BroadcastOp::verify() {

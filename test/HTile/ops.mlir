@@ -50,6 +50,76 @@ module {
 // -----
 
 module {
+  // CHECK-LABEL: func.func @unsqueeze
+  func.func @unsqueeze(%input: tensor<4x8xf32>) -> tensor<4x1x8xf32> {
+    // CHECK: htile.unsqueeze %{{.*}} mask [false, true, false]
+    // CHECK-SAME: tensor<4x8xf32> -> tensor<4x1x8xf32>
+    %result = htile.unsqueeze %input mask [false, true, false]
+        : tensor<4x8xf32> -> tensor<4x1x8xf32>
+    return %result : tensor<4x1x8xf32>
+  }
+}
+
+// -----
+
+module {
+  func.func @unsqueeze_non_unit_dimension(%input: tensor<4x8xf32>) {
+    // expected-error@+1 {{cannot insert result dimension 1 with extent 2}}
+    %0 = htile.unsqueeze %input mask [false, true, false]
+        : tensor<4x8xf32> -> tensor<4x2x8xf32>
+    return
+  }
+}
+
+// -----
+
+module {
+  func.func @unsqueeze_wrong_mask_length(%input: tensor<4x8xf32>) {
+    // expected-error@+1 {{requires one mask entry per result dimension}}
+    %0 = htile.unsqueeze %input mask [false, true]
+        : tensor<4x8xf32> -> tensor<4x1x8xf32>
+    return
+  }
+}
+
+// -----
+
+module {
+  // CHECK-LABEL: func.func @squeeze
+  func.func @squeeze(%input: tensor<4x1x8xf32>) -> tensor<4x8xf32> {
+    // CHECK: htile.squeeze %{{.*}} mask [false, true, false]
+    // CHECK-SAME: tensor<4x1x8xf32> -> tensor<4x8xf32>
+    %result = htile.squeeze %input mask [false, true, false]
+        : tensor<4x1x8xf32> -> tensor<4x8xf32>
+    return %result : tensor<4x8xf32>
+  }
+}
+
+// -----
+
+module {
+  func.func @squeeze_non_unit_dimension(%input: tensor<4x2x8xf32>) {
+    // expected-error@+1 {{cannot remove input dimension 1 with extent 2}}
+    %0 = htile.squeeze %input mask [false, true, false]
+        : tensor<4x2x8xf32> -> tensor<4x8xf32>
+    return
+  }
+}
+
+// -----
+
+module {
+  func.func @squeeze_wrong_mask_length(%input: tensor<4x1x8xf32>) {
+    // expected-error@+1 {{requires one mask entry per input dimension}}
+    %0 = htile.squeeze %input mask [false, true]
+        : tensor<4x1x8xf32> -> tensor<4x8xf32>
+    return
+  }
+}
+
+// -----
+
+module {
   // CHECK-LABEL: func.func @masked_parallel_insert_slice
   func.func @masked_parallel_insert_slice(
       %source: tensor<4x1x8xf32>, %mask: tensor<4x1x8xi1>,

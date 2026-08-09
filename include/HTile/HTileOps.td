@@ -190,6 +190,24 @@ def HTile_UnsqueezeOp : Op<HTile_Dialect, "unsqueeze"> {
   let arguments = (ins AnyRankedTensor:$input, DenseBoolArrayAttr:$mask);
   let results = (outs AnyRankedTensor:$result);
 
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$input `mask` $mask attr-dict `:` type($input) `->` type($result)";
+}
+
+def HTile_SqueezeOp : Op<HTile_Dialect, "squeeze"> {
+  let summary = "remove unit dimensions from a tile";
+  let description = [{
+    Removes dimensions of size one from a tile. The `mask` attribute contains
+    one entry per input dimension: `true` removes that dimension, while `false`
+    maps it to the next result dimension.
+  }];
+
+  let arguments = (ins AnyRankedTensor:$input, DenseBoolArrayAttr:$mask);
+  let results = (outs AnyRankedTensor:$result);
+
+  let hasVerifier = 1;
+
   let assemblyFormat = "$input `mask` $mask attr-dict `:` type($input) `->` type($result)";
 }
 
