@@ -78,6 +78,55 @@ struct RewriteUnitDimExpandShapeAsUnsqueeze : public OpRewritePattern<tensor::Ex
   }
 };
 
+struct RewriteUnitDimCollapseShapeAsSqueeze : public OpRewritePattern<tensor::CollapseShapeOp> {
+  using OpRewritePattern<tensor::CollapseShapeOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tensor::CollapseShapeOp collapseOp,
+                                PatternRewriter &rewriter) const override {
+    RankedTensorType inputType = collapseOp.getSrcType();
+    RankedTensorType resultType = collapseOp.getResultType();
+    if (inputType.getRank() <= resultType.getRank())
+      return failure();
+
+    SmallVector<bool> mask(static_cast<size_t>(inputType.getRank()), true);
+    ArrayRef<int64_t> inputShape = inputType.getShape();
+    ArrayRef<int64_t> resultShape = resultType.getShape();
+    for (auto [resultDim, group] : llvm::enumerate(collapseOp.getReassociationIndices())) {
+      std::optional<int64_t> carriedDim;
+      int64_t resultExtent = resultShape[resultDim];
+      for (int64_t inputDim : group) {
+        int64_t inputExtent = inputShape[inputDim];
+        bool carriesResult = resultExtent == ShapedType::kDynamic
+                                 ? inputExtent == ShapedType::kDynamic
+                                 : resultExtent != 1 && inputExtent == resultExtent;
+        if (!carriesResult) {
+          if (inputExtent != 1)
+            return failure();
+          continue;
+        }
+        if (carriedDim)
+          return failure();
+        carriedDim = inputDim;
+      }
+      if (!carriedDim) {
+        if (resultExtent != 1 || group.empty())
+          return failure();
+        carriedDim = group.front();
+      }
+      mask[static_cast<size_t>(*carriedDim)] = false;
+    }
+
+    if (resultType.getRank() == 0 && !llvm::all_of(inputShape, [](int64_t extent) {
+          return extent == 1;
+        }))
+      return failure();
+
+    rewriter.replaceOpWithNewOp<htile::SqueezeOp>(collapseOp, resultType, collapseOp.getSrc(),
+                                                   mask);
+    return success();
+  }
+};
+
 struct FoldRankReducingExtractOfExpandShape : public OpRewritePattern<tensor::ExtractSliceOp> {
   using OpRewritePattern<tensor::ExtractSliceOp>::OpRewritePattern;
 
@@ -735,8 +784,9 @@ DiagnosedSilenceableFailure HTileLinalgToSemanticOp::applyToOne(TransformRewrite
 
   if (failed(applyRewritesGreedily(rewriter, target, [&](RewritePatternSet &patterns) {
         patterns.add<RewriteUnitDimExpandShapeAsUnsqueeze>(patterns.getContext());
+        patterns.add<RewriteUnitDimCollapseShapeAsSqueeze>(patterns.getContext());
       })))
-    BAIL("failed to rewrite unit-dimension expansions");
+    BAIL("failed to rewrite unit-dimension reshapes");
 
   return DiagnosedSilenceableFailure::success();
 }

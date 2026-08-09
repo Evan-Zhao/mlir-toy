@@ -172,4 +172,18 @@ module attributes {transform.with_named_sequence} {
         : tensor<f32> into tensor<1xf32>
     return %expanded, %expanded_scalar : tensor<4x1x8xf32>, tensor<1xf32>
   }
+
+  // CHECK-LABEL: func.func @unit_dim_collapse_shape(
+  func.func @unit_dim_collapse_shape(%tile: tensor<4x1x8xf32>, %scalar: tensor<1xf32>)
+      -> (tensor<4x8xf32>, tensor<f32>) {
+    // CHECK: %[[TILE:.+]] = htile.squeeze %arg0 mask [false, true, false]
+    // CHECK-SAME: tensor<4x1x8xf32> -> tensor<4x8xf32>
+    // CHECK: %[[SCALAR:.+]] = htile.squeeze %arg1 mask [true]
+    // CHECK-SAME: tensor<1xf32> -> tensor<f32>
+    %collapsed = tensor.collapse_shape %tile [[0, 1], [2]]
+        : tensor<4x1x8xf32> into tensor<4x8xf32>
+    %collapsed_scalar = tensor.collapse_shape %scalar []
+        : tensor<1xf32> into tensor<f32>
+    return %collapsed, %collapsed_scalar : tensor<4x8xf32>, tensor<f32>
+  }
 }
