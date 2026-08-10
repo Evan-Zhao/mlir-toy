@@ -22,12 +22,21 @@ def _f16_matmul_f32(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     return torch.matmul(lhs.to(torch.float16), rhs.to(torch.float16)).to(torch.float32)
 
 
-class Attention4DModule(torch.nn.Module):
+class AttentionModule(torch.nn.Module):
     def __init__(self, mask_f: MaskF):
         super().__init__()
         self.mask_f = mask_f
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        output_shape = q.shape
+        q_heads, kv_heads = q.shape[1], k.shape[1]
+        if q_heads != kv_heads:
+            if q_heads % kv_heads != 0:
+                raise ValueError(f"q heads ({q_heads}) must be divisible by kv heads ({kv_heads})")
+            groups = q_heads // kv_heads
+            q = q.reshape(q.shape[0], groups, kv_heads, q.shape[2], q.shape[3])
+            k = k[:, None, :, :, :].expand(k.shape[0], groups, kv_heads, k.shape[2], k.shape[3])
+            v = v[:, None, :, :, :].expand(v.shape[0], groups, kv_heads, v.shape[2], v.shape[3])
         scale = 1.0 / math.sqrt(q.shape[-1])
         scores = _f16_matmul_f32(q, k.transpose(-1, -2))
         scores = scores * scale
@@ -36,8 +45,10 @@ class Attention4DModule(torch.nn.Module):
             neg_inf = torch.tensor(float("-inf"), dtype=scores.dtype, device=scores.device)
             scores = torch.where(mask, scores, neg_inf)
         probs = torch.softmax(scores, dim=-1)
-        out_f32 = _f16_matmul_f32(probs, v)
-        return out_f32.to(torch.float16)
+        output = _f16_matmul_f32(probs, v).to(torch.float16)
+        if q_heads != kv_heads:
+            output = output.reshape(output_shape)
+        return output
 
 
 def causal_mask(scores: torch.Tensor) -> torch.Tensor:
@@ -75,25 +86,6 @@ class AlibiCausalAttentionModule(torch.nn.Module):
         probs = torch.softmax(scores, dim=-1)
         out_f32 = _f16_matmul_f32(probs, v)
         return out_f32.to(torch.float16)
-
-
-class GlobalGQAModule(torch.nn.Module):
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        output_shape = q.shape
-        q_heads = q.shape[1]
-        kv_heads = k.shape[1]
-        if q_heads % kv_heads != 0:
-            raise ValueError(f"q heads ({q_heads}) must be divisible by kv heads ({kv_heads})")
-        groups = q_heads // kv_heads
-        q = q.reshape(q.shape[0], groups, kv_heads, q.shape[2], q.shape[3])
-        k = k[:, None, :, :, :].expand(k.shape[0], groups, kv_heads, k.shape[2], k.shape[3])
-        v = v[:, None, :, :, :].expand(v.shape[0], groups, kv_heads, v.shape[2], v.shape[3])
-        scale = 1.0 / math.sqrt(q.shape[-1])
-        scores = _f16_matmul_f32(q, k.transpose(-1, -2))
-        scores = scores * scale
-        probs = torch.softmax(scores, dim=-1)
-        out_f32 = _f16_matmul_f32(probs, v)
-        return out_f32.to(torch.float16).reshape(output_shape)
 
 
 class KVOnlyQuantizedAttentionModule(torch.nn.Module):
@@ -204,7 +196,7 @@ def parse_args() -> argparse.Namespace:
         "--kv-heads",
         type=int,
         default=None,
-        help="number of KV heads for GQA variants (defaults to --q-heads)",
+        help="number of KV heads (defaults to --q-heads)",
     )
     parser.add_argument("-s", "--seq-len", type=int, default=128, help="query sequence length")
     parser.add_argument(
@@ -231,20 +223,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _kv_heads(heads: int, kv_heads: int | None) -> int:
-    if kv_heads is not None:
-        resolved_kv_heads = kv_heads
-    elif heads % 2 == 0:
-        resolved_kv_heads = heads // 2
-    else:
-        resolved_kv_heads = 1
-    if resolved_kv_heads <= 0:
-        raise ValueError("--kv-heads must be positive")
-    if heads % resolved_kv_heads != 0:
-        raise ValueError("--heads must be divisible by --kv-heads for GQA variants")
-    return resolved_kv_heads
-
-
 def _build_module_and_args(
     variant: AttentionVariant,
     batch: int,
@@ -265,13 +243,6 @@ def _build_module_and_args(
         k, v = [torch.randn(kv_shape, dtype=fp16) for _ in range(2)]
         return q, k, v
 
-    if variant == AttentionVariant.GLOBAL_GQA:
-        return GlobalGQAModule().eval(), make_qkv()
-
-    if q_heads != kv_heads:
-        raise ValueError(
-            f"q_heads ({q_heads}) must equal kv_heads ({kv_heads}) for {variant.value}"
-        )
     masked_variants = {
         AttentionVariant.GLOBAL_ATTN: lambda _: None,
         AttentionVariant.CAUSAL_ATTN: causal_mask,
@@ -279,7 +250,10 @@ def _build_module_and_args(
     }
     mask_f = masked_variants.get(variant, None)
     if mask_f is not None:
-        return Attention4DModule(mask_f).eval(), make_qkv()
+        return AttentionModule(mask_f).eval(), make_qkv()
+
+    if q_heads != kv_heads:
+        raise ValueError(f"{variant.value} does not support different query and KV head counts")
 
     if variant == AttentionVariant.ALIBI_CAUSAL_ATTN:
         q, k, v = make_qkv()
@@ -340,9 +314,14 @@ def export_attention(
     # `x + arange(N)` into `x[i] + 0.000 + i`, and we don't want that 0.000.
     decomposition_table = get_decomposition_table()
     decomposition_table[torch.ops.aten.arange.default] = arange_default_iota_then_cast
-    kv_seq_len = kv_seq_len or seq_len
+    kv_heads = q_heads if kv_heads is None else kv_heads
+    if q_heads <= 0 or kv_heads <= 0:
+        raise ValueError("query and KV head counts must be positive")
+    if q_heads % kv_heads != 0:
+        raise ValueError(f"q heads ({q_heads}) must be divisible by kv heads ({kv_heads})")
+    resolved_kv_seq_len = seq_len if kv_seq_len is None else kv_seq_len
     model, example_args = _build_module_and_args(
-        variant, batch, q_heads, kv_heads or q_heads, seq_len, kv_seq_len, head_dim, window_size
+        variant, batch, q_heads, kv_heads, seq_len, resolved_kv_seq_len, head_dim, window_size
     )
     exported_program = torch.export.export(model, example_args)
     if output_type not in {"stablehlo", "linalg"}:

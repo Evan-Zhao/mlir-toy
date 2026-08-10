@@ -89,8 +89,9 @@ TRANSLATOR_INPUT_CASES = (
     ]
     + [make_attn_pytest_param(AttentionVariant.KV_FP8_CAUSAL_ATTN, 1, 4, 1024, 64)]
     + [
+        # GQA and MQA cases
         make_attn_pytest_param(
-            AttentionVariant.GLOBAL_GQA, batch, q_heads, seq_len, hd, kv_heads=kv_heads
+            AttentionVariant.GLOBAL_ATTN, batch, q_heads, seq_len, hd, kv_heads=kv_heads
         )
         for batch, (q_heads, kv_heads), seq_len, hd in product(
             BATCHES, GQA_HEADS, SEQ_LENS, HEAD_DIMS
@@ -195,15 +196,14 @@ def test_export_fp8_attention_preserves_quantized_kv_inputs() -> None:
         (AttentionVariant.ALIBI_CAUSAL_ATTN, {"q_heads": 2}),
         (AttentionVariant.WINDOWED_CAUSAL_ATTN, {"q_heads": 2, "window_size": 128}),
         (AttentionVariant.KV_FP8_CAUSAL_ATTN, {"q_heads": 2}),
-        (AttentionVariant.GLOBAL_GQA, {"q_heads": 4, "kv_heads": 2}),
+        (AttentionVariant.GLOBAL_ATTN, {"q_heads": 4, "kv_heads": 2}),
+        (AttentionVariant.CAUSAL_ATTN, {"q_heads": 4, "kv_heads": 2}),
     ],
 )
 def test_export_attention_to_htile_mlir(variant, kwargs) -> None:
     require_export_deps()
 
-    lowered = export_attention_to_htile_mlir(
-        variant=variant, seq_len=128, head_dim=64, **kwargs
-    )
+    lowered = export_attention_to_htile_mlir(variant=variant, seq_len=128, head_dim=64, **kwargs)
 
     assert "func.func @attention" in lowered
     assert "htile.launch_func" in lowered

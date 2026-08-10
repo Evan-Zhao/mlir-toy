@@ -34,8 +34,9 @@ def test_fp8_schedule_fuses_kv_dequantization() -> None:
 
 def test_gqa_keeps_batch_group_head_tiles_fixed() -> None:
     text = materialize_attention_schedule(
-        AttentionSchedule.GLOBAL_GQA,
+        AttentionSchedule.GLOBAL_ATTN,
         AttentionTileConfig(block_m=64, block_n=32),
+        n_batch_dims=3,
     )
     assert "tile_sizes [1, 1, 1, 64, 32, 0]" in text
 
