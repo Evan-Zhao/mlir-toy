@@ -162,9 +162,27 @@ class Translator(shared.BaseTranslator):
         tile_shape = spec.tile_shape
         indices = spec.offsets
 
+        if spec.mask is not None:
+            # Masked loads cannot use block pointer. Load directly from the tensor pointer.
+            if spec.other is None:
+                raise ValueError("masked htile.load requires an other value")
+            stmts, ptr = self._tensor_memref_ptr(
+                spec.memref, indices, mem_shape, tile_shape, spec.dimension_order
+            )
+            tile = self._bind(op.results[0], "tile")
+            stmts.append(
+                shared._assign(
+                    tile,
+                    shared._tl_call(
+                        "load", ptr, mask=self._expr(spec.mask), other=self._expr(spec.other)
+                    ),
+                )
+            )
+            return stmts
+
         # Scalar (0D) loads cannot use block pointer. Load directly.
         if not tile_shape:
-            stmts, ptr = self._scalar_memref_ptr(op.operands[0], indices, mem_shape)
+            stmts, ptr = self._scalar_memref_ptr(spec.memref, indices, mem_shape)
             tile = self._bind(op.results[0], "tile")
             stmts.append(shared._assign(tile, shared._tl_call("load", ptr)))
             return stmts
@@ -201,18 +219,32 @@ class Translator(shared.BaseTranslator):
         return stmts
 
     def _htile_store(self, op: ir.OpView) -> list[ast.stmt]:
-        tile_val = op.operands[0]
-        mem_shape, _ = shared._memref_shape(op.operands[1].type)
-        tile_shape, _ = shared._tensor_shape(op.operands[0].type)
-        indices = list(op.operands[2:])
+        spec = shared._decode_store(op)
+        tile_val = spec.value
+        mem_shape = spec.memref_shape
+        tile_shape = spec.tile_shape
+        indices = spec.offsets
+
+        if spec.mask is not None:
+            stmts, ptr = self._tensor_memref_ptr(
+                spec.memref, indices, mem_shape, tile_shape, spec.dimension_order
+            )
+            stmts.append(
+                ast.Expr(
+                    value=shared._tl_call(
+                        "store", ptr, self._expr(tile_val), mask=self._expr(spec.mask)
+                    )
+                )
+            )
+            return stmts
 
         if not tile_shape:
-            stmts, ptr = self._scalar_memref_ptr(op.operands[1], indices, mem_shape)
+            stmts, ptr = self._scalar_memref_ptr(spec.memref, indices, mem_shape)
             stmts.append(ast.Expr(value=shared._tl_call("store", ptr, self._expr(tile_val))))
             return stmts
 
         stmts, base_ptr, tile_indices, tile_strides = self._fold_batch_dims(
-            op.operands[1], indices, mem_shape, tile_shape
+            spec.memref, indices, mem_shape, tile_shape
         )
         bp = self._fresh("bp")
         stmts.append(
@@ -235,6 +267,59 @@ class Translator(shared.BaseTranslator):
             ast.Expr(value=shared._tl_call("store", shared._name(bp), self._expr(tile_val)))
         )
         return stmts
+
+    def _tensor_memref_ptr(
+        self,
+        memref_val: ir.Value,
+        indices: list[ir.Value],
+        mem_shape: list[int],
+        tile_shape: list[int],
+        dimension_order: list[int],
+    ) -> tuple[list[ast.stmt], ast.expr]:
+        if len(indices) != len(mem_shape):
+            raise NotImplementedError(
+                f"masked memref access rank mismatch: {len(indices)} indices for rank "
+                f"{len(mem_shape)}"
+            )
+        if len(tile_shape) > len(mem_shape):
+            raise NotImplementedError("masked memref access tile rank exceeds memref rank")
+
+        strides = [1] * len(mem_shape)
+        for i in range(len(mem_shape) - 2, -1, -1):
+            strides[i] = strides[i + 1] * mem_shape[i + 1]
+
+        linear_offset: ast.expr = shared._const(0)
+        for index, stride in zip(indices, strides):
+            term = ast.BinOp(left=self._expr(index), op=ast.Mult(), right=shared._const(stride))
+            linear_offset = ast.BinOp(left=linear_offset, op=ast.Add(), right=term)
+
+        first_tile_mem_dim = len(mem_shape) - len(tile_shape)
+        for logical_dim, extent in enumerate(tile_shape):
+            if extent == 1:
+                continue
+            indices_expr: list[ast.expr] = [shared._const(None)] * len(tile_shape)
+            indices_expr[logical_dim] = ast.Slice()
+            index_expr = (
+                ast.Tuple(elts=indices_expr, ctx=ast.Load())
+                if len(indices_expr) > 1
+                else indices_expr[0]
+            )
+            axis_offsets = ast.Subscript(
+                value=shared._tl_call("arange", shared._const(0), shared._const(extent)),
+                slice=index_expr,
+                ctx=ast.Load(),
+            )
+            mem_dim = first_tile_mem_dim + dimension_order[logical_dim]
+            contribution = ast.BinOp(
+                left=axis_offsets, op=ast.Mult(), right=shared._const(strides[mem_dim])
+            )
+            linear_offset = ast.BinOp(left=linear_offset, op=ast.Add(), right=contribution)
+
+        ptr = self._fresh("ptr")
+        stmt = shared._assign(
+            ptr, ast.BinOp(left=self._expr(memref_val), op=ast.Add(), right=linear_offset)
+        )
+        return [stmt], shared._name(ptr)
 
     def _scalar_memref_ptr(
         self, memref_val: ir.Value, indices: list[ir.Value], mem_shape: list[int]

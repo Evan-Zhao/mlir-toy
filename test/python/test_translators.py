@@ -193,6 +193,36 @@ def test_triton_translates_unsqueeze_and_squeeze():
     assert translated.count("tl.reshape") == 1
 
 
+def test_triton_masked_memory_uses_tensor_pointers():
+    source = """
+    module {
+      htile.kernel @masked_memory(
+          %src: memref<16x8xf32>, %dst: memref<16x8xf32>) {
+        %c0 = arith.constant 0 : index
+        %c8 = arith.constant 8 : index
+        %other = arith.constant 0.0 : f32
+        %range = htile.arange %c0 to %c8 : tensor<8xindex>
+        %indices = htile.broadcast %range dimensions = [0]
+            : tensor<8xindex> -> tensor<4x8xindex>
+        %zero = htile.full %c0 : index -> tensor<4x8xindex>
+        %mask = arith.cmpi sge, %indices, %zero : tensor<4x8xindex>
+        %value = htile.load %src[%c0, %c0]
+            mask(%mask : tensor<4x8xi1>) other(%other : f32)
+            : memref<16x8xf32> -> tensor<4x8xf32>
+        htile.store %value, %dst[%c0, %c0] mask(%mask : tensor<4x8xi1>)
+            : tensor<4x8xf32>, memref<16x8xf32>
+        htile.return
+      }
+    }
+    """
+    translated = ast.unparse(translate_triton(source))
+    assert "tl.make_block_ptr" not in translated
+    assert "tl.load(" in translated
+    assert "other=" in translated
+    assert translated.count("mask=") == 2
+    assert "tl.store(" in translated
+
+
 def test_triton_scalar_memref_access_uses_pointer_arithmetic():
     source = """
     module {

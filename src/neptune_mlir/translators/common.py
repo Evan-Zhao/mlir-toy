@@ -219,6 +219,19 @@ class BroadcastSpec:
 class LoadSpec:
     memref: ir.Value
     offsets: list[ir.Value]
+    mask: ir.Value | None
+    other: ir.Value | None
+    memref_shape: list[int]
+    tile_shape: list[int]
+    dimension_order: list[int]
+
+
+@dataclass(frozen=True)
+class StoreSpec:
+    value: ir.Value
+    memref: ir.Value
+    offsets: list[ir.Value]
+    mask: ir.Value | None
     memref_shape: list[int]
     tile_shape: list[int]
     dimension_order: list[int]
@@ -300,12 +313,54 @@ def _decode_permutation(op: ir.OpView) -> list[int]:
     return _parse_dense_i64_array(attr) if attr else [1, 0]
 
 
+def _operand_segment_sizes(op: ir.OpView) -> list[int]:
+    attr = op.attributes.get("operandSegmentSizes")
+    if attr is None:
+        raise ValueError(f"{_op_type_name(op)} is missing operandSegmentSizes")
+    return list(ir.DenseI32ArrayAttr(attr))
+
+
 def _decode_load(op: ir.OpView) -> LoadSpec:
+    segment_sizes = _operand_segment_sizes(op)
+    if len(segment_sizes) != 4 or segment_sizes[0] != 1:
+        raise ValueError(f"invalid htile.load operand segments: {segment_sizes}")
+    num_offsets, num_masks, num_others = segment_sizes[1:]
+    if num_masks not in (0, 1) or num_others not in (0, 1):
+        raise ValueError(f"invalid htile.load optional operand segments: {segment_sizes}")
+
+    offset_end = 1 + num_offsets
+    mask = op.operands[offset_end] if num_masks else None
+    other = op.operands[offset_end + num_masks] if num_others else None
     memref_shape, _ = _memref_shape(op.operands[0].type)
     tile_shape, _ = _tensor_shape(op.results[0].type)
     return LoadSpec(
         memref=op.operands[0],
-        offsets=list(op.operands[1:]),
+        offsets=list(op.operands[1:offset_end]),
+        mask=mask,
+        other=other,
+        memref_shape=memref_shape,
+        tile_shape=tile_shape,
+        dimension_order=_dimension_order(op, len(tile_shape)),
+    )
+
+
+def _decode_store(op: ir.OpView) -> StoreSpec:
+    segment_sizes = _operand_segment_sizes(op)
+    if len(segment_sizes) != 4 or segment_sizes[:2] != [1, 1]:
+        raise ValueError(f"invalid htile.store operand segments: {segment_sizes}")
+    num_offsets, num_masks = segment_sizes[2:]
+    if num_masks not in (0, 1):
+        raise ValueError(f"invalid htile.store optional operand segment: {segment_sizes}")
+
+    offset_end = 2 + num_offsets
+    mask = op.operands[offset_end] if num_masks else None
+    memref_shape, _ = _memref_shape(op.operands[1].type)
+    tile_shape, _ = _tensor_shape(op.operands[0].type)
+    return StoreSpec(
+        value=op.operands[0],
+        memref=op.operands[1],
+        offsets=list(op.operands[2:offset_end]),
+        mask=mask,
         memref_shape=memref_shape,
         tile_shape=tile_shape,
         dimension_order=_dimension_order(op, len(tile_shape)),
