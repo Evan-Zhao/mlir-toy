@@ -298,6 +298,8 @@ def FusionGreedyConsumersIntoProducerOp
 
     Consumers that cannot be fused are skipped and receive a diagnostic remark,
     allowing fusion to continue with other consumers.
+    This fusion has special handling for `tensor.collapse_shape` operations after `scf.forall`,
+    which MLIR standard fusion does not support.    
 
     The `producer_loop` handle is preserved and remapped to the rewritten loop.
     The optional `stop_op` handle is read-only. The result handle contains the

@@ -65,6 +65,104 @@ void FusionGreedyConsumersIntoProducerOp::getEffects(
   modifiesPayload(effects);
 }
 
+// Move a product collapse through a forall when every output tile remains contiguous:
+//
+//   %grouped = scf.forall ... -> tensor<2x2x8xf32>
+//   %flat = tensor.collapse_shape %grouped -> tensor<4x8xf32>
+//
+// becomes a forall over a rank-2 destination. Its parallel insertion uses a linearized output
+// offset and a locally collapsed tile.
+static FailureOr<scf::ForallOp>
+fuseCollapseShapeIntoForall(RewriterBase &rewriter, scf::ForallOp loop,
+                            tensor::CollapseShapeOp collapse,
+                            SmallVectorImpl<Operation *> &fusedOps) {
+  if (loop.getNumResults() != 1 || collapse.getSrc() != loop.getResult(0) ||
+      !loop.getResult(0).hasOneUse())
+    return failure();
+
+  auto sourceType = collapse.getSrcType();
+  auto resultType = collapse.getResultType();
+  if (!sourceType.hasStaticShape() || !resultType.hasStaticShape())
+    return failure();
+
+  tensor::ParallelInsertSliceOp oldInsert;
+  for (Operation &op : loop.getTerminator().getYieldingOps()) {
+    auto insert = dyn_cast<tensor::ParallelInsertSliceOp>(op);
+    if (!insert || oldInsert)
+      return failure();
+    oldInsert = insert;
+  }
+  if (!oldInsert || oldInsert.getDest() != loop.getRegionOutArgs().front())
+    return failure();
+  SmallVector<ReassociationIndices> reassociation = collapse.getReassociationIndices();
+
+  // Treat the parallel insertion as the equivalent extraction from the expanded destination.
+  // MLIR's reshape utility verifies that the tile is contiguous after collapsing and computes
+  // its collapsed offsets, sizes, and strides.
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(loop.getTerminator());
+  auto equivalentSlice = tensor::ExtractSliceOp::create(
+      rewriter, oldInsert.getLoc(), oldInsert.getDest(), oldInsert.getMixedOffsets(),
+      oldInsert.getMixedSizes(), oldInsert.getMixedStrides());
+  SmallVector<OpFoldResult> collapsedOffsets, collapsedSizes, collapsedStrides;
+  if (failed(tensor::getCollapsedExtractSliceInfo(rewriter, equivalentSlice, reassociation,
+                                                  collapsedOffsets, collapsedSizes,
+                                                  collapsedStrides))) {
+    rewriter.eraseOp(equivalentSlice);
+    return failure();
+  }
+  rewriter.eraseOp(equivalentSlice);
+
+  rewriter.setInsertionPoint(loop);
+  Value collapsedInit = tensor::CollapseShapeOp::create(rewriter, collapse.getLoc(), resultType,
+                                                        loop.getOutputs().front(), reassociation);
+  auto newLoop = scf::ForallOp::create(rewriter, loop.getLoc(), loop.getMixedLowerBound(),
+                                       loop.getMixedUpperBound(), loop.getMixedStep(),
+                                       ValueRange{collapsedInit}, loop.getMapping());
+  newLoop->setAttrs(loop->getAttrs());
+
+  IRMapping mapping;
+  mapping.map(loop.getInductionVars(), newLoop.getInductionVars());
+  rewriter.setInsertionPointToStart(newLoop.getBody());
+  Value expandedOutArg = tensor::ExpandShapeOp::create(
+      rewriter, loop.getLoc(), sourceType, newLoop.getRegionOutArgs().front(), reassociation);
+  mapping.map(loop.getRegionOutArgs().front(), expandedOutArg);
+  rewriter.setInsertionPoint(newLoop.getTerminator());
+  auto clonedOps = cloneBlockWithoutTerminator(rewriter, *loop.getBody(), mapping);
+  Value tile = mapping.lookupOrDefault(oldInsert.getSource());
+
+  auto mapFoldResult = [&](OpFoldResult value) -> OpFoldResult {
+    if (auto attr = dyn_cast<Attribute>(value))
+      return attr;
+    return mapping.lookupOrDefault(cast<Value>(value));
+  };
+  SmallVector<OpFoldResult> offsets = llvm::map_to_vector(collapsedOffsets, mapFoldResult);
+  SmallVector<OpFoldResult> sizes = llvm::map_to_vector(collapsedSizes, mapFoldResult);
+  SmallVector<OpFoldResult> strides = llvm::map_to_vector(collapsedStrides, mapFoldResult);
+
+  auto tileType = cast<RankedTensorType>(tile.getType());
+  auto collapsedTileType = tensor::CollapseShapeOp::inferCollapsedType(tileType, reassociation);
+  Value collapsedTile = tensor::CollapseShapeOp::create(rewriter, oldInsert.getLoc(),
+                                                        collapsedTileType, tile, reassociation);
+  pointBuilderToForallParallel(rewriter, newLoop);
+  Operation *newInsert = tensor::ParallelInsertSliceOp::create(
+      rewriter, oldInsert.getLoc(), collapsedTile, newLoop.getRegionOutArgs().front(), offsets,
+      sizes, strides);
+
+  notifyClonedOpsRecursively(rewriter, clonedOps);
+  fusedOps.push_back(collapsedTile.getDefiningOp());
+  fusedOps.push_back(newInsert);
+
+  rewriter.replaceOp(collapse, newLoop.getResult(0));
+  rewriter.setInsertionPointAfter(newLoop);
+  Value expandedResult = tensor::ExpandShapeOp::create(rewriter, loop.getLoc(), sourceType,
+                                                       newLoop.getResult(0), reassociation);
+  if (auto *listener = dyn_cast_if_present<RewriterBase::Listener>(rewriter.getListener()))
+    listener->notifyOperationReplaced(loop, newLoop);
+  rewriter.replaceOp(loop, expandedResult);
+  return newLoop;
+}
+
 static FailureOr<scf::ForallOp> canonicalizeForLoop(RewriterBase &rewriter, scf::ForallOp loop) {
   RewritePatternSet patterns(rewriter.getContext());
   scf::ForallOp::getCanonicalizationPatterns(patterns, rewriter.getContext());
@@ -154,8 +252,16 @@ FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewrite
       FailureOr<scf::SCFFuseConsumerOfSliceResult> fuseResult =
           tileAndFuseConsumerWithDebug(rewriter, *consumer, loops);
       if (failed(fuseResult) || fuseResult->tiledOps.empty()) {
-        consumer->emitRemark("failed to fuse this consumer into the producer loop");
-        failedConsumers.insert(consumer);
+        auto collapse = dyn_cast<tensor::CollapseShapeOp>(consumer);
+        FailureOr<scf::ForallOp> collapsedLoop =
+            collapse ? fuseCollapseShapeIntoForall(rewriter, loop, collapse, fusedOps)
+                     : FailureOr<scf::ForallOp>();
+        if (failed(collapsedLoop)) {
+          consumer->emitRemark("failed to fuse this consumer into the producer loop");
+          failedConsumers.insert(consumer);
+          continue;
+        }
+        loop = *collapsedLoop;
         continue;
       }
       loop = cast<scf::ForallOp>(loops.front());
