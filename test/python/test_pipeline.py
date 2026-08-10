@@ -54,7 +54,7 @@ def make_attn_pytest_param(
         variant_name = f"{variant.value}-w{window_size}"
     else:
         variant_name = variant.value
-    kvh_name = f"-kv{kv_heads}" if kv_heads is not None else ""
+    kvh_name = f"-kh{kv_heads}" if kv_heads is not None else ""
     kv_seq_name = f"-ks{kv_seq_len}" if kv_seq_len is not None else ""
     case_id = f"{variant_name}-b{batch}-qh{q_heads}{kvh_name}-qs{seq_len}{kv_seq_name}-d{head_dim}"
     return pytest.param((variant, kwargs, input_dtypes), id=case_id)
@@ -63,41 +63,26 @@ def make_attn_pytest_param(
 BATCHES = (1, 2)
 SEQ_LENS = (128, 1024, 16384)
 HEAD_DIMS = (64, 128)
-ATTN_HEADS = (2, 4)
 ATTN_VARIANTS = (
     AttentionVariant.GLOBAL_ATTN,
     AttentionVariant.CAUSAL_ATTN,
     AttentionVariant.WINDOWED_CAUSAL_ATTN,  # Using default window size (128)
+    AttentionVariant.ALIBI_CAUSAL_ATTN,
+    AttentionVariant.KV_FP8_CAUSAL_ATTN,
 )
-GQA_HEADS = ((4, 2), (4, 1))  # (4, 1) would be MQA
-TRANSLATOR_INPUT_CASES = (
-    [
-        make_attn_pytest_param(variant, batch, heads, seq_len, hdim)
-        for variant, batch, heads, seq_len, hdim in product(
-            ATTN_VARIANTS, BATCHES, ATTN_HEADS, SEQ_LENS, HEAD_DIMS
-        )
-    ]
-    + [
-        make_attn_pytest_param(
-            AttentionVariant.CAUSAL_ATTN, 1, 2, seq_len=s1, head_dim=64, kv_seq_len=s2
-        )
-        for s1, s2 in product(SEQ_LENS, SEQ_LENS)
-    ]
-    + [
-        make_attn_pytest_param(AttentionVariant.ALIBI_CAUSAL_ATTN, batch, heads, seq_len, 64)
-        for batch, heads, seq_len in product(BATCHES, ATTN_HEADS, SEQ_LENS)
-    ]
-    + [make_attn_pytest_param(AttentionVariant.KV_FP8_CAUSAL_ATTN, 1, 4, 1024, 64)]
-    + [
-        # GQA and MQA cases
-        make_attn_pytest_param(
-            AttentionVariant.GLOBAL_ATTN, batch, q_heads, seq_len, hd, kv_heads=kv_heads
-        )
-        for batch, (q_heads, kv_heads), seq_len, hd in product(
-            BATCHES, GQA_HEADS, SEQ_LENS, HEAD_DIMS
-        )
-    ]
-)
+Q_KV_HEADS = ((2, 2), (4, 2), (4, 1))  # (4, 1) would be MQA
+TRANSLATOR_INPUT_CASES = [
+    make_attn_pytest_param(variant, batch, q_heads, seq_len, hdim, kv_heads)
+    for variant, batch, (q_heads, kv_heads), seq_len, hdim in product(
+        ATTN_VARIANTS, BATCHES, Q_KV_HEADS, SEQ_LENS, HEAD_DIMS
+    )
+] + [
+    # Rectangular (q_seq_len != kv_seq_len) cases for causal attention
+    make_attn_pytest_param(
+        AttentionVariant.CAUSAL_ATTN, 1, 2, seq_len=s1, head_dim=64, kv_seq_len=s2
+    )
+    for s1, s2 in product(SEQ_LENS, SEQ_LENS)
+]
 
 
 def test_native_htile_dialect_typeids_match_mlir_runtime() -> None:
@@ -198,6 +183,9 @@ def test_export_fp8_attention_preserves_quantized_kv_inputs() -> None:
         (AttentionVariant.KV_FP8_CAUSAL_ATTN, {"q_heads": 2}),
         (AttentionVariant.GLOBAL_ATTN, {"q_heads": 4, "kv_heads": 2}),
         (AttentionVariant.CAUSAL_ATTN, {"q_heads": 4, "kv_heads": 2}),
+        (AttentionVariant.ALIBI_CAUSAL_ATTN, {"q_heads": 4, "kv_heads": 2}),
+        (AttentionVariant.KV_FP8_CAUSAL_ATTN, {"q_heads": 4, "kv_heads": 2}),
+        (AttentionVariant.KV_FP8_CAUSAL_ATTN, {"q_heads": 4, "kv_heads": 1}),
     ],
 )
 def test_export_attention_to_htile_mlir(variant, kwargs) -> None:
