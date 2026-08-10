@@ -124,11 +124,6 @@ class KVOnlyQuantizedAttentionModule(torch.nn.Module):
         return output
 
 
-class SparseMMModule(torch.nn.Module):
-    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return torch.sparse.mm(a, b)
-
-
 def _use_f32_accumulation_for_f16_dots(module) -> int:
     """Make attention dots accumulate in f32 while retaining f16 operands.
 
@@ -285,13 +280,6 @@ def _build_module_and_args(
         sv = torch.randn(scale_shape, dtype=fp32)
         return KVOnlyQuantizedAttentionModule().eval(), (q, k, v, sk, sv)
 
-    if variant == AttentionVariant.SPARSE_MM:
-        indices = torch.tensor([[0, 1, 1], [2, 0, 2]], dtype=torch.int64)
-        values = torch.tensor([3.0, 4.0, 5.0], dtype=fp32)
-        a = torch.sparse_coo_tensor(indices, values, (2, 3))
-        b = torch.randn(3, 4, dtype=fp32)
-        return SparseMMModule().eval(), (a, b)
-
     raise ValueError(f"unknown variant: {variant}")
 
 
@@ -351,7 +339,7 @@ def export_attention(
         import_symbolic_shape_expressions=True,
         decomposition_table=decomposition_table,
     )
-    if output_type == "stablehlo" and variant != AttentionVariant.SPARSE_MM:
+    if output_type == "stablehlo":
         promoted_dot_count = _use_f32_accumulation_for_f16_dots(module)
         if promoted_dot_count != 2:
             raise RuntimeError(
