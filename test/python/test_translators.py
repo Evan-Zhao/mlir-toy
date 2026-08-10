@@ -223,6 +223,23 @@ def test_triton_masked_memory_uses_tensor_pointers():
     assert "tl.store(" in translated
 
 
+def test_triton_translates_scalar_load_and_index_cast():
+    source = """
+    module {
+      htile.kernel @scalar_metadata(%src: memref<4xi32>) {
+        %c2 = arith.constant 2 : index
+        %value = htile.load %src[%c2] : memref<4xi32> -> i32
+        %index = arith.index_cast %value : i32 to index
+        %next = arith.addi %index, %c2 : index
+        htile.return
+      }
+    }
+    """
+    translated = ast.unparse(translate_triton(source))
+    assert translated.count("tl.load(") == 1
+    assert "tl.cast" not in translated
+
+
 def test_triton_scalar_memref_access_uses_pointer_arithmetic():
     source = """
     module {

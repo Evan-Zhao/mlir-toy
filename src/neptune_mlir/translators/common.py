@@ -332,7 +332,8 @@ def _decode_load(op: ir.OpView) -> LoadSpec:
     mask = op.operands[offset_end] if num_masks else None
     other = op.operands[offset_end + num_masks] if num_others else None
     memref_shape, _ = _memref_shape(op.operands[0].type)
-    tile_shape, _ = _tensor_shape(op.results[0].type)
+    result_type = op.results[0].type
+    tile_shape = _tensor_shape(result_type)[0] if _is_ranked_tensor_type(result_type) else []
     return LoadSpec(
         memref=op.operands[0],
         offsets=list(op.operands[1:offset_end]),
