@@ -174,6 +174,20 @@ def test_tilelang_translator_functional():
     _assert_causal_attention_output(torch, out, q, k, v)
 
 
+def test_tilelang_scalar_memref_uses_one_element_buffer():
+    source = """
+    module {
+      htile.kernel @scalar_load(%src: memref<f32>) attributes {program_bounds = array<i64: 1>} {
+        %value = htile.load %src[] : memref<f32> -> tensor<f32>
+        htile.return
+      }
+    }
+    """
+    translated = ast.unparse(translate_tilelang(source))
+    assert "buf_0: T.Tensor((1,), 'float32')" in translated
+    assert "scalar_2 = buf_0[0]" in translated
+
+
 def test_triton_translates_unsqueeze_and_squeeze():
     source = """
     module {
