@@ -66,8 +66,8 @@ module attributes {transform.with_named_sequence} {
         : (!any, !any, !any, !any, !any, !any) -> !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
-    %ret = transform.structured.match ops{["func.return"]} in %func : (!any) -> !any
-    transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %ret : (!any, !any) -> !any
+    %collapse = transform.structured.match ops{["tensor.collapse_shape"]} in %func : (!any) -> !any
+    transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %collapse : (!any, !any) -> !any
 
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.scf.localize_scratch_tensors %func : !any
@@ -87,7 +87,7 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 
-  func.func @attention(%arg0: tensor<1x4x1024x64xf16>, %arg1: tensor<1x2x1024x64xf16>, %arg2: tensor<1x2x1024x64xf16>) -> tensor<1x2x2x1024x64xf16> {
+  func.func @attention(%arg0: tensor<1x4x1024x64xf16>, %arg1: tensor<1x2x1024x64xf16>, %arg2: tensor<1x2x1024x64xf16>) -> tensor<1x4x1024x64xf16> {
     %cst = stablehlo.constant dense<0xFF800000> : tensor<f32>
     %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
     %cst_1 = arith.constant dense<1.250000e-01> : tensor<1xf64>
@@ -116,19 +116,19 @@ module attributes {transform.with_named_sequence} {
     %22 = stablehlo.broadcast_in_dim %4, dims = [0, 1, 2, 3, 4] : (tensor<1x2x2x1024x64xf16>) -> tensor<1x2x2x1024x64xf16>
     %23 = stablehlo.dot_general %21, %22, batching_dims = [0, 1, 2] x [0, 1, 2], contracting_dims = [4] x [3] : (tensor<1x2x2x1024x1024xf16>, tensor<1x2x2x1024x64xf16>) -> tensor<1x2x2x1024x64xf32>
     %24 = stablehlo.convert %23 : (tensor<1x2x2x1024x64xf32>) -> tensor<1x2x2x1024x64xf16>
-    %25 = stablehlo.reshape %24 : (tensor<1x2x2x1024x64xf16>) -> tensor<1x2x2x1024x64xf16>
-    return %25 : tensor<1x2x2x1024x64xf16>
+    %25 = stablehlo.reshape %24 : (tensor<1x2x2x1024x64xf16>) -> tensor<1x4x1024x64xf16>
+    return %25 : tensor<1x4x1024x64xf16>
   }
 }
 
 // CHECK-LABEL: func.func @attention(
-// CHECK-SAME: %arg0: tensor<1x4x1024x64xf16>, %arg1: tensor<1x2x1024x64xf16>, %arg2: tensor<1x2x1024x64xf16>) -> tensor<1x2x2x1024x64xf16>
+// CHECK-SAME: %arg0: tensor<1x4x1024x64xf16>, %arg1: tensor<1x2x1024x64xf16>, %arg2: tensor<1x2x1024x64xf16>) -> tensor<1x4x1024x64xf16>
 // CHECK-NOT: linalg.batch_matmul
 // CHECK-NOT: linalg.transpose
 // CHECK-NOT: linalg.generic
 // CHECK-NOT: tensor.empty() : tensor<4x1024x64xf32>
 // CHECK-NOT: tensor.empty() : tensor<2x2x1024x64xf16>
-// CHECK: %[[OUT:.*]] = memref.alloc() : memref<1x2x2x1024x64xf16>
+// CHECK: %[[OUT:.*]] = memref.alloc() : memref<1x4x1024x64xf16>
 // CHECK: %[[Q:.*]] = bufferization.to_buffer %arg0 read_only : tensor<1x4x1024x64xf16> to memref<1x4x1024x64xf16>
 // CHECK: %[[K:.*]] = bufferization.to_buffer %arg1 read_only : tensor<1x2x1024x64xf16> to memref<1x2x1024x64xf16>
 // CHECK: %[[V:.*]] = bufferization.to_buffer %arg2 read_only : tensor<1x2x1024x64xf16> to memref<1x2x1024x64xf16>
@@ -141,7 +141,7 @@ module attributes {transform.with_named_sequence} {
 // CHECK-SAME: memref<1x4x1024x64xf16>
 // CHECK-SAME: memref<1x2x1024x64xf16>
 // CHECK-SAME: memref<1x2x1024x64xf16>
-// CHECK-SAME: memref<1x2x2x1024x64xf16>
+// CHECK-SAME: memref<1x4x1024x64xf16>
 // CHECK-SAME: attributes {program_bounds = array<i64: 2, 2, 8>}
 // CHECK: htile.program_id 0
 // CHECK: htile.program_id 1

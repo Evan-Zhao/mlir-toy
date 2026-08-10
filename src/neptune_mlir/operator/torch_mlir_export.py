@@ -79,6 +79,7 @@ class AlibiCausalAttentionModule(torch.nn.Module):
 
 class GlobalGQAModule(torch.nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        output_shape = q.shape
         q_heads = q.shape[1]
         kv_heads = k.shape[1]
         if q_heads % kv_heads != 0:
@@ -92,7 +93,7 @@ class GlobalGQAModule(torch.nn.Module):
         scores = scores * scale
         probs = torch.softmax(scores, dim=-1)
         out_f32 = _f16_matmul_f32(probs, v)
-        return out_f32.to(torch.float16).reshape(q.shape)
+        return out_f32.to(torch.float16).reshape(output_shape)
 
 
 class KVOnlyQuantizedAttentionModule(torch.nn.Module):
