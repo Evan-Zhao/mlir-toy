@@ -1,3 +1,9 @@
+// RUN: neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
+//
+// Transform-dialect schedule for packed variable-length attention. Document
+// offsets are loaded as scalar metadata, while masked tile accesses prevent
+// reads and writes outside each document.
+
 !any = !transform.any_op
 
 module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32, transform.with_named_sequence} {
@@ -174,3 +180,47 @@ module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo
     return %41 : tensor<1024x4x64xf16>
   }
 }
+
+// CHECK-LABEL: func.func public @main(
+// CHECK-SAME: %arg0: tensor<1024x4x64xf16>, %arg1: tensor<1024x4x64xf16>, %arg2: tensor<1024x4x64xf16>, %arg3: tensor<9xi32>
+// CHECK: %[[OUT:.+]] = memref.alloc() : memref<1024x4x64xf16>
+// CHECK: %[[OFFSETS:.+]] = bufferization.to_buffer %arg3 read_only : tensor<9xi32> to memref<9xi32>
+// CHECK: %[[Q:.+]] = bufferization.to_buffer %arg0 read_only
+// CHECK: %[[K:.+]] = bufferization.to_buffer %arg1 read_only
+// CHECK: %[[V:.+]] = bufferization.to_buffer %arg2 read_only
+// CHECK: htile.launch_func @attention_kernel(%[[Q]], %[[K]], %[[V]], %[[OFFSETS]], %[[OUT]]) {program_bounds = array<i64: 8, 4, 4>}
+// CHECK-NOT: scf.forall
+// CHECK: bufferization.to_tensor %[[OUT]]
+// CHECK: return
+
+// CHECK-LABEL: htile.kernel @attention_kernel(
+// CHECK-SAME: %arg0 : memref<1024x4x64xf16>, %arg1 : memref<1024x4x64xf16>, %arg2 : memref<1024x4x64xf16>, %arg3 : memref<9xi32>, %arg4 : memref<1024x4x64xf16>
+// CHECK-SAME: attributes {program_bounds = array<i64: 8, 4, 4>}
+// CHECK: %[[DOC:.+]] = htile.program_id 0
+// CHECK: htile.program_id 1
+// CHECK: htile.program_id 2
+// CHECK: %[[START:.+]] = htile.load %arg3[%[[DOC]]] : memref<9xi32> -> i32
+// CHECK: %[[NEXT_INDEX:.+]] = affine.apply {{.*}}[%[[DOC]]]
+// CHECK: %[[END:.+]] = htile.load %arg3[%[[NEXT_INDEX]]] : memref<9xi32> -> i32
+// CHECK: %[[LENGTH:.+]] = arith.subi %[[END]], %[[START]] : i32
+// CHECK: arith.index_cast %[[START]] : i32 to index
+// CHECK: arith.index_cast %[[LENGTH]] : i32 to index
+// CHECK: htile.unsqueeze %{{.*}} mask [false, true, false] : tensor<128x64xi1> -> tensor<128x1x64xi1>
+// CHECK: %[[LIVE:.+]]:3 = scf.for
+// CHECK: htile.load %arg0{{.*}} mask(%{{.*}} : tensor<128x1x64xi1>) other(%{{.*}} : f16) : memref<1024x4x64xf16> -> tensor<128x1x64xf16>
+// CHECK: htile.load %arg1{{.*}} mask(%{{.*}} : tensor<64x1x64xi1>) other(%{{.*}} : f16) : memref<1024x4x64xf16> -> tensor<64x1x64xf16>
+// CHECK: htile.squeeze %{{.*}} mask [false, true, false] : tensor<128x1x64xf16> -> tensor<128x64xf16>
+// CHECK: htile.squeeze %{{.*}} mask [false, true, false] : tensor<64x1x64xf16> -> tensor<64x64xf16>
+// CHECK: htile.dot %{{.*}}, %{{.*}} {transpose_b} : tensor<128x64xf16>, tensor<64x64xf16> -> tensor<128x64xf32>
+// CHECK: htile.load %arg2{{.*}} mask(%{{.*}} : tensor<64x1x64xi1>) other(%{{.*}} : f16) : memref<1024x4x64xf16> -> tensor<64x1x64xf16>
+// CHECK: scf.yield
+// CHECK: %[[MIXED:.+]]:3 = scf.for
+// CHECK-SAME: iter_args(%{{.*}} = %[[LIVE]]#0, %{{.*}} = %[[LIVE]]#1, %{{.*}} = %[[LIVE]]#2)
+// CHECK: arith.select %{{.*}}, %{{.*}}, %{{.*}} : tensor<128x64xi1>, tensor<128x64xf32>
+// CHECK: scf.yield
+// CHECK: arith.divf %[[MIXED]]#2, %{{.*}} : tensor<128x64xf32>
+// CHECK: htile.unsqueeze %{{.*}} mask [false, true, false] : tensor<128x64xf16> -> tensor<128x1x64xf16>
+// CHECK-NOT: tensor.extract
+// CHECK-NOT: tensor.from_elements
+// CHECK: htile.store %{{.*}}, %arg4{{.*}} mask(%{{.*}} : tensor<128x1x64xi1>) : tensor<128x1x64xf16>, memref<1024x4x64xf16>
+// CHECK: htile.return
