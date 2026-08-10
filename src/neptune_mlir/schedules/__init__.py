@@ -11,7 +11,6 @@ class AttentionSchedule(str, Enum):
     MASKED_ATTN = "masked-attn"
     ALIBI_CAUSAL_ATTN = "alibi-causal-attn"
     KV_FP8_CAUSAL_ATTN = "kv-fp8-causal-attn"
-    GLOBAL_GQA = "global-gqa"
     VARLEN_ATTN = "varlen-attn"
 
     def __str__(self) -> str:
@@ -43,7 +42,6 @@ _SCHEDULE_TEMPLATES = {
     AttentionSchedule.MASKED_ATTN: ("attention.mlir.in", 2),
     AttentionSchedule.ALIBI_CAUSAL_ATTN: ("attention.mlir.in", 2),
     AttentionSchedule.KV_FP8_CAUSAL_ATTN: ("attention_kv_fp8.mlir.in", 2),
-    AttentionSchedule.GLOBAL_GQA: ("attention.mlir.in", 3),
     AttentionSchedule.VARLEN_ATTN: ("attention_varlen.mlir.in", None),
 }
 _PACKAGE = __name__
@@ -61,16 +59,24 @@ def _coerce_schedule(schedule: AttentionSchedule | str) -> AttentionSchedule:
 def materialize_attention_schedule(
     schedule: AttentionSchedule | str,
     tile_config: AttentionTileConfig | None = None,
+    *,
+    n_batch_dims: int | None = None,
 ) -> str:
     schedule = _coerce_schedule(schedule)
     tile_config = tile_config or AttentionTileConfig()
     tile_config.validate()
-    template_name, n_batch_dims = _SCHEDULE_TEMPLATES[schedule]
+    template_name, default_batch_dims = _SCHEDULE_TEMPLATES[schedule]
     template_text = resources.files(_PACKAGE).joinpath(template_name).read_text()
     if schedule == AttentionSchedule.VARLEN_ATTN:
+        if n_batch_dims is not None:
+            raise ValueError("n_batch_dims does not apply to variable-length attention")
         tile_sizes = f"[1, {tile_config.block_m}, 1, {tile_config.block_n}, 0]"
     else:
-        assert n_batch_dims is not None
+        n_batch_dims = default_batch_dims if n_batch_dims is None else n_batch_dims
+        if not isinstance(n_batch_dims, int) or isinstance(n_batch_dims, bool):
+            raise TypeError("n_batch_dims must be an integer")
+        if n_batch_dims <= 0:
+            raise ValueError("n_batch_dims must be positive")
         tile_sizes = tile_config.get_tile_sizes(n_batch_dims)
     return Template(template_text).substitute(tile_sizes=tile_sizes)
 

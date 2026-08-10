@@ -5,7 +5,6 @@ from enum import Enum
 
 class AttentionVariant(str, Enum):
     GLOBAL_ATTN = "global-attn"
-    GLOBAL_GQA = "global-gqa"
     CAUSAL_ATTN = "causal-attn"
     ALIBI_CAUSAL_ATTN = "alibi-causal-attn"
     WINDOWED_CAUSAL_ATTN = "windowed-causal-attn"

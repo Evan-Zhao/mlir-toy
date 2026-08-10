@@ -35,7 +35,6 @@ _VARIANT_TO_SCHEDULE = {
     AttentionVariant.ALIBI_CAUSAL_ATTN: AttentionSchedule.ALIBI_CAUSAL_ATTN,
     AttentionVariant.WINDOWED_CAUSAL_ATTN: AttentionSchedule.MASKED_ATTN,
     AttentionVariant.KV_FP8_CAUSAL_ATTN: AttentionSchedule.KV_FP8_CAUSAL_ATTN,
-    AttentionVariant.GLOBAL_GQA: AttentionSchedule.GLOBAL_GQA,
 }
 
 
@@ -151,8 +150,10 @@ def lower_attention_linalg_to_htile_mlir(
     input_mlir: str,
     schedule: AttentionSchedule | str,
     tile_config: AttentionTileConfig | None = None,
+    *,
+    n_batch_dims: int | None = None,
 ) -> str:
-    schedule_mlir = materialize_attention_schedule(schedule, tile_config)
+    schedule_mlir = materialize_attention_schedule(schedule, tile_config, n_batch_dims=n_batch_dims)
     with tempfile.TemporaryDirectory(prefix="neptune_mlir_") as tmp_dir:
         tmp_path = Path(tmp_dir)
         input_path = tmp_path / "input.mlir"
@@ -177,9 +178,14 @@ def export_attention_to_htile_mlir(
     tile_config: AttentionTileConfig | None = None,
 ) -> str:
     variant = _coerce_attention_variant(variant)
-    schedule = _VARIANT_TO_SCHEDULE.get(variant.value)  # type: ignore
+    schedule = _VARIANT_TO_SCHEDULE.get(variant)
     if schedule is None:
         raise ValueError(f"unsupported attention pipeline variant: {variant}")
+    resolved_kv_heads = q_heads if kv_heads is None else kv_heads
+    if q_heads <= 0 or resolved_kv_heads <= 0:
+        raise ValueError("query and KV head counts must be positive")
+    if q_heads % resolved_kv_heads != 0:
+        raise ValueError(f"q heads ({q_heads}) must be divisible by kv heads ({resolved_kv_heads})")
     input_mlir = export_attention_mlir(
         variant=variant,
         batch=batch,
@@ -191,7 +197,10 @@ def export_attention_to_htile_mlir(
         window_size=window_size,
         func_name=func_name,
     )
-    return lower_attention_linalg_to_htile_mlir(input_mlir, schedule, tile_config)
+    n_batch_dims = 2 if q_heads == resolved_kv_heads else 3
+    return lower_attention_linalg_to_htile_mlir(
+        input_mlir, schedule, tile_config, n_batch_dims=n_batch_dims
+    )
 
 
 def export_varlen_attention_to_htile_mlir(
