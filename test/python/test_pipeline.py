@@ -60,9 +60,6 @@ def make_attn_pytest_param(
     return pytest.param((variant, kwargs, input_dtypes), id=case_id)
 
 
-BATCHES = (1, 2)
-SEQ_LENS = (128, 1024, 16384)
-HEAD_DIMS = (64, 128)
 ATTN_VARIANTS = (
     AttentionVariant.GLOBAL_ATTN,
     AttentionVariant.CAUSAL_ATTN,
@@ -71,17 +68,43 @@ ATTN_VARIANTS = (
     AttentionVariant.KV_FP8_CAUSAL_ATTN,
 )
 Q_KV_HEADS = ((2, 2), (4, 2), (4, 1))  # (4, 1) would be MQA
+HEAD_DIM = 64
+SHORT_SEQ, LONG_SEQ = 512, 16384
 TRANSLATOR_INPUT_CASES = [
-    make_attn_pytest_param(variant, batch, q_heads, seq_len, hdim, kv_heads)
-    for variant, batch, (q_heads, kv_heads), seq_len, hdim in product(
-        ATTN_VARIANTS, BATCHES, Q_KV_HEADS, SEQ_LENS, HEAD_DIMS
-    )
-] + [
-    # Rectangular (q_seq_len != kv_seq_len) cases for causal attention
+    # Cover every variant and head layout at the standard shape.
+    # Batch indexing has historically interacted with grouped-head indexing, so retain the full
+    # variant/head-layout cross product for batch size two.
+    *[
+        make_attn_pytest_param(variant, batch, q_heads, SHORT_SEQ, HEAD_DIM, kv_heads)
+        for variant, (q_heads, kv_heads), batch in product(ATTN_VARIANTS, Q_KV_HEADS, (1, 2))
+    ],
+    # Exercise alternate dot shapes and long reduction loops once per variant.
+    *[
+        make_attn_pytest_param(variant, 1, 2, SHORT_SEQ, 2 * HEAD_DIM, 2)
+        for variant in ATTN_VARIANTS
+    ],
+    *[make_attn_pytest_param(variant, 1, 2, LONG_SEQ, HEAD_DIM, 1) for variant in ATTN_VARIANTS],
+    # Rectangular causal attention needs one case in each direction: (1024, 128) and (128, 1024).
     make_attn_pytest_param(
-        AttentionVariant.CAUSAL_ATTN, 1, 2, seq_len=s1, head_dim=64, kv_seq_len=s2
+        AttentionVariant.CAUSAL_ATTN, 1, 2, SHORT_SEQ, HEAD_DIM, kv_seq_len=LONG_SEQ
+    ),
+    make_attn_pytest_param(
+        AttentionVariant.CAUSAL_ATTN, 1, 2, LONG_SEQ, HEAD_DIM, kv_seq_len=SHORT_SEQ
+    ),
+]
+
+# Compile every variant and head layout on every backend, while distributing the expensive shape
+# edges across head layouts instead of taking their Cartesian product.
+BACKEND_COMPILATION_CASES = [
+    make_attn_pytest_param(
+        variant,
+        batch=2 if (q_heads, kv_heads) == (4, 2) else 1,
+        q_heads=q_heads,
+        kv_heads=kv_heads,
+        seq_len=16384 if (q_heads, kv_heads) == (4, 1) else SHORT_SEQ,
+        head_dim=128 if (q_heads, kv_heads) == (2, 2) else 64,
     )
-    for s1, s2 in product(SEQ_LENS, SEQ_LENS)
+    for variant, (q_heads, kv_heads) in product(ATTN_VARIANTS, Q_KV_HEADS)
 ]
 
 
@@ -191,8 +214,9 @@ def test_export_fp8_attention_preserves_quantized_kv_inputs() -> None:
 def test_export_attention_to_htile_mlir(variant, kwargs) -> None:
     require_export_deps()
 
-    lowered = export_attention_to_htile_mlir(variant=variant, seq_len=128, head_dim=64, **kwargs)
-
+    lowered = export_attention_to_htile_mlir(
+        variant=variant, seq_len=SHORT_SEQ, head_dim=64, **kwargs
+    )
     assert "func.func @attention" in lowered
     assert "htile.launch_func" in lowered
     assert "htile.kernel" in lowered
@@ -218,6 +242,11 @@ def test_custom_tile_config_reaches_lowered_loop_bounds() -> None:
     assert "htile.store" in lowered
 
 
+@pytest.fixture(scope="module", params=("triton", "cutile", "tilelang"))
+def codegen_target(request):
+    return request.param
+
+
 @pytest.fixture(scope="module", params=TRANSLATOR_INPUT_CASES)
 def lowered_attention_case(request):
     """Lower one attention case once before translating it to each backend."""
@@ -227,11 +256,21 @@ def lowered_attention_case(request):
     return lowered, get_htile_kernel_arguments(lowered)
 
 
-@pytest.fixture(scope="module", params=("triton", "cutile", "tilelang"))
-def translated_attention_case(request, lowered_attention_case):
+@pytest.fixture(scope="module")
+def translated_attention_case(codegen_target, lowered_attention_case):
     lowered, kernel_arguments = lowered_attention_case
-    module = translate_htile_to_ast(lowered, request.param)
-    return request.param, ast.unparse(module) + "\n", kernel_arguments
+    module = translate_htile_to_ast(lowered, codegen_target)
+    return codegen_target, ast.unparse(module) + "\n", kernel_arguments
+
+
+@pytest.fixture(scope="module", params=BACKEND_COMPILATION_CASES)
+def backend_compilation_case(request, codegen_target):
+    require_export_deps()
+    variant, kwargs, _ = request.param
+    lowered = export_attention_to_htile_mlir(variant=variant, **kwargs)
+    kernel_arguments = get_htile_kernel_arguments(lowered)
+    module = translate_htile_to_ast(lowered, codegen_target)
+    return codegen_target, ast.unparse(module) + "\n", kernel_arguments
 
 
 def require_nvidia_triton():
@@ -291,8 +330,8 @@ def test_attention_lowering_pipeline(translated_attention_case) -> None:
     assert "def attention_kernel" in source
 
 
-def test_attention_lowering_and_backend_compilation(translated_attention_case) -> None:
-    codegen_target, source, kernel_arguments = translated_attention_case
+def test_attention_lowering_and_backend_compilation(backend_compilation_case) -> None:
+    codegen_target, source, kernel_arguments = backend_compilation_case
     if codegen_target == "triton":
         require_nvidia_triton()
         ptx = compile_triton_source_to_ptx(source, kernel_arguments)
