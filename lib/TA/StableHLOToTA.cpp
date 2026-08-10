@@ -84,10 +84,26 @@ inferReshapeReassociation(stablehlo::ReshapeOp op) {
   return std::move(*reassociation);
 }
 
+static bool isDeferredProductCollapse(Operation *op) {
+  auto reshape = dyn_cast<stablehlo::ReshapeOp>(op);
+  if (!reshape)
+    return false;
+  auto sourceType = cast<RankedTensorType>(reshape.getOperand().getType());
+  auto resultType = cast<RankedTensorType>(reshape.getResult().getType());
+  if (sourceType.getRank() <= resultType.getRank())
+    return false;
+  auto reassociation = inferReshapeReassociation(reshape);
+  return succeeded(reassociation) &&
+         llvm::any_of(*reassociation,
+                      [](ReassociationIndicesRef group) { return group.size() > 1; });
+}
+
 // Keep this predicate in one place so root selection and per-scope emission agree on where a TA
 // island may continue. Unsupported operations remain in the surrounding function as tensor
 // producers or consumers.
 static bool isSupportedStableHLOOp(Operation *op) {
+  if (isDeferredProductCollapse(op))
+    return false;
   return isa<arith::ConstantOp, stablehlo::ConstantOp, stablehlo::IotaOp, stablehlo::DynamicIotaOp,
              stablehlo::ConvertOp, stablehlo::ExpOp, stablehlo::AddOp, stablehlo::SubtractOp,
              stablehlo::MulOp, stablehlo::DivOp, stablehlo::MaxOp, stablehlo::MinOp,
@@ -1609,6 +1625,25 @@ static LogicalResult importFunctionAsTA(func::FuncOp func) {
     for (Operation *op : llvm::reverse(componentOps))
       if (op->use_empty())
         op->erase();
+  }
+
+  // Keep product collapses outside TA: their source expression has one axis per factor, while TA
+  // substitution cannot delinearize the collapsed result axis back into those factors.
+  SmallVector<stablehlo::ReshapeOp> deferredCollapses;
+  func.walk([&](stablehlo::ReshapeOp reshape) {
+    if (isDeferredProductCollapse(reshape))
+      deferredCollapses.push_back(reshape);
+  });
+  for (stablehlo::ReshapeOp reshape : deferredCollapses) {
+    auto reassociation = inferReshapeReassociation(reshape);
+    if (failed(reassociation))
+      return failure();
+    OpBuilder builder(reshape);
+    auto resultType = cast<RankedTensorType>(reshape.getResult().getType());
+    Value collapse = tensor::CollapseShapeOp::create(builder, reshape.getLoc(), resultType,
+                                                     reshape.getOperand(), *reassociation);
+    reshape.replaceAllUsesWith(collapse);
+    reshape.erase();
   }
   return success();
 }
