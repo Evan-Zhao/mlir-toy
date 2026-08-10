@@ -27,11 +27,11 @@ using namespace mlir;
 
 namespace {
 
-// The importer runs in two phases. AxisDiscovery first assigns logical axes to every tensor
-// dimension, unifies dimensions related by StableHLO attributes, and determines which unit axes
-// remain structurally present. FunctionEmitter then replays the dataflow as scalar TA expressions
-// over those axes. Keeping discovery separate is important for dot_general: an axis may acquire its
-// final identity only after several producers and consumers have been visited.
+// The importer runs in three stages. AxisAnalysis first builds forward equality and reshape
+// relations, then propagates structural-axis demand backward to a fixed point. FunctionEmitter
+// finally replays the dataflow as scalar TA expressions over the resolved axes. Keeping analysis
+// separate is important for dot_general: an axis may acquire its final identity only after several
+// producers and consumers have been visited.
 //
 // StableHLO operations remain in place around the imported islands. Each supported value crossing
 // into unsupported IR or a function return becomes the root of a single-result TA scope.
@@ -52,6 +52,7 @@ using TensorAxes = SmallVector<std::optional<Axis>>;
 // itself uses compact union-find IDs because axis equivalences are still changing during the walk.
 struct DiscoveredAxisInfo {
   DenseMap<Value, TensorAxes> valueAxes;
+  DenseMap<Operation *, SmallVector<std::optional<int64_t>>> reshapeSourceProjections;
   SmallVector<Value> roots;
 };
 
@@ -82,6 +83,30 @@ inferReshapeReassociation(stablehlo::ReshapeOp op) {
     return failure();
   }
   return std::move(*reassociation);
+}
+
+static std::optional<SmallVector<ReassociationIndices>>
+inferRightAlignedExpansion(RankedTensorType sourceType, RankedTensorType resultType) {
+  if (sourceType.getRank() == 0 || sourceType.getRank() >= resultType.getRank() ||
+      !sourceType.hasStaticShape() || !resultType.hasStaticShape())
+    return std::nullopt;
+  SmallVector<ReassociationIndices> groups(sourceType.getRank());
+  int64_t resultDim = resultType.getRank() - 1;
+  for (int64_t sourceDim = sourceType.getRank() - 1; sourceDim >= 0; --sourceDim) {
+    int64_t product = 1;
+    do {
+      if (resultDim < 0)
+        return std::nullopt;
+      product *= resultType.getDimSize(resultDim);
+      groups[sourceDim].insert(groups[sourceDim].begin(), resultDim--);
+    } while (product != sourceType.getDimSize(sourceDim));
+  }
+  while (resultDim >= 0) {
+    if (resultType.getDimSize(resultDim) != 1)
+      return std::nullopt;
+    groups.front().insert(groups.front().begin(), resultDim--);
+  }
+  return groups;
 }
 
 static bool isDeferredProductCollapse(Operation *op) {
@@ -119,7 +144,7 @@ static bool isSupportedStableHLOOp(Operation *op) {
 /// static tensor dimension starts in its own union-find set. A forward walk merges sets when two
 /// dimensions denote the same logical coordinate. Once all unions are complete, presence analysis
 /// retains structural unit axes while omitting unit factors used only for expanding broadcasts.
-class AxisDiscovery {
+class AxisAnalysis {
 public:
   FailureOr<DiscoveredAxisInfo> run(func::FuncOp func) {
     for (BlockArgument argument : func.getArguments())
@@ -158,16 +183,20 @@ public:
         return returnOp.emitOpError("axis discovery requires static ranked tensors");
 
     SmallVector<Value> roots = collectRoots(func);
-    discoverPresentAxes(func, roots);
+    AxisDemandInfo demands = analyzeAxisDemands(func, roots);
 
-    // Freeze union-find representatives into value-owned Axis records. Unit dimensions omitted by
-    // presence analysis become null tensor axes; all non-unit dimensions remain present.
     DiscoveredAxisInfo info;
+    recordReshapeSourceProjections(func, demands, info);
+    propagateProductDemands(demands);
+
+    // Freeze the relation graph only after backward demand propagation. Reshape projections are
+    // recorded per operation: one lower-rank value may be expanded in multiple ways, so assigning
+    // it one guessed factor identity would be unsound.
     info.roots = std::move(roots);
     for (auto &[value, ids] : valueAxisIds)
       info.valueAxes[value] = llvm::map_to_vector(ids, [&](AxisId id) -> std::optional<Axis> {
         id = find(id);
-        if (axes[id].extent == 1 && !presentAxes.test(id))
+        if (axes[id].extent == 1 && !demands.present.test(id))
           return std::nullopt;
         return axes[id];
       });
@@ -177,6 +206,16 @@ public:
 private:
   using AxisId = unsigned;
   using AxisIds = SmallVector<AxisId, 4>;
+
+  struct AxisDemandInfo {
+    llvm::SmallBitVector present;
+    llvm::SmallBitVector structural;
+  };
+
+  struct ProductRelation {
+    AxisId product;
+    SmallVector<AxisId> factors;
+  };
 
   // Return one union-find ID per tensor dimension. ArrayRef keeps call sites lightweight while the
   // vectors remain owned by valueAxisIds for the lifetime of discovery. Dynamic shapes are
@@ -225,27 +264,30 @@ private:
     return roots;
   }
 
-  void markPresent(AxisId id) { presentAxes.set(find(id)); }
+  // After the forward relation analysis is complete, propagate logical-axis demand backward from
+  // external roots and operations whose semantics require iteration. Equality edges need no work:
+  // union-find has already made them the same bit. Reshape factor-to-product edges are closed to a
+  // fixed point because products may themselves be factors of other reshapes.
+  AxisDemandInfo analyzeAxisDemands(func::FuncOp func, ArrayRef<Value> roots) {
+    AxisDemandInfo result;
+    result.present.resize(parent.size());
+    result.structural.resize(parent.size());
 
-  void markValueDimPresent(Value value, int64_t dim) {
-    auto it = valueAxisIds.find(value);
-    if (it == valueAxisIds.end() || dim < 0 || dim >= static_cast<int64_t>(it->second.size()))
-      return;
-    markPresent(it->second[dim]);
-  }
+    auto markPresent = [&](AxisId id) { result.present.set(find(id)); };
+    auto markValueDimPresent = [&](Value value, int64_t dim) {
+      auto it = valueAxisIds.find(value);
+      if (it == valueAxisIds.end() || dim < 0 || dim >= static_cast<int64_t>(it->second.size()))
+        return;
+      AxisId id = find(it->second[dim]);
+      result.structural.set(id);
+      markPresent(id);
+    };
 
-  // Equality discovery already propagates presence through elementwise operations, transposes,
-  // equal-size broadcasts, and visible dot/reduction dimensions. Seed external boundaries and
-  // internal iteration-only dimensions, then carry factor demand back to collapsed products.
-  void discoverPresentAxes(func::FuncOp func, ArrayRef<Value> roots) {
-    presentAxes.resize(parent.size());
-
-    // Presence analysis only decides the fate of unit axes. Non-unit coordinates always affect
-    // indexing and remain part of expression support.
+    // Non-unit axes always affect indexing. Roots preserve the complete external tensor shape,
+    // including structural units that remain visible at the TA island boundary.
     for (AxisId id = 0; id < axes.size(); ++id)
       if (axes[find(id)].extent != 1)
         markPresent(id);
-
     for (Value root : roots) {
       auto it = valueAxisIds.find(root);
       if (it != valueAxisIds.end())
@@ -255,14 +297,18 @@ private:
 
     for (Operation &operation : func.front().without_terminator()) {
       if (auto iota = dyn_cast<stablehlo::IotaOp>(&operation))
-        markValueDimPresent(iota.getResult(), iota.getIotaDimension());
+        markValueDimPresent(iota.getResult(), static_cast<int64_t>(iota.getIotaDimension()));
       else if (auto iota = dyn_cast<stablehlo::DynamicIotaOp>(&operation))
-        markValueDimPresent(iota.getResult(), iota.getIotaDimension());
+        markValueDimPresent(iota.getResult(), static_cast<int64_t>(iota.getIotaDimension()));
       else if (auto reduce = dyn_cast<stablehlo::ReduceOp>(&operation))
         for (int64_t dim : reduce.getDimensions())
           markValueDimPresent(reduce.getInputs().front(), dim);
       else if (auto dot = dyn_cast<stablehlo::DotGeneralOp>(&operation)) {
         auto dims = dot.getDotDimensionNumbers();
+        for (int64_t dim : dims.getLhsBatchingDimensions())
+          markValueDimPresent(dot.getLhs(), dim);
+        for (int64_t dim : dims.getRhsBatchingDimensions())
+          markValueDimPresent(dot.getRhs(), dim);
         for (int64_t dim : dims.getLhsContractingDimensions())
           markValueDimPresent(dot.getLhs(), dim);
         for (int64_t dim : dims.getRhsContractingDimensions())
@@ -270,19 +316,93 @@ private:
       }
     }
 
+    propagateProductDemands(result);
+    return result;
+  }
+
+  void propagateProductDemands(AxisDemandInfo &demands) {
     bool changed;
     do {
       changed = false;
-      for (auto &[product_, factors] : productAxes) {
-        AxisId product = find(product_);
-        if (presentAxes.test(product))
-          continue;
-        if (llvm::any_of(factors, [&](AxisId factor) { return presentAxes.test(find(factor)); })) {
-          presentAxes.set(product);
-          changed = true;
+      for (const ProductRelation &relation : productRelations) {
+        AxisId product = find(relation.product);
+        for (AxisId factor_ : relation.factors) {
+          AxisId factor = find(factor_);
+          if (demands.present.test(factor) && !demands.present.test(product)) {
+            demands.present.set(product);
+            changed = true;
+          }
         }
       }
     } while (changed);
+  }
+
+  void recordReshapeSourceProjections(func::FuncOp func, AxisDemandInfo &demands,
+                                      DiscoveredAxisInfo &info) {
+    SmallVector<stablehlo::ReshapeOp> reshapes;
+    func.walk([&](stablehlo::ReshapeOp reshape) { reshapes.push_back(reshape); });
+    for (stablehlo::ReshapeOp reshape : llvm::reverse(reshapes)) {
+      auto sourceType = cast<RankedTensorType>(reshape.getOperand().getType());
+      auto resultType = cast<RankedTensorType>(reshape.getResult().getType());
+      if (sourceType.getRank() >= resultType.getRank() ||
+          info.reshapeSourceProjections.contains(reshape.getOperation()))
+        continue;
+      auto reassociation = inferReshapeReassociation(reshape);
+      auto sourceAxes = valueAxisIds.find(reshape.getOperand());
+      auto resultAxes = valueAxisIds.find(reshape.getResult());
+      if (failed(reassociation) || sourceAxes == valueAxisIds.end() ||
+          resultAxes == valueAxisIds.end())
+        continue;
+
+      auto buildProjection = [&](ArrayRef<ReassociationIndices> groups) {
+        SmallVector<std::optional<int64_t>> projection;
+        unsigned score = 0;
+        projection.reserve(sourceType.getRank());
+        for (auto [sourceDim, group] : llvm::enumerate(groups)) {
+          AxisId source = find(sourceAxes->second[sourceDim]);
+          std::optional<int64_t> selected;
+          std::optional<AxisId> selectedFactor;
+          bool ambiguous = false;
+          for (int64_t resultDim : group) {
+            AxisId factor = find(resultAxes->second[resultDim]);
+            if (!demands.present.test(factor) || axes[factor].extent != axes[source].extent)
+              continue;
+            if (llvm::any_of(group, [&](int64_t otherDim) {
+                  AxisId other = find(resultAxes->second[otherDim]);
+                  return other != factor && axes[other].extent != 1;
+                }))
+              continue;
+            if (selectedFactor && *selectedFactor != factor) {
+              ambiguous = true;
+              break;
+            }
+            selected = resultDim;
+            selectedFactor = factor;
+          }
+          if (ambiguous)
+            selected = std::nullopt;
+          if (selected && demands.structural.test(find(resultAxes->second[*selected])))
+            ++score;
+          projection.push_back(selected);
+        }
+        return std::make_pair(std::move(projection), score);
+      };
+
+      auto [projection, score] = buildProjection(*reassociation);
+      if (auto rightAligned = inferRightAlignedExpansion(sourceType, resultType)) {
+        auto [alternative, alternativeScore] = buildProjection(*rightAligned);
+        if (alternativeScore > score)
+          projection = std::move(alternative);
+      }
+      if (Operation *sourceDef = reshape.getOperand().getDefiningOp();
+          sourceDef && isSupportedStableHLOOp(sourceDef))
+        for (auto [sourceDim, targetDim] : llvm::enumerate(projection))
+          if (targetDim && demands.structural.test(find(resultAxes->second[*targetDim]))) {
+            AxisId source = find(sourceAxes->second[sourceDim]);
+            demands.present.set(source);
+          }
+      info.reshapeSourceProjections[reshape.getOperation()] = std::move(projection);
+    }
   }
 
   bool axesCompatible(AxisId lhs, AxisId rhs) const {
@@ -292,32 +412,12 @@ private:
            lhsExtent == rhsExtent;
   }
 
-  // Keep the relationship between a collapsed product axis and its expanded factor axes. If
-  // another reshape exposes the same product with a compatible factorization, corresponding
-  // factors become the same logical axes.
-  LogicalResult mergeProductFactors(Operation *op, AxisId product,
-                                    ArrayRef<AxisId> incomingFactors_) {
-    product = find(product);
-    SmallVector<AxisId> incomingFactors =
-        llvm::map_to_vector(incomingFactors_, [&](AxisId factor) { return find(factor); });
-
-    auto it = productAxes.find(product);
-    if (it == productAxes.end()) {
-      productAxes[product] = std::move(incomingFactors);
-      return success();
-    }
-
-    SmallVector<AxisId> existingFactors = it->second;
-    for (AxisId &axis : existingFactors)
-      axis = find(axis);
-    if (existingFactors.size() != incomingFactors.size())
-      return success();
-    for (auto [lhs, rhs] : llvm::zip_equal(existingFactors, incomingFactors))
-      if (!axesCompatible(lhs, rhs))
-        return success();
-    for (auto [lhs, rhs] : llvm::zip_equal(existingFactors, incomingFactors))
-      if (failed(unite(op, lhs, rhs)))
-        return failure();
+  // Keep every product factorization distinct. Equal products do not imply equal factors: both
+  // 4 -> 4x1 and 4 -> 1x4 are valid views, and only their downstream uses can identify factors.
+  LogicalResult mergeProductFactors(Operation *, AxisId product, ArrayRef<AxisId> incomingFactors) {
+    productRelations.push_back(ProductRelation{
+        find(product),
+        llvm::map_to_vector(incomingFactors, [&](AxisId factor) { return find(factor); })});
     return success();
   }
 
@@ -331,12 +431,6 @@ private:
     if (!axesCompatible(lhs, rhs))
       return op->emitOpError("axis discovery found conflicting extents");
     parent[rhs] = lhs;
-
-    if (auto it = productAxes.find(rhs); it != productAxes.end()) {
-      SmallVector<AxisId> rhsFactors = std::move(it->second);
-      productAxes.erase(it);
-      return mergeProductFactors(op, lhs, rhsFactors);
-    }
     return success();
   }
 
@@ -552,10 +646,9 @@ private:
   }
 
   DenseMap<Value, AxisIds> valueAxisIds;
-  DenseMap<AxisId, SmallVector<AxisId>> productAxes;
+  SmallVector<ProductRelation> productRelations;
   SmallVector<AxisId> parent;
   SmallVector<Axis> axes;
-  llvm::SmallBitVector presentAxes;
   unsigned nextAxisName = 0;
 };
 
@@ -1256,40 +1349,32 @@ private:
 
   // Project an expanded result back to source axes so a previously translated source expression
   // can be reused.
-  FailureOr<TensorAxes> projectExpandSourceAxes(Value source,
-                                                ArrayRef<ReassociationIndices> reassociation,
+  FailureOr<TensorAxes> projectExpandSourceAxes(stablehlo::ReshapeOp op,
                                                 const TensorAxes &targetAxes) {
-    auto sourceAxes = lookupAxes(source);
-    if (failed(sourceAxes) || (*sourceAxes)->size() != reassociation.size())
+    auto sourceAxes = lookupAxes(op.getOperand());
+    auto projection = axisInfo.reshapeSourceProjections.find(op.getOperation());
+    if (failed(sourceAxes) || projection == axisInfo.reshapeSourceProjections.end() ||
+        (*sourceAxes)->size() != projection->second.size())
       return failure();
 
     TensorAxes projected;
     projected.reserve((*sourceAxes)->size());
-    for (auto [sourceDim, group] : llvm::enumerate(reassociation)) {
-      const std::optional<Axis> &sourceAxis = (**sourceAxes)[sourceDim];
+    for (auto [sourceAxis, targetDim] : llvm::zip_equal(**sourceAxes, projection->second)) {
       if (!sourceAxis) {
         projected.push_back(std::nullopt);
         continue;
       }
-
-      std::optional<Axis> selected;
-      SmallVector<Axis> extentMatches;
-      for (int64_t dim : group) {
-        if (dim < 0 || dim >= static_cast<int64_t>(targetAxes.size()))
-          return failure();
-        const std::optional<Axis> &targetAxis = targetAxes[dim];
-        if (!targetAxis)
-          continue;
-        if (targetAxis->name == sourceAxis->name) {
-          selected = targetAxis;
-          break;
-        }
-        if (targetAxis->extent == sourceAxis->extent)
-          extentMatches.push_back(*targetAxis);
+      if (targetDim && *targetDim >= 0 && *targetDim < static_cast<int64_t>(targetAxes.size()) &&
+          targetAxes[*targetDim]) {
+        projected.push_back(targetAxes[*targetDim]);
+        continue;
       }
-      if (!selected && extentMatches.size() == 1)
-        selected = extentMatches.front();
-      projected.push_back(std::move(selected));
+      auto exact = llvm::find_if(targetAxes, [&](const std::optional<Axis> &targetAxis) {
+        return targetAxis && targetAxis->name == sourceAxis->name;
+      });
+      if (exact == targetAxes.end())
+        return failure();
+      projected.push_back(*exact);
     }
     return projected;
   }
@@ -1339,7 +1424,7 @@ private:
     FailureOr<Value> expr;
     if (inputType.getRank() < resultType.getRank()) {
       if (valueMap.contains(op.getOperand())) {
-        auto sourceAxes = projectExpandSourceAxes(op.getOperand(), *reassociation, **resultAxes);
+        auto sourceAxes = projectExpandSourceAxes(op, **resultAxes);
         if (failed(sourceAxes))
           return op.emitOpError("failed to project expanded source axes");
         expr = translateValue(op.getOperand(), *sourceAxes, inputType.getElementType());
@@ -1567,8 +1652,8 @@ static void collectSupportedComponent(Value value, Block *block, DenseSet<Operat
 }
 
 static LogicalResult importFunctionAsTA(func::FuncOp func) {
-  AxisDiscovery discovery;
-  auto axisInfoR = discovery.run(func);
+  AxisAnalysis analysis;
+  auto axisInfoR = analysis.run(func);
   if (failed(axisInfoR))
     return failure();
   DiscoveredAxisInfo &axisInfo = *axisInfoR;
