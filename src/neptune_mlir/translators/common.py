@@ -332,6 +332,7 @@ class BaseTranslator(ABC):
         "arith.muli": ast.Mult,
         "arith.addi": ast.Add,
         "arith.subi": ast.Sub,
+        "arith.divsi": ast.FloorDiv,
         "arith.divui": ast.FloorDiv,
         "arith.remui": ast.Mod,
         "arith.andi": ast.BitAnd,
