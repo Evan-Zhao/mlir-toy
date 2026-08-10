@@ -178,6 +178,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-doc-tokens", type=positive_int, default=512)
     parser.add_argument("--head-dim", type=positive_int, default=64)
     parser.add_argument("--index-dtype", choices=("int32", "int64"), default="int32")
+    parser.add_argument("--func-name", default="attention", help="exported function name")
     return parser.parse_args()
 
 
@@ -190,7 +191,13 @@ def main() -> None:
     offsets = jax.ShapeDtypeStruct((args.batch + 1,), index_dtype)
     attn_fn = partial(doc_offset_attention, max_doc_len=max_doc_tokens)
     stablehlo_module = jax.jit(attn_fn).lower(q, k, v, offsets)
-    print(stablehlo_module.as_text())
+    module_text = stablehlo_module.as_text()
+    if args.func_name != "main":
+        old_symbol = "func.func public @main("
+        if module_text.count(old_symbol) != 1:
+            raise RuntimeError("expected one public @main function in JAX StableHLO output")
+        module_text = module_text.replace(old_symbol, f"func.func public @{args.func_name}(")
+    print(module_text)
 
 
 if __name__ == "__main__":

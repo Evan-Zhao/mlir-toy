@@ -12,6 +12,7 @@ class AttentionSchedule(str, Enum):
     ALIBI_CAUSAL_ATTN = "alibi-causal-attn"
     KV_FP8_CAUSAL_ATTN = "kv-fp8-causal-attn"
     GLOBAL_GQA = "global-gqa"
+    VARLEN_ATTN = "varlen-attn"
 
     def __str__(self) -> str:
         return self.value
@@ -43,6 +44,7 @@ _SCHEDULE_TEMPLATES = {
     AttentionSchedule.ALIBI_CAUSAL_ATTN: ("attention.mlir.in", 2),
     AttentionSchedule.KV_FP8_CAUSAL_ATTN: ("attention_kv_fp8.mlir.in", 2),
     AttentionSchedule.GLOBAL_GQA: ("attention.mlir.in", 3),
+    AttentionSchedule.VARLEN_ATTN: ("attention_varlen.mlir.in", None),
 }
 _PACKAGE = __name__
 
@@ -65,7 +67,12 @@ def materialize_attention_schedule(
     tile_config.validate()
     template_name, n_batch_dims = _SCHEDULE_TEMPLATES[schedule]
     template_text = resources.files(_PACKAGE).joinpath(template_name).read_text()
-    return Template(template_text).substitute(tile_sizes=tile_config.get_tile_sizes(n_batch_dims))
+    if schedule == AttentionSchedule.VARLEN_ATTN:
+        tile_sizes = f"[1, {tile_config.block_m}, 1, {tile_config.block_n}, 0]"
+    else:
+        assert n_batch_dims is not None
+        tile_sizes = tile_config.get_tile_sizes(n_batch_dims)
+    return Template(template_text).substitute(tile_sizes=tile_sizes)
 
 
 def read_attention_schedule(schedule: AttentionSchedule | str) -> str:

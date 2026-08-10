@@ -12,7 +12,7 @@ dependencies = ["sympy>=1.14"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
-export = ["torch", "torch-mlir"]
+export = ["torch", "torch-mlir", "jax"]
 
 [project.scripts]
 neptune-export-attn = "neptune_mlir.cli.export_attention:main"

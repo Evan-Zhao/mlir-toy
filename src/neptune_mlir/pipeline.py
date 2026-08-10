@@ -59,6 +59,27 @@ def _run_neptune_opt_file(input_path: Path, pass_pipeline: str) -> str:
     return result.stdout
 
 
+def lower_stablehlo_to_linalg_mlir(input_mlir: str) -> str:
+    """Lower StableHLO tensor operations to Linalg while preserving custom calls."""
+    with tempfile.TemporaryDirectory(prefix="neptune_mlir_linalg_") as tmp_dir:
+        input_path = Path(tmp_dir) / "input.mlir"
+        input_path.write_text(input_mlir)
+        pass_pipeline = (
+            "builtin.module(inline,canonicalize,cse,stablehlo-legalize-to-linalg,canonicalize,cse)"
+        )
+        return _run_neptune_opt_file(input_path, pass_pipeline)
+
+
+def _run_export_worker(cmd: list[str], worker_name: str) -> str:
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        stdout = result.stdout.strip()
+        details = stderr or stdout or f"{worker_name} failed without output"
+        raise RuntimeError(f"{worker_name} failed with exit code {result.returncode}: {details}")
+    return result.stdout
+
+
 def export_attention_mlir(
     *,
     variant: AttentionVariant | str,
@@ -72,7 +93,7 @@ def export_attention_mlir(
     func_name: str = "attention",
     output_type: Literal["stablehlo", "linalg"] = "stablehlo",
 ) -> str:
-    """Export attention through Torch-MLIR in an isolated process."""
+    """Export dense attention through Torch-MLIR in an isolated process."""
     # Torch-MLIR and the standalone MLIR Python bindings ship separate native
     # runtimes that cannot be loaded into one Python process in arbitrary order.
     variant = _coerce_attention_variant(variant)
@@ -88,22 +109,40 @@ def export_attention_mlir(
         cmd += ["--kv-seq-len", str(kv_seq_len)]
     if window_size is not None:
         cmd += ["--window-size", str(window_size)]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        stdout = result.stdout.strip()
-        details = stderr or stdout or "Torch-MLIR export failed without output"
-        raise RuntimeError(
-            f"Torch-MLIR export failed with exit code {result.returncode}: {details}"
-        )
-    return result.stdout
+    return _run_export_worker(cmd, "Torch-MLIR export")
+
+
+def export_varlen_attention_mlir(
+    *,
+    num_docs: int = 8,
+    total_tokens: int = 1024,
+    heads: int = 4,
+    max_doc_tokens: int = 512,
+    head_dim: int = 64,
+    index_dtype: Literal["int32", "int64"] = "int32",
+    func_name: str = "attention",
+    output_type: Literal["stablehlo", "linalg"] = "stablehlo",
+) -> str:
+    """Export packed variable-length attention through JAX in an isolated process."""
+    if output_type not in {"stablehlo", "linalg"}:
+        raise ValueError(f"unsupported JAX export type: {output_type}")
+    cmd = [sys.executable, "-m", "neptune_mlir.operator.jax_varlen_packed_attention"]
+    cmd += ["--batch", str(num_docs), "--heads", str(heads)]
+    cmd += ["--total-tokens", str(total_tokens), "--max-doc-tokens", str(max_doc_tokens)]
+    cmd += ["--head-dim", str(head_dim), "--index-dtype", index_dtype]
+    cmd += ["--func-name", func_name]
+    stablehlo = _run_export_worker(cmd, "JAX varlen attention export")
+    if output_type == "linalg":
+        return lower_stablehlo_to_linalg_mlir(stablehlo)
+    return stablehlo
 
 
 def attention_to_htile_pass_pipeline(schedule_path: Path) -> str:
     return (
         "builtin.module("
+        "inline,canonicalize,cse,"
         f"transform-preload-library{{transform-library-paths={schedule_path.as_posix()}}},"
-        f"transform-interpreter,lower-affine,htile-dot-transpose-to-load-order,cse,canonicalize"
+        "transform-interpreter,lower-affine,htile-dot-transpose-to-load-order,cse,canonicalize"
         ")"
     )
 
@@ -153,6 +192,31 @@ def export_attention_to_htile_mlir(
         func_name=func_name,
     )
     return lower_attention_linalg_to_htile_mlir(input_mlir, schedule, tile_config)
+
+
+def export_varlen_attention_to_htile_mlir(
+    *,
+    num_docs: int = 8,
+    total_tokens: int = 1024,
+    heads: int = 4,
+    max_doc_tokens: int = 512,
+    head_dim: int = 64,
+    index_dtype: Literal["int32", "int64"] = "int32",
+    func_name: str = "attention",
+    tile_config: AttentionTileConfig | None = None,
+) -> str:
+    input_mlir = export_varlen_attention_mlir(
+        num_docs=num_docs,
+        total_tokens=total_tokens,
+        heads=heads,
+        max_doc_tokens=max_doc_tokens,
+        head_dim=head_dim,
+        index_dtype=index_dtype,
+        func_name=func_name,
+    )
+    return lower_attention_linalg_to_htile_mlir(
+        input_mlir, AttentionSchedule.VARLEN_ATTN, tile_config
+    )
 
 
 def translate_htile_to_ast(input_mlir: str, codegen_target: CodegenTarget) -> ast.Module:

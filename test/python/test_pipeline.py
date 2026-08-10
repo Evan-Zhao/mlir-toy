@@ -12,6 +12,8 @@ from neptune_mlir.pipeline import (
     compile_triton_source_to_ptx,
     export_attention_mlir,
     export_attention_to_htile_mlir,
+    export_varlen_attention_mlir,
+    export_varlen_attention_to_htile_mlir,
     get_htile_kernel_arguments,
     translate_htile_to_ast,
 )
@@ -117,6 +119,36 @@ def require_export_deps():
         pytest.skip("PyTorch is required for attention export tests")
     if importlib.util.find_spec("torch_mlir") is None:
         pytest.skip("Torch-MLIR is required for attention export tests")
+
+
+def require_jax():
+    import importlib.util
+
+    if importlib.util.find_spec("jax") is None:
+        pytest.skip("JAX is required for varlen attention export tests")
+
+
+def test_export_varlen_attention_to_htile_mlir() -> None:
+    require_jax()
+
+    exported = export_varlen_attention_mlir()
+    assert "func.func public @attention" in exported
+    assert "stablehlo.custom_call @neptune.packed_window_extract" in exported
+    assert "stablehlo.custom_call @neptune.packed_window_insert" in exported
+
+    linalg = export_varlen_attention_mlir(output_type="linalg")
+    assert "linalg.generic" in linalg
+    assert "stablehlo.custom_call @neptune.packed_window_extract" in linalg
+
+    lowered = export_varlen_attention_to_htile_mlir()
+    assert "htile.kernel @attention_kernel" in lowered
+    assert "mask(" in lowered
+    assert "other(" in lowered
+    assert "tensor.extract" not in lowered
+
+    translated = ast.unparse(translate_htile_to_ast(lowered, "triton"))
+    assert "tl.load(" in translated and "mask=" in translated and "other=" in translated
+    assert "tl.store(" in translated and translated.count("mask=") > 1
 
 
 def test_export_attention_uses_f16_dots_with_f32_accumulation() -> None:
@@ -295,7 +327,6 @@ def test_attention_lowering_and_backend_compilation(translated_attention_case) -
 def test_attention_pass_pipeline_embeds_schedule_preload() -> None:
     pipeline = attention_to_htile_pass_pipeline(Path("/tmp/schedule.mlir"))
 
-    assert pipeline.startswith("builtin.module(transform-preload-library")
     assert "transform-library-paths=/tmp/schedule.mlir" in pipeline
     assert "transform-interpreter" in pipeline
     assert "lower-affine" in pipeline
