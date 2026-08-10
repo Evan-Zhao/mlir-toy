@@ -33,9 +33,12 @@ class Translator(shared.BaseTranslator):
         for arg in entry.arguments:
             pname = self._bind(arg, "buf")
             shape, dtype = shared._memref_shape(arg.type)
+            # TVM's flattening pass does not support rank-zero buffers with explicit strides.
+            # Present a scalar memref as a one-element buffer to TileLang instead.
+            tilelang_shape = shape or [1]
             annotation = shared._T_call(
                 "Tensor",
-                shared._tuple(*[shared._const(s) for s in shape]),
+                shared._tuple(*[shared._const(s) for s in tilelang_shape]),
                 shared._const(shared._mlir_dtype_to_tl_str(dtype)),
             )
             params.append(ast.arg(arg=pname, annotation=annotation))
@@ -464,7 +467,7 @@ class Translator(shared.BaseTranslator):
             tile_shape, _ = shared._tensor_shape(tile_value.type)
         mem_shape, _ = shared._memref_shape(memref.type)
         batch_dims = len(mem_shape) - len(tile_shape)
-        indices: list[ast.expr] = []
+        indices: list[ast.expr] = [shared._const(0)] if not mem_shape else []
         for dim, offset in enumerate(offsets):
             if dim < batch_dims:
                 indices.append(self._expr(offset))
