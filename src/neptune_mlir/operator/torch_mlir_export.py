@@ -72,6 +72,14 @@ class AlibiCausalAttentionModule(torch.nn.Module):
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, slopes: torch.Tensor
     ) -> torch.Tensor:
+        output_shape = q.shape
+        q_heads, kv_heads = q.shape[1], k.shape[1]
+        if q_heads != kv_heads:
+            groups = q_heads // kv_heads
+            q = q.reshape(q.shape[0], groups, kv_heads, q.shape[2], q.shape[3])
+            k = k[:, None, :, :, :].expand(k.shape[0], groups, kv_heads, k.shape[2], k.shape[3])
+            v = v[:, None, :, :, :].expand(v.shape[0], groups, kv_heads, v.shape[2], v.shape[3])
+            slopes = slopes.reshape(groups, kv_heads)
         scale = 1.0 / math.sqrt(q.shape[-1])
         scores = _f16_matmul_f32(q, k.transpose(-1, -2))
         scores = scores * scale
@@ -79,30 +87,41 @@ class AlibiCausalAttentionModule(torch.nn.Module):
         query_pos = torch.arange(q_len, dtype=torch.float32, device=scores.device)
         key_pos = torch.arange(kv_len, dtype=torch.float32, device=scores.device)
         distance = key_pos[None, :] - query_pos[:, None]
-        scores = scores + distance * slopes[:, None, None]
+        scores = scores + distance * slopes[..., None, None]
         mask = causal_mask(scores)
         neg_inf = torch.tensor(float("-inf"), dtype=scores.dtype, device=scores.device)
         scores = torch.where(mask, scores, neg_inf)
         probs = torch.softmax(scores, dim=-1)
-        out_f32 = _f16_matmul_f32(probs, v)
-        return out_f32.to(torch.float16)
+        output = _f16_matmul_f32(probs, v).to(torch.float16)
+        if q_heads != kv_heads:
+            output = output.reshape(output_shape)
+        return output
 
 
 class KVOnlyQuantizedAttentionModule(torch.nn.Module):
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sk: torch.Tensor, sv: torch.Tensor
     ) -> torch.Tensor:
-        k_dq = (k.to(torch.float32) * sk).to(torch.float16)
-        v_dq = (v.to(torch.float32) * sv).to(torch.float16)
+        output_shape = q.shape
+        q_heads, kv_heads = q.shape[1], k.shape[1]
+        k = (k.to(torch.float32) * sk).to(torch.float16)
+        v = (v.to(torch.float32) * sv).to(torch.float16)
+        if q_heads != kv_heads:
+            groups = q_heads // kv_heads
+            q = q.reshape(q.shape[0], groups, kv_heads, q.shape[2], q.shape[3])
+            k = k[:, None, :, :, :].expand(k.shape[0], groups, kv_heads, k.shape[2], k.shape[3])
+            v = v[:, None, :, :, :].expand(v.shape[0], groups, kv_heads, v.shape[2], v.shape[3])
         scale = 1.0 / math.sqrt(q.shape[-1])
-        scores = _f16_matmul_f32(q, k_dq.transpose(-1, -2))
+        scores = _f16_matmul_f32(q, k.transpose(-1, -2))
         scores = scores * scale
         mask = causal_mask(scores)
         neg_inf = torch.tensor(float("-inf"), dtype=scores.dtype, device=scores.device)
         scores = torch.where(mask, scores, neg_inf)
         probs = torch.softmax(scores, dim=-1)
-        out_f32 = _f16_matmul_f32(probs, v_dq)
-        return out_f32.to(torch.float16)
+        output = _f16_matmul_f32(probs, v).to(torch.float16)
+        if q_heads != kv_heads:
+            output = output.reshape(output_shape)
+        return output
 
 
 class SparseMMModule(torch.nn.Module):
@@ -252,9 +271,6 @@ def _build_module_and_args(
     if mask_f is not None:
         return AttentionModule(mask_f).eval(), make_qkv()
 
-    if q_heads != kv_heads:
-        raise ValueError(f"{variant.value} does not support different query and KV head counts")
-
     if variant == AttentionVariant.ALIBI_CAUSAL_ATTN:
         q, k, v = make_qkv()
         slopes = (torch.arange(q_heads, dtype=fp32) + 1.0) / q_heads
@@ -264,8 +280,9 @@ def _build_module_and_args(
         q, k, v = make_qkv()
         k = k.to(torch.float8_e4m3fn)
         v = v.to(torch.float8_e4m3fn)
-        sk = torch.randn(kv_heads, dtype=fp32).reshape(1, q_heads, 1, 1)
-        sv = torch.randn(kv_heads, dtype=fp32).reshape(1, q_heads, 1, 1)
+        scale_shape = () if kv_heads == 1 else (1, kv_heads, 1, 1)
+        sk = torch.randn(scale_shape, dtype=fp32)
+        sv = torch.randn(scale_shape, dtype=fp32)
         return KVOnlyQuantizedAttentionModule().eval(), (q, k, v, sk, sv)
 
     if variant == AttentionVariant.SPARSE_MM:
