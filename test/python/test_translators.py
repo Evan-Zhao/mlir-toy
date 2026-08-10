@@ -174,6 +174,25 @@ def test_tilelang_translator_functional():
     _assert_causal_attention_output(torch, out, q, k, v)
 
 
+def test_triton_translates_unsqueeze_and_squeeze():
+    source = """
+    module {
+      htile.kernel @unit_dims() attributes {program_bounds = array<i64: 1>} {
+        %cst = arith.constant 0.0 : f32
+        %tile = htile.full %cst : f32 -> tensor<4x8xf32>
+        %expanded = htile.unsqueeze %tile mask [false, true, false]
+            : tensor<4x8xf32> -> tensor<4x1x8xf32>
+        %collapsed = htile.squeeze %expanded mask [false, true, false]
+            : tensor<4x1x8xf32> -> tensor<4x8xf32>
+        htile.return
+      }
+    }
+    """
+    translated = ast.unparse(translate_triton(source))
+    assert "tile_2 = tile_1[:, None, :]" in translated
+    assert translated.count("tl.reshape") == 1
+
+
 def test_triton_scalar_memref_access_uses_pointer_arithmetic():
     source = """
     module {

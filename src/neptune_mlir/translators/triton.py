@@ -1,6 +1,7 @@
 """HTile kernel MLIR -> Triton Python translator using MLIR Python bindings."""
 
 import ast
+from typing import ClassVar
 
 from mlir import ir
 
@@ -8,6 +9,12 @@ from . import common as shared
 
 
 class Translator(shared.BaseTranslator):
+    _OP_METHODS: ClassVar[dict[str, str]] = {
+        **shared.BaseTranslator._OP_METHODS,
+        "htile.unsqueeze": "_htile_unsqueeze",
+        "htile.squeeze": "_htile_squeeze",
+    }
+
     def __init__(self):
         super().__init__()
         self._for_output_names: list[list[str]] = []
@@ -362,6 +369,34 @@ class Translator(shared.BaseTranslator):
         # Placement change only — alias the SSA value, emit nothing.
         self._names[op.results[0]] = self._get(op.operands[0])
         return []
+
+    def _htile_unsqueeze(self, op: ir.OpView) -> list[ast.stmt]:
+        name = self._bind(op.results[0], "tile")
+        mask = list(ir.DenseBoolArrayAttr(op.attributes["mask"]))
+        indices: list[ast.expr] = [
+            shared._const(None) if inserted else ast.Slice() for inserted in mask
+        ]
+        index = ast.Tuple(elts=indices, ctx=ast.Load()) if len(indices) > 1 else indices[0]
+        return [
+            shared._assign(
+                name,
+                ast.Subscript(value=self._expr(op.operands[0]), slice=index, ctx=ast.Load()),
+            )
+        ]
+
+    def _htile_squeeze(self, op: ir.OpView) -> list[ast.stmt]:
+        name = self._bind(op.results[0], "tile")
+        shape, _ = shared._tensor_shape(op.results[0].type)
+        return [
+            shared._assign(
+                name,
+                shared._tl_call(
+                    "reshape",
+                    self._expr(op.operands[0]),
+                    shared._tuple(*[shared._const(extent) for extent in shape]),
+                ),
+            )
+        ]
 
     # --- htile.broadcast -> unsqueeze ---
 
