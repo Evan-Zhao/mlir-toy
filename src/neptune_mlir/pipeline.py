@@ -338,6 +338,7 @@ def compile_cutile_source(
     source: str,
     kernel_arguments: tuple[KernelArgument, ...],
     grid: tuple[int, int, int] = (1, 1, 1),
+    argument_values: dict[int, list[int | float]] | None = None,
 ) -> None:
     """Compile generated cuTile source by launching it once on the active CUDA device."""
     try:
@@ -357,6 +358,15 @@ def compile_cutile_source(
             )
             for argument in kernel_arguments
         ]
+        for index, values in (argument_values or {}).items():
+            value = torch.tensor(values, dtype=args[index].dtype, device="cuda")
+            if value.shape != args[index].shape:
+                raise ValueError(
+                    f"argument {index} initializer has shape {tuple(value.shape)}, "
+                    f"expected {tuple(args[index].shape)}"
+                )
+            args[index].copy_(value)
+
         stream = torch.cuda.current_stream()
         ct.launch(stream, grid, module.attention_kernel, tuple(args))
         torch.cuda.synchronize()

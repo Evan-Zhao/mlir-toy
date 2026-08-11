@@ -207,6 +207,25 @@ def test_triton_translates_unsqueeze_and_squeeze():
     assert translated.count("tl.reshape") == 1
 
 
+def test_cutile_translates_unsqueeze_and_squeeze():
+    source = """
+    module {
+      htile.kernel @unit_dims() {
+        %cst = arith.constant 0.0 : f32
+        %tile = htile.full %cst : f32 -> tensor<4x8xf32>
+        %expanded = htile.unsqueeze %tile mask [false, true, false]
+            : tensor<4x8xf32> -> tensor<4x1x8xf32>
+        %collapsed = htile.squeeze %expanded mask [false, true, false]
+            : tensor<4x1x8xf32> -> tensor<4x8xf32>
+        htile.return
+      }
+    }
+    """
+    translated = ast.unparse(translate_cutile(source))
+    assert translated.count("ct.expand_dims") == 1
+    assert translated.count("ct.reshape") == 1
+
+
 def test_triton_masked_memory_uses_tensor_pointers():
     source = """
     module {
@@ -235,6 +254,35 @@ def test_triton_masked_memory_uses_tensor_pointers():
     assert "other=" in translated
     assert translated.count("mask=") == 2
     assert "tl.store(" in translated
+
+
+def test_cutile_masked_memory_uses_raw_offsets():
+    source = """
+    module {
+      htile.kernel @masked_memory(
+          %src: memref<16x8xf32>, %dst: memref<16x8xf32>) {
+        %c0 = arith.constant 0 : index
+        %c8 = arith.constant 8 : index
+        %other = arith.constant 0.0 : f32
+        %range = htile.arange %c0 to %c8 : tensor<8xindex>
+        %indices = htile.broadcast %range dimensions = [0]
+            : tensor<8xindex> -> tensor<4x8xindex>
+        %zero = htile.full %c0 : index -> tensor<4x8xindex>
+        %mask = arith.cmpi sge, %indices, %zero : tensor<4x8xindex>
+        %value = htile.load %src[%c0, %c0]
+            mask(%mask : tensor<4x8xi1>) other(%other : f32)
+            : memref<16x8xf32> -> tensor<4x8xf32>
+        htile.store %value, %dst[%c0, %c0] mask(%mask : tensor<4x8xi1>)
+            : tensor<4x8xf32>, memref<16x8xf32>
+        htile.return
+      }
+    }
+    """
+    translated = ast.unparse(translate_cutile(source))
+    assert translated.count("get_raw_memory()") == 2
+    assert ".load_offset(" in translated and "padding_value=" in translated
+    assert ".store_offset(" in translated
+    assert translated.count("mask=") == 2
 
 
 def test_triton_translates_scalar_load_and_index_cast():

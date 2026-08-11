@@ -5,6 +5,7 @@ the lowering is closer to the Triton translator than to TileLang.
 """
 
 import ast
+from typing import ClassVar
 
 from mlir import ir
 
@@ -24,6 +25,12 @@ def _mlir_dtype_to_ct(dtype: str) -> ast.expr:
 
 
 class Translator(shared.BaseTranslator):
+    _OP_METHODS: ClassVar[dict[str, str]] = {
+        **shared.BaseTranslator._OP_METHODS,
+        "htile.unsqueeze": "_htile_unsqueeze",
+        "htile.squeeze": "_htile_squeeze",
+    }
+
     def __init__(self):
         super().__init__()
         self._for_output_names: list[list[str]] = []
@@ -153,6 +160,14 @@ class Translator(shared.BaseTranslator):
         mem_shape = spec.memref_shape
         tile_shape = spec.tile_shape
         offsets = spec.offsets
+        if spec.mask is not None:
+            if spec.other is None:
+                raise ValueError("masked htile.load requires an other value")
+            raw_assignment, load = self._masked_memref_call(
+                spec, "load_offset", padding_value=self._expr(spec.other)
+            )
+            result = self._bind(op.results[0], "tile")
+            return [raw_assignment, shared._assign(result, load)]
         if len(offsets) != len(mem_shape):
             raise NotImplementedError("cuTile load expects one offset per memref dimension")
 
@@ -183,15 +198,25 @@ class Translator(shared.BaseTranslator):
         stmts.append(
             shared._assign(
                 result,
-                _ct_call("reshape", shared._name(loaded), shared._tuple(*[shared._const(s) for s in tile_shape])),
+                _ct_call(
+                    "reshape",
+                    shared._name(loaded),
+                    shared._tuple(*[shared._const(s) for s in tile_shape]),
+                ),
             )
         )
         return stmts
 
     def _htile_store(self, op: ir.OpView) -> list[ast.stmt]:
-        mem_shape, _ = shared._memref_shape(op.operands[1].type)
-        tile_shape, _ = shared._tensor_shape(op.operands[0].type)
-        offsets = list(op.operands[2:])
+        spec = shared._decode_store(op)
+        mem_shape = spec.memref_shape
+        tile_shape = spec.tile_shape
+        offsets = spec.offsets
+        if spec.mask is not None:
+            raw_assignment, store = self._masked_memref_call(
+                spec, "store_offset", self._expr(spec.value)
+            )
+            return [raw_assignment, shared._expr_stmt(store)]
         if len(offsets) != len(mem_shape):
             raise NotImplementedError("cuTile store expects one offset per memref dimension")
 
@@ -201,10 +226,94 @@ class Translator(shared.BaseTranslator):
         index = self._tile_space_index(offsets, full_order, full_tile_shape)
         tile = _ct_call(
             "reshape",
-            self._expr(op.operands[0]),
+            self._expr(spec.value),
             shared._tuple(*[shared._const(s) for s in full_tile_shape]),
         )
-        return [shared._expr_stmt(_ct_call("store", self._expr(op.operands[1]), shared._tuple(*index), tile))]
+        return [
+            shared._expr_stmt(
+                _ct_call("store", self._expr(spec.memref), shared._tuple(*index), tile)
+            )
+        ]
+
+    def _masked_memref_call(
+        self,
+        spec: shared.LoadSpec | shared.StoreSpec,
+        method: str,
+        *args: ast.expr,
+        **kwargs: ast.expr,
+    ) -> tuple[ast.stmt, ast.Call]:
+        if spec.mask is None:
+            raise ValueError("masked memref call requires a mask")
+        linear_offsets = self._linear_memref_offsets(
+            spec.offsets, spec.memref_shape, spec.tile_shape, spec.dimension_order
+        )
+        raw = self._fresh("raw")
+        raw_assignment = shared._assign(
+            raw, shared._call(shared._attr(self._expr(spec.memref), "get_raw_memory"))
+        )
+        call = shared._call(
+            shared._attr(shared._name(raw), method),
+            linear_offsets,
+            *args,
+            mask=self._expr(spec.mask),
+            **kwargs,
+        )
+        return raw_assignment, call
+
+    def _linear_memref_offsets(
+        self,
+        offsets: list[ir.Value],
+        mem_shape: list[int],
+        tile_shape: list[int],
+        dimension_order: list[int],
+    ) -> ast.expr:
+        if len(offsets) != len(mem_shape):
+            raise NotImplementedError(
+                f"masked memref access rank mismatch: {len(offsets)} offsets for rank "
+                f"{len(mem_shape)}"
+            )
+        if len(tile_shape) > len(mem_shape):
+            raise NotImplementedError("masked memref access tile rank exceeds memref rank")
+
+        strides = [1] * len(mem_shape)
+        for dim in range(len(mem_shape) - 2, -1, -1):
+            strides[dim] = strides[dim + 1] * mem_shape[dim + 1]
+
+        linear_offset: ast.expr = shared._const(0)
+        for offset, stride in zip(offsets, strides):
+            contribution = ast.BinOp(
+                left=self._expr(offset), op=ast.Mult(), right=shared._const(stride)
+            )
+            linear_offset = ast.BinOp(left=linear_offset, op=ast.Add(), right=contribution)
+
+        first_tile_mem_dim = len(mem_shape) - len(tile_shape)
+        has_tile_axis = False
+        for logical_dim, extent in enumerate(tile_shape):
+            if extent == 1:
+                continue
+            has_tile_axis = True
+            axis_shape = [1] * len(tile_shape)
+            axis_shape[logical_dim] = extent
+            axis_offsets = _ct_call(
+                "reshape",
+                _ct_call("arange", shared._const(extent), dtype=_ct("int64")),
+                shared._tuple(*[shared._const(size) for size in axis_shape]),
+            )
+            mem_dim = first_tile_mem_dim + dimension_order[logical_dim]
+            contribution = ast.BinOp(
+                left=axis_offsets, op=ast.Mult(), right=shared._const(strides[mem_dim])
+            )
+            linear_offset = ast.BinOp(left=linear_offset, op=ast.Add(), right=contribution)
+
+        if tile_shape and not has_tile_axis:
+            zero_tile = _ct_call(
+                "full",
+                shared._tuple(*[shared._const(size) for size in tile_shape]),
+                shared._const(0),
+                dtype=_ct("int64"),
+            )
+            linear_offset = ast.BinOp(left=linear_offset, op=ast.Add(), right=zero_tile)
+        return linear_offset
 
     def _tile_space_index(
         self,
@@ -319,6 +428,24 @@ class Translator(shared.BaseTranslator):
         self._names[op.results[0]] = self._get(op.operands[0])
         return []
 
+    def _htile_unsqueeze(self, op: ir.OpView) -> list[ast.stmt]:
+        name = self._bind(op.results[0], "tile")
+        expression = self._expr(op.operands[0])
+        for axis, inserted in enumerate(ir.DenseBoolArrayAttr(op.attributes["mask"])):
+            if inserted:
+                expression = _ct_call("expand_dims", expression, shared._const(axis))
+        return [shared._assign(name, expression)]
+
+    def _htile_squeeze(self, op: ir.OpView) -> list[ast.stmt]:
+        name = self._bind(op.results[0], "tile")
+        shape, _ = shared._tensor_shape(op.results[0].type)
+        extents = [shared._const(extent) for extent in shape]
+        return [
+            shared._assign(
+                name, _ct_call("reshape", self._expr(op.operands[0]), shared._tuple(*extents))
+            )
+        ]
+
     # --- htile.broadcast -> expand dims ---
 
     def _htile_broadcast(self, op: ir.OpView) -> list[ast.stmt]:
@@ -327,12 +454,8 @@ class Translator(shared.BaseTranslator):
         expr = self._expr(spec.source)
         for dim in spec.dimensions:
             expr = _ct_call("expand_dims", expr, axis=shared._const(dim))
-        return [
-            shared._assign(
-                name,
-                _ct_call("broadcast_to", expr, shared._tuple(*[shared._const(s) for s in spec.result_shape])),
-            )
-        ]
+        result_shape = [shared._const(s) for s in spec.result_shape]
+        return [shared._assign(name, _ct_call("broadcast_to", expr, shared._tuple(*result_shape)))]
 
     # --- scf.for ---
 
