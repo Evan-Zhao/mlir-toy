@@ -8,9 +8,10 @@ the scheduled L1 form used by the downstream pipeline.
 Implement an MLIR Transform dialect schedule that lowers an algorithm-only attention program into
 a scheduled, tile-level FlashAttention-like form.
 
-Integrated schedules for variants of attention lives in the pipeline tests `test/Pipeline/`, such as
-[`test/Pipeline/tm_global_attention.mlir`](../test/Pipeline/tm_global_attention.mlir) for global attention.
-The test contains a payload module in algorithmic form and a `transform` region with the schedule.
+Integrated schedules for attention variants live in the pipeline tests `test/Pipeline/`, such as
+[`test/Pipeline/tm_global_attention.mlir`](../test/Pipeline/tm_global_attention.mlir) for global
+attention. Each test contains a payload module in algorithmic form and a `transform` region with the
+schedule.
 
 ## Scheduling Model
 
@@ -121,7 +122,10 @@ transformations. See [the rolling update design](rolling-update-design.md) for d
 
 ## Current Status
 
-The L0-to-L1 schedule is implemented for the current global attention shape.
+The L0-to-L1 schedule is implemented for dense global, causal, rectangular causal, sliding-window,
+ALiBi, grouped-query/multi-query, FP8 K/V, packed variable-length, and SplitK decode cases. Not every
+case uses the same schedule: decode uses SplitK update, while the prefill-like cases use rolling
+update.
 
 - [x] TA prepass imports StableHLO attention into expression form, rewrites `exp` to `exp2`,
       exchanges division and matmul where needed, and lowers back to linalg.
@@ -131,4 +135,5 @@ The L0-to-L1 schedule is implemented for the current global attention shape.
 - [x] Row-max is fused under the outer loop and creates the inner streaming `scf.for`.
 - [x] Rolling update repairs row-sum and `P @ V` frontiers into online-softmax state.
 - [x] Trailing normalization and FP32-to-FP16 cast are fused after the streaming loop.
-- [x] The integrated pipeline test checks the FlashAttention-like structural shape.
+- [x] Integrated pipeline tests check the FlashAttention-like structural shape and lower selected
+      loops through Kernel HTile.
