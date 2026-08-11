@@ -8,6 +8,7 @@
 #include "TA/TADialect.h"
 #include "TA/TAPasses.h"
 #include "TA/TATransformExtension.h"
+#include "Tune/TuneTransformExtension.h"
 #include "stablehlo/conversions/linalg/transforms/Passes.h"
 #include "stablehlo/dialect/StablehloOps.h"
 
@@ -20,6 +21,7 @@ void neptune::registerAllExtensions(mlir::DialectRegistry &registry) {
   neptune::registerStableHLOTransformExtension(registry);
   ta::registerTATransformExtension(registry);
   loop::registerLoopTransformExtension(registry);
+  neptune::registerTuneTransformExtension(registry);
 }
 
 void neptune::registerAllPasses() {
