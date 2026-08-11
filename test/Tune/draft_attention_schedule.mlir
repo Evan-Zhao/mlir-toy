@@ -1,0 +1,193 @@
+// RUN: neptune-opt %s | FileCheck %s
+
+// Draft tunable variant of the global-attention schedule. Tuning choices
+// currently execute their defaults until candidate materialization is added.
+
+!any = !transform.any_op
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @configure_triton(%func: !any, %pipeline_loop: !any) {
+    %backend = transform.param.constant "triton" -> !transform.any_param
+    transform.annotate %func "neptune.codegen.backend" = %backend
+        : !any, !transform.any_param
+    %num_warps = transform.tune.sample_categorical "triton.num_warps"
+        candidates = [4, 8] default = 4 : !transform.param<i64>
+    transform.annotate %pipeline_loop "triton.num_warps" = %num_warps
+        : !any, !transform.param<i64>
+    transform.yield
+  }
+
+  transform.named_sequence @configure_cutile(%func: !any, %pipeline_loop: !any) {
+    %backend = transform.param.constant "cutile" -> !transform.any_param
+    transform.annotate %func "neptune.codegen.backend" = %backend
+        : !any, !transform.any_param
+    %k_latency = transform.tune.sample_categorical "cutile.k_load_latency"
+        candidates = [1, 2, 3] default = 2 : !transform.param<i64>
+    %v_latency = transform.tune.sample_categorical "cutile.v_load_latency"
+        candidates = [2, 3, 4, 5] default = 4 : !transform.param<i64>
+    transform.annotate %pipeline_loop "cutile.k_load_latency" = %k_latency
+        : !any, !transform.param<i64>
+    transform.annotate %pipeline_loop "cutile.v_load_latency" = %v_latency
+        : !any, !transform.param<i64>
+    transform.yield
+  }
+
+  transform.named_sequence @configure_tilelang(%func: !any, %pipeline_loop: !any) {
+    %backend = transform.param.constant "tilelang" -> !transform.any_param
+    transform.annotate %func "neptune.codegen.backend" = %backend
+        : !any, !transform.any_param
+    %stages = transform.tune.sample_categorical "tilelang.pipeline_stages"
+        candidates = [1, 2, 3, 4] default = 2 : !transform.param<i64>
+    transform.annotate %pipeline_loop "htile.pipeline_stages" = %stages
+        : !any, !transform.param<i64>
+    transform.yield
+  }
+
+  transform.named_sequence @match_4d_matmul_transb(%candidate: !any {transform.readonly}) -> !any {
+    %matched = transform.match.ta.einsum %candidate
+        {equation = "b ... h i d, b h j d -> b ... h i j"} : (!any) -> !any
+    transform.yield %matched : !any
+  }
+
+  transform.named_sequence @__transform_main(%module: !any) {
+    // Prepass. Translate the StableHLO input function to `ta`, which enables more flexible
+    // expression rewrites. Apply rewrites, then translate to linalg for scheduling.
+    %func0 = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
+    %func = transform.apply_registered_pass "stablehlo-to-ta" to %func0 : (!any) -> !any
+    transform.apply_patterns to %func {
+      // This canonicalization step folds trunc(const(f64), f32) into a constant in f32.
+      transform.apply_patterns.canonicalization
+      // Replace `exp(x)` with `exp2(x * log2(e))`, then push `log2(e)` constant around
+      // until it folds with other multiplicative constants.
+      transform.apply_patterns.ta.exp_to_exp2
+      // Replace `matmul(P_ij / s_i, V_jd)` with `matmul(P_ij, V_jd) / s_i`.
+      transform.apply_patterns.ta.sink_div_after_matmul
+    } : !any
+    // Factor a positive scale out of masked scores, then move it after the max reduction.
+    // Keep this separate from exp-to-exp2's opposite scale-motion patterns.
+    transform.apply_patterns to %func {
+      transform.apply_patterns.ta.sink_scale_after_max
+    } : !any
+    transform.apply_cse to %func : !any
+    // This is a special idiom: use einsum to match matmuls in `ta` dialect is easy.
+    // Then the `to_linalg` translator keeps these handles alive even after the translation,
+    // so you get %bmm0 to point to the first matmul in linalg.
+    %bmm0 = transform.collect_matching @match_4d_matmul_transb in %func : (!any) -> !any
+    transform.ta.to_linalg %func : !any
+
+    // Start working out a full loop nest over the first batch matmul `bmm0`.
+    // Tile all parallel dimensions of bmm0 (b, h, i, j) into a scf.forall loop.
+    // We'll fuse everything else into this loop nest.
+    %block_m = transform.tune.sample_categorical "attention.block_m"
+        candidates = [32, 64, 128] default = 128 : !transform.param<i64>
+    %block_n = transform.tune.sample_categorical "attention.block_n"
+        candidates = [32, 64, 128] default = 64 : !transform.param<i64>
+    %_1, %forall_loop = transform.structured.tile_using_forall
+        %bmm0 tile_sizes [1, 1, %block_m, %block_n, 0]
+        : (!any, !transform.param<i64>, !transform.param<i64>) -> (!any, !any)
+    // Canonicalization removes trivial (size-1) dimensions. This copies the loop and invalidates
+    // all handles pointing to ops inside the loop body.
+    // So we want to do this before we start fusion.
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+
+    // Fusion 1. Match element-wise ops that consumes mm0. Keep going until we reach a reduction
+    // (`find_next_reduction` finds the nearest reduction).
+    // In this case, the nearest reduction is the row-wise max of the softmax,
+    // and we only have one elementwise op (the scale op) to fuse.
+    //   TVM: sch.reverse_compute_at(bscale, j0)
+    %bmax, %_2 = transform.fusion.find_next_reduction %forall_loop : (!any) -> (!any, !any)
+    %prefix = transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %bmax { inline_elementwise } : (!any, !any) -> !any
+    transform.linalg.erase_unused_operands_and_results %prefix : !any
+
+    // Fusion 2. Fuse row-max into forall, splitting a serial `for` loop from forall in the process.
+    // Because of how MLIR scf.for works, this fusion implicitly also r-factors the reduction.
+    //   TVM: sch.reverse_compute_at(bmax, j0); sch.rfactor(...)
+    // The "row-max" in the input program has two outputs: the max value and the argmax.
+    // The subsequent fusion only supports single-output ops, so we remove the unused argmax
+    // output before fusion.
+    transform.linalg.erase_unused_operands_and_results %bmax : !any
+    %fused_bmax, %j0_loop = transform.scf.fuse_reduction_into_forall
+        %bmax into %forall_loop : (!any, !any) -> (!any, !any)
+
+    // Fusion 3 (rolling update). First find the nearest reduction reachable from the loop's
+    // output value, together with the ordered elementwise chain between them.
+    // This could find either the row-sum of softmax, or the second matmul, since they both
+    // depend on the loop's output. Currently in this schedule it finds the row-sum first,
+    // but just keep in mind that this can change (and doesn't matter).
+    %bsum, %elemwise = transform.fusion.find_next_reduction
+        %forall_loop : (!any) -> (!any, !any)
+    // Clone and fuse that elementwise chain under %forall_loop and %j0_loop,
+    // publishing the "sidecar" tensors as extra loop results.
+    %elemwise_sidecars = transform.fusion.clone_fuse_elemwise
+        %elemwise into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
+    // Repair the first reduction frontier by turning it into loop-carried state
+    // driven by the relayed sidecar value.
+    %_3 = transform.fusion.repair_reduction_frontier
+        %bsum reduce_producer %fused_bmax
+        substituting elemwise %elemwise -> %elemwise_sidecars
+        into %forall_loop, %j0_loop
+        : (!any, !any, !any, !any, !any, !any) -> !any
+
+    // Fusion 4. Apply rolling update again, this time with the second matmul being the reduction.
+    %bmm1, %elemwise_1 = transform.fusion.find_next_reduction
+        %forall_loop : (!any) -> (!any, !any)
+    %elemwise_sidecars_1 = transform.fusion.clone_fuse_elemwise
+        %elemwise_1 into %forall_loop, %j0_loop : (!any, !any, !any) -> !any
+    %_4 = transform.fusion.repair_reduction_frontier
+        %bmm1 reduce_producer %fused_bmax
+        substituting elemwise %elemwise_1 -> %elemwise_sidecars_1
+        into %forall_loop, %j0_loop
+        : (!any, !any, !any, !any, !any, !any) -> !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+
+    // Fusion 5. Fuse the trailing elemwise ops into the forall loop (but outside the for loop):
+    // elemwise division, then FP32->FP16 cast. Keep going until we see the return op.
+    %ret = transform.structured.match ops{["func.return"]} in %func : (!any) -> !any
+    transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %ret : (!any, !any) -> !any
+
+    // Post-pass: pushes lingering init tensor (see destination-passing style)
+    // before and outside the loops into the loop body.
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+    transform.scf.localize_scratch_tensors %func : !any
+    // Remove unit-size dims from the loops and the linalg ops in the loop.
+    // This is useful when we lower to HTile, because HTile requires (for example) dot to be in 2D.
+    transform.apply_patterns to %func {
+      transform.apply_patterns.scf.fold_unit_extent_dims_via_reshapes
+      transform.apply_patterns.linalg.fold_unit_extent_dims_via_reshapes
+      transform.apply_patterns.canonicalization
+    } : !any
+    transform.apply_cse to %func : !any
+    // This will hoist the load of Q outside of the inner loop because it is invariant there.
+    transform.apply_licm to %j0_loop : !any
+
+    // 0xFF800000: -inf in f32
+    %live_loop, %mixed_loop, %unchanged_loop =
+        transform.loop.specialize_dead_tile in %j0_loop
+        {dead_value = 0xFF800000 : f32} : (!any) -> (!any, !any, !any)
+
+    // Pipeline either the fully-live prefix or the original unspecialized loop.
+    %pipeline_loop = transform.merge_handles %live_loop, %unchanged_loop : !any
+    transform.tune.choose_sequence "backend" %func, %pipeline_loop
+        default = "triton"
+        cases = {cutile = @configure_cutile,
+                 tilelang = @configure_tilelang,
+                 triton = @configure_triton}
+        : (!any, !any) -> ()
+
+    // --- HTile lowering begins ---
+    // Use the translator to lower the tiled linalg program into HTile.
+    transform.htile.linalg_to_semantic %func : !any
+    %launches, %kernels = transform.htile.outline_kernels %forall_loop
+        {kernel_names = ["attention_kernel"]} : (!any) -> (!any, !any)
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+    transform.verify %func : !any
+
+    transform.yield
+  }
+}
+
+// CHECK: transform.tune.sample_categorical "attention.block_m"
+// CHECK: transform.tune.sample_categorical "attention.block_n"
+// CHECK: transform.tune.choose_sequence "backend"
+// CHECK-SAME: default = "triton"
+// CHECK-SAME: cases = {cutile = @configure_cutile, tilelang = @configure_tilelang, triton = @configure_triton}

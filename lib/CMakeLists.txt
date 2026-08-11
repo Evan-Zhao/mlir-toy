@@ -11,6 +11,7 @@ add_subdirectory(TA)
 add_subdirectory(LoopTr)
 add_subdirectory(HTile)
 add_subdirectory(StableHLO)
+add_subdirectory(Tune)
 add_subdirectory(Python)
 
 add_library(NeptuneInitAll STATIC InitAll.cpp)
@@ -20,5 +21,6 @@ target_link_libraries(NeptuneInitAll PUBLIC
   NeptuneTA
   NeptuneLoopTransform
   NeptuneStableHLO
+  NeptuneTuneTransform
   StablehloLinalgTransforms
 )
