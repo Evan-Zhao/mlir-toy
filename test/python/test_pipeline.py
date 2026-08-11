@@ -331,6 +331,23 @@ def varlen_triton_compilation_case(request):
     return ast.unparse(module) + "\n", kernel_arguments
 
 
+@pytest.fixture(scope="module")
+def varlen_cutile_compilation_case():
+    require_jax()
+    require_nvidia_python_backend("cuda.tile")
+    lowered = export_varlen_attention_to_htile_mlir(
+        num_docs=2,
+        total_tokens=512,
+        heads=2,
+        max_doc_tokens=512,
+        head_dim=64,
+        index_dtype="int32",
+    )
+    kernel_arguments = get_htile_kernel_arguments(lowered)
+    module = translate_htile_to_ast(lowered, "cutile")
+    return ast.unparse(module) + "\n", kernel_arguments
+
+
 def require_nvidia_triton():
     import importlib.util
 
@@ -415,6 +432,19 @@ def test_varlen_attention_triton_compilation(varlen_triton_compilation_case) -> 
 
     assert ".version" in ptx
     assert ".visible .entry attention_kernel" in ptx
+
+
+def test_varlen_attention_cutile_compilation(varlen_cutile_compilation_case) -> None:
+    source, kernel_arguments = varlen_cutile_compilation_case
+
+    assert "get_raw_memory()" in source
+    assert ".load_offset(" in source
+    assert ".store_offset(" in source
+    compile_cutile_source(
+        source,
+        kernel_arguments,
+        argument_values={3: [0, 256, 512]},
+    )
 
 
 def test_attention_pass_pipeline_embeds_schedule_preload() -> None:
