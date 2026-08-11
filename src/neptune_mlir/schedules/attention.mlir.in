@@ -113,11 +113,19 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.canonicalization
     } : !any
     transform.apply_cse to %func : !any
+    // This will hoist the load of Q outside of the inner loop because it is invariant there.
+    transform.apply_licm to %j0_loop : !any
 
     // 0xFF800000: -inf in f32
     %live_loop, %mixed_loop, %unchanged_loop =
         transform.loop.specialize_dead_tile in %j0_loop
         {dead_value = 0xFF800000 : f32} : (!any) -> (!any, !any, !any)
+
+    // Pipeline either the fully-live prefix or the original unspecialized loop.
+    %pipeline_loop = transform.merge_handles %live_loop, %unchanged_loop : !any
+    %stages = transform.param.constant 2 : i64 -> !transform.param<i64>
+    transform.annotate %pipeline_loop "htile.pipeline_stages" = %stages
+        : !any, !transform.param<i64>
 
     // --- HTile lowering begins ---
     // Use the translator to lower the tiled linalg program into HTile.
