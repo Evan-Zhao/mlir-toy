@@ -83,8 +83,9 @@ module attributes {transform.with_named_sequence} {
     transform.apply_cse to %func : !any
 
     // 0xFF800000: -inf in f32
-    %live_loop, %mixed_loop = transform.loop.specialize_dead_tile in %j0_loop
-        {dead_value = 0xFF800000 : f32} : (!any) -> (!any, !any)
+    %live_loop, %mixed_loop, %unchanged_loop =
+        transform.loop.specialize_dead_tile in %j0_loop
+        {dead_value = 0xFF800000 : f32} : (!any) -> (!any, !any, !any)
 
     // --- HTile lowering begins ---
     transform.htile.linalg_to_semantic %func : !any
