@@ -398,15 +398,17 @@ def LoopSpecializeDeadTileOp
       its live input, and
     - a mixed suffix loop, where the original producer remains.
 
-    The `loop` handle is consumed because the original loop is replaced by two
-    new loops. The transform returns handles to those new loops explicitly:
-    `live_loop` and `mixed_loop`.
+    The `loop` handle is consumed because the original loop may be replaced by
+    two new loops. The transform returns handles to those new loops explicitly:
+    `live_loop` and `mixed_loop`. If the transform is a no-op, it returns the
+    original loop through `unchanged_loop` instead.
 
     The optional `producer_op` handle is read-only and remains valid after the rewrite.
     If provided, it is remapped to the cloned producer operation in the mixed suffix loop.
     If omitted or empty, the producer is inferred as the unique dead-select
     `linalg.generic` nested in `loop`. If no such producer is found, the op is
-    a no-op and returns empty handles. If more than one is found, the op fails.
+    a no-op: `live_loop` and `mixed_loop` are empty, and `unchanged_loop`
+    contains the original loop. If more than one is found, the op fails.
 
     If dead-value propagation cannot prove that a fully-dead iteration preserves
     every used loop-carried result, the mixed loop retains the original upper bound.
@@ -416,7 +418,8 @@ def LoopSpecializeDeadTileOp
   let arguments = (ins Optional<TransformHandleTypeInterface>:$producer_op,
       TransformHandleTypeInterface:$loop, AnyAttr:$dead_value);
   let results = (outs TransformHandleTypeInterface:$live_loop,
-      TransformHandleTypeInterface:$mixed_loop);
+      TransformHandleTypeInterface:$mixed_loop,
+      TransformHandleTypeInterface:$unchanged_loop);
 
   let assemblyFormat = "($producer_op^)? `in` $loop attr-dict "
                        " `:` functional-type(operands, results)";

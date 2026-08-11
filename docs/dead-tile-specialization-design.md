@@ -20,8 +20,9 @@ It takes as input:
 - and a schedule-provided dead value.
 
 ```mlir
-%live_loop, %mixed_loop = transform.loop.specialize_dead_tile %producer in %loop
-    {dead_value = 0xFF800000 : f32} : (!any, !any) -> !any, !any
+%live_loop, %mixed_loop, %unchanged_loop =
+    transform.loop.specialize_dead_tile %producer in %loop
+    {dead_value = 0xFF800000 : f32} : (!any, !any) -> (!any, !any, !any)
 ```
 
 Contract:
@@ -32,12 +33,14 @@ Contract:
   predicate.
 - `dead_value` is an explicit hint. The pass does not try to rediscover it.
 - The transform may fail if it cannot prove the rewrite preserves loop state.
-- When the producer handle is omitted or empty, the transform infers a unique
-  matching producer. If no producer matches, it succeeds as a no-op and returns
-  empty handles. Multiple inferred matches remain an ambiguity and fail.
+- When the producer handle is omitted or empty, the transform infers a unique matching producer.
+  If no producer matches, it succeeds as a no-op, returns empty live/mixed handles, and returns the
+  original loop through the unchanged handle. Multiple inferred matches remain an ambiguity and
+  fail.
 
-The op returns handles to the new fully-live prefix loop and mixed loop. The
-producer handle remains valid when tracking succeeds.
+The op returns handles to the new fully-live prefix loop and mixed loop. If no matching producer is
+found, those handles are empty and `unchanged_loop` contains the original loop; after a rewrite,
+`unchanged_loop` is empty. The producer handle remains valid when tracking succeeds.
 
 ## Current Implementation
 

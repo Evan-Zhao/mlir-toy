@@ -1222,6 +1222,7 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
     if (candidates.empty()) {
       transformResults.set(getOperation()->getResult(0), {});
       transformResults.set(getOperation()->getResult(1), {});
+      transformResults.set(getOperation()->getResult(2), {loop.getOperation()});
       return DiagnosedSilenceableFailure::success();
     }
     if (!llvm::hasSingleElement(candidates))
@@ -1309,6 +1310,7 @@ DiagnosedSilenceableFailure LoopSpecializeDeadTileOp::apply(TransformRewriter &r
     rewriter.replaceOp(loop, mixedLoop->getResults());
   transformResults.set(getOperation()->getResult(0), {liveLoop->getOperation()});
   transformResults.set(getOperation()->getResult(1), {mixedLoop->getOperation()});
+  transformResults.set(getOperation()->getResult(2), {});
   return DiagnosedSilenceableFailure::success();
 }
 
