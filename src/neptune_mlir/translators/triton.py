@@ -1,7 +1,6 @@
 """HTile kernel MLIR -> Triton Python translator using MLIR Python bindings."""
 
 import ast
-from typing import ClassVar
 
 from mlir import ir
 
@@ -9,12 +8,6 @@ from . import common as shared
 
 
 class Translator(shared.BaseTranslator):
-    _OP_METHODS: ClassVar[dict[str, str]] = {
-        **shared.BaseTranslator._OP_METHODS,
-        "htile.unsqueeze": "_htile_unsqueeze",
-        "htile.squeeze": "_htile_squeeze",
-    }
-
     def __init__(self):
         super().__init__()
         self._for_output_names: list[list[str]] = []
@@ -284,9 +277,7 @@ class Translator(shared.BaseTranslator):
         if len(tile_shape) > len(mem_shape):
             raise NotImplementedError("masked memref access tile rank exceeds memref rank")
 
-        strides = [1] * len(mem_shape)
-        for i in range(len(mem_shape) - 2, -1, -1):
-            strides[i] = strides[i + 1] * mem_shape[i + 1]
+        strides = shared._row_major_strides(mem_shape)
 
         linear_offset: ast.expr = shared._const(0)
         for index, stride in zip(indices, strides):
@@ -329,9 +320,7 @@ class Translator(shared.BaseTranslator):
                 f"scalar memref access rank mismatch: {len(indices)} indices for rank {len(mem_shape)}"
             )
 
-        strides = [1] * len(mem_shape)
-        for i in range(len(mem_shape) - 2, -1, -1):
-            strides[i] = strides[i + 1] * mem_shape[i + 1]
+        strides = shared._row_major_strides(mem_shape)
 
         offset: ast.expr = shared._const(0)
         for index, stride in zip(indices, strides):
@@ -358,9 +347,7 @@ class Translator(shared.BaseTranslator):
         stmts: list[ast.stmt] = []
         base_ptr = self._expr(memref_val)
         if len(mem_shape) > 2 and len(indices) >= len(mem_shape):
-            strides = [1] * len(mem_shape)
-            for i in range(len(mem_shape) - 2, -1, -1):
-                strides[i] = strides[i + 1] * mem_shape[i + 1]
+            strides = shared._row_major_strides(mem_shape)
             batch_dims = len(mem_shape) - 2
             offset: ast.expr = shared._const(0)
             for i in range(batch_dims):

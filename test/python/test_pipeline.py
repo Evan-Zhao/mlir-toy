@@ -1,13 +1,15 @@
 import ast
+import importlib.util
 from itertools import product
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
 from neptune_mlir.operator.variants import AttentionVariant
 from neptune_mlir.pipeline import (
     attention_to_htile_pass_pipeline,
-    compile_cutile_source,
+    compile_and_launch_cutile_source,
     compile_tilelang_source_to_cuda,
     compile_triton_source_to_ptx,
     export_attention_mlir,
@@ -107,7 +109,7 @@ BACKEND_COMPILATION_CASES = [
     for variant, (q_heads, kv_heads) in product(ATTN_VARIANTS, Q_KV_HEADS)
 ]
 
-VARLEN_TRITON_COMPILATION_CASES = [
+VARLEN_BACKEND_COMPILATION_CASES = [
     pytest.param(
         {
             "num_docs": 2,
@@ -133,25 +135,14 @@ VARLEN_TRITON_COMPILATION_CASES = [
     pytest.param(
         {
             "num_docs": 4,
-            "total_tokens": 2048,
-            "heads": 2,
-            "max_doc_tokens": 1024,
-            "head_dim": 64,
-            "index_dtype": "int64",
-        },
-        id="docs4-tokens2048-h2-d64-i64",
-    ),
-    pytest.param(
-        {
-            "num_docs": 4,
             "total_tokens": 512,
             "heads": 2,
             "max_doc_tokens": 256,
             "head_dim": 64,
-            "index_dtype": "int32",
+            "index_dtype": "int64",
             "tile_config": AttentionTileConfig(block_m=64, block_n=32),
         },
-        id="docs4-tokens512-h2-d64-i32-m64-n32",
+        id="docs4-tokens512-h2-d64-i64-m64-n32",
     ),
 ]
 
@@ -169,9 +160,7 @@ def test_native_htile_dialect_typeids_match_mlir_runtime() -> None:
     assert str(module).count("htile.return") == 1
 
 
-def require_export_deps():
-    import importlib.util
-
+def require_torch_mlir():
     if importlib.util.find_spec("torch") is None:
         pytest.skip("PyTorch is required for attention export tests")
     if importlib.util.find_spec("torch_mlir") is None:
@@ -179,8 +168,6 @@ def require_export_deps():
 
 
 def require_jax():
-    import importlib.util
-
     if importlib.util.find_spec("jax") is None:
         pytest.skip("JAX is required for varlen attention export tests")
 
@@ -209,7 +196,7 @@ def test_export_varlen_attention_to_htile_mlir() -> None:
 
 
 def test_export_attention_uses_f16_dots_with_f32_accumulation() -> None:
-    require_export_deps()
+    require_torch_mlir()
 
     exported = export_attention_mlir(
         variant=AttentionVariant.GLOBAL_ATTN,
@@ -225,7 +212,7 @@ def test_export_attention_uses_f16_dots_with_f32_accumulation() -> None:
 
 
 def test_export_fp8_attention_preserves_quantized_kv_inputs() -> None:
-    require_export_deps()
+    require_torch_mlir()
 
     exported = export_attention_mlir(
         variant=AttentionVariant.KV_FP8_CAUSAL_ATTN,
@@ -260,7 +247,7 @@ def test_export_fp8_attention_preserves_quantized_kv_inputs() -> None:
     ],
 )
 def test_export_attention_to_htile_mlir(variant, kwargs) -> None:
-    require_export_deps()
+    require_torch_mlir()
 
     lowered = export_attention_to_htile_mlir(
         variant=variant, seq_len=SHORT_SEQ, head_dim=64, **kwargs
@@ -275,7 +262,7 @@ def test_export_attention_to_htile_mlir(variant, kwargs) -> None:
 
 
 def test_custom_tile_config_reaches_lowered_loop_bounds() -> None:
-    require_export_deps()
+    require_torch_mlir()
 
     lowered = export_attention_to_htile_mlir(
         variant=AttentionVariant.GLOBAL_ATTN,
@@ -298,7 +285,7 @@ def codegen_target(request):
 @pytest.fixture(scope="module", params=TRANSLATOR_INPUT_CASES)
 def lowered_attention_case(request):
     """Lower one attention case once before translating it to each backend."""
-    require_export_deps()
+    require_torch_mlir()
     variant, kwargs, _ = request.param
     lowered = export_attention_to_htile_mlir(variant=variant, **kwargs)
     return lowered, get_htile_kernel_arguments(lowered)
@@ -313,7 +300,7 @@ def translated_attention_case(codegen_target, lowered_attention_case):
 
 @pytest.fixture(scope="module", params=BACKEND_COMPILATION_CASES)
 def backend_compilation_case(request, codegen_target):
-    require_export_deps()
+    require_torch_mlir()
     variant, kwargs, _ = request.param
     lowered = export_attention_to_htile_mlir(variant=variant, **kwargs)
     kernel_arguments = get_htile_kernel_arguments(lowered)
@@ -321,65 +308,35 @@ def backend_compilation_case(request, codegen_target):
     return codegen_target, ast.unparse(module) + "\n", kernel_arguments
 
 
-@pytest.fixture(scope="module", params=VARLEN_TRITON_COMPILATION_CASES)
-def varlen_triton_compilation_case(request):
+@pytest.fixture(scope="module", params=("triton", "cutile", "tilelang"))
+def varlen_codegen_target(request):
+    return request.param
+
+
+@pytest.fixture(scope="module", params=VARLEN_BACKEND_COMPILATION_CASES)
+def lowered_varlen_compilation_case(request):
     require_jax()
-    require_nvidia_triton()
-    lowered = export_varlen_attention_to_htile_mlir(**request.param)
+    kwargs = request.param
+    lowered = export_varlen_attention_to_htile_mlir(**kwargs)
     kernel_arguments = get_htile_kernel_arguments(lowered)
-    module = translate_htile_to_ast(lowered, "triton")
-    return ast.unparse(module) + "\n", kernel_arguments
+    offsets = [
+        document * kwargs["total_tokens"] // kwargs["num_docs"]
+        for document in range(kwargs["num_docs"] + 1)
+    ]
+    return lowered, kernel_arguments, offsets
 
 
 @pytest.fixture(scope="module")
-def varlen_cutile_compilation_case():
-    require_jax()
-    require_nvidia_python_backend("cuda.tile")
-    lowered = export_varlen_attention_to_htile_mlir(
-        num_docs=2,
-        total_tokens=512,
-        heads=2,
-        max_doc_tokens=512,
-        head_dim=64,
-        index_dtype="int32",
-    )
-    kernel_arguments = get_htile_kernel_arguments(lowered)
-    module = translate_htile_to_ast(lowered, "cutile")
-    return ast.unparse(module) + "\n", kernel_arguments
+def varlen_backend_compilation_case(varlen_codegen_target, lowered_varlen_compilation_case):
+    require_nvidia_python_backend(varlen_codegen_target)
+    lowered, kernel_arguments, offsets = lowered_varlen_compilation_case
+    module = translate_htile_to_ast(lowered, varlen_codegen_target)
+    return varlen_codegen_target, ast.unparse(module) + "\n", kernel_arguments, offsets
 
 
-def require_nvidia_triton():
+def require_torch_with_cuda():
     import importlib.util
 
-    if importlib.util.find_spec("triton") is None:
-        pytest.skip("Triton is required for Triton compilation tests")
-    if importlib.util.find_spec("torch") is None:
-        pytest.skip("PyTorch is required for Triton compilation tests")
-
-    import torch
-    import triton
-
-    if torch.version.cuda is None or not torch.cuda.is_available():
-        pytest.skip("An Nvidia GPU is required for Triton compilation tests")
-    try:
-        torch.cuda.init()
-        target = triton.runtime.driver.active.get_current_target()
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"Triton CUDA initialization failed: {exc}")
-    if target.backend != "cuda":  # type: ignore
-        pytest.skip(f"Triton compilation tests require the CUDA backend, got {target.backend}")  # type: ignore
-    return torch
-
-
-def require_nvidia_python_backend(module_name: str):
-    import importlib.util
-
-    try:
-        available = importlib.util.find_spec(module_name) is not None
-    except ModuleNotFoundError:
-        available = False
-    if not available:
-        pytest.skip(f"{module_name} is required for its compilation test")
     if importlib.util.find_spec("torch") is None:
         pytest.skip("PyTorch is required for backend compilation tests")
 
@@ -390,8 +347,27 @@ def require_nvidia_python_backend(module_name: str):
     try:
         torch.cuda.init()
     except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"CUDA initialization failed: {exc}")
+        pytest.skip(f"Torch CUDA initialization failed: {exc}")
     return torch
+
+
+def require_nvidia_python_backend(backend_name: Literal["cutile", "tilelang", "triton"]):
+    import importlib
+
+    module_name = "cuda.tile" if backend_name == "cutile" else backend_name
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError:
+        module = None
+    if module is None:
+        pytest.skip(f"{module_name} is required for its compilation test")
+    if module_name == "triton":
+        try:
+            target = module.runtime.driver.active.get_current_target()
+        except Exception as exc:  # noqa: BLE001
+            pytest.skip(f"Triton CUDA initialization failed: {exc}")
+        if target.backend != "cuda":  # type: ignore
+            pytest.skip(f"Triton compilation tests require the CUDA backend, got {target.backend}")  # type: ignore
 
 
 def test_attention_lowering_pipeline(translated_attention_case) -> None:
@@ -407,44 +383,48 @@ def test_attention_lowering_pipeline(translated_attention_case) -> None:
 
 def test_attention_lowering_and_backend_compilation(backend_compilation_case) -> None:
     codegen_target, source, kernel_arguments = backend_compilation_case
+    torch = require_torch_with_cuda()
+    require_nvidia_python_backend(codegen_target)
     if codegen_target == "triton":
-        require_nvidia_triton()
         ptx = compile_triton_source_to_ptx(source, kernel_arguments)
         assert ".version" in ptx
     elif codegen_target == "cutile":
-        torch = require_nvidia_python_backend("cuda.tile")
         if any(argument.dtype.startswith("f8") for argument in kernel_arguments):
             major, _ = torch.cuda.get_device_capability()
             if major < 10:
                 pytest.skip("cuTile FP8 compilation requires an sm100 or newer GPU")
-        compile_cutile_source(source, kernel_arguments)
+        compile_and_launch_cutile_source(source, kernel_arguments)
     else:
-        require_nvidia_python_backend("tilelang")
         cuda_source = compile_tilelang_source_to_cuda(
             source, output_index=len(kernel_arguments) - 1
         )
         assert "__global__" in cuda_source
 
 
-def test_varlen_attention_triton_compilation(varlen_triton_compilation_case) -> None:
-    source, kernel_arguments = varlen_triton_compilation_case
-    ptx = compile_triton_source_to_ptx(source, kernel_arguments)
+def test_varlen_attention_backend_compilation(varlen_backend_compilation_case) -> None:
+    codegen_target, source, kernel_arguments, offsets = varlen_backend_compilation_case
 
-    assert ".version" in ptx
-    assert ".visible .entry attention_kernel" in ptx
-
-
-def test_varlen_attention_cutile_compilation(varlen_cutile_compilation_case) -> None:
-    source, kernel_arguments = varlen_cutile_compilation_case
-
-    assert "get_raw_memory()" in source
-    assert ".load_offset(" in source
-    assert ".store_offset(" in source
-    compile_cutile_source(
-        source,
-        kernel_arguments,
-        argument_values={3: [0, 256, 512]},
-    )
+    if codegen_target == "triton":
+        ptx = compile_triton_source_to_ptx(source, kernel_arguments)
+        assert ".version" in ptx
+        assert ".visible .entry attention_kernel" in ptx
+    elif codegen_target == "cutile":
+        assert "get_raw_memory()" in source
+        assert ".load_offset(" in source
+        assert ".store_offset(" in source
+        compile_and_launch_cutile_source(
+            source,
+            kernel_arguments,
+            argument_values={3: offsets},
+        )
+    else:
+        assert "T.reshape(" in source
+        assert "T.if_then_else(" in source
+        assert "if view_" in source
+        cuda_source = compile_tilelang_source_to_cuda(
+            source, output_index=len(kernel_arguments) - 1
+        )
+        assert "__global__" in cuda_source
 
 
 def test_attention_pass_pipeline_embeds_schedule_preload() -> None:

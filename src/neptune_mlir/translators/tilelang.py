@@ -97,7 +97,14 @@ class Translator(shared.BaseTranslator):
         if op_name == "scf.for":
             allocs.extend(self._collect_allocs(op.regions[0].blocks[0]))
             return allocs
-        if op_name in {"htile.broadcast", "htile.permute", "tensor.empty", "htile.copy"}:
+        if op_name in {
+            "htile.broadcast",
+            "htile.permute",
+            "htile.unsqueeze",
+            "htile.squeeze",
+            "tensor.empty",
+            "htile.copy",
+        }:
             return allocs
 
         for result in op.results:
@@ -211,6 +218,16 @@ class Translator(shared.BaseTranslator):
         )
 
     def _arith_index_cast(self, op: ir.OpView) -> list[ast.stmt]:
+        if not shared._is_ranked_tensor_type(op.results[0].type):
+            name = self._bind(op.results[0], "v")
+            dtype = shared._mlir_dtype_to_tl_str(str(op.results[0].type))
+            return [
+                shared._assign(
+                    name,
+                    shared._T_call("cast", self._expr(op.operands[0]), shared._const(dtype)),
+                )
+            ]
+
         _, dtype = shared._tensor_shape(op.results[0].type)
         dtype_str = shared._mlir_dtype_to_tl_str(dtype)
         return self._parallel_store(
@@ -222,6 +239,19 @@ class Translator(shared.BaseTranslator):
 
     def _arith_cmpi(self, op: ir.OpView) -> list[ast.stmt]:
         cmp_op = shared._decode_cmp_predicate(op)
+        if not shared._is_ranked_tensor_type(op.results[0].type):
+            name = self._bind(op.results[0], "cmp")
+            return [
+                shared._assign(
+                    name,
+                    ast.Compare(
+                        left=self._expr(op.operands[0]),
+                        ops=[cmp_op],
+                        comparators=[self._expr(op.operands[1])],
+                    ),
+                )
+            ]
+
         return self._parallel_store(
             op.results[0],
             lambda indices: ast.Compare(
@@ -232,6 +262,20 @@ class Translator(shared.BaseTranslator):
         )
 
     def _arith_select(self, op: ir.OpView) -> list[ast.stmt]:
+        if not shared._is_ranked_tensor_type(op.results[0].type):
+            name = self._bind(op.results[0], "sel")
+            return [
+                shared._assign(
+                    name,
+                    shared._T_call(
+                        "if_then_else",
+                        self._expr(op.operands[0]),
+                        self._expr(op.operands[1]),
+                        self._expr(op.operands[2]),
+                    ),
+                )
+            ]
+
         return self._parallel_store(
             op.results[0],
             lambda indices: shared._T_call(
@@ -255,25 +299,33 @@ class Translator(shared.BaseTranslator):
     def _parallel_store(self, result: ir.Value, expr_builder) -> list[ast.stmt]:
         shape, _ = shared._tensor_shape(result.type)
         out = self._get(result)
+
+        def build(indices: list[ast.expr]) -> list[ast.stmt]:
+            return [
+                ast.Assign(
+                    targets=[shared._store_subscript(shared._name(out), indices)],
+                    value=expr_builder(indices),
+                    lineno=0,
+                )
+            ]
+
+        return self._parallel(shape, build)
+
+    def _parallel(self, shape: list[int], body_builder) -> list[ast.stmt]:
         index_names = [self._fresh(f"i{dim}") for dim in range(len(shape))]
-        indices: list[ast.expr] = [shared._name(n) for n in index_names]
+        indices: list[ast.expr] = [shared._name(name) for name in index_names]
         target: ast.expr
         if len(index_names) == 1:
             target = shared._name(index_names[0], ast.Store())
         else:
-            target = shared._tuple(*[shared._name(n, ast.Store()) for n in index_names], ctx=ast.Store())
-        body: list[ast.stmt] = [
-            ast.Assign(
-                targets=[shared._store_subscript(shared._name(out), indices)],
-                value=expr_builder(indices),
-                lineno=0,
+            target = shared._tuple(
+                *[shared._name(name, ast.Store()) for name in index_names], ctx=ast.Store()
             )
-        ]
         return [
             ast.For(
                 target=target,
-                iter=shared._T_call("Parallel", *[shared._const(s) for s in shape]),
-                body=body,
+                iter=shared._T_call("Parallel", *[shared._const(size) for size in shape]),
+                body=body_builder(indices),
                 orelse=[],
                 lineno=0,
                 col_offset=0,
@@ -302,9 +354,25 @@ class Translator(shared.BaseTranslator):
         if not shape:
             self._scalar_tiles.add(op.results[0])
             name = self._bind(op.results[0], "scalar")
-            src = self._mem_region(op.operands[0], list(op.operands[1:]), op.results[0])
-            return [shared._assign(name, src)]
+            return [shared._assign(name, self._mem_element(spec.memref, spec.offsets))]
+
         dimension_order = spec.dimension_order
+        if spec.mask is not None:
+            if spec.other is None:
+                raise ValueError("masked htile.load requires an other value")
+            self._require_identity_masked_layout(dimension_order)
+
+            def build(indices: list[ast.expr]) -> ast.expr:
+                source = self._mem_tile_element(spec.memref, spec.offsets, shape, indices)
+                return shared._T_call(
+                    "if_then_else",
+                    self._value_at(spec.mask, indices),
+                    source,
+                    self._value_at(spec.other, indices),
+                )
+
+            return self._parallel_store(op.results[0], build)
+
         physical_shape = [shape[dim] for dim in dimension_order]
         if dimension_order != list(range(len(shape))):
             if dimension_order != [1, 0]:
@@ -312,17 +380,42 @@ class Translator(shared.BaseTranslator):
                     f"unsupported TileLang load dimension_order: {dimension_order}"
                 )
             self._transposed_tiles.add(op.results[0])
-        src = self._mem_region(
-            op.operands[0], list(op.operands[1:]), op.results[0], tile_shape=physical_shape
-        )
+        src = self._mem_region(spec.memref, spec.offsets, op.results[0], tile_shape=physical_shape)
         return [shared._expr_stmt(shared._T_call("copy", src, self._expr(op.results[0])))]
 
     def _htile_store(self, op: ir.OpView) -> list[ast.stmt]:
-        dst = self._mem_region(op.operands[1], list(op.operands[2:]), op.operands[0])
-        return [shared._expr_stmt(shared._T_call("copy", self._expr(op.operands[0]), dst))]
+        spec = shared._decode_store(op)
+        if spec.mask is not None:
+            self._require_identity_masked_layout(spec.dimension_order)
+
+            def build(indices: list[ast.expr]) -> list[ast.stmt]:
+                destination = self._mem_tile_element(
+                    spec.memref, spec.offsets, spec.tile_shape, indices, store=True
+                )
+                return [
+                    ast.If(
+                        test=self._value_at(spec.mask, indices),
+                        body=[
+                            ast.Assign(
+                                targets=[destination],
+                                value=self._value_at(spec.value, indices),
+                            )
+                        ],
+                        orelse=[],
+                    )
+                ]
+
+            return self._parallel(spec.tile_shape, build)
+
+        dst = self._mem_region(spec.memref, spec.offsets, spec.value)
+        return [shared._expr_stmt(shared._T_call("copy", self._expr(spec.value), dst))]
 
     def _htile_full(self, op: ir.OpView) -> list[ast.stmt]:
-        return [shared._expr_stmt(shared._T_call("fill", self._expr(op.results[0]), self._expr(op.operands[0])))]
+        return [
+            shared._expr_stmt(
+                shared._T_call("fill", self._expr(op.results[0]), self._expr(op.operands[0]))
+            )
+        ]
 
     def _htile_arange(self, op: ir.OpView) -> list[ast.stmt]:
         start = self._expr(op.operands[0])
@@ -388,6 +481,26 @@ class Translator(shared.BaseTranslator):
         self._names[op.results[0]] = self._get(op.operands[0])
         return []
 
+    def _htile_unsqueeze(self, op: ir.OpView) -> list[ast.stmt]:
+        return self._htile_reshape(op)
+
+    def _htile_squeeze(self, op: ir.OpView) -> list[ast.stmt]:
+        return self._htile_reshape(op)
+
+    def _htile_reshape(self, op: ir.OpView) -> list[ast.stmt]:
+        shape, _ = shared._tensor_shape(op.results[0].type)
+        name = self._bind(op.results[0], "view")
+        return [
+            shared._assign(
+                name,
+                shared._T_call(
+                    "reshape",
+                    self._expr(op.operands[0]),
+                    shared._list(*[shared._const(size) for size in shape]),
+                ),
+            )
+        ]
+
     # --- htile.broadcast ---
 
     def _htile_broadcast(self, op: ir.OpView) -> list[ast.stmt]:
@@ -451,10 +564,61 @@ class Translator(shared.BaseTranslator):
         for dest, value in zip(self._yield_dests[-1], op.operands):
             src = self._get(value)
             if src != dest:
-                stmts.append(shared._expr_stmt(shared._T_call("copy", shared._name(src), shared._name(dest))))
+                stmts.append(
+                    shared._expr_stmt(shared._T_call("copy", shared._name(src), shared._name(dest)))
+                )
         return stmts
 
     # --- helpers ---
+
+    def _mem_element(self, memref: ir.Value, offsets: list[ir.Value]) -> ast.Subscript:
+        mem_shape, _ = shared._memref_shape(memref.type)
+        if len(offsets) != len(mem_shape):
+            raise NotImplementedError(
+                f"scalar memref access rank mismatch: {len(offsets)} offsets for rank "
+                f"{len(mem_shape)}"
+            )
+        indices = [self._expr(offset) for offset in offsets] or [shared._const(0)]
+        return shared._subscript(self._expr(memref), indices)
+
+    def _mem_tile_element(
+        self,
+        memref: ir.Value,
+        offsets: list[ir.Value],
+        tile_shape: list[int],
+        tile_indices: list[ast.expr],
+        *,
+        store: bool = False,
+    ) -> ast.Subscript:
+        mem_shape, _ = shared._memref_shape(memref.type)
+        if len(offsets) != len(mem_shape):
+            raise NotImplementedError(
+                f"masked memref access rank mismatch: {len(offsets)} offsets for rank "
+                f"{len(mem_shape)}"
+            )
+        batch_dims = len(mem_shape) - len(tile_shape)
+        if batch_dims < 0:
+            raise NotImplementedError("masked memref access tile rank exceeds memref rank")
+
+        indices: list[ast.expr] = []
+        for dim, offset in enumerate(offsets):
+            index = self._expr(offset)
+            if dim >= batch_dims:
+                index = ast.BinOp(
+                    left=index,
+                    op=ast.Add(),
+                    right=tile_indices[dim - batch_dims],
+                )
+            indices.append(index)
+        if store:
+            return shared._store_subscript(self._expr(memref), indices)
+        return shared._subscript(self._expr(memref), indices)
+
+    def _require_identity_masked_layout(self, dimension_order: list[int]) -> None:
+        if dimension_order != list(range(len(dimension_order))):
+            raise NotImplementedError(
+                "masked TileLang memory access does not yet support dimension_order"
+            )
 
     def _mem_region(
         self,
