@@ -259,4 +259,93 @@ After removing the row-constant term, precomputing `col * slope` outside the K/V
 scalar block offset improved timings by only about another 1%. Row-wise reciprocal normalization
 was slightly slower, and duplicate probability `exp2` expressions in generated Triton were already
 eliminated in PTX. Tile and warp changes remain shape-dependent autotuning decisions.
->>>>>>> conflict 1 of 1 ends
+
+## 4. Add cuTile-Specific FMHA Scheduling and Arithmetic Hints
+
+**Status:** Measured with manual cuTile prototypes; not implemented.
+
+The generated cuTile kernel is sensitive to memory-latency hints and division semantics that do not
+have direct equivalents in the current HTile schedule. Measurements used an RTX 6000 Ada,
+`B=1`, `H=4`, `S=4096`, `D=64`, and `BLOCK_N=64`. Timings are medians from interleaved runs.
+
+### 4.1 Mark K and V Loads with Asymmetric Latency
+
+The official cuTile FMHA kernel assigns different expected DRAM latencies to its loop-carried
+loads:
+
+```python
+k = ct.load(K, ..., latency=2)
+v = ct.load(V, ..., latency=4)
+```
+
+Adding only these hints to the generated `BLOCK_M=128` kernel improved latency from 122.21 us to
+116.16 us, or 5.0%. The cubin changed from a single loop body to a deeper software-pipelined form:
+
+| Metric | Inferred latency | K=2, V=4 |
+| --- | ---: | ---: |
+| Registers per thread | 255 | 255 |
+| Stack per thread | 64 bytes | 24 bytes |
+| Shared memory | 49,200 bytes | 49,184 bytes |
+| Static `HMMA` instructions | 128 | 256 |
+| Static `MUFU.EX2` instructions | 72 | 144 |
+
+The doubled static compute counts reflect loop unrolling rather than additional runtime work. Using
+the same hint for both loads was neutral at low values and regressed at high values; the asymmetric
+K/V hints are material.
+
+The cuTile translator should attach backend-specific latency hints based on the semantic role of a
+memory operation. The values remain candidates for shape-dependent tuning rather than universal
+constants.
+
+### 4.2 Use Approximate Division for FP16 Output Normalization
+
+The generated epilogue uses precise elementwise division after broadcasting the row sum. The
+maintained NVIDIA cuTile kernel instead requests approximate division:
+
+```python
+out = ct.truediv(
+    acc,
+    row_sum,
+    rounding_mode=ct.RoundingMode.APPROX,
+    flush_to_zero=True,
+)
+```
+
+Changing only the rounding mode improved the same kernel from 122.21 us to 118.07 us, or 3.4%.
+`flush_to_zero=True` alone had no effect. Selected SASS counts changed as follows:
+
+| Metric | Precise | Approximate |
+| --- | ---: | ---: |
+| Reciprocal helper calls | 65 | 1 |
+| `FCHK` correction instructions | 64 | 0 |
+| `FFMA` instructions | 341 | 12 |
+| Stack per thread | 64 bytes | 40 bytes |
+| Cubin size | 148,256 bytes | 132,512 bytes |
+
+The optimized output differed in 31 of 1,048,576 FP16 elements, with maximum difference
+`6.10e-5` and mean difference `4.62e-10`. Selection of approximate division must therefore be tied
+to the operator's numerical policy rather than applied as a general arithmetic canonicalization.
+
+### 4.3 Tune Query Tile Size After Applying the Hints
+
+Combining the latency hints and approximate division reduced the `BLOCK_M=128` kernel to
+114.72 us. Selecting `BLOCK_M=64` after those changes reduced it further to 110.53 us, an
+additional 3.7% and a total 9.6% improvement over the generated baseline. The M=64 cubin used 238
+registers, no stack, and 40,968 bytes of shared memory.
+
+This does not establish M=64 as a universal cuTile default. Tile-size changes alter grid
+parallelism and repeated K/V work, and prior Triton measurements favored M=128 at this sequence
+length. cuTile tile selection should be tuned independently by backend and shape.
+
+### Operation Reordering Experiments
+
+Operation reordering is not yet a standalone roadmap item. Explicitly reusing the probability tile
+increased stack use from 64 to 392 bytes per thread, while reusing both probability and rescaling
+tiles increased it to 1,016 bytes and regressed latency to 553 us. Preserving reduction dimensions,
+tracking a scaled maximum, and forcing `occupancy=2` also regressed when applied independently.
+
+cuTile and `tileiras` already perform code motion, loop splitting, software pipelining, and register
+allocation. Source transformations still change the dataflow graph and tile live ranges, but no
+isolated operation-order rewrite has yet improved this kernel. The maintained NVIDIA kernel's
+ordering may be useful only together with its tile shape, latency hints, approximate division, and
+occupancy target.
