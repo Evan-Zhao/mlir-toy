@@ -116,6 +116,13 @@ def _tensor_shape(mlir_type) -> tuple[list[int], str]:
     return list(mlir_type.shape), str(mlir_type.element_type)
 
 
+def _row_major_strides(shape: list[int]) -> list[int]:
+    strides = [1] * len(shape)
+    for dim in range(len(shape) - 2, -1, -1):
+        strides[dim] = strides[dim + 1] * shape[dim + 1]
+    return strides
+
+
 def _memref_shape(mlir_type) -> tuple[list[int], str]:
     """Return (shape, element_dtype_str) from an MLIR MemRefType."""
     if not isinstance(mlir_type, ir.MemRefType):
@@ -419,6 +426,8 @@ class BaseTranslator(ABC):
         "htile.permute": "_htile_permute",
         "htile.copy": "_htile_copy",
         "htile.broadcast": "_htile_broadcast",
+        "htile.unsqueeze": "_htile_unsqueeze",
+        "htile.squeeze": "_htile_squeeze",
         "scf.for": "_scf_for",
         "scf.yield": "_scf_yield",
     }

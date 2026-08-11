@@ -188,6 +188,47 @@ def test_tilelang_scalar_memref_uses_one_element_buffer():
     assert "scalar_2 = buf_0[0]" in translated
 
 
+def test_tilelang_translates_varlen_primitives():
+    source = """
+    module {
+      htile.kernel @varlen_primitives(
+          %src: memref<16x8xf32>, %offsets: memref<2xi32>,
+          %dst: memref<16x8xf32>) attributes {program_bounds = array<i64: 1>} {
+        %c0 = arith.constant 0 : index
+        %c8 = arith.constant 8 : index
+        %other = arith.constant 0.0 : f32
+        %offset_i32 = htile.load %offsets[%c0] : memref<2xi32> -> i32
+        %offset = arith.index_cast %offset_i32 : i32 to index
+        %has_offset = arith.cmpi sgt, %offset, %c0 : index
+        %start = arith.select %has_offset, %offset, %c0 : index
+        %range = htile.arange %c0 to %c8 : tensor<8xindex>
+        %indices = htile.broadcast %range dimensions = [0]
+            : tensor<8xindex> -> tensor<4x8xindex>
+        %zero = htile.full %c0 : index -> tensor<4x8xindex>
+        %mask = arith.cmpi sge, %indices, %zero : tensor<4x8xindex>
+        %expanded_mask = htile.unsqueeze %mask mask [false, true, false]
+            : tensor<4x8xi1> -> tensor<4x1x8xi1>
+        %value = htile.load %src[%start, %c0]
+            mask(%mask : tensor<4x8xi1>) other(%other : f32)
+            : memref<16x8xf32> -> tensor<4x8xf32>
+        %expanded = htile.unsqueeze %value mask [false, true, false]
+            : tensor<4x8xf32> -> tensor<4x1x8xf32>
+        %collapsed = htile.squeeze %expanded mask [false, true, false]
+            : tensor<4x1x8xf32> -> tensor<4x8xf32>
+        htile.store %collapsed, %dst[%start, %c0] mask(%mask : tensor<4x8xi1>)
+            : tensor<4x8xf32>, memref<16x8xf32>
+        htile.return
+      }
+    }
+    """
+    translated = ast.unparse(translate_tilelang(source))
+    assert "scalar_" in translated and "buf_1[c_" in translated
+    assert "T.cast(" in translated
+    assert translated.count("T.reshape") == 3
+    assert "= T.if_then_else(" in translated
+    assert "if frag_" in translated
+
+
 def test_triton_translates_unsqueeze_and_squeeze():
     source = """
     module {

@@ -5,7 +5,6 @@ the lowering is closer to the Triton translator than to TileLang.
 """
 
 import ast
-from typing import ClassVar
 
 from mlir import ir
 
@@ -25,12 +24,6 @@ def _mlir_dtype_to_ct(dtype: str) -> ast.expr:
 
 
 class Translator(shared.BaseTranslator):
-    _OP_METHODS: ClassVar[dict[str, str]] = {
-        **shared.BaseTranslator._OP_METHODS,
-        "htile.unsqueeze": "_htile_unsqueeze",
-        "htile.squeeze": "_htile_squeeze",
-    }
-
     def __init__(self):
         super().__init__()
         self._for_output_names: list[list[str]] = []
@@ -275,9 +268,7 @@ class Translator(shared.BaseTranslator):
         if len(tile_shape) > len(mem_shape):
             raise NotImplementedError("masked memref access tile rank exceeds memref rank")
 
-        strides = [1] * len(mem_shape)
-        for dim in range(len(mem_shape) - 2, -1, -1):
-            strides[dim] = strides[dim + 1] * mem_shape[dim + 1]
+        strides = shared._row_major_strides(mem_shape)
 
         linear_offset: ast.expr = shared._const(0)
         for offset, stride in zip(offsets, strides):

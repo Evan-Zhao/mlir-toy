@@ -334,13 +334,13 @@ def compile_triton_source_to_ptx(source: str, kernel_arguments: tuple[KernelArgu
         return ptx
 
 
-def compile_cutile_source(
+def compile_and_launch_cutile_source(
     source: str,
     kernel_arguments: tuple[KernelArgument, ...],
     grid: tuple[int, int, int] = (1, 1, 1),
     argument_values: dict[int, list[int | float]] | None = None,
 ) -> None:
-    """Compile generated cuTile source by launching it once on the active CUDA device."""
+    """Compile and launch generated cuTile source once on the active CUDA device."""
     try:
         import cuda.tile as ct  # type: ignore
         import torch
