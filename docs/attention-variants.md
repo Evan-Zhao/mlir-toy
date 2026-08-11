@@ -24,8 +24,8 @@ Checked items have current Neptune pipeline coverage; unchecked items are useful
 - [x] **Basic score value modifiers**: ALiBi head-dependent additive bias.
 - [x] **Basic input numeric representation**: FP16 attention, plus causal attention with FP8 K/V inputs
       and fused per-head K/V dequantization scales.
-- [ ] **Runtime sequence and segment bounds**: logical Q and K/V lengths should be carried by
-      runtime metadata for variable-length requests or packed document segments.
+- [x] **Runtime sequence and segment bounds**: packed variable-length prefill carries document starts
+      and lengths as runtime metadata and lowers masked packed-window loads and stores.
 - [ ] **KV-cache decode ABI**: K/V may come from persistent cache storage rather than freshly
       materialized dense tensors, with explicit request slots, cache lengths, cache positions,
       and batch indirection.
@@ -47,23 +47,19 @@ For the features that Neptune already supports, the static Transform-dialect exa
 The Python pipeline tests also exercise multiple shapes, including GQA with one K/V head.
 Decode-input scheduling support is tracked in the [SplitK update design](split-k-update-design.md).
 
+## Current Runtime-Bounds Coverage
+
+Packed variable-length prefill attention is implemented by
+[`tm_varlen_attention.mlir`](../test/Pipeline/tm_varlen_attention.mlir) and the JAX exporter.
+Q, K, and V are flattened across the batch, while `cu_seqlens`-style starts and lengths select each
+logical document. The schedule fuses semantic packed-window extraction and insertion into masked
+HTile loads and stores. Python tests cover HTile export and Triton, TileLang, and cuTile backend
+compilation.
+
+The current path still uses a static maximum document window and document count. General dynamic
+shapes and a serving-oriented request ABI remain separate work.
+
 ## Missing Feature Axes
-
-### Runtime Sequence and Segment Bounds
-
-Runtime sequence and segment bounds cover batches where each request, sequence, or packed document
-segment has different valid Q and K/V lengths. The operator should not infer validity only from
-static tensor extents or from a padded square score matrix. Instead, valid row and K/V ranges should
-come from metadata such as per-request lengths, cumulative sequence lengths, or segment boundaries.
-
-The first target should be **variable-length packed prefill attention**. Q, K, and V are flattened
-across the batch, and `cu_seqlens`-style metadata maps each token range back to a request or
-document segment. This removes padding work and exercises nonuniform tile liveness without requiring
-KV-cache storage.
-
-This axis composes with causal and document masking. Bounds say which tokens exist; the score domain
-says which valid Q/K pairs may interact. For packed causal training, the effective mask is usually
-“same document segment and not in the future.”
 
 ### KV-Cache Decode ABI
 

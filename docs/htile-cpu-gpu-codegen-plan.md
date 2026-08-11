@@ -1,12 +1,11 @@
 # HTile CPU+GPU Codegen Plan
 
-This note sketches the path from the current single-kernel HTile lowering to a mixed CPU+GPU
-program with multiple device kernels, explicit temporary buffers, and runtime workspace allocation.
+This note tracks the path from Semantic HTile to a mixed CPU+GPU program with multiple device
+kernels, explicit temporary buffers, and runtime workspace allocation.
 
-The immediate target is decode-input attention after SplitK update. That schedule naturally creates
-multiple top-level loop nests in one function: one loop nest computes split-local partial tensors,
-and later loop nests merge or post-process those tensors. Each top-level loop nest should become a
-separate device kernel, while the enclosing function becomes a host-side schedule.
+SplitK decode attention now reaches the multi-kernel HTile IR milestone: its top-level loop nests are
+outlined as separate device kernels, and the enclosing function contains ordered launches with
+explicit memref temporaries. Runtime allocation and executable host lowering are still outstanding.
 
 ## Goal
 
@@ -53,11 +52,12 @@ htile.runtime.free %tmp0
 
 ## Thrust 1: Minimal Decode Path
 
-The first thrust should get the current SplitK decode attention schedule through multi-kernel HTile
-lowering with the least machinery that can be correct for the cases at hand.
+The first thrust gets the current SplitK decode attention schedule through multi-kernel HTile
+lowering with the least machinery that can be correct for the cases at hand. Kernel outlining and
+targeted boundary bufferization are implemented; runtime allocation and host legality remain.
 
-This is intentionally not a general bufferization/runtime solution. It should be narrow enough to
-debug quickly and broad enough to prove the CPU+GPU split.
+This is intentionally not a general bufferization/runtime solution. It is narrow enough to debug
+quickly and broad enough to prove the CPU+GPU split.
 
 ### Checklist
 

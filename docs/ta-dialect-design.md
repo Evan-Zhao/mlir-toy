@@ -411,10 +411,10 @@ scale, and moves normalization after the second contraction while retaining
 explicit f16 operand rounding. The normalization motion across that rounding
 is intentionally approximate.
 
-The `test/Pipeline` directory contains the fuller transform schedules that use
-TA matching and rewrites before lowering back to linalg and continuing with
-loop-level scheduling. It currently covers global attention, grouped-query
-attention, and causal attention.
+The `test/Pipeline` directory contains the fuller transform schedules that use TA matching and
+rewrites before lowering back to linalg and continuing with loop-level scheduling. Coverage includes
+global, grouped-query/multi-query, causal and rectangular causal, sliding-window, ALiBi, FP8 K/V,
+packed variable-length, and decode attention.
 
 ## Operation Reference
 

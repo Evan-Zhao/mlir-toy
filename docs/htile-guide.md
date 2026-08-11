@@ -59,6 +59,8 @@ The transform rewrites these operations:
   the rewritten tensor body uses ordinary tensor `arith` ops.
 - `linalg.index` inside elementwise bodies becomes an `htile.arange` along that dimension,
   broadcast to the elementwise result shape when needed.
+- Unit-dimension `tensor.expand_shape` and `tensor.collapse_shape` become `htile.unsqueeze` and
+  `htile.squeeze`.
 - Projected row-vector operands in elementwise ops are materialized with `htile.broadcast`.
 - Captured scalar operands in elementwise ops are materialized as tile-shaped `htile.full` values;
   scalar `arith.constant` ops inside the body become tensor `arith.constant` splats.

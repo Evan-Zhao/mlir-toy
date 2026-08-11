@@ -4,7 +4,7 @@ This document describes how an attention program is lowered from algorithmic att
 languages like Triton. Each stage in the pipeline has its own design documents, which this
 document links to and summarizes. The integrated example for attention lowering is at
 [`test/Pipeline/tm_global_attention.mlir`](../test/Pipeline/tm_global_attention.mlir).
-Potential next attention variants are tracked in the
+Current coverage and remaining attention feature axes are tracked in the
 [attention variant roadmap](attention-variants.md).
 
 ## Pipeline Overview
@@ -77,11 +77,13 @@ Semantic HTile deliberately keeps the tensor ABI, `scf.forall` / `scf.for` loop 
 `tensor.extract_slice`, and `tensor.parallel_insert_slice`. It is a compute-level translation, not
 yet a backend kernel ABI.
 
-The later HTile/backend pipeline should:
+The current pipeline then uses `transform.htile.outline_kernels` to cross the kernel boundary. It:
 
-- add placement decisions such as shared/local tile encodings,
-- normalize tensor views into memory-rooted `htile.load` operations,
-- convert tensor-return Semantic HTile into Kernel HTile with explicit output memory and
-  `htile.store`,
-- legalize Kernel HTile to each backend translator's launch form, types, layouts, and software
-  pipelining constraints.
+- outlines selected top-level `scf.forall` loops as `htile.kernel` operations,
+- replaces them in the host function with result-free `htile.launch_func` operations,
+- materializes tensor values crossing kernel boundaries as explicit memrefs,
+- rewrites kernel reads and publications as `htile.load` and `htile.store`, and
+- represents the launch domain with `htile.program_id` and `program_bounds`.
+
+The Triton, TileLang, and cuTile translators consume this Kernel HTile form. Placement policy,
+principled bufferization, runtime allocation, and backend-specific scheduling remain later work.
