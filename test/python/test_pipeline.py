@@ -107,6 +107,54 @@ BACKEND_COMPILATION_CASES = [
     for variant, (q_heads, kv_heads) in product(ATTN_VARIANTS, Q_KV_HEADS)
 ]
 
+VARLEN_TRITON_COMPILATION_CASES = [
+    pytest.param(
+        {
+            "num_docs": 2,
+            "total_tokens": 512,
+            "heads": 2,
+            "max_doc_tokens": 512,
+            "head_dim": 64,
+            "index_dtype": "int32",
+        },
+        id="docs2-tokens512-h2-d64-i32",
+    ),
+    pytest.param(
+        {
+            "num_docs": 8,
+            "total_tokens": 1024,
+            "heads": 4,
+            "max_doc_tokens": 512,
+            "head_dim": 128,
+            "index_dtype": "int32",
+        },
+        id="docs8-tokens1024-h4-d128-i32",
+    ),
+    pytest.param(
+        {
+            "num_docs": 4,
+            "total_tokens": 2048,
+            "heads": 2,
+            "max_doc_tokens": 1024,
+            "head_dim": 64,
+            "index_dtype": "int64",
+        },
+        id="docs4-tokens2048-h2-d64-i64",
+    ),
+    pytest.param(
+        {
+            "num_docs": 4,
+            "total_tokens": 512,
+            "heads": 2,
+            "max_doc_tokens": 256,
+            "head_dim": 64,
+            "index_dtype": "int32",
+            "tile_config": AttentionTileConfig(block_m=64, block_n=32),
+        },
+        id="docs4-tokens512-h2-d64-i32-m64-n32",
+    ),
+]
+
 
 def test_native_htile_dialect_typeids_match_mlir_runtime() -> None:
     from mlir import ir
@@ -273,6 +321,16 @@ def backend_compilation_case(request, codegen_target):
     return codegen_target, ast.unparse(module) + "\n", kernel_arguments
 
 
+@pytest.fixture(scope="module", params=VARLEN_TRITON_COMPILATION_CASES)
+def varlen_triton_compilation_case(request):
+    require_jax()
+    require_nvidia_triton()
+    lowered = export_varlen_attention_to_htile_mlir(**request.param)
+    kernel_arguments = get_htile_kernel_arguments(lowered)
+    module = translate_htile_to_ast(lowered, "triton")
+    return ast.unparse(module) + "\n", kernel_arguments
+
+
 def require_nvidia_triton():
     import importlib.util
 
@@ -349,6 +407,14 @@ def test_attention_lowering_and_backend_compilation(backend_compilation_case) ->
             source, output_index=len(kernel_arguments) - 1
         )
         assert "__global__" in cuda_source
+
+
+def test_varlen_attention_triton_compilation(varlen_triton_compilation_case) -> None:
+    source, kernel_arguments = varlen_triton_compilation_case
+    ptx = compile_triton_source_to_ptx(source, kernel_arguments)
+
+    assert ".version" in ptx
+    assert ".visible .entry attention_kernel" in ptx
 
 
 def test_attention_pass_pipeline_embeds_schedule_preload() -> None:
