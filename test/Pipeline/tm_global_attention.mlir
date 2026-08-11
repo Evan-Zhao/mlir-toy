@@ -120,6 +120,14 @@ module attributes {transform.with_named_sequence} {
       transform.apply_patterns.canonicalization
     } : !any
     transform.apply_cse to %func : !any
+    // This will hoist the load of Q outside of the inner loop because it is invariant there.
+    transform.apply_licm to %j0_loop : !any
+
+    // Hint at 2-stage pipelining for the inner (scf.for) loop.
+    // Some kernel translators will pick this up (such as tilelang).
+    %stages = transform.param.constant 2 : i64 -> !transform.param<i64>
+    transform.annotate %j0_loop "htile.pipeline_stages" = %stages
+        : !any, !transform.param<i64>
 
     // --- HTile lowering begins ---
     // Use the translator to lower the tiled linalg program into HTile.
@@ -182,12 +190,13 @@ module attributes {transform.with_named_sequence} {
 // CHECK-NOT: scf.forall
 // CHECK: htile.full %{{.*}} : f32 -> tensor<128xf32>
 // CHECK: htile.full %{{.*}} : f32 -> tensor<128x128xf32>
+// CHECK: %[[Q_TILE:.+]] = htile.load %arg0
 // CHECK: %{{.*}}:5 = scf.for %{{.*}} = %c0 to %c2 step %c1
 // CHECK-SAME: -> (tensor<128xf32>, tensor<128xf32>, tensor<128xf32>,
 // CHECK-SAME: tensor<128xf32>, tensor<128x128xf32>)
-// CHECK: htile.load %arg0
-// CHECK: htile.load %arg1
-// CHECK: %[[RAW_SCORES:.+]] = htile.dot %{{.*}}, %{{.*}} {transpose_b} : tensor<128x128xf16>, tensor<64x128xf16> -> tensor<128x64xf32>
+// CHECK-NOT: htile.load %arg0
+// CHECK: %[[K_TILE:.+]] = htile.load %arg1
+// CHECK: %[[RAW_SCORES:.+]] = htile.dot %[[Q_TILE]], %[[K_TILE]] {transpose_b} : tensor<128x128xf16>, tensor<64x128xf16> -> tensor<128x64xf32>
 // CHECK: htile.reduce %[[RAW_SCORES]] axis 1 kind "max" : tensor<128x64xf32> -> tensor<128xf32>
 // CHECK: arith.mulf %[[RAW_SCORES]], %{{.*}} : tensor<128x64xf32>
 // CHECK: htile.broadcast %{{.*}} dimensions = [1] : tensor<128xf32> -> tensor<128x64xf32>
@@ -195,6 +204,7 @@ module attributes {transform.with_named_sequence} {
 // CHECK: htile.reduce %{{.*}} axis 1 kind "sum" : tensor<128x64xf32> -> tensor<128xf32>
 // CHECK: htile.load %arg2
 // CHECK: htile.dot %{{.*}}, %{{.*}}, %{{.*}} : tensor<128x64xf16>, tensor<64x128xf16>, tensor<128x128xf32> -> tensor<128x128xf32>
+// CHECK: } {htile.pipeline_stages = 2 : i64}
 // CHECK: arith.divf %{{.*}}, %{{.*}} : tensor<128x128xf32>
 // CHECK: arith.truncf %{{.*}} : tensor<128x128xf32> to tensor<128x128xf16>
 // CHECK: htile.store %{{.*}}, %arg3
