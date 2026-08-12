@@ -506,3 +506,99 @@ module attributes {transform.with_named_sequence} {
     return
   }
 }
+
+// -----
+
+!any = !transform.any_op
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !any) {
+    %func = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
+    %foralls = transform.structured.match ops{["scf.forall"]} in %func : (!any) -> !any
+    %launches, %kernels = transform.htile.outline_kernels %foralls
+        {kernel_names = ["collapsed_sparse_gather"]} : (!any) -> (!any, !any)
+    transform.yield
+  }
+
+  func.func @outline_collapsed_sparse_gather(
+      %source: tensor<1x16x8xf32>, %indices: tensor<1x1x4x1xi32>) {
+    scf.forall (%i) in (1) {
+      %c0 = arith.constant 0 : index
+      %index_tile = htile.load %indices[%c0, %c0, %c0, %c0]
+          : tensor<1x1x4x1xi32> -> tensor<1x1x4x1xi32>
+      %gathered = "stablehlo.gather"(%source, %index_tile) <{
+        dimension_numbers = #stablehlo.gather<
+          offset_dims = [3], collapsed_slice_dims = [1],
+          operand_batching_dims = [0], start_indices_batching_dims = [0],
+          start_index_map = [1], index_vector_dim = 3>,
+        indices_are_sorted = false,
+        slice_sizes = array<i64: 1, 1, 8>
+      }> : (tensor<1x16x8xf32>, tensor<1x1x4x1xi32>) -> tensor<1x1x4x8xf32>
+      %collapsed = tensor.collapse_shape %gathered [[0, 1, 2], [3]]
+          : tensor<1x1x4x8xf32> into tensor<4x8xf32>
+      scf.forall.in_parallel {
+      }
+    }
+    return
+  }
+}
+
+// CHECK-LABEL: htile.kernel @collapsed_sparse_gather
+// CHECK-SAME: %[[SOURCE:.*]] : memref<1x16x8xf32>
+// CHECK-SAME: %[[INDICES:.*]] : memref<1x1x4x1xi32>
+// CHECK: %[[INDEX_TILE:.*]] = htile.load %[[INDICES]]
+// CHECK: %[[TOKENS:.*]] = htile.squeeze %[[INDEX_TILE]]
+// CHECK-SAME: -> tensor<4xi32>
+// CHECK: %[[TOKEN_GRID:.*]] = htile.broadcast %[[TOKENS]] dimensions = [1]
+// CHECK-SAME: -> tensor<4x8xi32>
+// CHECK: %[[BATCH_GRID:.*]] = htile.full %{{.*}} : index -> tensor<4x8xindex>
+// CHECK: %[[FEATURES:.*]] = htile.arange %{{.*}} to %{{.*}} : tensor<8xindex>
+// CHECK: %[[FEATURE_GRID:.*]] = htile.broadcast %[[FEATURES]] dimensions = [0]
+// CHECK: htile.gather_nd %[[SOURCE]][%[[BATCH_GRID]], %[[TOKEN_GRID]], %[[FEATURE_GRID]]]
+// CHECK-SAME: memref<1x16x8xf32>
+// CHECK-SAME: -> tensor<4x8xf32>
+// CHECK-NOT: stablehlo.gather
+// CHECK-NOT: tensor.collapse_shape
+// CHECK: htile.return
+
+// -----
+
+!any = !transform.any_op
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !any) {
+    %func = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
+    %foralls = transform.structured.match ops{["scf.forall"]} in %func : (!any) -> !any
+    %launches, %kernels = transform.htile.outline_kernels %foralls
+        {kernel_names = ["rank2_sparse_gather"]} : (!any) -> (!any, !any)
+    transform.yield
+  }
+
+  func.func @outline_rank2_sparse_gather(
+      %source: tensor<16x8xf32>, %indices: tensor<4x1xi32>) {
+    scf.forall (%i) in (1) {
+      %c0 = arith.constant 0 : index
+      %index_tile = htile.load %indices[%c0, %c0]
+          : tensor<4x1xi32> -> tensor<4x1xi32>
+      %unused = "stablehlo.gather"(%source, %index_tile) <{
+        dimension_numbers = #stablehlo.gather<
+          offset_dims = [1], collapsed_slice_dims = [0],
+          start_index_map = [0], index_vector_dim = 1>,
+        indices_are_sorted = false,
+        slice_sizes = array<i64: 1, 8>
+      }> : (tensor<16x8xf32>, tensor<4x1xi32>) -> tensor<4x8xf32>
+      scf.forall.in_parallel {
+      }
+    }
+    return
+  }
+}
+
+// CHECK-LABEL: htile.kernel @rank2_sparse_gather
+// CHECK-SAME: %[[SOURCE:.*]] : memref<16x8xf32>
+// CHECK: %[[TOKENS:.*]] = htile.squeeze %{{.*}} mask [false, true]
+// CHECK: %[[TOKEN_GRID:.*]] = htile.broadcast %[[TOKENS]] dimensions = [1]
+// CHECK: %[[FEATURES:.*]] = htile.arange %{{.*}} to %{{.*}} : tensor<8xindex>
+// CHECK: %[[FEATURE_GRID:.*]] = htile.broadcast %[[FEATURES]] dimensions = [0]
+// CHECK: htile.gather_nd %[[SOURCE]][%[[TOKEN_GRID]], %[[FEATURE_GRID]]]
+// CHECK-SAME: -> tensor<4x8xf32>

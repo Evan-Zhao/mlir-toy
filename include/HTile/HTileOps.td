@@ -229,13 +229,15 @@ def HTile_GatherNdOp : Op<HTile_Dialect, "gather_nd"> {
   let description = [{
     Gathers elements from a source using tile-shaped index tensors.
 
-    The source may be a memory object, a tensor tile, or a lower-level pointer
-    value depending on the lowering stage. All index tensors are expected to
-    have the result tile shape.
+    The source is a ranked tensor before kernel outlining and a memref inside
+    an outlined kernel. There is one index tensor per source dimension, and
+    every index tensor has the result tile shape.
   }];
 
   let arguments = (ins AnyType:$source, Variadic<AnyRankedTensor>:$indices);
   let results = (outs AnyRankedTensor:$result);
+
+  let hasVerifier = 1;
 
   let assemblyFormat = "$source `[` $indices `]` attr-dict `:` type($source) `,` "
                        "type($indices) `->` type($result)";

@@ -1,4 +1,4 @@
-// RUN: not neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
+// RUN: neptune-opt %s --transform-interpreter | FileCheck %s
 //
 // Sparse-attention schedule for the default output of:
 //
@@ -116,10 +116,50 @@ module @jit_deepseek_sparse_attention attributes {mhlo.num_partitions = 1 : i32,
   }
 }
 
-// HTile kernel outlining does not recognize stablehlo.gather operations (yet).
-// A failure is preferable here.
-// CHECK: error: unsupported tensor read by 'stablehlo.gather' during kernel outlining
-// CHECK: note: see current operation:
-// CHECK-SAME: "stablehlo.gather"
-// CHECK-SAME: tensor<1x1x64x576xbf16>
-// CHECK: error: failed to bufferize tensor reads in foralls
+// CHECK-LABEL: func.func public @main(
+// CHECK-SAME: %arg0: tensor<1x128x128x576xbf16>
+// CHECK-SAME: %arg1: tensor<1x16384x576xbf16>
+// CHECK-SAME: %arg2: tensor<1x16384x512xbf16>
+// CHECK-SAME: %arg3: tensor<1x128x2048xi32>
+// CHECK-NOT: "stablehlo.gather"
+// CHECK: htile.launch_func @deepseek_sparse_attention_kernel
+// CHECK-SAME: {program_bounds = array<i64: 128, 8>}
+// CHECK-SAME: memref<1x128x128x576xbf16>, memref<1x16384x576xbf16>, memref<1x16384x512xbf16>, memref<1x128x2048xi32>, memref<1x128x128x512xbf16>
+
+// CHECK-LABEL: htile.kernel @deepseek_sparse_attention_kernel
+// CHECK-SAME: %arg0 : memref<1x128x128x576xbf16>, %arg1 : memref<1x16384x576xbf16>, %arg2 : memref<1x16384x512xbf16>, %arg3 : memref<1x128x2048xi32>
+// CHECK: %[[Q:.*]] = htile.load %arg0
+// CHECK-SAME: -> tensor<16x576xbf16>
+// CHECK: %[[STATE:.*]]:5 = scf.for
+// CHECK: %[[SELECTED:.*]] = htile.load %arg3
+// CHECK-SAME: -> tensor<1x1x64xi32>
+// CHECK: %[[INDEX_VECTORS:.*]] = htile.broadcast %[[SELECTED]] dimensions = [3]
+// CHECK: %[[TOKENS_K:.*]] = htile.squeeze %[[INDEX_VECTORS]]
+// CHECK-SAME: -> tensor<64xi32>
+// CHECK: %[[TOKEN_GRID_K:.*]] = htile.broadcast %[[TOKENS_K]] dimensions = [1]
+// CHECK-SAME: -> tensor<64x576xi32>
+// CHECK: %[[BATCH_GRID_K:.*]] = htile.full %{{.*}} : index -> tensor<64x576xindex>
+// CHECK: %[[FEATURES_K:.*]] = htile.arange %{{.*}} to %{{.*}} : tensor<576xindex>
+// CHECK: %[[FEATURE_GRID_K:.*]] = htile.broadcast %[[FEATURES_K]] dimensions = [0]
+// CHECK: %[[K:.*]] = htile.gather_nd %arg1[%[[BATCH_GRID_K]], %[[TOKEN_GRID_K]], %[[FEATURE_GRID_K]]]
+// CHECK-SAME: memref<1x16384x576xbf16>
+// CHECK-SAME: -> tensor<64x576xbf16>
+// CHECK: %[[QK:.*]] = htile.dot %[[Q]], %[[K]] {transpose_b}
+// CHECK-SAME: -> tensor<16x64xf32>
+// CHECK: htile.reduce %[[QK]] axis 1 kind "max"
+// CHECK: math.exp2
+// CHECK: htile.reduce {{.*}} axis 1 kind "sum"
+// CHECK: %[[P:.*]] = arith.truncf {{.*}} : tensor<16x64xf32> to tensor<16x64xbf16>
+// CHECK: %[[TOKEN_GRID_V:.*]] = htile.broadcast {{.*}} dimensions = [1]
+// CHECK-SAME: -> tensor<64x512xi32>
+// CHECK: %[[BATCH_GRID_V:.*]] = htile.full %{{.*}} : index -> tensor<64x512xindex>
+// CHECK: %[[FEATURES_V:.*]] = htile.arange %{{.*}} to %{{.*}} : tensor<512xindex>
+// CHECK: %[[FEATURE_GRID_V:.*]] = htile.broadcast %[[FEATURES_V]] dimensions = [0]
+// CHECK: %[[V:.*]] = htile.gather_nd %arg2[%[[BATCH_GRID_V]], %[[TOKEN_GRID_V]], %[[FEATURE_GRID_V]]]
+// CHECK-SAME: memref<1x16384x512xbf16>
+// CHECK-SAME: -> tensor<64x512xbf16>
+// CHECK: htile.dot %[[P]], %[[V]], {{.*}} : tensor<16x64xbf16>, tensor<64x512xbf16>, tensor<16x512xf32> -> tensor<16x512xf32>
+// CHECK: arith.divf %[[STATE]]#4, {{.*}} : tensor<16x512xf32>
+// CHECK: arith.truncf {{.*}} : tensor<16x512xf32> to tensor<16x512xbf16>
+// CHECK: htile.store
+// CHECK: htile.return

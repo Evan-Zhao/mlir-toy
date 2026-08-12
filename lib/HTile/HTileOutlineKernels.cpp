@@ -10,9 +10,12 @@
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/SymbolTable.h"
+#include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Support/CheckedArithmetic.h"
+
+#include <numeric>
 
 using namespace mlir;
 using bufferization::ToTensorOp;
@@ -212,13 +215,145 @@ LogicalResult bufferizeForallResults(RewriterBase &rewriter, ArrayRef<scf::Foral
   return success();
 }
 
+LogicalResult materializeGatherRead(RewriterBase &rewriter, stablehlo::GatherOp gather,
+                                    Value sourceBuffer) {
+  auto sourceType = cast<RankedTensorType>(gather.getOperand().getType());
+  auto indicesType = cast<RankedTensorType>(gather.getStartIndices().getType());
+  auto gatherType = cast<RankedTensorType>(gather.getResult().getType());
+  auto dimensions = gather.getDimensionNumbers();
+  ArrayRef<int64_t> startIndexMap = dimensions.getStartIndexMap();
+  int64_t indexVectorDim = dimensions.getIndexVectorDim();
+  bool hasExplicitIndexVector = indexVectorDim < indicesType.getRank();
+  if (startIndexMap.size() != 1 ||
+      (hasExplicitIndexVector && indexVectorDim != indicesType.getRank() - 1))
+    return gather.emitError("expected one trailing start index during kernel outlining");
+  int64_t indexedOperandDim = startIndexMap.front();
+  if (!llvm::is_contained(dimensions.getCollapsedSliceDims(), indexedOperandDim) ||
+      gather.getSliceSizes()[indexedOperandDim] != 1)
+    return gather.emitError("expected the indexed operand dimension to be collapsed");
+
+  // Fold a rank reduction that only removes unit dimensions. Otherwise, gather
+  // directly into the StableHLO result shape.
+  Operation *resultOp = gather;
+  RankedTensorType resultType = gatherType;
+  SmallVector<int64_t> gatherToResult(gatherType.getRank(), -1);
+  if (gather->hasOneUse() &&
+      isa<htile::SqueezeOp, tensor::CollapseShapeOp>(*gather->user_begin())) {
+    resultOp = *gather->user_begin();
+    resultType = cast<RankedTensorType>(resultOp->getResult(0).getType());
+    if (auto squeeze = dyn_cast<htile::SqueezeOp>(resultOp)) {
+      int64_t resultDim = 0;
+      for (auto [gatherDim, remove] : llvm::enumerate(squeeze.getMask()))
+        if (!remove)
+          gatherToResult[gatherDim] = resultDim++;
+    } else {
+      auto collapse = cast<tensor::CollapseShapeOp>(resultOp);
+      for (auto [resultDim, group] : llvm::enumerate(collapse.getReassociationIndices())) {
+        SmallVector<int64_t> nonUnitDims;
+        llvm::copy_if(group, std::back_inserter(nonUnitDims),
+                      [&](int64_t dim) { return gatherType.getDimSize(dim) != 1; });
+        if (nonUnitDims.size() > 1)
+          return collapse.emitError("cannot fold a gather view that flattens non-unit dimensions");
+        gatherToResult[nonUnitDims.empty() ? group.front() : nonUnitDims.front()] = resultDim;
+      }
+    }
+  } else {
+    std::iota(gatherToResult.begin(), gatherToResult.end(), 0);
+  }
+  if (!resultType.hasStaticShape())
+    return resultOp->emitError("expected a static gather tile during kernel outlining");
+
+  SmallVector<int64_t> batchResultDims;
+  for (int64_t dim = 0; dim < gatherType.getRank(); ++dim)
+    if (!llvm::is_contained(dimensions.getOffsetDims(), dim))
+      batchResultDims.push_back(dim);
+  int64_t indexBatchRank = indicesType.getRank() - hasExplicitIndexVector;
+  if (batchResultDims.size() != static_cast<size_t>(indexBatchRank))
+    return gather.emitError("inconsistent gather batch dimensions");
+
+  Location loc = gather.getLoc();
+  rewriter.setInsertionPoint(gather);
+  Value zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+  auto coordinateType = RankedTensorType::get(resultType.getShape(), rewriter.getIndexType());
+  auto makeCoordinate = [&](int64_t resultDim) -> Value {
+    if (resultDim < 0)
+      return htile::FullOp::create(rewriter, loc, coordinateType, zero);
+    int64_t extent = resultType.getDimSize(resultDim);
+    Value end = arith::ConstantIndexOp::create(rewriter, loc, extent);
+    auto rangeType = RankedTensorType::get({extent}, rewriter.getIndexType());
+    Value range = htile::ArangeOp::create(rewriter, loc, rangeType, zero, end);
+    SmallVector<int64_t> broadcastDims;
+    for (int64_t dim = 0; dim < resultType.getRank(); ++dim)
+      if (dim != resultDim)
+        broadcastDims.push_back(dim);
+    return htile::BroadcastOp::create(rewriter, loc, coordinateType, range,
+                                      rewriter.getDenseI64ArrayAttr(broadcastDims));
+  };
+
+  // Start indices have the gather batch shape. Remove the index-vector and any
+  // unit batch dimensions folded by the result view, then broadcast over the
+  // window dimensions.
+  SmallVector<bool> squeezeMask(indicesType.getRank(), false);
+  if (hasExplicitIndexVector)
+    squeezeMask[indexVectorDim] = true;
+  SmallVector<int64_t> indexBroadcastDims;
+  for (auto [indexDim, gatherDim] : llvm::enumerate(batchResultDims))
+    if (gatherToResult[gatherDim] < 0)
+      squeezeMask[indexDim] = true;
+  for (int64_t gatherDim : dimensions.getOffsetDims())
+    if (gatherToResult[gatherDim] >= 0)
+      indexBroadcastDims.push_back(gatherToResult[gatherDim]);
+  SmallVector<int64_t> indexShape;
+  for (auto [dim, extent] : llvm::enumerate(indicesType.getShape()))
+    if (!squeezeMask[dim])
+      indexShape.push_back(extent);
+  auto squeezedIndexType = RankedTensorType::get(indexShape, indicesType.getElementType());
+  Value index = htile::SqueezeOp::create(rewriter, loc, squeezedIndexType, gather.getStartIndices(),
+                                         rewriter.getDenseBoolArrayAttr(squeezeMask));
+  auto indexGridType = RankedTensorType::get(resultType.getShape(), indicesType.getElementType());
+  Value indexGrid = htile::BroadcastOp::create(rewriter, loc, indexGridType, index,
+                                               rewriter.getDenseI64ArrayAttr(indexBroadcastDims));
+
+  SmallVector<Value> coordinates(sourceType.getRank());
+  coordinates[startIndexMap.front()] = indexGrid;
+  for (auto [operandDim, indicesDim] : llvm::zip_equal(dimensions.getOperandBatchingDims(),
+                                                       dimensions.getStartIndicesBatchingDims()))
+    coordinates[operandDim] = makeCoordinate(gatherToResult[batchResultDims[indicesDim]]);
+
+  SmallVector<int64_t> windowOperandDims;
+  for (int64_t dim = 0; dim < sourceType.getRank(); ++dim)
+    if (!llvm::is_contained(dimensions.getCollapsedSliceDims(), dim) &&
+        !llvm::is_contained(dimensions.getOperandBatchingDims(), dim))
+      windowOperandDims.push_back(dim);
+  for (auto [operandDim, gatherDim] :
+       llvm::zip_equal(windowOperandDims, dimensions.getOffsetDims()))
+    coordinates[operandDim] = makeCoordinate(gatherToResult[gatherDim]);
+  for (Value &coordinate : coordinates)
+    if (!coordinate)
+      coordinate = makeCoordinate(/*resultDim=*/-1);
+
+  auto lowered = htile::GatherNdOp::create(rewriter, loc, resultType, sourceBuffer, coordinates);
+  rewriter.replaceOp(resultOp, lowered.getResult());
+  if (resultOp != gather)
+    rewriter.eraseOp(gather);
+  return success();
+}
+
 FailureOr<bool> materializeLoadsForTensorUsers(RewriterBase &rewriter, OpOperand &use,
                                                RankedTensorType tensorType, Value buffer,
                                                bool emitHTileLoad) {
   Operation *owner = use.getOwner();
   OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPoint(owner);
-  if (isa<htile::LoadOp>(owner) && use.getOperandNumber() == 0) {
+  if (auto gather = dyn_cast<stablehlo::GatherOp>(owner);
+      emitHTileLoad && use.getOperandNumber() == 0 && gather) {
+    if (failed(materializeGatherRead(rewriter, gather, buffer)))
+      return failure();
+    return FailureOr<bool>(true); // Gather erased
+  } else if (isa<htile::GatherNdOp>(owner) && use.getOperandNumber() == 0) {
+    use.set(buffer);
+    return FailureOr<bool>(false); // Op not erased
+  } else if (isa<htile::LoadOp>(owner) && use.getOperandNumber() == 0) {
     // Another transform may have already materialized the desired tile load.
     // Retarget that load instead of reading the entire tensor first.
     use.set(buffer);
@@ -257,34 +392,41 @@ LogicalResult bufferizeTensorReadInForalls(RewriterBase &rewriter,
                                            TensorToBufferMap &map) {
   for (auto forall : forallOps) {
     DenseSet<Value> blockArgs;
-    for (auto arg : forall.getBody()->getArguments()) {
+    for (auto arg : forall.getBody()->getArguments())
       blockArgs.insert(arg);
-    }
-    WalkResult walkResult = forall.getBody()->walk([&](Operation *op) {
+
+    auto getBoundaryTensorType = [&](Value value) -> RankedTensorType {
+      auto tensorType = dyn_cast<RankedTensorType>(value.getType());
+      if (!tensorType)
+        return {};
+      bool isBlockArg = blockArgs.count(value);
+      bool isInLoop = forall.getRegion().isAncestor(value.getParentRegion());
+      return isInLoop && !isBlockArg ? RankedTensorType() : tensorType;
+    };
+
+    // Snapshot only operations that read tensors across the forall boundary.
+    // Rewrites may then erase both a user and a later rank-reducing view
+    // without invalidating traversal.
+    SmallVector<Operation *> worklist;
+    forall.getBody()->walk([&](Operation *op) {
+      if (llvm::any_of(op->getOperands(), getBoundaryTensorType))
+        worklist.push_back(op);
+    });
+
+    for (Operation *op : worklist) {
       for (OpOperand &operand : op->getOpOperands()) {
-        // Skip non-tensors, and tensors defined inside the loop body (not block arguments).
-        Value tensor = operand.get();
-        auto tensorType = dyn_cast<RankedTensorType>(tensor.getType());
+        RankedTensorType tensorType = getBoundaryTensorType(operand.get());
         if (!tensorType)
           continue;
-        bool isBlockArg = blockArgs.count(tensor);
-        bool isInLoop = forall.getRegion().isAncestor(tensor.getParentRegion());
-        if (isInLoop && !isBlockArg)
-          continue;
-        auto buffer = map.getOrCreateTensorMemrefForRead(rewriter, forall, tensor);
-        // If this op is an extract_slice, it may be entirely removed.
-        FailureOr<bool> erased =
-            materializeLoadsForTensorUsers(rewriter, operand, tensorType, buffer,
-                                           /*emitHTileLoad=*/true);
+        Value buffer = map.getOrCreateTensorMemrefForRead(rewriter, forall, operand.get());
+        FailureOr<bool> erased = materializeLoadsForTensorUsers(rewriter, operand, tensorType,
+                                                                buffer, /*emitHTileLoad=*/true);
         if (failed(erased))
-          return WalkResult::interrupt();
+          return failure();
         if (*erased)
-          return WalkResult::skip();
+          break;
       }
-      return WalkResult::advance();
-    });
-    if (walkResult.wasInterrupted())
-      return failure();
+    }
   }
   return success();
 }

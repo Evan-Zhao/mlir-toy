@@ -63,6 +63,33 @@ mlir::LogicalResult LaunchFuncOp::verifySymbolUses(mlir::SymbolTableCollection &
   return mlir::success();
 }
 
+mlir::LogicalResult GatherNdOp::verify() {
+  auto sourceType = mlir::dyn_cast<mlir::ShapedType>(getSource().getType());
+  if (!sourceType || !sourceType.hasRank())
+    return emitOpError("requires a ranked tensor or memref source");
+  if (getOperation()->getParentOfType<KernelOp>() &&
+      !mlir::isa<mlir::MemRefType>(getSource().getType()))
+    return emitOpError("requires source to be a memref inside an htile.kernel");
+
+  auto resultType = getResult().getType();
+  if (sourceType.getElementType() != resultType.getElementType())
+    return emitOpError("requires source and result element types to match");
+  if (getIndices().size() != static_cast<size_t>(sourceType.getRank()))
+    return emitOpError() << "requires one index tensor per source dimension; expected "
+                         << sourceType.getRank() << " but got " << getIndices().size();
+
+  for (auto [index, value] : llvm::enumerate(getIndices())) {
+    auto indexType = mlir::cast<mlir::RankedTensorType>(value.getType());
+    if (!indexType.getElementType().isIntOrIndex())
+      return emitOpError() << "requires index tensor #" << index
+                           << " to have integer or index element type";
+    if (indexType.getShape() != resultType.getShape())
+      return emitOpError() << "requires index tensor #" << index
+                           << " shape to match result shape";
+  }
+  return mlir::success();
+}
+
 mlir::LogicalResult LoadOp::verify() {
   if (getOperation()->getParentOfType<KernelOp>() &&
       !mlir::isa<mlir::MemRefType>(getSource().getType()))
