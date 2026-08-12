@@ -74,18 +74,18 @@ def TASinkDivAfterMatmulPatternsOp
 
   let description = [{
     Collects PDLL-authored TA rewrite patterns that sink a division through
-    f16 operand rounding and after a multiplication and add reduction:
+    f16 or bf16 operand rounding and after a multiplication and add reduction:
 
     ```
-      sum(f32(f16(num / denom)) * rhs)
-        -> sum(f32(f16(num)) * rhs) / denom
+      sum(f32(bf16(num / denom)) * rhs)
+        -> sum(f32(bf16(num)) * rhs) / denom
     ```
 
-    The patterns support the left- and right-operand forms of f16 matmuls with
-    f32 accumulation. Moving the divisor across f16 rounding is intentionally
-    approximate. The `denom` divisor must have axes disjoint from the reduction
-    axes. The patterns preserve the matched add reducer kind, axes, and
-    import-group attributes.
+    The patterns support the left- and right-operand forms of f16 and bf16
+    matmuls with f32 accumulation. Moving the divisor across low-precision
+    rounding is intentionally approximate. The `denom` divisor must have axes
+    disjoint from the reduction axes. The patterns preserve the matched add
+    reducer kind, axes, and import-group attributes.
   }];
 
   let assemblyFormat = "attr-dict";
@@ -98,17 +98,19 @@ def TASinkRightMulAfterMatmulPatternsOp
 
   let description = [{
     Collects a PDLL-authored TA rewrite pattern that sinks a multiplicative
-    factor through f16 operand rounding and after an add-reduced multiply:
+    factor through f16 or bf16 operand rounding and after an add-reduced
+    multiply:
 
     ```
-      sum(lhs * f32(f16(rhs * factor)))
-        -> sum(lhs * f32(f16(rhs))) * factor
+      sum(lhs * f32(bf16(rhs * factor)))
+        -> sum(lhs * f32(bf16(rhs))) * factor
     ```
 
-    The pattern supports f16 matmul operands with f32 accumulation. Moving the
-    factor across f16 rounding is intentionally approximate. The `factor` must
-    have axes disjoint from the reduction axes. The pattern preserves the
-    matched add reducer kind, axes, and import-group attributes.
+    The pattern supports f16 and bf16 matmul operands with f32 accumulation.
+    Moving the factor across low-precision rounding is intentionally
+    approximate. The `factor` must have axes disjoint from the reduction axes.
+    The pattern preserves the matched add reducer kind, axes, and import-group
+    attributes.
   }];
 
   let assemblyFormat = "attr-dict";

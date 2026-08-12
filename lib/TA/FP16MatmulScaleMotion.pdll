@@ -34,19 +34,22 @@ Constraint F32F16F32CastChain(source: Value, narrowed: Value, widened: Value) [{
   auto sourceType = dyn_cast<ta::ExprType>(source.getType());
   auto narrowedType = dyn_cast<ta::ExprType>(narrowed.getType());
   auto widenedType = dyn_cast<ta::ExprType>(widened.getType());
+  Type narrowElementType = narrowedType ? narrowedType.getElementType() : Type();
   return success(sourceType && narrowedType && widenedType &&
                  sourceType.getElementType().isF32() &&
-                 narrowedType.getElementType().isF16() &&
+                 (narrowElementType.isF16() || narrowElementType.isBF16()) &&
                  widenedType.getElementType().isF32());
 }];
 
-Rewrite RoundThroughF16(input: Value, narrowGroup: Attr, widenGroup: Attr) -> Value [{
+Rewrite RoundThroughF16(input: Value, matchedNarrowType: Type,
+                        narrowGroup: Attr, widenGroup: Attr) -> Value [{
   auto inputType = dyn_cast<ta::ExprType>(input.getType());
-  if (!inputType || !isa<FloatType>(inputType.getElementType()))
+  auto narrowExprType = dyn_cast<ta::ExprType>(matchedNarrowType);
+  if (!inputType || !narrowExprType || !isa<FloatType>(inputType.getElementType()))
     return Value();
 
-  auto narrowType = ta::ExprType::get(rewriter.getContext(), rewriter.getF16Type(),
-                                      inputType.getAxes());
+  auto narrowType = ta::ExprType::get(rewriter.getContext(),
+                                      narrowExprType.getElementType(), inputType.getAxes());
   auto narrow = ta::CastOp::create(rewriter, input.getLoc(), narrowType, input);
   narrow->setAttr("ta.import_group", narrowGroup);
   auto wideType = ta::ExprType::get(rewriter.getContext(), rewriter.getF32Type(),
@@ -68,7 +71,7 @@ Pattern SinkLeftDivThroughF16AfterMatmul {
   AddReduceKind(kind);
 
   rewrite reduce with {
-    let newWide = RoundThroughF16(lhs, srcNarrow, srcWiden);
+    let newWide = RoundThroughF16(lhs, narrowType, srcNarrow, srcWiden);
     let newMul = op<ta.mul>(newWide, rhs) {"ta.import_group" = srcMul};
     let newReduce = op<ta.reduce>(newMul) {kind = kind, axes = axes, "ta.import_group" = srcReduce} -> (resultType);
     replace reduce with op<ta.div>(newReduce, denom) {"ta.import_group" = srcDiv};
@@ -87,7 +90,7 @@ Pattern SinkRightDivThroughF16AfterMatmul {
   AddReduceKind(kind);
 
   rewrite reduce with {
-    let newWide = RoundThroughF16(rhs, srcNarrow, srcWiden);
+    let newWide = RoundThroughF16(rhs, narrowType, srcNarrow, srcWiden);
     let newMul = op<ta.mul>(lhs, newWide) {"ta.import_group" = srcMul};
     let newReduce = op<ta.reduce>(newMul) {kind = kind, axes = axes, "ta.import_group" = srcReduce} -> (resultType);
     replace reduce with op<ta.div>(newReduce, denom) {"ta.import_group" = srcDiv};
@@ -112,7 +115,7 @@ Pattern SinkRightMulWithPreWidenThroughF16AfterMatmul with benefit(2) {
   AddReduceKind(kind);
 
   rewrite reduce with {
-    let roundedRhs = RoundThroughF16(rhs, srcNarrow, srcWiden);
+    let roundedRhs = RoundThroughF16(rhs, narrowType, srcNarrow, srcWiden);
     let newMul = op<ta.mul>(lhs, roundedRhs) {"ta.import_group" = srcOuter};
     let newReduce = op<ta.reduce>(newMul) {kind = kind, axes = axes, "ta.import_group" = srcReduce} -> (resultType);
     replace reduce with op<ta.mul>(newReduce, factor) {"ta.import_group" = srcScaled};
