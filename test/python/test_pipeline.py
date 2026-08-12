@@ -403,7 +403,8 @@ def test_attention_lowering_and_backend_compilation(backend_compilation_case) ->
 
 def test_varlen_attention_backend_compilation(varlen_backend_compilation_case) -> None:
     codegen_target, source, kernel_arguments, offsets = varlen_backend_compilation_case
-
+    require_torch_with_cuda()
+    require_nvidia_python_backend(codegen_target)
     if codegen_target == "triton":
         ptx = compile_triton_source_to_ptx(source, kernel_arguments)
         assert ".version" in ptx
@@ -412,11 +413,7 @@ def test_varlen_attention_backend_compilation(varlen_backend_compilation_case) -
         assert "get_raw_memory()" in source
         assert ".load_offset(" in source
         assert ".store_offset(" in source
-        compile_and_launch_cutile_source(
-            source,
-            kernel_arguments,
-            argument_values={3: offsets},
-        )
+        compile_and_launch_cutile_source(source, kernel_arguments, argument_values={3: offsets})
     else:
         assert "T.reshape(" in source
         assert "T.if_then_else(" in source
