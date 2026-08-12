@@ -1,7 +1,5 @@
 // RUN: neptune-opt %s --inline --canonicalize --cse | FileCheck %s --check-prefix=CLEAN
-// RUN: neptune-opt %s --inline --canonicalize --cse --transform-interpreter --canonicalize --cse | FileCheck %s --check-prefix=SCF
-// RUN: neptune-opt %s --inline --canonicalize --cse --stablehlo-to-ta | FileCheck %s --check-prefix=TA
-// RUN: neptune-opt %s --inline --canonicalize --cse --stablehlo-legalize-to-linalg | FileCheck %s --check-prefix=LINALG
+// RUN: neptune-opt %s --inline --canonicalize --cse --transform-interpreter --canonicalize --cse | FileCheck %s
 //
 // StableHLO payload from the default output of:
 //
@@ -30,10 +28,10 @@
 // update; distribute BxC tiles around the whole recurrence; fuse the per-token
 // producer/reduction graph; hoist A, D, and delta_bias tile loads; lower the
 // state-dimension reduction; and outline the forall as one persistent kernel.
-// `transform.stablehlo.legalize_control_flow`, adapted from IREE, now performs
-// the loop normalization. The checks below contrast that path with the
-// remaining stopping points: TA does not enter region control flow, while invoking the
-// generic StableHLO-to-Linalg pass alone leaves the StableHLO loop shell intact.
+// `transform.stablehlo.legalize_control_flow`, adapted from IREE, performs the
+// loop normalization before StableHLO's native conversion lowers the body to
+// Linalg. Running that conversion without loop normalization would leave the
+// StableHLO loop shell intact.
 
 !any = !transform.any_op
 
@@ -41,6 +39,9 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
   transform.named_sequence @__transform_main(%module: !any) {
     %funcs = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
     transform.stablehlo.legalize_control_flow %funcs : !any
+    // Skip the StableHLO-to-TA conversion because we have no rewrite to perform in TA.
+    %func = transform.apply_registered_pass "stablehlo-legalize-to-linalg" to %funcs : (!any) -> !any
+    transform.verify %func : !any
     transform.yield
   }
 
@@ -157,30 +158,15 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
 
 // JAX's counted while is recognized as a for loop. Canonicalization drops the
 // invariant loop operands and leaves the state, output, and JAX's second synchronized index.
-// SCF-LABEL: func.func public @main(
-// SCF-NOT: stablehlo.while
-// SCF: scf.for
-// SCF-SAME: iter_args(
-// SCF: stablehlo.dynamic_slice
-// SCF: stablehlo.log_plus_one
-// SCF: stablehlo.dot_general
-// SCF: stablehlo.dynamic_update_slice
-// SCF: scf.yield
-// SCF-NOT: stablehlo.return
-
-// The TA importer only visits a function's entry block, so nothing inside the while is imported.
-// TA-LABEL: func.func public @main(
-// TA: stablehlo.while
-// TA: stablehlo.log_plus_one
-// TA: stablehlo.dot_general
-// TA-NOT: ta.scope
-
-// Generic legalization reaches the body math, including softplus and the N=16 reduction, but
-// does not normalize the loop into the SCF form consumed by scheduling and HTile backends.
-// LINALG-LABEL: func.func public @main(
-// LINALG: stablehlo.while
-// LINALG: math.absf
-// LINALG: math.exp
-// LINALG: math.log1p
-// LINALG: iterator_types = ["parallel", "parallel", "reduction"]
-// LINALG: tensor.insert_slice
+// CHECK-LABEL: func.func public @main(
+// CHECK-NOT: stablehlo.while
+// CHECK: scf.for
+// CHECK-SAME: iter_args(
+// CHECK: tensor.extract_slice
+// CHECK: math.absf
+// CHECK: math.exp
+// CHECK: math.log1p
+// CHECK: iterator_types = ["parallel", "parallel", "reduction"]
+// CHECK: tensor.insert_slice
+// CHECK: scf.yield
+// CHECK-NOT: stablehlo.

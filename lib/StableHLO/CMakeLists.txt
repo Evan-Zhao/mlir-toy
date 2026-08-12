@@ -20,7 +20,14 @@ target_link_libraries(NeptuneStableHLO PUBLIC
   NeptuneMLIRCore
   StablehloLinalgTransforms
   StablehloOps
+  MLIRBufferizationDialect
+  MLIRComplexDialect
+  MLIRLinalgDialect
+  MLIRMathDialect
+  MLIRMemRefDialect
   MLIRSCFDialect
+  MLIRShapeDialect
+  MLIRSparseTensorDialect
   MLIRTensorDialect
   MLIRTilingInterface
   MLIRTransformDialectInterfaces
