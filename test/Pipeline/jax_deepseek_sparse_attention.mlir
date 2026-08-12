@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter | FileCheck %s
+// RUN: not neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
 //
 // Sparse-attention schedule for the default output of:
 //
@@ -116,44 +116,10 @@ module @jit_deepseek_sparse_attention attributes {mhlo.num_partitions = 1 : i32,
   }
 }
 
-
-// CHECK-LABEL: func.func public @main(
-// CHECK-SAME: %arg0: tensor<1x128x128x576xbf16>
-// CHECK-SAME: %arg1: tensor<1x16384x576xbf16>
-// CHECK-SAME: %arg2: tensor<1x16384x512xbf16>
-// CHECK-SAME: %arg3: tensor<1x128x2048xi32>
-// CHECK-NOT: "stablehlo.gather"
-// CHECK: htile.launch_func @deepseek_sparse_attention_kernel
-// CHECK-SAME: {program_bounds = array<i64: 128, 8>}
-// CHECK-SAME: memref<1x128x128x576xbf16>, memref<1x16384x576xbf16>, memref<1x16384x512xbf16>, memref<1x128x2048xi32>, memref<1x128x128x512xbf16>
-// CHECK-LABEL: htile.kernel @deepseek_sparse_attention_kernel
-// CHECK-SAME: %arg0 : memref<1x128x128x576xbf16>, %arg1 : memref<1x16384x576xbf16>, %arg2 : memref<1x16384x512xbf16>, %arg3 : memref<1x128x2048xi32>
-// CHECK: %[[Q:.*]] = htile.load %arg0
-// CHECK-SAME: -> tensor<16x576xbf16>
-// CHECK: %[[STATE:.*]]:5 = scf.for
-// CHECK: %[[INDICES:.*]] = htile.load %arg3
-// CHECK-SAME: -> tensor<1x1x64xi32>
-// CHECK: %[[INDEX_VECTORS:.*]] = htile.broadcast %[[INDICES]] dimensions = [3]
-// CHECK: %[[K_CACHE:.*]] = htile.load %arg1
-// CHECK-SAME: -> tensor<1x16384x576xbf16>
-// CHECK: %[[K_GATHER:.*]] = "stablehlo.gather"(%[[K_CACHE]], %[[INDEX_VECTORS]])
-// CHECK-SAME: slice_sizes = array<i64: 1, 1, 576>
-// CHECK-SAME: -> tensor<1x1x64x576xbf16>
-// CHECK: %[[K:.*]] = htile.squeeze %[[K_GATHER]]
-// CHECK: %[[QK:.*]] = htile.dot %[[Q]], %[[K]] {transpose_b}
-// CHECK-SAME: -> tensor<16x64xf32>
-// CHECK: htile.reduce %[[QK]] axis 1 kind "max"
-// CHECK: math.exp2
-// CHECK: htile.reduce {{.*}} axis 1 kind "sum"
-// CHECK: %[[P:.*]] = arith.truncf {{.*}} : tensor<16x64xf32> to tensor<16x64xbf16>
-// CHECK: %[[V_CACHE:.*]] = htile.load %arg2
-// CHECK-SAME: -> tensor<1x16384x512xbf16>
-// CHECK: %[[V_GATHER:.*]] = "stablehlo.gather"(%[[V_CACHE]], %[[INDEX_VECTORS]])
-// CHECK-SAME: slice_sizes = array<i64: 1, 1, 512>
-// CHECK-SAME: -> tensor<1x1x64x512xbf16>
-// CHECK: %[[V:.*]] = htile.squeeze %[[V_GATHER]]
-// CHECK: htile.dot %[[P]], %[[V]], {{.*}} : tensor<16x64xbf16>, tensor<64x512xbf16>, tensor<16x512xf32> -> tensor<16x512xf32>
-// CHECK: arith.divf %[[STATE]]#4, {{.*}} : tensor<16x512xf32>
-// CHECK: arith.truncf {{.*}} : tensor<16x512xf32> to tensor<16x512xbf16>
-// CHECK: htile.store
-// CHECK: htile.return
+// HTile kernel outlining does not recognize stablehlo.gather operations (yet).
+// A failure is preferable here.
+// CHECK: error: unsupported tensor read by 'stablehlo.gather' during kernel outlining
+// CHECK: note: see current operation:
+// CHECK-SAME: "stablehlo.gather"
+// CHECK-SAME: tensor<1x1x64x576xbf16>
+// CHECK: error: failed to bufferize tensor reads in foralls

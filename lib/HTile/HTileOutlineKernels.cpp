@@ -144,16 +144,12 @@ FailureOr<Value> materializeLoadForExtractSlice(OpBuilder &builder, tensor::Extr
 
 Value materializeLoadForWholeTensor(OpBuilder &builder, Location loc, RankedTensorType tensorType,
                                     Value buffer, bool emitHTileLoad) {
-  if (emitHTileLoad) {
-    SmallVector<Value> offsets;
-    offsets.reserve(tensorType.getRank());
-    for (int64_t i = 0, e = tensorType.getRank(); i < e; ++i)
-      offsets.push_back(arith::ConstantIndexOp::create(builder, loc, 0));
-    return htile::LoadOp::create(builder, loc, tensorType, buffer, offsets);
-  } else {
-    return ToTensorOp::create(builder, loc, tensorType, buffer,
-                              /*restrict=*/true, /*writable=*/true);
-  }
+  assert(tensorType.getRank() == 0 && cast<MemRefType>(buffer.getType()).getRank() == 0 &&
+         "whole-tensor reads are supported only for rank-zero tensors");
+  if (emitHTileLoad)
+    return htile::LoadOp::create(builder, loc, tensorType, buffer, ValueRange{});
+  return ToTensorOp::create(builder, loc, tensorType, buffer,
+                            /*restrict=*/true, /*writable=*/true);
 }
 
 LogicalResult bufferizeForallResults(RewriterBase &rewriter, ArrayRef<scf::ForallOp> forallOps,
@@ -238,13 +234,22 @@ FailureOr<bool> materializeLoadsForTensorUsers(RewriterBase &rewriter, OpOperand
       return failure();
     rewriter.replaceOp(extract, *loaded);
     return FailureOr<bool>(true); // Op erased
-  } else {
-    // Otherwise, fall back to a full read of the buffer.
+  } else if (tensorType.getRank() == 0 && cast<MemRefType>(buffer.getType()).getRank() == 0) {
+    // Preserve the old whole-tensor fallback only when the tensor and its buffer are scalar.
     Value loaded =
         materializeLoadForWholeTensor(rewriter, owner->getLoc(), tensorType, buffer, emitHTileLoad);
     use.set(loaded);
     return FailureOr<bool>(false); // Op not erased
+  } else if (!emitHTileLoad && isa<func::ReturnOp>(owner)) {
+    Value tensor = ToTensorOp::create(rewriter, owner->getLoc(), tensorType, buffer,
+                                      /*restrict=*/true, /*writable=*/true);
+    use.set(tensor);
+    return FailureOr<bool>(false); // Op not erased
   }
+
+  return owner->emitError() << "unsupported tensor read by '" << owner->getName()
+                            << "' during kernel outlining; expected htile.load, tensor.extract, or "
+                               "tensor.extract_slice";
 }
 
 LogicalResult bufferizeTensorReadInForalls(RewriterBase &rewriter,

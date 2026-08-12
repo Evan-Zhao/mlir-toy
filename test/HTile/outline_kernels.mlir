@@ -449,3 +449,60 @@ module attributes {transform.with_named_sequence} {
     return %result : tensor<4x1xf32>
   }
 }
+
+// -----
+
+!any = !transform.any_op
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !any) {
+    %func = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
+    %foralls = transform.structured.match ops{["scf.forall"]} in %func : (!any) -> !any
+    %launches, %kernels = transform.htile.outline_kernels %foralls
+        {kernel_names = ["rank_zero_kernel"]} : (!any) -> (!any, !any)
+    transform.yield
+  }
+
+  func.func @rank_zero_tensor_read(%input: tensor<f32>) {
+    scf.forall (%i) in (1) {
+      %unused = htile.broadcast %input dimensions = [0] : tensor<f32> -> tensor<4xf32>
+      scf.forall.in_parallel {
+      }
+    }
+    return
+  }
+}
+
+// CHECK-LABEL: func.func @rank_zero_tensor_read
+// CHECK: bufferization.to_buffer %arg0 read_only : tensor<f32> to memref<f32>
+// CHECK: htile.launch_func @rank_zero_kernel
+// CHECK-LABEL: htile.kernel @rank_zero_kernel
+// CHECK: %[[SCALAR:.*]] = htile.load %arg0[] : memref<f32> -> tensor<f32>
+// CHECK: htile.broadcast %[[SCALAR]] dimensions = [0] : tensor<f32> -> tensor<4xf32>
+
+// -----
+
+!any = !transform.any_op
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !any) {
+    %func = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
+    %foralls = transform.structured.match ops{["scf.forall"]} in %func : (!any) -> !any
+    // expected-error @below {{failed to bufferize tensor reads in foralls}}
+    %launches, %kernels = transform.htile.outline_kernels %foralls
+        {kernel_names = ["unknown_tensor_user"]} : (!any) -> (!any, !any)
+    transform.yield
+  }
+
+  func.func @reject_unknown_tensor_user(%input: tensor<4xf32>) {
+    scf.forall (%i) in (1) {
+      // Do not silently materialize the whole `%input` tensor for an unknown
+      // tensor operation inside a kernel.
+      // expected-error @below {{unsupported tensor read by 'arith.addf' during kernel outlining; expected htile.load, tensor.extract, or tensor.extract_slice}}
+      %unused = arith.addf %input, %input : tensor<4xf32>
+      scf.forall.in_parallel {
+      }
+    }
+    return
+  }
+}
