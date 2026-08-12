@@ -1,4 +1,5 @@
 // RUN: neptune-opt %s --inline --canonicalize --cse | FileCheck %s --check-prefix=CLEAN
+// RUN: neptune-opt %s --inline --canonicalize --cse --transform-interpreter --canonicalize --cse | FileCheck %s --check-prefix=SCF
 // RUN: neptune-opt %s --inline --canonicalize --cse --stablehlo-to-ta | FileCheck %s --check-prefix=TA
 // RUN: neptune-opt %s --inline --canonicalize --cse --stablehlo-legalize-to-linalg | FileCheck %s --check-prefix=LINALG
 //
@@ -29,11 +30,20 @@
 // update; distribute BxC tiles around the whole recurrence; fuse the per-token
 // producer/reduction graph; hoist A, D, and delta_bias tile loads; lower the
 // state-dimension reduction; and outline the forall as one persistent kernel.
-// The checks below contrast that path with the remaining
-// stopping points: TA does not enter region control flow, while invoking the
+// `transform.stablehlo.legalize_control_flow`, adapted from IREE, now performs
+// the loop normalization. The checks below contrast that path with the
+// remaining stopping points: TA does not enter region control flow, while invoking the
 // generic StableHLO-to-Linalg pass alone leaves the StableHLO loop shell intact.
 
-module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32} {
+!any = !transform.any_op
+
+module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_replicas = 1 : i32, transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !any) {
+    %funcs = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
+    transform.stablehlo.legalize_control_flow %funcs : !any
+    transform.yield
+  }
+
   func.func public @main(%arg0: tensor<8x2048x1536xbf16>, %arg1: tensor<8x2048x1536xbf16>, %arg2: tensor<1536x16xf32>, %arg3: tensor<8x2048x16xbf16>, %arg4: tensor<8x2048x16xbf16>, %arg5: tensor<1536xf32>, %arg6: tensor<1536xf32>) -> (tensor<8x2048x1536xbf16> {jax.result_info = "result"}) {
     %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
     %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<8x1536x16xf32>
@@ -144,6 +154,19 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
 // CLEAN: stablehlo.dot_general
 // CLEAN: stablehlo.dynamic_update_slice
 // CLEAN-NOT: func.func private
+
+// JAX's counted while is recognized as a for loop. Canonicalization drops the
+// invariant loop operands and leaves the state, output, and JAX's second synchronized index.
+// SCF-LABEL: func.func public @main(
+// SCF-NOT: stablehlo.while
+// SCF: scf.for
+// SCF-SAME: iter_args(
+// SCF: stablehlo.dynamic_slice
+// SCF: stablehlo.log_plus_one
+// SCF: stablehlo.dot_general
+// SCF: stablehlo.dynamic_update_slice
+// SCF: scf.yield
+// SCF-NOT: stablehlo.return
 
 // The TA importer only visits a function's entry block, so nothing inside the while is imported.
 // TA-LABEL: func.func public @main(

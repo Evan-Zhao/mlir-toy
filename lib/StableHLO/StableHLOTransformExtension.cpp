@@ -1,6 +1,7 @@
 #include "StableHLO/StableHLOTransformExtension.h"
 
 #include "StableHLO/StableHLOTransformOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Transform/IR/TransformDialect.h"
 #include "stablehlo/dialect/StablehloOps.h"
@@ -15,6 +16,7 @@ public:
   using Base::Base;
 
   void init() {
+    declareDependentDialect<mlir::scf::SCFDialect>();
     declareDependentDialect<mlir::stablehlo::StablehloDialect>();
     declareDependentDialect<mlir::tensor::TensorDialect>();
     registerTransformOps<
