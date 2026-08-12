@@ -141,18 +141,15 @@ def deepseek_sparse_attention(
     selected_value = gather_selected(value)
 
     attention_scores = jnp.einsum(
-        "bqhd,bqtd->bqht",
-        query,
-        selected_key,
-        preferred_element_type=jnp.float32,
+        "bqhd,bqtd->bqht", query, selected_key, preferred_element_type=jnp.float32
     )
     attention_scores *= jnp.asarray(1.0 / math.sqrt(qk_dim), dtype=jnp.float32)
-    probabilities = jax.nn.softmax(attention_scores, axis=-1)
+    # FlashMLA keeps the softmax recurrence in FP32, but rounds P to BF16 for
+    # tensor-core P @ V with FP32 accumulation. Match that mixed-precision path
+    # by casting P to the activation dtype (BF16 by default) before contraction.
+    probabilities = jax.nn.softmax(attention_scores, axis=-1).astype(query.dtype)
     output = jnp.einsum(
-        "bqht,bqtv->bqhv",
-        probabilities,
-        selected_value,
-        preferred_element_type=jnp.float32,
+        "bqht,bqtv->bqhv", probabilities, selected_value, preferred_element_type=jnp.float32
     )
     return output.astype(query.dtype)
 
