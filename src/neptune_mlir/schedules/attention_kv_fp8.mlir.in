@@ -105,9 +105,7 @@ module attributes {transform.with_named_sequence} {
 
     // Fuse K/V dequantization producer chains into the completed loop nest.
     %consumer_loops = transform.merge_handles %forall_loop, %j0_loop : !any
-    %fused_inputs, %updated_consumer_loops =
-        transform.fusion.greedy_input_producers_into_consumer %consumer_loops
-        : (!any) -> (!any, !any)
+    %fused_inputs = transform.fusion.greedy_input_producers_into_consumer %consumer_loops : (!any) -> !any
 
     // Post-pass: pushes lingering init tensor (see destination-passing style)
     // before and outside the loops into the loop body.

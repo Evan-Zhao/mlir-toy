@@ -74,23 +74,19 @@ module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo
     // packed_window_extract become the immediate producers of in-loop slices.
     // Then fuse the packed_window_extract into the loop nest as a masked slice consumption.
     %consumer_loops = transform.merge_handles %forall_loop, %j0_loop : !any
-    %_5, %consumer_loops_1 =
-        transform.fusion.greedy_input_producers_into_consumer %consumer_loops
-        : (!any) -> (!any, !any)
+    %_5 = transform.fusion.greedy_input_producers_into_consumer %consumer_loops : (!any) -> !any
     %extracts = transform.structured.match
         ops{["stablehlo.custom_call"]} attributes {call_target_name = "neptune.packed_window_extract"}
         in %func : (!any) -> !any
-    transform.htile.fuse_packed_window_extract %extracts into %consumer_loops_1 : (!any, !any) -> !any
-    %_6, %consumer_loops_2 =
-        transform.fusion.greedy_input_producers_into_consumer %consumer_loops
-        : (!any) -> (!any, !any)
+    transform.htile.fuse_packed_window_extract %extracts into %consumer_loops : (!any, !any) -> !any
+    %_6 = transform.fusion.greedy_input_producers_into_consumer %consumer_loops : (!any) -> !any
 
     // StableHLO slices were not fused because they are not fusable either. However, we can convert them to
     // tensor.extract_slice ops, then combine them with existing tensor.extract_slice ops in the loop.
     transform.apply_conversion_patterns to %func {
       transform.apply_conversion_patterns.stablehlo.slice_to_tensor
     } {illegal_ops = ["stablehlo.slice"], legal_dialects = ["tensor"], partial_conversion, preserve_handles} : !any
-    transform.apply_patterns to %func {
+        transform.apply_patterns to %func {
       transform.apply_patterns.tensor.merge_consecutive_insert_extract_slice
     } : !any
 

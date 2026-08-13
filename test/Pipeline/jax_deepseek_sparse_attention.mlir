@@ -65,8 +65,7 @@ module @jit_deepseek_sparse_attention attributes {mhlo.num_partitions = 1 : i32,
     // streaming selected-token loop. Each gather is retiled from
     // [1, 128, 2048, D] to [1, 1, 64, D].
     %consumer_loops = transform.merge_handles %forall_loop, %t_loop : !any
-    %fused_producers, %_5 = transform.fusion.greedy_input_producers_into_consumer %consumer_loops
-        : (!any) -> (!any, !any)
+    transform.fusion.greedy_input_producers_into_consumer %consumer_loops : (!any) -> !any
 
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.scf.localize_scratch_tensors %func : !any

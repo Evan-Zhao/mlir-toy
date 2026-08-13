@@ -263,10 +263,9 @@ def FusionGreedyInputProducersIntoConsumerOp
     operands are not followed.
 
     `consumer_op` may identify either one loop or multiple strictly nested
-    loops. The outermost loop must be an `scf.forall`. Each producer chain is
-    fused into the deepest selected loop containing its boundary slice. Loop
-    nesting, rather than handle order, determines the outer-to-inner order
-    passed to MLIR's producer fusion utility.
+    loops in outer-to-inner handle order. The outermost loop must be an
+    `scf.forall`. Each producer chain is fused into the deepest selected loop
+    containing its boundary slice.
 
     Producers exposed by fusing another producer are processed recursively.
     When a fused producer result also has consumers after the outer forall, the
@@ -281,14 +280,13 @@ def FusionGreedyInputProducersIntoConsumerOp
     producers already inside the selected placement loop, init-only chains,
     and non-tileable operations are not fused.
 
-    The `consumer_op` handle is read-only. The `new_consumer` result contains
-    the updated loop nest in outer-to-inner order. The `fused_ops` result
-    contains the producer operations in fusion order.
+    The `consumer_op` handle is read-only and is updated by payload tracking
+    when a loop is replaced. The `fused_ops` result contains the producer
+    operations in fusion order.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$consumer_op);
-  let results = (outs TransformHandleTypeInterface:$fused_ops,
-      TransformHandleTypeInterface:$new_consumer);
+  let results = (outs TransformHandleTypeInterface:$fused_ops);
 
   let assemblyFormat = "$consumer_op attr-dict `:` functional-type(operands, results)";
 }

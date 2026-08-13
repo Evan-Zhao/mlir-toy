@@ -108,8 +108,7 @@ module attributes {transform.with_named_sequence} {
 
     // Fuse KV scale multiplication downwards into the loops.
     %consumer_loops = transform.merge_handles %forall_loop, %j0_loop : !any
-    %_5, %_6 = transform.fusion.greedy_input_producers_into_consumer %consumer_loops
-        : (!any) -> (!any, !any)
+    %_5 = transform.fusion.greedy_input_producers_into_consumer %consumer_loops : (!any) -> !any
 
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.scf.localize_scratch_tensors %func : !any

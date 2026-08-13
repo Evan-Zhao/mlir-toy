@@ -18,9 +18,8 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %loop = transform.structured.match ops{["scf.forall"]} in %func
         : (!transform.any_op) -> !transform.any_op
-    %candidates, %new_loop =
-        transform.fusion.greedy_input_producers_into_consumer %loop
-        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %candidates = transform.fusion.greedy_input_producers_into_consumer %loop
+        : (!transform.any_op) -> !transform.any_op
     transform.yield
   }
 
@@ -91,12 +90,9 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %for = transform.structured.match ops{["scf.for"]} in %func
         : (!transform.any_op) -> !transform.any_op
-    // Deliberately merge in inner-to-outer order. The fusion op infers the
-    // loop order from payload nesting.
-    %loop_nest = transform.merge_handles %for, %forall : !transform.any_op
-    %candidates, %new_loop_nest =
-        transform.fusion.greedy_input_producers_into_consumer %loop_nest
-        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %loop_nest = transform.merge_handles %forall, %for : !transform.any_op
+    %candidates = transform.fusion.greedy_input_producers_into_consumer %loop_nest
+        : (!transform.any_op) -> !transform.any_op
     transform.yield
   }
 
@@ -160,9 +156,8 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %loop = transform.structured.match ops{["scf.forall"]} in %func
         : (!transform.any_op) -> !transform.any_op
-    %candidates, %new_loop =
-        transform.fusion.greedy_input_producers_into_consumer %loop
-        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %candidates = transform.fusion.greedy_input_producers_into_consumer %loop
+        : (!transform.any_op) -> !transform.any_op
     transform.yield
   }
 
@@ -208,9 +203,8 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %loop = transform.structured.match ops{["scf.forall"]} in %func
         : (!transform.any_op) -> !transform.any_op
-    %candidates, %new_loop =
-        transform.fusion.greedy_input_producers_into_consumer %loop
-        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %candidates = transform.fusion.greedy_input_producers_into_consumer %loop
+        : (!transform.any_op) -> !transform.any_op
     transform.yield
   }
 
@@ -264,7 +258,7 @@ module attributes {transform.with_named_sequence} {
     %loop = transform.structured.match ops{["scf.forall"]} in %func
         : (!transform.any_op) -> !transform.any_op
     transform.fusion.greedy_input_producers_into_consumer %loop
-        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+        : (!transform.any_op) -> !transform.any_op
     transform.yield
   }
 
@@ -302,8 +296,8 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %loop = transform.structured.match ops{["scf.forall"]} in %func
         : (!transform.any_op) -> !transform.any_op
-    transform.fusion.greedy_input_producers_into_consumer %loop
-        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    %candidates = transform.fusion.greedy_input_producers_into_consumer %loop
+        : (!transform.any_op) -> !transform.any_op
     transform.yield
   }
 
@@ -342,7 +336,7 @@ module attributes {transform.with_named_sequence} {
     %loop = transform.structured.match ops{["scf.forall"]} in %func
         : (!transform.any_op) -> !transform.any_op
     transform.fusion.greedy_input_producers_into_consumer %loop
-        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+        : (!transform.any_op) -> !transform.any_op
     transform.yield
   }
 

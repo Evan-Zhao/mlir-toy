@@ -658,18 +658,6 @@ FusionGreedyInputProducersIntoConsumerOp::apply(transform::TransformRewriter &re
   auto transform = cast<TransformOpInterface>(getOperation());
   CHECK_NON_EMPTY_OPS(state, transform, getConsumerOp, "consumer loop", consumerLoops);
 
-  // The consumer handle denotes a loop nest. Infer its outer-to-inner order
-  // from payload ancestry rather than relying on the order in the handle.
-  llvm::sort(consumerLoops, [](Operation *lhs, Operation *rhs) {
-    auto getDepth = [](Operation *op) {
-      unsigned depth = 0;
-      for (Operation *parent = op->getParentOp(); parent; parent = parent->getParentOp())
-        ++depth;
-      return depth;
-    };
-    return getDepth(lhs) < getDepth(rhs);
-  });
-
   SmallVector<LoopLikeOpInterface> loops;
   loops.reserve(consumerLoops.size());
   for (auto [index, loop] : llvm::enumerate(consumerLoops)) {
@@ -677,7 +665,7 @@ FusionGreedyInputProducersIntoConsumerOp::apply(transform::TransformRewriter &re
     if (!loopLike)
       BAIL("expected every consumer loop to implement LoopLikeOpInterface");
     if (index > 0 && !consumerLoops[index - 1]->isProperAncestor(loop))
-      BAIL("expected consumer loops to form a strictly nested loop nest");
+      BAIL("expected consumer loops in strictly nested outer-to-inner order");
     loops.push_back(loopLike);
   }
   if (!isa<scf::ForallOp>(loops.front().getOperation()))
@@ -842,10 +830,7 @@ FusionGreedyInputProducersIntoConsumerOp::apply(transform::TransformRewriter &re
       rewriter.eraseOp(originalProducer);
   }
 
-  SmallVector<Operation *> updatedLoops =
-      llvm::map_to_vector(loops, [](LoopLikeOpInterface loop) { return loop.getOperation(); });
   transformResults.set(getOperation()->getResult(0), fusedOps);
-  transformResults.set(getOperation()->getResult(1), updatedLoops);
   if (hasFailure)
     transform.emitRemark("failed to fuse some producers into the consumer loop nest");
   return DiagnosedSilenceableFailure::success();
