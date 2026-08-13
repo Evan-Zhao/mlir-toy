@@ -39,8 +39,32 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
   transform.named_sequence @__transform_main(%module: !any) {
     %funcs = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
     transform.stablehlo.legalize_control_flow %funcs : !any
-    // Skip the StableHLO-to-TA conversion because we have no rewrite to perform in TA.
-    %func = transform.apply_registered_pass "stablehlo-legalize-to-linalg" to %funcs : (!any) -> !any
+    // Primitive Linalg leaves the output projection as the only generic op,
+    // making it a stable anchor for the BxC schedule.
+    %func = transform.apply_registered_pass "stablehlo-legalize-to-linalg"
+        with options = {"enable-primitive-ops" = true} to %funcs : (!any) -> !any
+    %project = transform.structured.match ops{["linalg.generic"]} in %func : (!any) -> !any
+    %tiled_project, %bc_forall = transform.structured.tile_using_forall
+        %project tile_sizes [1, 128, 0] : (!any) -> (!any, !any)
+
+    // Pull the state update and token-local inputs into each 1x128 channel
+    // tile, then carry the skip/cast/output path forward to the time-slice write.
+    %producers, %bc_forall_1 =
+        transform.fusion.greedy_input_producers_into_consumer %bc_forall
+        : (!any) -> (!any, !any)
+    %consumers = transform.fusion.greedy_consumers_into_producer
+        %bc_forall_1[0] inline_elementwise : (!any) -> !any
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+    transform.scf.localize_scratch_tensors %func : !any
+    transform.apply_patterns to %func {
+      transform.apply_patterns.scf.fold_unit_extent_dims_via_reshapes
+      transform.apply_patterns.linalg.fold_unit_extent_dims_via_reshapes
+      transform.apply_patterns.canonicalization
+    } : !any
+    transform.apply_cse to %func : !any
+
+    // The forall is still inside the recurrence. Moving it outside requires
+    // distribution of the loop-carried state and output tensors.
     transform.verify %func : !any
     transform.yield
   }
@@ -166,7 +190,10 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
 // CHECK: math.absf
 // CHECK: math.exp
 // CHECK: math.log1p
-// CHECK: iterator_types = ["parallel", "parallel", "reduction"]
+// CHECK: scf.forall (%{{.+}}, %{{.+}}) in (8, 12)
+// CHECK: tensor.extract_slice {{.*}} : tensor<8x1536x16xf32> to tensor<1x128x16xf32>
+// CHECK: linalg.generic {{.*}}iterator_types = ["parallel", "reduction"]{{.*}}tensor<128x16xf32>
+// CHECK: tensor.parallel_insert_slice {{.*}} [1, 128]
 // CHECK: tensor.insert_slice
 // CHECK: scf.yield
 // CHECK-NOT: stablehlo.
