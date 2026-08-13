@@ -336,6 +336,13 @@ def FusionGreedyInputProducersIntoConsumerOp
     passed to MLIR's producer fusion utility.
 
     Producers exposed by fusing another producer are processed recursively.
+    When a fused producer result also has consumers after the outer forall, the
+    transform reconstructs that result by adding a `shared_out` and parallel
+    insertion to the forall, then redirects those escaping uses to the new loop
+    result. This allows the original full-tensor producer to become dead. The
+    reconstruction is unconditional for replaceable escaping uses; ordinary
+    canonicalization may remove redundant loop results.
+
     Function arguments, producers already inside the selected placement loop,
     init-only chains, and non-tileable operations are not fused.
 

@@ -70,8 +70,7 @@ module attributes {transform.with_named_sequence} {
 // -----
 
 // CHECK-LABEL: func.func @nested_loop_path
-// CHECK: linalg.generic
-// CHECK-SAME: {fusion_root}
+// CHECK-NOT: {fusion_root}
 // CHECK: scf.forall
 // The outer use is fused into the forall, not into the inner loop.
 // CHECK: %[[OUTER_ROOT:.*]] = linalg.generic
@@ -183,5 +182,75 @@ module attributes {transform.with_named_sequence} {
       }
     }
     return %result : tensor<8xf32>
+  }
+}
+
+// -----
+
+// A producer that is also used after the forall is reconstructed as another
+// shared_out. Its escaping use reads the new forall result, so the untiled
+// producer becomes dead.
+// CHECK-LABEL: func.func @reconstruct_escaping_producer
+// CHECK-NOT: {escaping_producer}
+// CHECK: %[[LOOP:.*]]:2 = scf.forall
+// CHECK-SAME: shared_outs(%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}})
+// CHECK: %[[TILED:.*]] = linalg.generic
+// CHECK-SAME: {escaping_producer}
+// CHECK: tensor.parallel_insert_slice %[[TILED]] into %{{.*}}
+// CHECK: tensor.parallel_insert_slice %{{.*}} into %{{.*}}
+// CHECK: %[[AFTER:.*]] = linalg.generic
+// CHECK-SAME: ins(%[[LOOP]]#0, %[[LOOP]]#1
+// CHECK-SAME: {after_loop}
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %func = transform.structured.match ops{["func.func"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    %loop = transform.structured.match ops{["scf.forall"]} in %func
+        : (!transform.any_op) -> !transform.any_op
+    %candidates, %new_loop =
+        transform.fusion.greedy_input_producers_into_consumer %loop
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.yield
+  }
+
+  func.func @reconstruct_escaping_producer(%arg: tensor<8xf32>) -> tensor<8xf32> {
+    %producer_empty = tensor.empty() : tensor<8xf32>
+    %producer = linalg.generic {
+        escaping_producer,
+        indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+        iterator_types = ["parallel"]}
+        ins(%arg : tensor<8xf32>) outs(%producer_empty : tensor<8xf32>) {
+      ^bb0(%in: f32, %out: f32):
+        %one = arith.constant 1.0 : f32
+        %sum = arith.addf %in, %one : f32
+        linalg.yield %sum : f32
+    } -> tensor<8xf32>
+
+    %loop_empty = tensor.empty() : tensor<8xf32>
+    %loop_result = scf.forall (%iv) = (0) to (2) step (1)
+        shared_outs(%out = %loop_empty) -> tensor<8xf32> {
+      %offset = affine.apply affine_map<(d0) -> (d0 * 4)>(%iv)
+      %slice = tensor.extract_slice %producer[%offset] [4] [1]
+          : tensor<8xf32> to tensor<4xf32>
+      scf.forall.in_parallel {
+        tensor.parallel_insert_slice %slice into %out[%offset] [4] [1]
+            : tensor<4xf32> into tensor<8xf32>
+      }
+    }
+
+    %after_empty = tensor.empty() : tensor<8xf32>
+    %after = linalg.generic {
+        after_loop,
+        indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>,
+                         affine_map<(d0) -> (d0)>],
+        iterator_types = ["parallel"]}
+        ins(%loop_result, %producer : tensor<8xf32>, tensor<8xf32>)
+        outs(%after_empty : tensor<8xf32>) {
+      ^bb0(%lhs: f32, %rhs: f32, %out: f32):
+        %sum = arith.addf %lhs, %rhs : f32
+        linalg.yield %sum : f32
+    } -> tensor<8xf32>
+    return %after : tensor<8xf32>
   }
 }

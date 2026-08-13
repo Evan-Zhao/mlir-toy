@@ -305,6 +305,19 @@ static bool hasDataUse(tensor::ExtractSliceOp slice) {
   return llvm::any_of(slice->getUses(), [](OpOperand &use) { return !isInitUse(use); });
 }
 
+/// Return true when the forall result can replace this escaping use without
+/// changing dominance. The forall's own initialization edge is excluded.
+static bool isReplaceableEscapingUse(OpOperand &use, scf::ForallOp forallOp) {
+  Operation *user = use.getOwner();
+  if (user == forallOp || forallOp->isProperAncestor(user))
+    return false;
+
+  Operation *ancestor = user;
+  while (ancestor && ancestor->getBlock() != forallOp->getBlock())
+    ancestor = ancestor->getParentOp();
+  return ancestor && forallOp->isBeforeInBlock(ancestor);
+}
+
 DiagnosedSilenceableFailure
 FusionGreedyInputProducersIntoConsumerOp::apply(transform::TransformRewriter &rewriter,
                                                 TransformResults &transformResults,
@@ -426,8 +439,44 @@ FusionGreedyInputProducersIntoConsumerOp::apply(transform::TransformRewriter &re
     });
     fusedOps.append(fused->tiledOps);
 
+    SmallVector<Operation *> generatedSlices = fused->generatedSlices;
+    Operation *originalProducer = fused->origProducer.getOwner();
+    SmallVector<unsigned> escapingResults;
+    auto outerForall = cast<scf::ForallOp>(loops.front().getOperation());
+    for (auto [resultNumber, result] : llvm::enumerate(originalProducer->getResults()))
+      if (llvm::any_of(result.getUses(),
+                       [&](OpOperand &use) { return isReplaceableEscapingUse(use, outerForall); }))
+        escapingResults.push_back(resultNumber);
+
+    // Reconstruct fused values that still escape the loop. This turns
+    //
+    //   %p = producer
+    //   %r = scf.forall { use tile(%p) }
+    //   use %p
+    //
+    // into a forall with an additional shared_out/result, allowing the
+    // original full-tensor producer to become dead. The upstream helper only
+    // supports a forall as the innermost selected loop, so nested placement is
+    // left unchanged until it has an escaping producer at the forall level.
+    if (!escapingResults.empty() && item.loopDepth == 0) {
+      FailureOr<SmallVector<Operation *>> reconstructionSlices =
+          scf::yieldReplacementForFusedProducer(rewriter, slice, *fused, loops, escapingResults);
+      if (failed(reconstructionSlices))
+        BAIL("failed to reconstruct an escaping fused producer from the consumer loop");
+      generatedSlices.append(*reconstructionSlices);
+
+      outerForall = cast<scf::ForallOp>(loops.front().getOperation());
+      ValueRange reconstructed = outerForall.getResults().take_back(escapingResults.size());
+      for (auto [resultNumber, replacement] : llvm::zip_equal(escapingResults, reconstructed)) {
+        Value original = originalProducer->getResult(resultNumber);
+        original.replaceUsesWithIf(replacement, [&](OpOperand &use) {
+          return isReplaceableEscapingUse(use, outerForall);
+        });
+      }
+    }
+
     SmallVector<WorkItem> generatedItems;
-    for (Operation *generated : fused->generatedSlices)
+    for (Operation *generated : generatedSlices)
       if (auto generatedSlice = dyn_cast<tensor::ExtractSliceOp>(generated))
         enqueue(generatedSlice, item.loopDepth, generatedItems);
     worklist.insert(worklist.end(), generatedItems.begin(), generatedItems.end());
@@ -436,6 +485,8 @@ FusionGreedyInputProducersIntoConsumerOp::apply(transform::TransformRewriter &re
     // intentionally leaves the now-dead operation behind.
     if (slice->use_empty())
       rewriter.eraseOp(slice);
+    if (isOpTriviallyDead(originalProducer))
+      rewriter.eraseOp(originalProducer);
   }
 
   SmallVector<Operation *> updatedLoops =
