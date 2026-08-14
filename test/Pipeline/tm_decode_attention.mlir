@@ -29,7 +29,7 @@ module attributes {transform.with_named_sequence} {
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     %bmax, %_2 = transform.fusion.find_next_reduction %forall_loop : (!any) -> (!any, !any)
-    %prefix = transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %bmax { inline_elementwise } : (!any, !any) -> !any
+    %prefix = transform.fusion.greedy_consumers_into_producer %forall_loop until %bmax { inline_elementwise } : (!any, !any) -> !any
     transform.linalg.erase_unused_operands_and_results %prefix : !any
 
     // Use fuse_partial_reduction_into_forall here (similar to RFactor in TVM).

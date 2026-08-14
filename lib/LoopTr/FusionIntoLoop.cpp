@@ -498,8 +498,8 @@ FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewrite
     auto stopOpRange = state.getPayloadOps(stopOpHandle);
     stopOps.insert(stopOpRange.begin(), stopOpRange.end());
   }
-  size_t resultNumber = getResultNumber();
-  if (resultNumber >= loop->getNumResults())
+  std::optional<uint64_t> resultNumber = getResultNumber();
+  if (resultNumber && *resultNumber >= loop->getNumResults())
     BAIL("result number is out of range for producer loop");
   const bool inlineElemwise = getInlineElementwise();
 
@@ -509,40 +509,49 @@ FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewrite
   TrackedOperationsListener fusedOpsListener(fusedOps, previousListener);
   rewriter.setListener(&fusedOpsListener);
   auto restoreListener = llvm::scope_exit([&]() { rewriter.setListener(previousListener); });
+  auto finish = [&]() -> DiagnosedSilenceableFailure {
+    transformResults.set(getOperation()->getResult(0), fusedOps);
+    if (!failedConsumers.empty())
+      transform.emitRemark("did not fuse all discovered consumers into the producer loop");
+    return DiagnosedSilenceableFailure::success();
+  };
 
-  bool followFusedChain = false;
   while (true) {
-    // Run CSE on the loop body because fusion may fail without it (fusion compares indices by
-    // operation equality of affine ops, so we want to make sure that we don't have duplicate affine
-    // ops in the loop body).
+    // Fusion compares affine index operations by identity, so remove duplicate
+    // index computations before selecting the next consumer.
     eliminateLocalCommonSubexpressions(rewriter, loop);
 
-    SmallVector<Operation *> consumers;
-    for (Operation *consumer : loop->getResult(resultNumber).getUsers()) {
-      if (failedConsumers.contains(consumer))
-        continue;
-      if (stopOps.contains(consumer)) {
-        // Stop all fusing when we reach the stop op.
-        transformResults.set(getOperation()->getResult(0), fusedOps);
-        if (!failedConsumers.empty())
-          transform.emitRemark("did not fuse all discovered consumers into the producer loop");
-        return DiagnosedSilenceableFailure::success();
+    DenseSet<Operation *> candidateSet;
+    auto collectConsumers = [&](OpResult result) {
+      for (Operation *consumer : result.getUsers()) {
+        if (stopOps.contains(consumer))
+          return failure();
+        if (!failedConsumers.contains(consumer))
+          candidateSet.insert(consumer);
       }
-      consumers.push_back(consumer);
+      return success();
+    };
+    if (resultNumber) {
+      if (failed(collectConsumers(loop->getResult(*resultNumber))))
+        return finish();
+    } else {
+      for (OpResult result : loop->getResults())
+        if (failed(collectConsumers(result)))
+          return finish();
     }
-    if (consumers.empty()) {
-      // No consumer found -- we are done.
-      transformResults.set(getOperation()->getResult(0), fusedOps);
-      if (!failedConsumers.empty())
-        transform.emitRemark("did not fuse all discovered consumers into the producer loop");
-      return DiagnosedSilenceableFailure::success();
-    }
-    // Sort by their position in the block so that we fuse consumers in program order.
-    llvm::sort(consumers, [](Operation *lhs, Operation *rhs) {
-      return lhs->getBlock() == rhs->getBlock() && lhs->isBeforeInBlock(rhs);
-    });
+    if (candidateSet.empty())
+      return finish();
 
-    SmallVector<Operation *> nextFrontierUsers;
+    // Lexical preorder is deterministic and respects SSA order. Rediscovery
+    // after every fusion lets a join become eligible after either input branch.
+    SmallVector<Operation *> consumers;
+    loop->getParentOp()->walk<WalkOrder::PreOrder>([&](Operation *op) {
+      if (candidateSet.erase(op))
+        consumers.push_back(op);
+    });
+    assert(candidateSet.empty() && "expected loop result users below the loop's parent op");
+
+    bool madeProgress = false;
     for (Operation *consumer : consumers) {
       LLVM_DEBUG(llvm::dbgs() << "greedy consumer-fusion candidate: " << consumer->getName()
                               << "\n");
@@ -565,49 +574,49 @@ FusionGreedyConsumersIntoProducerOp::apply(transform::TransformRewriter &rewrite
                                                      DefChainAction::Move)))
         BAIL("failed to make consumer operands available before the producer loop");
 
-      unsigned loopOperandCount = llvm::count_if(
-          consumer->getOperands(), [&](Value operand) { return operand.getDefiningOp() == loop; });
-      bool advanceFrontier = followFusedChain || loopOperandCount > 1;
-      if (advanceFrontier && consumers.size() == 1 && consumer->getNumResults() == 1)
-        nextFrontierUsers = llvm::map_to_vector(consumer->getResult(0).getUsers(),
-                                                [](Operation *user) { return user; });
-
       SmallVector<LoopLikeOpInterface> loops{loop};
       FailureOr<scf::SCFFuseConsumerOfSliceResult> fuseResult =
           tileAndFuseConsumerWithDebug(rewriter, *consumer, loops);
       if (failed(fuseResult) || fuseResult->tiledOps.empty()) {
+        std::optional<unsigned> consumerResultNumber;
+        for (Value operand : consumer->getOperands()) {
+          auto loopResult = dyn_cast<OpResult>(operand);
+          if (!loopResult || loopResult.getOwner() != loop)
+            continue;
+          if (consumerResultNumber && *consumerResultNumber != loopResult.getResultNumber()) {
+            consumerResultNumber.reset();
+            break;
+          }
+          consumerResultNumber = loopResult.getResultNumber();
+        }
         FailureOr<TensorConsumerFusionResult> tensorFusion =
-            pushTensorConsumerThroughForall(rewriter, loop, resultNumber, consumer);
+            consumerResultNumber
+                ? pushTensorConsumerThroughForall(rewriter, loop, *consumerResultNumber, consumer)
+                : FailureOr<TensorConsumerFusionResult>();
         if (failed(tensorFusion)) {
           consumer->emitRemark("failed to fuse this consumer into the producer loop");
           failedConsumers.insert(consumer);
           continue;
         }
         loop = tensorFusion->loop;
-        followFusedChain = advanceFrontier;
         fusedOps.append(tensorFusion->fusedOps);
-        continue;
+      } else {
+        loop = cast<scf::ForallOp>(loops.front());
+        fusedOps.append(fuseResult->tiledOps);
+        if (isOpTriviallyDead(consumer))
+          rewriter.eraseOp(consumer);
       }
-      loop = cast<scf::ForallOp>(loops.front());
-      followFusedChain = advanceFrontier;
-      fusedOps.append(fuseResult->tiledOps);
-      if (isOpTriviallyDead(consumer))
-        rewriter.eraseOp(consumer);
+      madeProgress = true;
+      break;
     }
+    if (!madeProgress)
+      return finish();
 
     FailureOr<scf::ForallOp> canonicalizedLoop = canonicalizeForLoop(rewriter, loop);
     if (failed(canonicalizedLoop))
       BAIL("failed to canonicalize the producer loop after consumer fusion");
     loop = *canonicalizedLoop;
-    SmallVector<unsigned> frontierResults;
-    for (auto [index, result] : llvm::enumerate(loop.getResults()))
-      if (llvm::any_of(result.getUsers(), [&](Operation *user) {
-            return llvm::is_contained(nextFrontierUsers, user);
-          }))
-        frontierResults.push_back(index);
-    if (llvm::hasSingleElement(frontierResults))
-      resultNumber = frontierResults.front();
-    else if (resultNumber >= loop->getNumResults())
+    if (resultNumber && *resultNumber >= loop->getNumResults())
       BAIL("result number is out of range for producer loop after canonicalization");
   }
 }

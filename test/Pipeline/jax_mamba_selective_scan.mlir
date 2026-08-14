@@ -54,8 +54,7 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
     // We have seen this pattern previously in some attention variants (which needed CSE),
     // but here we need canonicalization which does more.
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
-    %consumers = transform.fusion.greedy_consumers_into_producer
-        %bc_forall[2] inline_elementwise : (!any) -> !any
+    transform.fusion.greedy_consumers_into_producer %bc_forall inline_elementwise : (!any) -> !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.scf.localize_scratch_tensors %func : !any
     transform.apply_patterns to %func {

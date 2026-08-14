@@ -184,3 +184,75 @@ module attributes {transform.with_named_sequence} {
 // CHECK: %[[TILE:.*]] = tensor.expand_shape %{{.*}} {{.*}}output_shape [1, 2, 2]
 // CHECK: tensor.parallel_insert_slice %[[TILE]] into %[[OUT]][%{{.*}}, 0, 0] [1, 2, 2]
 // CHECK: return %[[RESULT]] : tensor<2x2x2xf32>
+
+// -----
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %func = transform.structured.match ops{["func.func"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    %loop = transform.structured.match ops{["scf.forall"]} in %func
+        : (!transform.any_op) -> !transform.any_op
+    %ret = transform.structured.match ops{["func.return"]} in %func
+        : (!transform.any_op) -> !transform.any_op
+    transform.fusion.greedy_consumers_into_producer %loop until %ret
+        : (!transform.any_op, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
+  func.func @all_results_lexical_order(
+      %input0: tensor<8xf32>, %input1: tensor<8xf32>,
+      %init0: tensor<8xf32>, %init1: tensor<8xf32>,
+      %out0: tensor<8xf32>, %out1: tensor<8xf32>,
+      %joined_out: tensor<8xf32>) -> tensor<8xf32> {
+    %results:2 = scf.forall (%i) in (2) shared_outs(%arg0 = %init0, %arg1 = %init1)
+        -> (tensor<8xf32>, tensor<8xf32>) {
+      %offset = affine.apply affine_map<(d0) -> (d0 * 4)>(%i)
+      %tile0 = tensor.extract_slice %input0[%offset] [4] [1]
+          : tensor<8xf32> to tensor<4xf32>
+      %tile1 = tensor.extract_slice %input1[%offset] [4] [1]
+          : tensor<8xf32> to tensor<4xf32>
+      scf.forall.in_parallel {
+        tensor.parallel_insert_slice %tile0 into %arg0[%offset] [4] [1]
+            : tensor<4xf32> into tensor<8xf32>
+        tensor.parallel_insert_slice %tile1 into %arg1[%offset] [4] [1]
+            : tensor<4xf32> into tensor<8xf32>
+      }
+    }
+    %first = linalg.generic {first,
+        indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+        iterator_types = ["parallel"]}
+        ins(%results#1 : tensor<8xf32>) outs(%out1 : tensor<8xf32>) {
+      ^bb0(%in: f32, %out: f32):
+        %value = arith.negf %in : f32
+        linalg.yield %value : f32
+    } -> tensor<8xf32>
+    %second = linalg.generic {second,
+        indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>],
+        iterator_types = ["parallel"]}
+        ins(%results#0 : tensor<8xf32>) outs(%out0 : tensor<8xf32>) {
+      ^bb0(%in: f32, %out: f32):
+        %value = arith.negf %in : f32
+        linalg.yield %value : f32
+    } -> tensor<8xf32>
+    %joined = linalg.generic {join,
+        indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> (d0)>,
+                         affine_map<(d0) -> (d0)>],
+        iterator_types = ["parallel"]}
+        ins(%first, %second : tensor<8xf32>, tensor<8xf32>)
+        outs(%joined_out : tensor<8xf32>) {
+      ^bb0(%lhs: f32, %rhs: f32, %out: f32):
+        %value = arith.addf %lhs, %rhs : f32
+        linalg.yield %value : f32
+    } -> tensor<8xf32>
+    return %joined : tensor<8xf32>
+  }
+}
+
+// CHECK-LABEL: func.func @all_results_lexical_order
+// CHECK: scf.forall
+// CHECK: linalg.generic {{.*}} attrs = {{ *}}{first}
+// CHECK: linalg.generic {{.*}} attrs = {{ *}}{second}
+// CHECK: linalg.generic {{.*}} attrs = {{ *}}{join}
+// CHECK: scf.forall.in_parallel
+// CHECK: return %{{.*}} : tensor<8xf32>

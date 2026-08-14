@@ -33,7 +33,7 @@ module @jit_deepseek_sparse_attention attributes {mhlo.num_partitions = 1 : i32,
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     %bmax, %_2 = transform.fusion.find_next_reduction %forall_loop : (!any) -> (!any, !any)
-    %prefix = transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %bmax { inline_elementwise } : (!any, !any) -> !any
+    %prefix = transform.fusion.greedy_consumers_into_producer %forall_loop until %bmax { inline_elementwise } : (!any, !any) -> !any
     transform.linalg.erase_unused_operands_and_results %prefix : !any
     transform.linalg.erase_unused_operands_and_results %bmax : !any
     %fused_bmax, %t_loop = transform.scf.fuse_reduction_into_forall
@@ -59,7 +59,7 @@ module @jit_deepseek_sparse_attention attributes {mhlo.num_partitions = 1 : i32,
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     %ret = transform.structured.match ops{["func.return"]} in %func : (!any) -> !any
-    transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %ret : (!any, !any) -> !any
+    transform.fusion.greedy_consumers_into_producer %forall_loop until %ret : (!any, !any) -> !any
 
     // Pull both gathers and their shared selected-index producer into the
     // streaming selected-token loop. Each gather is retiled from

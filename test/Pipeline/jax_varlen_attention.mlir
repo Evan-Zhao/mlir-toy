@@ -33,7 +33,7 @@ module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     %bmax, %_2 = transform.fusion.find_next_reduction %forall_loop : (!any) -> (!any, !any)
-    %prefix = transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %bmax { inline_elementwise } : (!any, !any) -> !any
+    %prefix = transform.fusion.greedy_consumers_into_producer %forall_loop until %bmax { inline_elementwise } : (!any, !any) -> !any
     transform.linalg.erase_unused_operands_and_results %prefix : !any
 
     transform.linalg.erase_unused_operands_and_results %bmax : !any
@@ -67,7 +67,7 @@ module @jit_doc_offset_attention attributes {mhlo.num_partitions = 1 : i32, mhlo
     %insert = transform.structured.match
         ops{["stablehlo.custom_call"]} attributes {call_target_name = "neptune.packed_window_insert"}
         in %func : (!any) -> !any
-    transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %insert : (!any, !any) -> !any
+    transform.fusion.greedy_consumers_into_producer %forall_loop until %insert : (!any, !any) -> !any
     transform.htile.fuse_packed_window_insert %insert into %forall_loop : (!any, !any) -> !any
 
     // Difference from dense attention (2): first fuse ordinary producer chains so our custom

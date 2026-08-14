@@ -210,40 +210,53 @@ def FusionGreedyConsumersIntoProducerOp
   let summary = "Greedily fuse consumers into a producer loop";
 
   let description = [{
-    Starting from `producer_loop[result_number]`, repeatedly fuse the unique
-    direct consumer of the current loop result into `producer_loop`.
+    Greedily fuse direct consumers of `producer_loop` back into the loop. This
+    is the forward, result-to-user counterpart of
+    `transform.fusion.greedy_input_producers_into_consumer`.
 
-    The `result_number` identifies the initial loop result. When a consumer
-    joins multiple results of the same loop, fusion continues from the result
-    produced by that consumer; otherwise it continues discovering consumers of
-    the selected loop result.
+    If `result_number` is present, each discovery step considers direct users
+    of that result slot. Otherwise, it considers direct users of every loop
+    result. Candidates are deduplicated and visited in lexical payload order.
 
-    If `stop_op` is provided and the next direct consumer is one of its payload
-    operations, fusion stops before that consumer and succeeds. This is useful
-    for fusing the elementwise prefix of a chain and stopping at a reduction
-    frontier.
+    The transform performs at most one successful fusion per discovery step.
+    It then canonicalizes the rewritten loop and rediscovers candidates from
+    its new results. In all-results mode, this lets separate result branches
+    converge without special frontier tracking. For example, the fusion order
+    below is `first`, `second`, then `join`:
 
-    If `inline_elementwise` is present, the transform should first try to
-    greedily inline elementwise producers into each selected consumer before
-    fusing that consumer into the loop. This inlining is best-effort: a
-    consumer with no eligible elementwise producers should still be considered
-    for loop fusion.
+    ```mlir
+    %r:2 = scf.forall ... -> (tensor<...>, tensor<...>)
+    %first = linalg.generic ins(%r#1 : tensor<...>) ...
+    %second = linalg.generic ins(%r#0 : tensor<...>) ...
+    %join = linalg.generic ins(%first, %second : tensor<...>, tensor<...>) ...
+    ```
 
-    Consumers that cannot be fused are skipped and receive a diagnostic remark,
-    allowing fusion to continue with other consumers. Tensor insertions and
-    rectangular collapse/expand shape transfers are fused by rebuilding the
-    forall publication in the consumer's coordinate space.
+    If any currently selected direct consumer is in `stop_op`, fusion stops
+    before that consumer and succeeds. In all-results mode this stops the
+    entire transform, not just one result branch.
+
+    If `inline_elementwise` is present, the transform first tries to greedily
+    inline elementwise producers into each selected consumer. This is
+    best-effort; a consumer with no eligible elementwise producers remains a
+    fusion candidate.
+
+    Ordinary tileable consumers use SCF consumer fusion. Rectangular
+    `tensor.insert_slice`, `tensor.collapse_shape`, and `tensor.expand_shape`
+    consumers can instead be fused by transferring the published region and
+    rebuilding the forall destination. Consumers that cannot be fused are
+    skipped with a diagnostic remark.
 
     The `producer_loop` handle is preserved and remapped to the rewritten loop.
-    The optional `stop_op` handle is read-only. The result handle contains the
-    fused consumer operations in fusion order.
+    The optional `stop_op` handle is read-only. The `fused_ops` result contains
+    the payload operations created by successful fusions, in fusion order.
   }];
 
-  let arguments = (ins TransformHandleTypeInterface:$producer_loop, I64Attr:$result_number,
+  let arguments = (ins TransformHandleTypeInterface:$producer_loop,
+      OptionalAttr<I64Attr>:$result_number,
       Optional<TransformHandleTypeInterface>:$stop_op, UnitAttr:$inline_elementwise);
   let results = (outs TransformHandleTypeInterface:$fused_ops);
 
-  let assemblyFormat = "$producer_loop `[` $result_number `]` "
+  let assemblyFormat = "$producer_loop (`[` $result_number^ `]`)? "
                        "(`until` $stop_op^)? "
                        "(`inline_elementwise` $inline_elementwise^)? "
                        "attr-dict `:` functional-type(operands, results)";
@@ -257,32 +270,46 @@ def FusionGreedyInputProducersIntoConsumerOp
   let summary = "Greedily fuse input producers into a consumer loop nest";
 
   let description = [{
-    Starting from tensor.extract_slice operations that read values defined
-    outside `consumer_op`, greedily fuse their tileable producer chains into
-    the loop nest. Destination-style init operands and loop iter-arg init
-    operands are not followed.
+    Greedily fuse input producers into the loop nest identified by
+    `consumer_op`. This is the backward, operand-to-defining-op counterpart of
+    `transform.fusion.greedy_consumers_into_producer`.
 
-    `consumer_op` may identify either one loop or multiple strictly nested
-    loops in outer-to-inner handle order. The outermost loop must be an
-    `scf.forall`. Each producer chain is fused into the deepest selected loop
-    containing its boundary slice.
+    `consumer_op` may identify one loop or multiple strictly nested loops in
+    outer-to-inner handle order. The outermost loop must be an `scf.forall`.
+    Fusion starts from `tensor.extract_slice` operations that are inside the
+    selected nest and read values defined outside it. Each boundary slice is
+    assigned to the deepest selected loop containing it; deeper initial
+    candidates are processed first.
 
-    Producers exposed by fusing another producer are processed recursively.
-    When a fused producer result also has consumers after the outer forall, the
-    transform reconstructs that result by adding a `shared_out` and parallel
-    insertion to the forall, then redirects those escaping uses to the new loop
-    result. This allows the original full-tensor producer to become dead. The
-    reconstruction is unconditional for replaceable escaping uses; ordinary
-    canonicalization may remove redundant loop results.
+    Destination-style init operands and loop iter-arg init operands are not
+    followed. Slices exposed by a successful producer fusion are added to the
+    worklist, so tileable producer chains are processed recursively.
 
-    Consecutive tensor slices and rectangular collapse/expand shape transfers
-    are pulled through before ordinary producer fusion. Function arguments,
-    producers already inside the selected placement loop, init-only chains,
-    and non-tileable operations are not fused.
+    Before ordinary producer fusion, rectangular regions can be pulled through
+    consecutive `tensor.extract_slice`, `tensor.collapse_shape`, and
+    `tensor.expand_shape` producers. For example, the requested region is
+    transferred from the collapsed coordinates back to `%source` here:
+
+    ```mlir
+    %view = tensor.collapse_shape %source ...
+    scf.forall ... {
+      %tile = tensor.extract_slice %view[...] ...
+    }
+    ```
+
+    When a fused producer result also has replaceable uses after the outer
+    forall, the transform adds a `shared_out` publication and redirects those
+    uses to the new loop result. This reconstructs only escaping producer
+    results and lets a dead full-tensor producer be erased.
+
+    Function arguments, producers already inside the selected placement loop,
+    init-only chains, unsupported region transfers, and non-tileable operations
+    are not fused. A failed candidate receives a diagnostic remark, and fusion
+    continues with the remaining worklist.
 
     The `consumer_op` handle is read-only and is updated by payload tracking
-    when a loop is replaced. The `fused_ops` result contains the producer
-    operations in fusion order.
+    when a loop is replaced. The `fused_ops` result contains the payload
+    operations created by successful producer fusions, in fusion order.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$consumer_op);

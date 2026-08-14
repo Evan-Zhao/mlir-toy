@@ -52,7 +52,7 @@ module attributes {transform.with_named_sequence} {
     // and we only have one elementwise op (the scale op) to fuse.
     //   TVM: sch.reverse_compute_at(bscale, j0)
     %bmax, %_2 = transform.fusion.find_next_reduction %forall_loop : (!any) -> (!any, !any)
-    %prefix = transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %bmax { inline_elementwise } : (!any, !any) -> !any
+    %prefix = transform.fusion.greedy_consumers_into_producer %forall_loop until %bmax { inline_elementwise } : (!any, !any) -> !any
     transform.linalg.erase_unused_operands_and_results %prefix : !any
 
     // Fusion 2. Fuse row-max into forall, splitting a serial `for` loop from forall in the process.
@@ -99,7 +99,7 @@ module attributes {transform.with_named_sequence} {
     // Fusion 5. Fuse the trailing elemwise ops into the forall loop (but outside the for loop):
     // elemwise division, then FP32->FP16 cast. Keep going until we see the return op.
     %ret = transform.structured.match ops{["func.return"]} in %func : (!any) -> !any
-    transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %ret : (!any, !any) -> !any
+    transform.fusion.greedy_consumers_into_producer %forall_loop until %ret : (!any, !any) -> !any
 
     // Post-pass: pushes lingering init tensor (see destination-passing style)
     // before and outside the loops into the loop body.

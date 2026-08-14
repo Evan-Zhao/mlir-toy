@@ -43,7 +43,7 @@ module attributes {transform.with_named_sequence} {
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     %bmax, %_2 = transform.fusion.find_next_reduction %forall_loop : (!any) -> (!any, !any)
-    %prefix = transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %bmax { inline_elementwise } : (!any, !any) -> !any
+    %prefix = transform.fusion.greedy_consumers_into_producer %forall_loop until %bmax { inline_elementwise } : (!any, !any) -> !any
     transform.linalg.erase_unused_operands_and_results %prefix : !any
 
     transform.linalg.erase_unused_operands_and_results %bmax : !any
@@ -72,7 +72,7 @@ module attributes {transform.with_named_sequence} {
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
 
     %ret = transform.structured.match ops{["func.return"]} in %func : (!any) -> !any
-    transform.fusion.greedy_consumers_into_producer %forall_loop[0] until %ret : (!any, !any) -> !any
+    transform.fusion.greedy_consumers_into_producer %forall_loop until %ret : (!any, !any) -> !any
 
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.scf.localize_scratch_tensors %func : !any
