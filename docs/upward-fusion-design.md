@@ -7,38 +7,27 @@ L0-to-L1 schedules under `test/Pipeline`, starting with
 `test/Pipeline/tm_global_attention.mlir`.
 
 The intent is the same as TVM `reverse_compute_at`: move a consumer under the
-loop nest that already materializes tiles of its input. In MLIR, this is not a
-single general upstream primitive, so Neptune uses two narrow transform ops:
+loop nest that already materializes tiles of its input. Neptune uses two custom
+transform ops for the pointwise and reduction cases:
 
-- `transform.fusion.into_producer`
+- `transform.fusion.greedy_consumers_into_producer`
 - `transform.scf.fuse_reduction_into_forall`
 
-Both are specialized for fusing a Linalg consumer operation into an SCF loop nest.
+Both fuse Linalg consumer operations into an SCF loop nest.
 
-## `fusion.into_producer`
+## `fusion.greedy_consumers_into_producer`
 
-`transform.fusion.into_producer` applies pointwise,
-"upward" (consumer into producer) fusion. It takes:
+`transform.fusion.greedy_consumers_into_producer` repeatedly fuses direct consumers into an
+`scf.forall`. For attention, it first fuses the elementwise score prefix and stops before the row
+reduction:
 
-- an elementwise consumer, currently either:
-  - a single-result `linalg.map`, or
-  - a single-result, single-init `linalg.generic` with all-parallel loops and
-    projected-permutation indexing maps,
-- a containing tiled loop nest rooted at `scf.for` or `scf.forall`.
-
-The implementation is intentionally thin. It delegates most of the real work to
-upstream `scf::tileAndFuseConsumer` after checking that the consumer is
-elementwise and that the supplied loop is the root of a supported tiled loop nest.
-
-For attention, this is used to fuse the score-scaling step into the main loop nest:
-
-```text
-qk = Q @ K^T
-score = scale(qk)
+```mlir
+%prefix = transform.fusion.greedy_consumers_into_producer %forall_loop until %row_max
+    { inline_elementwise } : (!transform.any_op, !transform.any_op) -> !transform.any_op
 ```
 
-After tiling `qk`, the scale map is fused directly onto each `qk` tile before
-that tile is written back.
+The operation delegates pointwise fusion to upstream `scf::tileAndFuseConsumerOfSlice`. The
+`inline_elementwise` option first folds eligible elementwise producers into each selected consumer.
 
 ## `scf.fuse_reduction_into_forall`
 

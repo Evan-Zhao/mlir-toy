@@ -60,44 +60,6 @@ def LinalgEraseUnusedOperandsAndResultsOp
   }];
 }
 
-def LinalgGreedyInlineElementwiseOp : Op<Transform_Dialect, "linalg.greedy_inline_elementwise",
-                                         [TransformOpInterface, TransformEachOpTrait,
-                                          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
-                                          ReportTrackingListenerFailuresOpTrait]> {
-  let summary = "Greedily inline elementwise producers into a linalg.generic consumer";
-
-  let description = [{
-    Thin transform-level wrapper around upstream `linalg::fuseElementwiseOps`.
-
-    For the targeted `linalg.generic`, this op repeatedly inlines one producer
-    of an input operand into the consumer, until no supported operations are left to inline.
-
-    If `operand_number` is present, only that operand of the generic op is considered for inlining.
-    Otherwise, operands are tried from left to right and the first eligible operand is inlined.
-    The transform keeps iterating until no inlining can make further progress.
-    After the inlining loop, it also applies
-    `linalg::populateEraseUnusedOperandsAndResultsPatterns(...)` to remove
-    dead relay results and redundant operands exposed by the fusion.
-
-    This transform reads the target handle and modifies the payload. If payload
-    tracking succeeds, the target handle remains valid and is updated to point
-    to the rewritten `linalg.generic`.
-  }];
-
-  let arguments = (ins TransformHandleTypeInterface:$target, OptionalAttr<I64Attr>:$operand_number);
-  let results = (outs);
-
-  let assemblyFormat = "$target attr-dict `:` type($target)";
-
-  let extraClassDeclaration = [{
-    ::mlir::DiagnosedSilenceableFailure applyToOne(
-        ::mlir::transform::TransformRewriter &rewriter,
-        ::mlir::linalg::GenericOp target,
-        ::mlir::transform::ApplyToEachResultList &results,
-        ::mlir::transform::TransformState &state);
-  }];
-}
-
 def ScfLocalizeScratchTensorsOp : Op<Transform_Dialect, "scf.localize_scratch_tensors",
                                      [TransformOpInterface, TransformEachOpTrait,
                                       DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
@@ -237,34 +199,6 @@ def ScfFusePartialReductionIntoForallOp
       TransformHandleTypeInterface:$writeback_reduce_op);
 
   let assemblyFormat = "$consumer_op `into` $forall_loop attr-dict "
-                       " `:` functional-type(operands, results)";
-}
-
-def FusionIntoProducerOp
-    : Op<Transform_Dialect, "fusion.into_producer",
-         [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
-          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
-  let summary = "Fuse a consumer into a producer that is also a loop";
-
-  let description = [{
-    Fuse a single consumer operation into a producer that implements LoopLikeOpInterface.
-
-    Delegates to upstream `scf::tileAndFuseConsumer`, which:
-    - identifies operands of `consumer` defined by the containing loop,
-    - locates the `tensor.insert_slice`/`tensor.parallel_insert_slice` that
-      produces each such operand from within the loop body,
-    - tiles the consumer to operate on those same slices in-place, and
-    - adds the tiled result as an additional loop-carried value.
-
-    The `producer_loop` handle is preserved and remapped to the rewritten loop.
-    The `consumer_op` handle is consumed.
-  }];
-
-  let arguments = (ins TransformHandleTypeInterface:$consumer_op,
-      TransformHandleTypeInterface:$producer_loop);
-  let results = (outs TransformHandleTypeInterface:$fused_op);
-
-  let assemblyFormat = "$consumer_op `into` $producer_loop attr-dict "
                        " `:` functional-type(operands, results)";
 }
 
