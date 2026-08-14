@@ -17,6 +17,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Transforms/RegionUtils.h"
 #include "llvm/ADT/STLExtras.h"
 
 using namespace mlir;
@@ -660,7 +661,11 @@ DiagnosedSilenceableFailure ScfFuseReductionIntoForallOp::apply(TransformRewrite
   if (failed(splitPlan))
     BAIL("failed to detect a split plan for the reduction");
 
-  rewriter.setInsertionPoint(consumer);
+  // Keep the replacement at the original loop so it continues to dominate all
+  // existing users. Move the reduction init's backward slice there first.
+  if (failed(moveValueDefinitions(rewriter, ValueRange{splitPlan->reductionInit}, loop)))
+    BAIL("failed to move the reduction init before the forall loop");
+  rewriter.setInsertionPoint(loop);
   auto splitR = splitForallDimensionForReduction(transform, rewriter, loop, *splitPlan);
   if (failed(splitR))
     BAIL("failed to split the forall loop for the reduction");

@@ -18,7 +18,8 @@
 // CHECK: scf.forall.in_parallel {
 // CHECK: tensor.parallel_insert_slice %[[FOR]]#0 into %[[SCORES]][%[[I_OFF]], %{{.*}}] [64, 128] [1, 1] : tensor<64x128xf32> into tensor<128x128xf32>
 // CHECK: tensor.parallel_insert_slice %[[FOR]]#1 into %[[ROWS]][%{{.*}}] [64] [1] : tensor<64xf32> into tensor<128xf32>
-// CHECK: return %[[FORALL]]#0, %[[FORALL]]#1 : tensor<128x128xf32>, tensor<128xf32>
+// CHECK: %[[SHIFTED:.*]] = arith.addf %[[FORALL]]#0, %[[FORALL]]#0 : tensor<128x128xf32>
+// CHECK: return %[[SHIFTED]], %[[FORALL]]#1 : tensor<128x128xf32>, tensor<128xf32>
 
 
 #map = affine_map<(d0) -> (d0 * 64)>
@@ -42,6 +43,7 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op, !transform.any_op) -> (!transform.any_op, !transform.any_op)
     // Check that the %scale handle remains valid after the transformation.
     transform.print %scale : !transform.any_op
+    transform.verify %func : !transform.any_op
 
     transform.yield
   }
@@ -67,6 +69,9 @@ module attributes {transform.with_named_sequence} {
       }
     }
 
+    // Keep a user between the forall and reduction init to check that the
+    // replacement forall continues to dominate all existing users.
+    %shifted = arith.addf %scaled#0, %scaled#0 : tensor<128x128xf32>
     %row_max_e = tensor.empty() : tensor<128xf32>
     %row_max_init = linalg.fill ins(%neg_inf : f32)
         outs(%row_max_e : tensor<128xf32>) -> tensor<128xf32>
@@ -79,6 +84,6 @@ module attributes {transform.with_named_sequence} {
         linalg.yield %m : f32
     } -> tensor<128xf32>
 
-    return %scaled#0, %row_max : tensor<128x128xf32>, tensor<128xf32>
+    return %shifted, %row_max : tensor<128x128xf32>, tensor<128xf32>
   }
 }
