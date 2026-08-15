@@ -1,12 +1,15 @@
 #include "StableHLO/StableHLOTransformExtension.h"
 
 #include "StableHLO/StableHLOTransformOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/IR/ValueBoundsOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Complex/IR/Complex.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/IR/ValueBoundsOpInterfaceImpl.h"
 #include "mlir/Dialect/Shape/IR/Shape.h"
 #include "mlir/Dialect/SparseTensor/IR/SparseTensor.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -26,6 +29,7 @@ public:
     // Preload the StableHLO-to-Linalg pass dependencies. A pass invoked by
     // transform.apply_registered_pass cannot load dialects while the transform
     // interpreter's parent pass manager is running in multithreaded mode.
+    declareDependentDialect<mlir::arith::ArithDialect>();
     declareDependentDialect<mlir::bufferization::BufferizationDialect>();
     declareDependentDialect<mlir::complex::ComplexDialect>();
     declareDependentDialect<mlir::linalg::LinalgDialect>();
@@ -47,5 +51,7 @@ public:
 } // namespace
 
 void neptune::registerStableHLOTransformExtension(mlir::DialectRegistry &registry) {
+  mlir::arith::registerValueBoundsOpInterfaceExternalModels(registry);
+  mlir::scf::registerValueBoundsOpInterfaceExternalModels(registry);
   registry.addExtensions<StableHLOTransformDialectExtension>();
 }

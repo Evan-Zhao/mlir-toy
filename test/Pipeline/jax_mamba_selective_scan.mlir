@@ -43,6 +43,10 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
     // making it a stable anchor for the BxC schedule.
     %func = transform.apply_registered_pass "stablehlo-legalize-to-linalg"
         with options = {"enable-primitive-ops" = true} to %funcs : (!any) -> !any
+    transform.apply_patterns to %func {
+      transform.apply_patterns.stablehlo.simplify_in_bounds_clamps
+      transform.apply_patterns.canonicalization
+    } : !any
     %project = transform.structured.match ops{["linalg.generic"]} in %func : (!any) -> !any
     %tiled_project, %bc_forall = transform.structured.tile_using_forall
         %project tile_sizes [1, 128, 0] : (!any) -> (!any, !any)
@@ -161,6 +165,8 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
 // CHECK-NOT: stablehlo.while
 // CHECK: %{{.+}}:2 = scf.for
 // CHECK-SAME: iter_args(
+// CHECK-NOT: arith.maxsi
+// CHECK-NOT: arith.minsi
 // CHECK: tensor.insert_slice
 // CHECK: %[[TILED:.+]]:2 = scf.forall (%{{.+}}, %{{.+}}) in (8, 12)
 // CHECK-SAME: shared_outs(

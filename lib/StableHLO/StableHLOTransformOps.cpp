@@ -1,8 +1,12 @@
 #include "StableHLO/StableHLOTransformOps.h"
 
 #include "StableHLO/StableHLOLegalizeControlFlow.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Transform/Interfaces/TransformInterfaces.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/DataLayoutInterfaces.h"
+#include "mlir/Interfaces/ValueBoundsOpInterface.h"
 #include "stablehlo/conversions/linalg/transforms/Rewriters.h"
 #include "stablehlo/conversions/linalg/transforms/TypeConversion.h"
 #include "stablehlo/dialect/StablehloOps.h"
@@ -30,6 +34,81 @@ StablehloLegalizeControlFlowOp::applyToOne(TransformRewriter &rewriter, Operatio
 
 namespace {
 
+FailureOr<std::pair<Value, int64_t>> getValueAndConstant(Value lhs, Value rhs) {
+  APInt constant;
+  Value value;
+  if (matchPattern(rhs, m_ConstantInt(&constant))) {
+    value = lhs;
+  } else if (matchPattern(lhs, m_ConstantInt(&constant))) {
+    value = rhs;
+  } else {
+    return failure();
+  }
+
+  if (matchPattern(value, m_Constant()) || !constant.isSignedIntN(64))
+    return failure();
+  return std::make_pair(value, constant.getSExtValue());
+}
+
+FailureOr<int64_t> computeConstantBound(Value value, presburger::BoundType boundType) {
+  // StableHLO-to-Linalg casts scalar integer slice indices to index. A
+  // widening index cast preserves the signed range of its input.
+  if (auto cast = value.getDefiningOp<arith::IndexCastOp>();
+      cast && value.getType().isIndex() && cast.getIn().getType().isInteger() &&
+      DataLayout::closest(cast).getTypeSizeInBits(value.getType()).getFixedValue() >=
+          cast.getIn().getType().getIntOrFloatBitWidth())
+    value = cast.getIn();
+
+  bool allowIntegerType = value.getType().isInteger();
+  if (allowIntegerType) {
+    auto blockArg = dyn_cast<BlockArgument>(value);
+    auto forOp = blockArg ? dyn_cast<scf::ForOp>(blockArg.getOwner()->getParentOp()) : nullptr;
+    if (!forOp || forOp.getInductionVar() != value)
+      return failure();
+  }
+
+  ValueBoundsOptions options;
+  options.closedUB = true;
+  options.allowIntegerType = allowIntegerType;
+  return ValueBoundsConstraintSet::computeConstantBound(boundType,
+                                                        ValueBoundsConstraintSet::Variable(value),
+                                                        /*stopCondition=*/nullptr, options);
+}
+
+struct SimplifyBoundedMaxSIPattern : OpRewritePattern<arith::MaxSIOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::MaxSIOp op, PatternRewriter &rewriter) const override {
+    FailureOr<std::pair<Value, int64_t>> match = getValueAndConstant(op.getLhs(), op.getRhs());
+    if (failed(match))
+      return failure();
+
+    FailureOr<int64_t> lowerBound = computeConstantBound(match->first, presburger::BoundType::LB);
+    if (failed(lowerBound) || *lowerBound < match->second)
+      return failure();
+
+    rewriter.replaceOp(op, match->first);
+    return success();
+  }
+};
+
+struct SimplifyBoundedMinSIPattern : OpRewritePattern<arith::MinSIOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::MinSIOp op, PatternRewriter &rewriter) const override {
+    FailureOr<std::pair<Value, int64_t>> match = getValueAndConstant(op.getLhs(), op.getRhs());
+    if (failed(match))
+      return failure();
+
+    FailureOr<int64_t> upperBound = computeConstantBound(match->first, presburger::BoundType::UB);
+    if (failed(upperBound) || *upperBound > match->second)
+      return failure();
+
+    rewriter.replaceOp(op, match->first);
+    return success();
+  }
+};
+
 void appendStablehloConversionPatternsForRoot(TypeConverter &typeConverter,
                                               RewritePatternSet &patterns, StringRef rootName) {
   RewritePatternSet stablehloPatterns(patterns.getContext());
@@ -45,6 +124,10 @@ void appendStablehloConversionPatternsForRoot(TypeConverter &typeConverter,
 }
 
 } // namespace
+
+void StablehloSimplifyInBoundsClampsPatternsOp::populatePatterns(RewritePatternSet &patterns) {
+  patterns.add<SimplifyBoundedMaxSIPattern, SimplifyBoundedMinSIPattern>(patterns.getContext());
+}
 
 void StablehloSliceToTensorConversionPatternsOp::populatePatterns(TypeConverter &typeConverter,
                                                                   RewritePatternSet &patterns) {

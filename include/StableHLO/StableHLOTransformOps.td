@@ -33,6 +33,31 @@ def StablehloLegalizeControlFlowOp
   }];
 }
 
+def StablehloSimplifyInBoundsClampsPatternsOp
+    : Op<Transform_Dialect,
+         "apply_patterns.stablehlo.simplify_in_bounds_clamps",
+         [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
+  let summary = "Remove signed integer clamps proven redundant by value bounds";
+
+  let description = [{
+    Collects patterns that simplify `arith.maxsi` and `arith.minsi` when value
+    bounds prove that one operand is already within a constant bound. The
+    patterns look through `arith.index_cast`, allowing them to remove clamps
+    materialized by StableHLO dynamic-slice legalization for an `scf.for`
+    induction variable.
+
+    ```mlir
+    // Given 0 <= %iv < 2048:
+    %index = arith.index_cast %iv : i32 to index
+    %lower = arith.maxsi %index, %c0 : index
+    %start = arith.minsi %lower, %c2047 : index
+    // becomes %index.
+    ```
+  }];
+
+  let assemblyFormat = "attr-dict";
+}
+
 def StablehloSliceToTensorConversionPatternsOp
     : Op<Transform_Dialect, "apply_conversion_patterns.stablehlo.slice_to_tensor",
          [DeclareOpInterfaceMethods<ConversionPatternDescriptorOpInterface,

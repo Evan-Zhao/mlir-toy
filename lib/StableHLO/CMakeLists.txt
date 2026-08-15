@@ -20,8 +20,11 @@ target_link_libraries(NeptuneStableHLO PUBLIC
   NeptuneMLIRCore
   StablehloLinalgTransforms
   StablehloOps
+  MLIRArithDialect
+  MLIRArithValueBoundsOpInterfaceImpl
   MLIRBufferizationDialect
   MLIRComplexDialect
+  MLIRDataLayoutInterfaces
   MLIRLinalgDialect
   MLIRMathDialect
   MLIRMemRefDialect
@@ -31,4 +34,5 @@ target_link_libraries(NeptuneStableHLO PUBLIC
   MLIRTensorDialect
   MLIRTilingInterface
   MLIRTransformDialectInterfaces
+  MLIRValueBoundsOpInterface
 )
