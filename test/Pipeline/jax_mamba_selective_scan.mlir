@@ -154,11 +154,12 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
 // CLEAN: stablehlo.dynamic_update_slice
 // CLEAN-NOT: func.func private
 
-// JAX's counted while is recognized as a for loop. Canonicalization drops the
-// invariant loop operands and leaves the state, output, and JAX's second synchronized index.
+// JAX's counted while is recognized as a for loop. Its synchronized counters
+// become the structural induction variable, leaving only state and output
+// loop-carried.
 // CHECK-LABEL: func.func public @main(
 // CHECK-NOT: stablehlo.while
-// CHECK: scf.for
+// CHECK: %{{.+}}:2 = scf.for
 // CHECK-SAME: iter_args(
 // CHECK: tensor.insert_slice
 // CHECK: %[[TILED:.+]]:2 = scf.forall (%{{.+}}, %{{.+}}) in (8, 12)

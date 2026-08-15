@@ -26,12 +26,57 @@ func.func @fori_loop(%lb: tensor<i32>, %ub: tensor<i32>, %step: tensor<i32>,
 // CHECK-DAG: %[[LB:.+]] = tensor.extract %arg0[] : tensor<i32>
 // CHECK-DAG: %[[UB:.+]] = tensor.extract %arg1[] : tensor<i32>
 // CHECK-DAG: %[[STEP:.+]] = tensor.extract %arg2[] : tensor<i32>
-// CHECK: %[[RESULT:.+]]:2 = scf.for %[[IV:.+]] = %[[LB]] to %[[UB]] step %[[STEP]]
+// CHECK: %[[RESULT:.+]] = scf.for %[[IV:.+]] = %[[LB]] to %[[UB]] step %[[STEP]]
+// CHECK-SAME: iter_args(%[[ARG:.+]] = %arg3)
+// CHECK: %[[TENSOR_IV:.+]] = tensor.from_elements %[[IV]] : tensor<i32>
+// CHECK-NOT: stablehlo.add %[[TENSOR_IV]], %arg2
+// CHECK: scf.yield %[[ARG]] : tensor<4xf32>
+// CHECK: return %[[RESULT]] : tensor<4xf32>
+
+func.func @fori_loop_synchronized_index(%lb: tensor<i32>, %ub: tensor<i32>,
+                                         %step: tensor<i32>) -> tensor<i32> {
+  %0:4 = stablehlo.while(%i = %lb, %j = %lb, %k = %lb, %last = %lb)
+      : tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32> cond {
+    %pred = stablehlo.compare LT, %i, %ub : (tensor<i32>, tensor<i32>) -> tensor<i1>
+    stablehlo.return %pred : tensor<i1>
+  } do {
+    %next_i = stablehlo.add %i, %step : tensor<i32>
+    %next_j = stablehlo.add %j, %step : tensor<i32>
+    %next_k = stablehlo.add %k, %step : tensor<i32>
+    stablehlo.return %next_i, %next_j, %next_k, %j
+        : tensor<i32>, tensor<i32>, tensor<i32>, tensor<i32>
+  }
+  return %0#3 : tensor<i32>
+}
+
+// CHECK-LABEL: func.func @fori_loop_synchronized_index(
+// CHECK: %[[RESULT:.+]] = scf.for %[[IV:[^ ]+]]
+// CHECK-SAME: iter_args(%{{.+}} = %arg0)
+// CHECK: %[[TENSOR_IV:.+]] = tensor.from_elements %[[IV]] : tensor<i32>
+// CHECK-NOT: stablehlo.add
+// CHECK: scf.yield %[[TENSOR_IV]] : tensor<i32>
+// CHECK: return %[[RESULT]] : tensor<i32>
+
+func.func @fori_loop_used_index(%lb: tensor<i32>, %ub: tensor<i32>, %step: tensor<i32>,
+                                %value: tensor<4xf32>)
+    -> (tensor<i32>, tensor<4xf32>) {
+  %0:2 = stablehlo.while(%i = %lb, %arg = %value) : tensor<i32>, tensor<4xf32> cond {
+    %pred = stablehlo.compare LT, %i, %ub : (tensor<i32>, tensor<i32>) -> tensor<i1>
+    stablehlo.return %pred : tensor<i1>
+  } do {
+    %next = stablehlo.add %i, %step : tensor<i32>
+    stablehlo.return %next, %arg : tensor<i32>, tensor<4xf32>
+  }
+  return %0#0, %0#1 : tensor<i32>, tensor<4xf32>
+}
+
+// CHECK-LABEL: func.func @fori_loop_used_index(
+// CHECK: %[[RESULT:.+]]:2 = scf.for %[[IV:[^ ]+]]
 // CHECK-SAME: iter_args(%{{.+}} = %arg0, %[[ARG:.+]] = %arg3)
 // CHECK: %[[TENSOR_IV:.+]] = tensor.from_elements %[[IV]] : tensor<i32>
 // CHECK: %[[NEXT:.+]] = stablehlo.add %[[TENSOR_IV]], %arg2 : tensor<i32>
 // CHECK: scf.yield %[[NEXT]], %[[ARG]] : tensor<i32>, tensor<4xf32>
-// CHECK: return %[[RESULT]]#1 : tensor<4xf32>
+// CHECK: return %[[RESULT]]#0, %[[RESULT]]#1
 
 func.func @general_while(%value: tensor<i32>) -> tensor<i32> {
   %0 = stablehlo.while(%arg = %value) : tensor<i32> cond {

@@ -97,23 +97,94 @@ struct WhileOpPattern final : OpConversionPattern<mlir::stablehlo::WhileOp> {
     Location loc = op.getLoc();
 
     if (std::optional<ForBounds> bounds = extractForBounds(op)) {
+      Block &stableBody = op.getBody().front();
+      auto matchIncrement = [&](unsigned argument) -> mlir::stablehlo::AddOp {
+        auto add = dyn_cast_if_present<mlir::stablehlo::AddOp>(
+            stableBody.getTerminator()->getOperand(argument).getDefiningOp());
+        auto lhs = add ? dyn_cast<BlockArgument>(add.getLhs()) : BlockArgument();
+        if (!add || !lhs || lhs.getOwner() != &stableBody || lhs.getArgNumber() != argument ||
+            add.getRhs() != bounds->step || !add->hasOneUse())
+          return {};
+        return add;
+      };
+
+      mlir::stablehlo::AddOp inductionIncrement = matchIncrement(bounds->inductionArgument);
+      bool dropInduction =
+          op->getResult(bounds->inductionArgument).use_empty() && inductionIncrement;
+
+      // Frontends may carry any number of counters synchronized with the
+      // condition induction. Treat every unused counter with the same initial
+      // value and update as an alias of the structural scf.for induction.
+      SmallVector<unsigned> droppedArguments;
+      SmallVector<Operation *> droppedIncrements;
+      if (dropInduction) {
+        droppedArguments.push_back(bounds->inductionArgument);
+        droppedIncrements.push_back(inductionIncrement);
+        for (unsigned argument = 0; argument < op->getNumOperands(); ++argument) {
+          if (argument == bounds->inductionArgument ||
+              op->getOperand(argument) != bounds->lowerBound ||
+              !op->getResult(argument).use_empty())
+            continue;
+          if (mlir::stablehlo::AddOp increment = matchIncrement(argument)) {
+            droppedArguments.push_back(argument);
+            droppedIncrements.push_back(increment);
+          }
+        }
+        llvm::sort(droppedArguments);
+      }
+
+      SmallVector<Value> initOperands(adaptor.getOperands());
+      for (unsigned argument : llvm::reverse(droppedArguments))
+        initOperands.erase(initOperands.begin() + argument);
+
       auto forOp =
           scf::ForOp::create(rewriter, loc, extractTensorValue(rewriter, bounds->lowerBound),
                              extractTensorValue(rewriter, bounds->upperBound),
-                             extractTensorValue(rewriter, bounds->step), adaptor.getOperands());
+                             extractTensorValue(rewriter, bounds->step), initOperands);
       inlineStableHLORegionIntoSCFRegion(rewriter, op.getBody(), forOp.getRegion());
 
       // SCF supplies a scalar induction variable. Rebuild the tensor form used
       // by the inlined StableHLO body and replace its old loop-carried index.
+      Block &body = forOp.getRegion().front();
       BlockArgument induction =
           forOp.getRegion().insertArgument(unsigned{0}, forOp.getLowerBound().getType(), loc);
-      BlockArgument oldInduction = forOp.getRegion().getArgument(1 + bounds->inductionArgument);
-      rewriter.setInsertionPointToStart(&forOp.getRegion().front());
+      BlockArgument oldInduction = body.getArgument(1 + bounds->inductionArgument);
+      rewriter.setInsertionPointToStart(&body);
       Value tensorInduction =
           tensor::FromElementsOp::create(rewriter, loc, oldInduction.getType(), induction);
       oldInduction.replaceAllUsesWith(tensorInduction);
 
-      rewriter.replaceOp(op, forOp.getResults());
+      if (!dropInduction) {
+        rewriter.replaceOp(op, forOp.getResults());
+        return success();
+      }
+
+      // Omit unused structural counters from the iter_args and yield. Current
+      // iteration uses have already been redirected to the tensor induction.
+      for (unsigned argument : droppedArguments)
+        body.getArgument(1 + argument).replaceAllUsesWith(tensorInduction);
+      auto yield = cast<scf::YieldOp>(body.getTerminator());
+      rewriter.modifyOpInPlace(yield, [&]() {
+        for (unsigned argument : llvm::reverse(droppedArguments))
+          yield->eraseOperand(argument);
+      });
+      for (unsigned argument : llvm::reverse(droppedArguments))
+        body.eraseArgument(1 + argument);
+      for (Operation *increment : droppedIncrements)
+        rewriter.eraseOp(increment);
+
+      SmallVector<Value> replacements;
+      replacements.reserve(op->getNumResults());
+      unsigned forResult = 0;
+      for (unsigned result = 0; result < op->getNumResults(); ++result) {
+        // These values are unused, but keeping same-typed replacements lets
+        // the conversion rewriter report one replacement per original result.
+        if (llvm::is_contained(droppedArguments, result))
+          replacements.push_back(bounds->lowerBound);
+        else
+          replacements.push_back(forOp.getResult(forResult++));
+      }
+      rewriter.replaceOp(op, replacements);
       return success();
     }
 
