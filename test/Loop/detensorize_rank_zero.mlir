@@ -1,5 +1,13 @@
-// RUN: neptune-opt %s --transform-interpreter | FileCheck %s
+// RUN: neptune-opt %s --split-input-file --transform-interpreter | FileCheck %s
 
+// CHECK-LABEL: func.func @rank_zero_linalg(
+// CHECK-NOT: tensor.extract_slice
+// CHECK-DAG: %[[LHS:.+]] = tensor.extract %arg0[%arg1] : tensor<9xi32>
+// CHECK-DAG: %[[RHS:.+]] = tensor.extract %arg0[%arg2] : tensor<9xi32>
+// CHECK: %[[SUB:.+]] = arith.subi %[[LHS]], %[[RHS]] : i32
+// CHECK: %[[TENSOR:.+]] = tensor.from_elements %[[SUB]] : tensor<i32>
+// CHECK-NOT: tensor.extract
+// CHECK: return %[[TENSOR]], %[[SUB]] : tensor<i32>, i32
 module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
     %funcs = transform.structured.match ops{["func.func"]} in %module
@@ -12,16 +20,8 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 
-  // CHECK-LABEL: func.func @rank_zero_linalg(
   func.func @rank_zero_linalg(%source: tensor<9xi32>, %i: index, %j: index)
       -> (tensor<i32>, i32) {
-    // CHECK-NOT: tensor.extract_slice
-    // CHECK-DAG: %[[LHS:.+]] = tensor.extract %arg0[%arg1] : tensor<9xi32>
-    // CHECK-DAG: %[[RHS:.+]] = tensor.extract %arg0[%arg2] : tensor<9xi32>
-    // CHECK: %[[SUB:.+]] = arith.subi %[[LHS]], %[[RHS]] : i32
-    // CHECK: %[[TENSOR:.+]] = tensor.from_elements %[[SUB]] : tensor<i32>
-    // CHECK-NOT: tensor.extract
-    // CHECK: return %[[TENSOR]], %[[SUB]] : tensor<i32>, i32
     %lhs = tensor.extract_slice %source[%i] [1] [1]
         : tensor<9xi32> to tensor<i32>
     %rhs = tensor.extract_slice %source[%j] [1] [1]
@@ -39,32 +39,62 @@ module attributes {transform.with_named_sequence} {
     %scalar = tensor.extract %difference[] : tensor<i32>
     return %difference, %scalar : tensor<i32>, i32
   }
+}
+// -----
 
-  // CHECK-LABEL: func.func @rank_zero_arith(
+// CHECK-LABEL: func.func @rank_zero_arith(
+// CHECK-NOT: tensor.from_elements %arg0
+// CHECK-NOT: tensor.from_elements %arg1
+// CHECK: %[[SUM:.+]] = arith.addi %arg0, %arg1 : i32
+// CHECK: %[[TENSOR:.+]] = tensor.from_elements %[[SUM]] : tensor<i32>
+// CHECK-NOT: tensor.extract
+// CHECK: return %[[TENSOR]], %[[SUM]] : tensor<i32>, i32
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %funcs = transform.structured.match ops{["func.func"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %funcs {
+      transform.apply_patterns.linalg.detensorize_rank_zero
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.apply_cse to %funcs : !transform.any_op
+    transform.yield
+  }
+
   func.func @rank_zero_arith(%lhs: i32, %rhs: i32) -> (tensor<i32>, i32) {
-    // CHECK-NOT: tensor.from_elements %arg0
-    // CHECK-NOT: tensor.from_elements %arg1
-    // CHECK: %[[SUM:.+]] = arith.addi %arg0, %arg1 : i32
-    // CHECK: %[[TENSOR:.+]] = tensor.from_elements %[[SUM]] : tensor<i32>
-    // CHECK-NOT: tensor.extract
-    // CHECK: return %[[TENSOR]], %[[SUM]] : tensor<i32>, i32
     %lhs_tensor = tensor.from_elements %lhs : tensor<i32>
     %rhs_tensor = tensor.from_elements %rhs : tensor<i32>
     %sum = arith.addi %lhs_tensor, %rhs_tensor : tensor<i32>
     %scalar = tensor.extract %sum[] : tensor<i32>
     return %sum, %scalar : tensor<i32>, i32
   }
+}
+// -----
 
-  // CHECK-LABEL: func.func @rank_zero_inputs_to_tiled_linalg(
+// CHECK-LABEL: func.func @rank_zero_inputs_to_tiled_linalg(
+// CHECK-NOT: tensor.from_elements
+// CHECK: linalg.generic
+// CHECK-SAME: ins(%arg2 : tensor<4x8xf32>)
+// CHECK-SAME: outs(%arg3 : tensor<4x8xf32>)
+// CHECK: arith.subi %arg0, %arg1 : i32
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %funcs = transform.structured.match ops{["func.func"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %funcs {
+      transform.apply_patterns.linalg.detensorize_rank_zero
+      transform.apply_patterns.canonicalization
+    } : !transform.any_op
+    transform.apply_cse to %funcs : !transform.any_op
+    transform.yield
+  }
+
   func.func @rank_zero_inputs_to_tiled_linalg(
       %lhs: i32, %rhs: i32, %input: tensor<4x8xf32>, %output: tensor<4x8xf32>)
       -> tensor<4x8xf32> {
     %c0_i32 = arith.constant 0 : i32
-    // CHECK-NOT: tensor.from_elements
-    // CHECK: linalg.generic
-    // CHECK-SAME: ins(%arg2 : tensor<4x8xf32>)
-    // CHECK-SAME: outs(%arg3 : tensor<4x8xf32>)
-    // CHECK: arith.subi %arg0, %arg1 : i32
     %lhs_tensor = tensor.from_elements %lhs : tensor<i32>
     %rhs_tensor = tensor.from_elements %rhs : tensor<i32>
     %result = linalg.generic {

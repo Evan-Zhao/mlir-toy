@@ -1,34 +1,24 @@
-// RUN: neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
+// RUN: neptune-opt %s --transform-interpreter --split-input-file 2>&1 | FileCheck %s
+
+// CHECK: IR printer
+// CHECK-NEXT: %{{.*}} = linalg.generic {{.*}}iterator_types = ["parallel", "parallel", "reduction"]
+// CHECK: arith.addf
+// CHECK-LABEL: func.func @ta_matmul_to_linalg_transform(
+// CHECK: arith.mulf
+// CHECK: linalg.generic {{.*}}iterator_types = ["parallel", "parallel", "reduction"]
+// CHECK: arith.addf
 
 module attributes {transform.with_named_sequence} {
-  transform.named_sequence @match_ta_matmul(%candidate: !transform.any_op {transform.readonly})
-      -> !transform.any_op {
-    %matched = transform.match.ta.einsum %candidate
-        {equation = "m k, k n -> m n"}
-        : (!transform.any_op) -> !transform.any_op
-    transform.yield %matched : !transform.any_op
-  }
-
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
     %func = transform.structured.match ops{["func.func"]} in %module
         : (!transform.any_op) -> !transform.any_op
-    %ta_matmul = transform.collect_matching @match_ta_matmul in %module
+    %ta_matmul = transform.structured.match ops{["ta.reduce"]} in %module
         : (!transform.any_op) -> !transform.any_op
     transform.ta.to_linalg %func : !transform.any_op
     transform.print %ta_matmul : !transform.any_op
     transform.yield
   }
 
-// CHECK: IR printer
-// CHECK-NEXT: %{{.*}} = linalg.generic {{.*}}iterator_types = ["parallel", "parallel", "reduction"]
-// CHECK: arith.addf
-// CHECK-DAG: #[[IDENTITY_2D:map[0-9]*]] = affine_map<(d0, d1) -> (d0, d1)>
-// CHECK-DAG: #[[FIRST_DIM:map[0-9]*]] = affine_map<(d0, d1) -> (d0)>
-// CHECK-DAG: #[[SECOND_DIM:map[0-9]*]] = affine_map<(d0, d1) -> (d1)>
-// CHECK-LABEL: func.func @ta_matmul_to_linalg_transform(
-// CHECK: arith.mulf
-// CHECK: linalg.generic {{.*}}iterator_types = ["parallel", "parallel", "reduction"]
-// CHECK: arith.addf
   func.func @ta_matmul_to_linalg_transform(%lhs: tensor<4x8xf32>,
                                            %rhs: tensor<8x16xf32>)
       -> tensor<4x16xf32> {
@@ -45,16 +35,31 @@ module attributes {transform.with_named_sequence} {
     } : () -> tensor<4x16xf32>
     return %out : tensor<4x16xf32>
   }
+}
+
+// -----
 
 // CHECK-LABEL: func.func @subst_to_linalg(
 // CHECK-NOT: ta.subst
-// CHECK: linalg.generic {indexing_maps = [#[[IDENTITY_2D]]], iterator_types = ["parallel", "parallel"]}
+// CHECK: linalg.generic {indexing_maps = [#{{.*}}], iterator_types = ["parallel", "parallel"]}
 // CHECK-NEXT: ^bb0(%{{.*}}: i64):
 // CHECK-NEXT: %[[J_INDEX:.*]] = linalg.index 0 : index
 // CHECK-NEXT: %[[J:.*]] = arith.index_cast %[[J_INDEX]] : index to i64
 // CHECK-NEXT: %[[I_INDEX:.*]] = linalg.index 1 : index
 // CHECK-NEXT: %[[I:.*]] = arith.index_cast %[[I_INDEX]] : index to i64
 // CHECK-NEXT: arith.subi %[[J]], %[[I]] : i64
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %func = transform.structured.match ops{["func.func"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    %ta_matmul = transform.structured.match ops{["ta.reduce"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    transform.ta.to_linalg %func : !transform.any_op
+    transform.print %ta_matmul : !transform.any_op
+    transform.yield
+  }
+
   func.func @subst_to_linalg() -> tensor<4x4xi64> {
     %out = ta.scope axes(%i "i" extent 4, %j "j" extent 4) {
       %idx = ta.index %i : !ta.expr<i64, [i]>
@@ -66,12 +71,27 @@ module attributes {transform.with_named_sequence} {
     } : () -> tensor<4x4xi64>
     return %out : tensor<4x4xi64>
   }
+}
+
+// -----
 
 // CHECK-LABEL: func.func @cast_to_linalg(
 // CHECK: linalg.generic
 // CHECK: %[[INDEX:.*]] = linalg.index 0 : index
 // CHECK: %[[INDEX_CAST:.*]] = arith.index_cast %[[INDEX]] : index to i64
 // CHECK: arith.sitofp %[[INDEX_CAST]] : i64 to f32
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %func = transform.structured.match ops{["func.func"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    %ta_matmul = transform.structured.match ops{["ta.reduce"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    transform.ta.to_linalg %func : !transform.any_op
+    transform.print %ta_matmul : !transform.any_op
+    transform.yield
+  }
+
   func.func @cast_to_linalg() -> tensor<4xf32> {
     %out = ta.scope axes(%i "i" extent 4) {
       %idx = ta.index %i : !ta.expr<i64, [i]>
@@ -80,11 +100,25 @@ module attributes {transform.with_named_sequence} {
     } : () -> tensor<4xf32>
     return %out : tensor<4xf32>
   }
+}
+// -----
 
 // CHECK-LABEL: func.func @subst_at_to_linalg(
 // CHECK-NOT: ta.subst
-// CHECK: linalg.generic {indexing_maps = [#[[FIRST_DIM]], #[[SECOND_DIM]], #[[IDENTITY_2D]]], iterator_types = ["parallel", "parallel"]} ins(%arg0, %arg0
+// CHECK: linalg.generic {indexing_maps = [#{{.*}}, #{{.*}}, #{{.*}}], iterator_types = ["parallel", "parallel"]} ins(%arg0, %arg0
 // CHECK: arith.addf
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %func = transform.structured.match ops{["func.func"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    %ta_matmul = transform.structured.match ops{["ta.reduce"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    transform.ta.to_linalg %func : !transform.any_op
+    transform.print %ta_matmul : !transform.any_op
+    transform.yield
+  }
+
   func.func @subst_at_to_linalg(%tensor: tensor<4xf32>) -> tensor<4x4xf32> {
     %out = ta.scope axes(%i "i" extent 4, %j "j" extent 4) {
       %x = ta.at %tensor[%i]

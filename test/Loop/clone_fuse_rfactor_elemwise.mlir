@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter | FileCheck %s
+// RUN: neptune-opt %s --transform-interpreter --split-input-file | FileCheck %s
 
 // SplitK sidecar fusion case:
 //   - the forall publishes score tiles and split-local row-max partials,

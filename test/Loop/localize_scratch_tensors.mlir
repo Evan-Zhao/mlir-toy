@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter | FileCheck %s
+// RUN: neptune-opt %s --transform-interpreter --split-input-file | FileCheck %s
 
 // CHECK-LABEL: func.func @localize_inner_scratch
 // CHECK: %[[ROW_INIT:.*]] = linalg.fill
@@ -14,7 +14,6 @@
 // CHECK: scf.yield %[[ROW_NEXT]] : tensor<8xf32>
 
 #map = affine_map<(d0) -> (d0 * 4)>
-
 module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
     %func = transform.structured.match ops{["func.func"]} in %module
@@ -74,11 +73,23 @@ module attributes {transform.with_named_sequence} {
     }
     return %result : tensor<8xf32>
   }
+}
+// -----
 
-  // CHECK-LABEL: func.func @localize_multi_use_fill_slices
-  // CHECK-NOT: tensor.empty() : tensor<8x8xf32>
-  // CHECK-COUNT-2: linalg.fill
-  // CHECK-NOT: tensor.extract_slice
+// CHECK-LABEL: func.func @localize_multi_use_fill_slices
+// CHECK-NOT: tensor.empty() : tensor<8x8xf32>
+// CHECK-COUNT-2: linalg.fill
+// CHECK-NOT: tensor.extract_slice
+
+#map = affine_map<(d0) -> (d0 * 4)>
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %func = transform.structured.match ops{["func.func"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    transform.scf.localize_scratch_tensors %func : !transform.any_op
+    transform.yield
+  }
+
   func.func @localize_multi_use_fill_slices() -> (tensor<8x4xf32>, tensor<8x4xf32>) {
     %zero = arith.constant 0.0 : f32
     %full_empty = tensor.empty() : tensor<8x8xf32>

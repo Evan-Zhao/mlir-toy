@@ -1,5 +1,7 @@
-// RUN: neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
+// RUN: neptune-opt %s --transform-interpreter --split-input-file 2>&1 | FileCheck %s
 
+// CHECK: IR printer
+// CHECK: ta.reduce <add> {{.*}} -> !ta.expr<f32, [b, h, i, j]>
 module attributes {transform.with_named_sequence} {
   transform.named_sequence @match_var_leading(%candidate: !transform.any_op {transform.readonly})
       -> !transform.any_op {
@@ -16,8 +18,6 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 
-  // CHECK: IR printer
-  // CHECK: ta.reduce <add> {{.*}} -> !ta.expr<f32, [b, h, i, j]>
   func.func @zero_variadic_leading(%q: tensor<2x3x4x6xf32>,
                                    %k: tensor<2x3x5x6xf32>)
       -> tensor<2x3x4x5xf32> {
@@ -37,8 +37,28 @@ module attributes {transform.with_named_sequence} {
     } : () -> tensor<2x3x4x5xf32>
     return %out : tensor<2x3x4x5xf32>
   }
+}
 
-  // CHECK: ta.reduce <add> {{.*}} -> !ta.expr<f32, [b, g, h, i, j]>
+// -----
+
+// CHECK: ta.reduce <add> {{.*}} -> !ta.expr<f32, [b, g, h, i, j]>
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @match_var_leading(%candidate: !transform.any_op {transform.readonly})
+      -> !transform.any_op {
+    %matched = transform.match.ta.einsum %candidate
+        {equation = "b ... h i d, b h j d -> b ... h i j"}
+        : (!transform.any_op) -> !transform.any_op
+    transform.yield %matched : !transform.any_op
+  }
+
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %matches = transform.collect_matching @match_var_leading in %module
+        : (!transform.any_op) -> !transform.any_op
+    transform.print %matches : !transform.any_op
+    transform.yield
+  }
+
   func.func @one_variadic_leading(%q: tensor<2x7x3x4x6xf32>,
                                   %k: tensor<2x3x5x6xf32>)
       -> tensor<2x7x3x4x5xf32> {

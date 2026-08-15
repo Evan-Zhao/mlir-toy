@@ -1,4 +1,11 @@
-// RUN: neptune-opt %s --transform-interpreter | FileCheck %s
+// RUN: neptune-opt %s --transform-interpreter --split-input-file | FileCheck %s
+
+// CHECK-LABEL: func.func @bounded
+// CHECK: scf.for %[[IV:.+]] =
+// CHECK: %[[INDEX:.+]] = arith.index_cast %[[IV]] : i32 to index
+// CHECK-NEXT: func.call @consume(%[[INDEX]])
+// CHECK-NOT: arith.maxsi
+// CHECK-NOT: arith.minsi
 
 module attributes {transform.with_named_sequence} {
   transform.named_sequence @__transform_main(%module: !transform.any_op) {
@@ -12,12 +19,6 @@ module attributes {transform.with_named_sequence} {
 
   func.func private @consume(index)
 
-  // CHECK-LABEL: func.func @bounded
-  // CHECK: scf.for %[[IV:.+]] =
-  // CHECK: %[[INDEX:.+]] = arith.index_cast %[[IV]] : i32 to index
-  // CHECK-NEXT: func.call @consume(%[[INDEX]])
-  // CHECK-NOT: arith.maxsi
-  // CHECK-NOT: arith.minsi
   func.func @bounded() {
     %c0_i32 = arith.constant 0 : i32
     %c1_i32 = arith.constant 1 : i32
@@ -32,10 +33,25 @@ module attributes {transform.with_named_sequence} {
     }
     return
   }
+}
+// -----
 
-  // CHECK-LABEL: func.func @not_bounded
-  // CHECK: %[[LOWER:.+]] = arith.maxsi
-  // CHECK: arith.minsi %[[LOWER]]
+// CHECK-LABEL: func.func @not_bounded
+// CHECK: %[[LOWER:.+]] = arith.maxsi
+// CHECK: arith.minsi %[[LOWER]]
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %funcs = transform.structured.match ops{["func.func"]} in %module
+      : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %funcs {
+      transform.apply_patterns.stablehlo.simplify_in_bounds_clamps
+    } : !transform.any_op
+    transform.yield
+  }
+
+  func.func private @consume(index)
+
   func.func @not_bounded() {
     %cm1_i32 = arith.constant -1 : i32
     %c1_i32 = arith.constant 1 : i32

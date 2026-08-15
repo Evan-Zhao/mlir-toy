@@ -1,4 +1,5 @@
-// RUN: neptune-opt %s --split-input-file --transform-interpreter | FileCheck %s
+// RUN: neptune-opt %s --transform-interpreter --split-input-file --verify-diagnostics | FileCheck %s
+
 
 // CHECK-LABEL: func.func @producer_path
 // CHECK: %[[INIT:.*]] = linalg.fill {unrelated_init}
@@ -156,6 +157,7 @@ module attributes {transform.with_named_sequence} {
         : (!transform.any_op) -> !transform.any_op
     %loop = transform.structured.match ops{["scf.forall"]} in %func
         : (!transform.any_op) -> !transform.any_op
+    // expected-remark @below {{failed to fuse some producers into the consumer loop nest}}
     %candidates = transform.fusion.greedy_input_producers_into_consumer %loop
         : (!transform.any_op) -> !transform.any_op
     transform.yield
@@ -163,6 +165,7 @@ module attributes {transform.with_named_sequence} {
 
   func.func @failed_fusion_cleanup() -> tensor<8xf32> {
     %zero = arith.constant 0.0 : f32
+    // expected-remark @below {{failed to fuse this op into the consumer loop nest}}
     %source = tensor.from_elements %zero, %zero, %zero, %zero,
         %zero, %zero, %zero, %zero : tensor<8xf32>
     %empty = tensor.empty() : tensor<8xf32>
@@ -364,3 +367,32 @@ module attributes {transform.with_named_sequence} {
 // CHECK: %[[TILED:.*]] = linalg.map
 // CHECK: %[[EXPANDED:.*]] = tensor.expand_shape %[[TILED]]
 // CHECK: tensor.parallel_insert_slice %[[EXPANDED]]
+
+// -----
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %func = transform.structured.match ops{["func.func"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    %forall = transform.structured.match ops{["scf.forall"]} in %func
+        : (!transform.any_op) -> !transform.any_op
+    %for = transform.structured.match ops{["scf.for"]} in %func
+        : (!transform.any_op) -> !transform.any_op
+    %inner_to_outer = transform.merge_handles %for, %forall
+        : !transform.any_op
+    // expected-error @below {{expected consumer loops in strictly nested outer-to-inner order}}
+    %fused = transform.fusion.greedy_input_producers_into_consumer %inner_to_outer
+        : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
+  func.func @wrong_loop_order() {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    scf.forall (%i) in (1) {
+      scf.for %j = %c0 to %c1 step %c1 {
+      }
+    }
+    return
+  }
+}

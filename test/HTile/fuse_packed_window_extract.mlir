@@ -1,4 +1,4 @@
-// RUN: neptune-opt --transform-interpreter %s | FileCheck %s
+// RUN: neptune-opt %s --transform-interpreter --split-input-file --verify-diagnostics | FileCheck %s
 
 // CHECK-LABEL: func.func @fuse_packed_window_extract(
 // CHECK-SAME: %[[PACKED:[^,]+]]: tensor<8x3xf32>
@@ -53,5 +53,38 @@ module attributes {transform.with_named_sequence} {
       }
     }
     return %result : tensor<2x4x3xf32>
+  }
+}
+
+// -----
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %extracts = transform.structured.match
+        ops{["stablehlo.custom_call"]}
+        attributes {call_target_name = "neptune.packed_window_extract"}
+        in %module : (!transform.any_op) -> !transform.any_op
+    %loops = transform.structured.match ops{["scf.for"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    // expected-error @below {{invalid packed-window extraction custom call}}
+    %loads = transform.htile.fuse_packed_window_extract %extracts into %loops
+        : (!transform.any_op, !transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
+  func.func @invalid_extract_other(%packed: tensor<8x4xf16>,
+                                   %starts: tensor<2xi32>,
+                                   %lengths: tensor<2xi32>,
+                                   %other: tensor<f32>) -> tensor<2x3x4xf16> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    scf.for %i = %c0 to %c1 step %c1 {
+    }
+    // expected-error @below {{expected packed, windows, and scalar other element types to match}}
+    %windows = stablehlo.custom_call @neptune.packed_window_extract(
+        %packed, %starts, %lengths, %other)
+        : (tensor<8x4xf16>, tensor<2xi32>, tensor<2xi32>, tensor<f32>)
+        -> tensor<2x3x4xf16>
+    return %windows : tensor<2x3x4xf16>
   }
 }
