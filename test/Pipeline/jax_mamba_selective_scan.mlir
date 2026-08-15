@@ -52,10 +52,12 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
     %producers, %bc_forall_1 =
         transform.fusion.greedy_input_producers_into_consumer %bc_forall
         : (!any) -> (!any, !any)
-    // Escaping-producer reconstruction prepends the tiled state result; the
-    // original projection is now forall result 1.
+    // Normalize equivalent tile coordinates using canonicalization before fusion.
+    // We have seen this pattern previously in some attention variants (which needed CSE),
+    // but here we need canonicalization which does more.
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     %consumers = transform.fusion.greedy_consumers_into_producer
-        %bc_forall_1[1] inline_elementwise : (!any) -> !any
+        %bc_forall_1[2] inline_elementwise : (!any) -> !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.scf.localize_scratch_tensors %func : !any
     transform.apply_patterns to %func {
@@ -161,16 +163,16 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
 // CHECK-NOT: stablehlo.while
 // CHECK: scf.for
 // CHECK-SAME: iter_args(
+// CHECK: tensor.insert_slice
+// CHECK: %[[TILED:.+]]:2 = scf.forall (%{{.+}}, %{{.+}}) in (8, 12)
+// CHECK-SAME: shared_outs(
 // CHECK: tensor.extract_slice
 // CHECK: math.absf
 // CHECK: math.exp
 // CHECK: math.log1p
-// CHECK: %[[TILED:.+]]:2 = scf.forall (%{{.+}}, %{{.+}}) in (8, 12)
-// CHECK-SAME: shared_outs(
 // CHECK: tensor.extract_slice {{.*}} : tensor<8x1536x16xf32> to tensor<1x128x16xf32>
 // CHECK: linalg.generic {{.*}}iterator_types = ["parallel", "reduction"]{{.*}}tensor<128x16xf32>
-// CHECK: tensor.parallel_insert_slice {{.*}} [1, 128]
 // CHECK: tensor.parallel_insert_slice {{.*}} [1, 128, 16]
-// CHECK: tensor.insert_slice
-// CHECK: scf.yield {{.*}}, %[[TILED]]#1,
+// CHECK: tensor.parallel_insert_slice {{.*}} [1, 1, 128]
+// CHECK: scf.yield {{.*}}, %[[TILED]]#1
 // CHECK-NOT: stablehlo.

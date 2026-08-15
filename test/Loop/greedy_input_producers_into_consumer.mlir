@@ -254,3 +254,119 @@ module attributes {transform.with_named_sequence} {
     return %after : tensor<8xf32>
   }
 }
+
+// -----
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %func = transform.structured.match ops{["func.func"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    %loop = transform.structured.match ops{["scf.forall"]} in %func
+        : (!transform.any_op) -> !transform.any_op
+    transform.fusion.greedy_input_producers_into_consumer %loop
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.yield
+  }
+
+  func.func @extract_slice(%arg: tensor<12x4xf32>) -> tensor<8x4xf32> {
+    %empty = tensor.empty() : tensor<12x4xf32>
+    %producer = linalg.map { arith.negf } ins(%arg : tensor<12x4xf32>)
+        outs(%empty : tensor<12x4xf32>)
+    %outer = tensor.extract_slice %producer[4, 0] [8, 4] [1, 1]
+        : tensor<12x4xf32> to tensor<8x4xf32>
+    %init = tensor.empty() : tensor<8x4xf32>
+    %result = scf.forall (%row) in (2) shared_outs(%out = %init) -> tensor<8x4xf32> {
+      %offset = affine.apply affine_map<(d0) -> (d0 * 4)>(%row)
+      %tile = tensor.extract_slice %outer[%offset, 0] [4, 4] [1, 1]
+          : tensor<8x4xf32> to tensor<4x4xf32>
+      scf.forall.in_parallel {
+        tensor.parallel_insert_slice %tile into %out[%offset, 0] [4, 4] [1, 1]
+            : tensor<4x4xf32> into tensor<8x4xf32>
+      }
+    }
+    return %result : tensor<8x4xf32>
+  }
+}
+
+// CHECK-LABEL: func.func @extract_slice
+// CHECK: scf.forall
+// CHECK: tensor.extract_slice %arg0
+// CHECK: linalg.map
+// CHECK-NOT: tensor.extract_slice %{{.*}} : tensor<12x4xf32> to tensor<8x4xf32>
+
+// -----
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %func = transform.structured.match ops{["func.func"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    %loop = transform.structured.match ops{["scf.forall"]} in %func
+        : (!transform.any_op) -> !transform.any_op
+    transform.fusion.greedy_input_producers_into_consumer %loop
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.yield
+  }
+
+  func.func @collapse_shape(%arg: tensor<2x4xf32>) -> tensor<8xf32> {
+    %empty = tensor.empty() : tensor<2x4xf32>
+    %producer = linalg.map { arith.negf } ins(%arg : tensor<2x4xf32>)
+        outs(%empty : tensor<2x4xf32>)
+    %collapsed = tensor.collapse_shape %producer [[0, 1]]
+        : tensor<2x4xf32> into tensor<8xf32>
+    %init = tensor.empty() : tensor<8xf32>
+    %result = scf.forall (%row) in (2) shared_outs(%out = %init) -> tensor<8xf32> {
+      %offset = affine.apply affine_map<(d0) -> (d0 * 4)>(%row)
+      %tile = tensor.extract_slice %collapsed[%offset] [4] [1]
+          : tensor<8xf32> to tensor<4xf32>
+      scf.forall.in_parallel {
+        tensor.parallel_insert_slice %tile into %out[%offset] [4] [1]
+            : tensor<4xf32> into tensor<8xf32>
+      }
+    }
+    return %result : tensor<8xf32>
+  }
+}
+
+// CHECK-LABEL: func.func @collapse_shape
+// CHECK: scf.forall
+// CHECK: %[[TILED:.*]] = linalg.map
+// CHECK: %[[COLLAPSED:.*]] = tensor.collapse_shape %[[TILED]]
+// CHECK: tensor.parallel_insert_slice %[[COLLAPSED]]
+
+// -----
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %func = transform.structured.match ops{["func.func"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    %loop = transform.structured.match ops{["scf.forall"]} in %func
+        : (!transform.any_op) -> !transform.any_op
+    transform.fusion.greedy_input_producers_into_consumer %loop
+        : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
+    transform.yield
+  }
+
+  func.func @expand_shape(%arg: tensor<8xf32>) -> tensor<2x4xf32> {
+    %empty = tensor.empty() : tensor<8xf32>
+    %producer = linalg.map { arith.negf } ins(%arg : tensor<8xf32>)
+        outs(%empty : tensor<8xf32>)
+    %expanded = tensor.expand_shape %producer [[0, 1]] output_shape [2, 4]
+        : tensor<8xf32> into tensor<2x4xf32>
+    %init = tensor.empty() : tensor<2x4xf32>
+    %result = scf.forall (%row) in (2) shared_outs(%out = %init) -> tensor<2x4xf32> {
+      %tile = tensor.extract_slice %expanded[%row, 0] [1, 4] [1, 1]
+          : tensor<2x4xf32> to tensor<1x4xf32>
+      scf.forall.in_parallel {
+        tensor.parallel_insert_slice %tile into %out[%row, 0] [1, 4] [1, 1]
+            : tensor<1x4xf32> into tensor<2x4xf32>
+      }
+    }
+    return %result : tensor<2x4xf32>
+  }
+}
+
+// CHECK-LABEL: func.func @expand_shape
+// CHECK: scf.forall
+// CHECK: %[[TILED:.*]] = linalg.map
+// CHECK: %[[EXPANDED:.*]] = tensor.expand_shape %[[TILED]]
+// CHECK: tensor.parallel_insert_slice %[[EXPANDED]]

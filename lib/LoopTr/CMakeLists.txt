@@ -32,6 +32,7 @@ target_link_libraries(NeptuneLoopTransform PUBLIC
   NeptuneMLIRCore
   MLIRAffineAnalysis
   MLIRAffineDialect
+  MLIRAffineUtils
   MLIRArithDialect
   MLIRArithUtils
   MLIRAsmParser

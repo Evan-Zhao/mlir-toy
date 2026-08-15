@@ -213,11 +213,10 @@ def FusionGreedyConsumersIntoProducerOp
     Starting from `producer_loop[result_number]`, repeatedly fuse the unique
     direct consumer of the current loop result into `producer_loop`.
 
-    This transform follows a single def-use chain. The `result_number`
-    identifies only the initial loop result. After each successful consumer
-    fusion, the implementation is expected to advance the frontier to the loop
-    result produced by the fused consumer, rather than continuing to query the
-    original result number.
+    The `result_number` identifies the initial loop result. When a consumer
+    joins multiple results of the same loop, fusion continues from the result
+    produced by that consumer; otherwise it continues discovering consumers of
+    the selected loop result.
 
     If `stop_op` is provided and the next direct consumer is one of its payload
     operations, fusion stops before that consumer and succeeds. This is useful
@@ -231,9 +230,9 @@ def FusionGreedyConsumersIntoProducerOp
     for loop fusion.
 
     Consumers that cannot be fused are skipped and receive a diagnostic remark,
-    allowing fusion to continue with other consumers.
-    This fusion has special handling for `tensor.collapse_shape` operations after `scf.forall`,
-    which MLIR standard fusion does not support.    
+    allowing fusion to continue with other consumers. Tensor insertions and
+    rectangular collapse/expand shape transfers are fused by rebuilding the
+    forall publication in the consumer's coordinate space.
 
     The `producer_loop` handle is preserved and remapped to the rewritten loop.
     The optional `stop_op` handle is read-only. The result handle contains the
@@ -277,8 +276,10 @@ def FusionGreedyInputProducersIntoConsumerOp
     reconstruction is unconditional for replaceable escaping uses; ordinary
     canonicalization may remove redundant loop results.
 
-    Function arguments, producers already inside the selected placement loop,
-    init-only chains, and non-tileable operations are not fused.
+    Consecutive tensor slices and rectangular collapse/expand shape transfers
+    are pulled through before ordinary producer fusion. Function arguments,
+    producers already inside the selected placement loop, init-only chains,
+    and non-tileable operations are not fused.
 
     The `consumer_op` handle is read-only. The `new_consumer` result contains
     the updated loop nest in outer-to-inner order. The `fused_ops` result
