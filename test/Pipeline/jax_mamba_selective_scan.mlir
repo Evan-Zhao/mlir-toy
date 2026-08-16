@@ -47,19 +47,19 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
       transform.apply_patterns.stablehlo.simplify_in_bounds_clamps
       transform.apply_patterns.canonicalization
     } : !any
+    %outer_loop = transform.structured.match ops{["scf.for"]} in %func : (!any) -> !any
     %project = transform.structured.match ops{["linalg.generic"]} in %func : (!any) -> !any
-    %tiled_project, %bc_forall = transform.structured.tile_using_forall
+    %outer_yield = transform.structured.match ops{["scf.yield"]} in %outer_loop : (!any) -> !any
+    %tiled_project, %inner_loop = transform.structured.tile_using_forall
         %project tile_sizes [1, 128, 0] : (!any) -> (!any, !any)
 
+    transform.fusion.greedy_consumers_into_producer %inner_loop until %outer_yield: (!any, !any) -> !any
     // Pull the state update and token-local inputs into each 1x128 channel
     // tile, then carry the skip/cast/output path forward to the time-slice write.
-    %producers = transform.fusion.greedy_input_producers_into_consumer %bc_forall : (!any) -> !any
-    // Normalize equivalent tile coordinates using canonicalization before fusion.
-    // We have seen this pattern previously in some attention variants (which needed CSE),
-    // but here we need canonicalization which does more.
+    transform.fusion.greedy_input_producers_into_consumer %inner_loop : (!any) -> !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
-    transform.fusion.greedy_consumers_into_producer %bc_forall inline_elementwise : (!any) -> !any
-    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+    transform.apply_cse to %func : !any
+
     transform.scf.localize_scratch_tensors %func : !any
     transform.apply_patterns to %func {
       transform.apply_patterns.scf.fold_unit_extent_dims_via_reshapes
@@ -176,7 +176,7 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
 // CHECK: math.log1p
 // CHECK: tensor.extract_slice {{.*}} : tensor<8x1536x16xf32> to tensor<1x128x16xf32>
 // CHECK: linalg.generic {{.*}}iterator_types = ["parallel", "reduction"]{{.*}}tensor<128x16xf32>
-// CHECK: tensor.parallel_insert_slice {{.*}} [1, 128, 16]
 // CHECK: tensor.parallel_insert_slice {{.*}} [1, 1, 128]
-// CHECK: scf.yield {{.*}}, %[[TILED]]#1
+// CHECK: tensor.parallel_insert_slice {{.*}} [1, 128, 16]
+// CHECK: scf.yield %[[TILED]]#1, %[[TILED]]#0
 // CHECK-NOT: stablehlo.
