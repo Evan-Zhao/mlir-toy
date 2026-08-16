@@ -161,6 +161,43 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 
+  func.func @insert_slice_empty_init(%tiles: tensor<2x4xf32>,
+                                     %dest: tensor<2x3x4xf32>) -> tensor<2x3x4xf32> {
+    %init = tensor.empty() : tensor<2x4xf32>
+    %result = scf.forall (%row) in (2) shared_outs(%out = %init) -> tensor<2x4xf32> {
+      %tile = tensor.extract_slice %tiles[%row, 0] [1, 4] [1, 1]
+          : tensor<2x4xf32> to tensor<1x4xf32>
+      scf.forall.in_parallel {
+        tensor.parallel_insert_slice %tile into %out[%row, 0] [1, 4] [1, 1]
+            : tensor<1x4xf32> into tensor<2x4xf32>
+      }
+    }
+    %inserted = tensor.insert_slice %result into %dest[0, 1, 0] [2, 1, 4] [1, 1, 1]
+        : tensor<2x4xf32> into tensor<2x3x4xf32>
+    return %inserted : tensor<2x3x4xf32>
+  }
+}
+
+// CHECK-LABEL: func.func @insert_slice_empty_init
+// CHECK-NOT: tensor.insert_slice
+// CHECK: %[[RESULT:.*]] = scf.forall
+// CHECK-SAME: shared_outs(%[[OUT:.*]] = %arg1) -> (tensor<2x3x4xf32>)
+// CHECK: tensor.parallel_insert_slice %{{.*}} into %[[OUT]][%{{.*}}, 1, 0] [1, 1, 4]
+// CHECK: return %[[RESULT]] : tensor<2x3x4xf32>
+
+// -----
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %func = transform.structured.match ops{["func.func"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    %loop = transform.structured.match ops{["scf.forall"]} in %func
+        : (!transform.any_op) -> !transform.any_op
+    transform.fusion.greedy_consumers_into_producer %loop[0]
+        : (!transform.any_op) -> !transform.any_op
+    transform.yield
+  }
+
   func.func @expand_shape(%init: tensor<2x4xf32>, %tiles: tensor<2x4xf32>)
       -> tensor<2x2x2xf32> {
     %result = scf.forall (%row) in (2) shared_outs(%out = %init) -> tensor<2x4xf32> {

@@ -243,7 +243,9 @@ def FusionGreedyConsumersIntoProducerOp
     Ordinary tileable consumers use SCF consumer fusion. Rectangular
     `tensor.insert_slice`, `tensor.collapse_shape`, and `tensor.expand_shape`
     consumers can instead be fused by transferring the published region and
-    rebuilding the forall destination. Consumers that cannot be fused are
+    rebuilding the forall destination. When the old forall destination is a
+    `tensor.empty`, it is bypassed instead of being inserted into the rebuilt
+    destination. Consumers that cannot be fused are
     skipped with a diagnostic remark.
 
     The `producer_loop` handle is preserved and remapped to the rewritten loop.

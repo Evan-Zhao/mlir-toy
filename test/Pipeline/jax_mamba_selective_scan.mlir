@@ -167,7 +167,7 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
 // CHECK-SAME: iter_args(
 // CHECK-NOT: arith.maxsi
 // CHECK-NOT: arith.minsi
-// CHECK: tensor.insert_slice
+// CHECK-NOT: tensor.insert_slice
 // CHECK: %[[TILED:.+]]:2 = scf.forall (%{{.+}}, %{{.+}}) in (8, 12)
 // CHECK-SAME: shared_outs(
 // CHECK: tensor.extract_slice

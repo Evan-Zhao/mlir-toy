@@ -383,9 +383,16 @@ static FailureOr<TensorConsumerFusionResult> pushTensorConsumerThroughForall(Rew
 
   rewriter.setInsertionPoint(loop);
   auto resultType = cast<RankedTensorType>(consumer->getResult(0).getType());
-  Value newInit =
-      materializeTensorValueTransform(rewriter, loc, transfer->forallDestination->initTransform,
-                                      consumer, oldInit, resultType, resultShape);
+  Value newInit;
+  if (auto insert = dyn_cast<tensor::InsertSliceOp>(consumer);
+      insert && oldInit.getDefiningOp<tensor::EmptyOp>()) {
+    // Avoid seeding the larger destination with an unused empty tile.
+    newInit = insert.getDest();
+  } else {
+    newInit = materializeTensorValueTransform(
+        rewriter, loc, transfer->forallDestination->initTransform, consumer, oldInit, resultType,
+        resultShape);
+  }
   SmallVector<Value> newInits(loop.getOutputs());
   newInits[resultNumber] = newInit;
   auto newLoop = scf::ForallOp::create(rewriter, loop.getLoc(), loop.getMixedLowerBound(),
