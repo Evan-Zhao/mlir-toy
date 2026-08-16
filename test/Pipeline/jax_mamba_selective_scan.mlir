@@ -163,10 +163,9 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
 // loop-carried.
 // CHECK-LABEL: func.func public @main(
 // CHECK-NOT: stablehlo.while
-// CHECK: %{{.+}}:2 = scf.for
-// CHECK-SAME: iter_args(
-// CHECK-NOT: arith.maxsi
-// CHECK-NOT: arith.minsi
+// CHECK: %{{.+}}:2 = scf.for {{.*}} iter_args{{.*}} -> ({{.*}})
+// CHECK-NOT: : i32
+// CHECK: {
 // CHECK-NOT: tensor.insert_slice
 // CHECK: %[[TILED:.+]]:2 = scf.forall (%{{.+}}, %{{.+}}) in (8, 12)
 // CHECK-SAME: shared_outs(

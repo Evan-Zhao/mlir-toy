@@ -9,6 +9,7 @@
 
 #include "StableHLO/StableHLOLegalizeControlFlow.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -41,6 +42,12 @@ Value extractTensorValue(OpBuilder &builder, Value tensorValue) {
                                                   SmallVector<ReassociationIndices>());
   }
   return tensor::ExtractOp::create(builder, loc, tensorValue, ValueRange());
+}
+
+Value castToIndex(OpBuilder &builder, Value value) {
+  if (value.getType().isIndex())
+    return value;
+  return arith::IndexCastOp::create(builder, value.getLoc(), builder.getIndexType(), value);
 }
 
 struct ForBounds {
@@ -137,10 +144,10 @@ struct WhileOpPattern final : OpConversionPattern<mlir::stablehlo::WhileOp> {
       for (unsigned argument : llvm::reverse(droppedArguments))
         initOperands.erase(initOperands.begin() + argument);
 
-      auto forOp =
-          scf::ForOp::create(rewriter, loc, extractTensorValue(rewriter, bounds->lowerBound),
-                             extractTensorValue(rewriter, bounds->upperBound),
-                             extractTensorValue(rewriter, bounds->step), initOperands);
+      Value lowerBound = castToIndex(rewriter, extractTensorValue(rewriter, bounds->lowerBound));
+      Value upperBound = castToIndex(rewriter, extractTensorValue(rewriter, bounds->upperBound));
+      Value step = castToIndex(rewriter, extractTensorValue(rewriter, bounds->step));
+      auto forOp = scf::ForOp::create(rewriter, loc, lowerBound, upperBound, step, initOperands);
       inlineStableHLORegionIntoSCFRegion(rewriter, op.getBody(), forOp.getRegion());
 
       // SCF supplies a scalar induction variable. Rebuild the tensor form used
@@ -150,8 +157,14 @@ struct WhileOpPattern final : OpConversionPattern<mlir::stablehlo::WhileOp> {
           forOp.getRegion().insertArgument(unsigned{0}, forOp.getLowerBound().getType(), loc);
       BlockArgument oldInduction = body.getArgument(1 + bounds->inductionArgument);
       rewriter.setInsertionPointToStart(&body);
+      Type tensorElementType = cast<ShapedType>(oldInduction.getType()).getElementType();
+      Value stablehloInduction = induction;
+      if (stablehloInduction.getType() != tensorElementType) {
+        stablehloInduction =
+            arith::IndexCastOp::create(rewriter, loc, tensorElementType, stablehloInduction);
+      }
       Value tensorInduction =
-          tensor::FromElementsOp::create(rewriter, loc, oldInduction.getType(), induction);
+          tensor::FromElementsOp::create(rewriter, loc, oldInduction.getType(), stablehloInduction);
       oldInduction.replaceAllUsesWith(tensorInduction);
 
       if (!dropInduction) {

@@ -1,12 +1,16 @@
 // RUN: neptune-opt %s --transform-interpreter --split-input-file | FileCheck %s
 
 // CHECK-LABEL: func.func @fori_loop(
-// CHECK-DAG: %[[LB:.+]] = tensor.extract %arg0[] : tensor<i32>
-// CHECK-DAG: %[[UB:.+]] = tensor.extract %arg1[] : tensor<i32>
-// CHECK-DAG: %[[STEP:.+]] = tensor.extract %arg2[] : tensor<i32>
+// CHECK-DAG: %[[LB_I32:.+]] = tensor.extract %arg0[] : tensor<i32>
+// CHECK-DAG: %[[LB:.+]] = arith.index_cast %[[LB_I32]] : i32 to index
+// CHECK-DAG: %[[UB_I32:.+]] = tensor.extract %arg1[] : tensor<i32>
+// CHECK-DAG: %[[UB:.+]] = arith.index_cast %[[UB_I32]] : i32 to index
+// CHECK-DAG: %[[STEP_I32:.+]] = tensor.extract %arg2[] : tensor<i32>
+// CHECK-DAG: %[[STEP:.+]] = arith.index_cast %[[STEP_I32]] : i32 to index
 // CHECK: %[[RESULT:.+]] = scf.for %[[IV:.+]] = %[[LB]] to %[[UB]] step %[[STEP]]
 // CHECK-SAME: iter_args(%[[ARG:.+]] = %arg3)
-// CHECK: %[[TENSOR_IV:.+]] = tensor.from_elements %[[IV]] : tensor<i32>
+// CHECK: %[[IV_I32:.+]] = arith.index_cast %[[IV]] : index to i32
+// CHECK: %[[TENSOR_IV:.+]] = tensor.from_elements %[[IV_I32]] : tensor<i32>
 // CHECK-NOT: stablehlo.add %[[TENSOR_IV]], %arg2
 // CHECK: scf.yield %[[ARG]] : tensor<4xf32>
 // CHECK: return %[[RESULT]] : tensor<4xf32>
@@ -36,7 +40,8 @@ module attributes {transform.with_named_sequence} {
 // CHECK-LABEL: func.func @fori_loop_synchronized_index(
 // CHECK: %[[RESULT:.+]] = scf.for %[[IV:[^ ]+]]
 // CHECK-SAME: iter_args(%{{.+}} = %arg0)
-// CHECK: %[[TENSOR_IV:.+]] = tensor.from_elements %[[IV]] : tensor<i32>
+// CHECK: %[[IV_I32:.+]] = arith.index_cast %[[IV]] : index to i32
+// CHECK: %[[TENSOR_IV:.+]] = tensor.from_elements %[[IV_I32]] : tensor<i32>
 // CHECK-NOT: stablehlo.add
 // CHECK: scf.yield %[[TENSOR_IV]] : tensor<i32>
 // CHECK: return %[[RESULT]] : tensor<i32>
@@ -71,7 +76,8 @@ module attributes {transform.with_named_sequence} {
 // CHECK-LABEL: func.func @fori_loop_used_index(
 // CHECK: %[[RESULT:.+]]:2 = scf.for %[[IV:[^ ]+]]
 // CHECK-SAME: iter_args(%{{.+}} = %arg0, %[[ARG:.+]] = %arg3)
-// CHECK: %[[TENSOR_IV:.+]] = tensor.from_elements %[[IV]] : tensor<i32>
+// CHECK: %[[IV_I32:.+]] = arith.index_cast %[[IV]] : index to i32
+// CHECK: %[[TENSOR_IV:.+]] = tensor.from_elements %[[IV_I32]] : tensor<i32>
 // CHECK: %[[NEXT:.+]] = stablehlo.add %[[TENSOR_IV]], %arg2 : tensor<i32>
 // CHECK: scf.yield %[[NEXT]], %[[ARG]] : tensor<i32>, tensor<4xf32>
 // CHECK: return %[[RESULT]]#0, %[[RESULT]]#1
