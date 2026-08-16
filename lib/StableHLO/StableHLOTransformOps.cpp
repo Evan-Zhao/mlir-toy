@@ -75,6 +75,34 @@ FailureOr<int64_t> computeConstantBound(Value value, presburger::BoundType bound
                                                         /*stopCondition=*/nullptr, options);
 }
 
+struct SimplifyBoundedIndexCastRoundTripPattern : OpRewritePattern<arith::IndexCastOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(arith::IndexCastOp op, PatternRewriter &rewriter) const override {
+    if (!op.getType().isIndex())
+      return failure();
+    auto narrow = op.getIn().getDefiningOp<arith::IndexCastOp>();
+    if (!narrow || !narrow.getIn().getType().isIndex())
+      return failure();
+    auto narrowType = dyn_cast<IntegerType>(narrow.getType());
+    if (!narrowType || narrowType.getWidth() > 64)
+      return failure();
+
+    FailureOr<int64_t> lowerBound = computeConstantBound(narrow.getIn(), presburger::BoundType::LB);
+    FailureOr<int64_t> upperBound = computeConstantBound(narrow.getIn(), presburger::BoundType::UB);
+    if (failed(lowerBound) || failed(upperBound))
+      return failure();
+
+    APInt signedMin = APInt::getSignedMinValue(narrowType.getWidth()).sextOrTrunc(64);
+    APInt signedMax = APInt::getSignedMaxValue(narrowType.getWidth()).sextOrTrunc(64);
+    if (*lowerBound < signedMin.getSExtValue() || *upperBound > signedMax.getSExtValue())
+      return failure();
+
+    rewriter.replaceOp(op, narrow.getIn());
+    return success();
+  }
+};
+
 struct SimplifyBoundedMaxSIPattern : OpRewritePattern<arith::MaxSIOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -126,7 +154,8 @@ void appendStablehloConversionPatternsForRoot(TypeConverter &typeConverter,
 } // namespace
 
 void StablehloSimplifyInBoundsClampsPatternsOp::populatePatterns(RewritePatternSet &patterns) {
-  patterns.add<SimplifyBoundedMaxSIPattern, SimplifyBoundedMinSIPattern>(patterns.getContext());
+  patterns.add<SimplifyBoundedIndexCastRoundTripPattern, SimplifyBoundedMaxSIPattern,
+               SimplifyBoundedMinSIPattern>(patterns.getContext());
 }
 
 void StablehloSliceToTensorConversionPatternsOp::populatePatterns(TypeConverter &typeConverter,

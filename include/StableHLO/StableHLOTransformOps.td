@@ -37,14 +37,15 @@ def StablehloSimplifyInBoundsClampsPatternsOp
     : Op<Transform_Dialect,
          "apply_patterns.stablehlo.simplify_in_bounds_clamps",
          [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {
-  let summary = "Remove signed integer clamps proven redundant by value bounds";
+  let summary = "Remove integer clamps and casts proven redundant by value bounds";
 
   let description = [{
     Collects patterns that simplify `arith.maxsi` and `arith.minsi` when value
     bounds prove that one operand is already within a constant bound. The
-    patterns look through `arith.index_cast`, allowing them to remove clamps
-    materialized by StableHLO dynamic-slice legalization for an `scf.for`
-    induction variable.
+    patterns also remove `index` to integer to `index` round trips when the
+    intermediate integer can represent the full value range. This cleans up
+    casts and clamps materialized by StableHLO dynamic-slice legalization for
+    an `scf.for` induction variable.
 
     ```mlir
     // Given 0 <= %iv < 2048:
