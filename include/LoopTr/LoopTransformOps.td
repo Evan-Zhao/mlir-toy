@@ -105,6 +105,47 @@ def ScfLocalizeScratchTensorsOp : Op<Transform_Dialect, "scf.localize_scratch_te
   }];
 }
 
+def ScfInterchangeForAndForallOp
+    : Op<Transform_Dialect, "scf.interchange_for_and_forall",
+         [FunctionalStyleTransformOpTrait, DeclareOpInterfaceMethods<TransformOpInterface>,
+          DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+          ReportTrackingListenerFailuresOpTrait]> {
+  let summary = "Interchange a tensor recurrence with a nested forall";
+
+  let description = [{
+    Rebuilds an outer sequential `scf.for` and its perfectly nested
+    `scf.forall` as an outer forall containing a sequential for. The forall
+    must be the only non-terminator operation in the for body. The for must use
+    an index-typed induction variable and a positive constant step.
+
+    Loop-carried full tensors are localized to worker tiles or slabs. A
+    publication may be invariant under the for IV, or exactly one offset may
+    equal the IV and publish a size-one point. Other IV-dependent publication
+    geometry is rejected. Final worker values are published once by the new
+    forall.
+
+    The results explicitly identify the new nesting order: `outer_forall` is
+    the rebuilt outer `scf.forall`, and `inner_for` is the rebuilt sequential
+    `scf.for`. Existing input handles continue to track their logical loops:
+    `for_loop` tracks `inner_for`, while `forall_loop` tracks `outer_forall`.
+
+    ```mlir
+    %outer_forall, %inner_for =
+      transform.scf.interchange_for_and_forall %for with %forall
+        : (!transform.any_op, !transform.any_op)
+            -> (!transform.any_op, !transform.any_op)
+    ```
+  }];
+
+  let arguments = (ins TransformHandleTypeInterface:$for_loop,
+                        TransformHandleTypeInterface:$forall_loop);
+  let results = (outs TransformHandleTypeInterface:$outer_forall,
+                      TransformHandleTypeInterface:$inner_for);
+
+  let assemblyFormat = "$for_loop `with` $forall_loop attr-dict `:` "
+                       "functional-type(operands, results)";
+}
+
 def ScfFoldUnitExtentDimsViaReshapesPatternsOp
     : Op<Transform_Dialect, "apply_patterns.scf.fold_unit_extent_dims_via_reshapes",
          [DeclareOpInterfaceMethods<PatternDescriptorOpInterface>]> {

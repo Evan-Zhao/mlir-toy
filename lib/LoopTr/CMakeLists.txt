@@ -19,6 +19,7 @@ add_library(NeptuneLoopTransform STATIC
   LoopSpecializeDeadTile.cpp
   LoopTransformExtension.cpp
   LoopTransformOps.cpp
+  ScfForallLoopExchange.cpp
   ScfLocalizeScratchTensors.cpp
   ScfTransformOps.cpp
   Utils.cpp

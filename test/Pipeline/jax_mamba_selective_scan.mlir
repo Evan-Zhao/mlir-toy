@@ -53,23 +53,35 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
     %tiled_project, %inner_loop = transform.structured.tile_using_forall
         %project tile_sizes [1, 128, 0] : (!any) -> (!any, !any)
 
+    // Powerful and aggressive fusion to fuse ops before and after the scf.forall loop into the loop.
     transform.fusion.greedy_consumers_into_producer %inner_loop until %outer_yield: (!any, !any) -> !any
-    // Pull the state update and token-local inputs into each 1x128 channel
-    // tile, then carry the skip/cast/output path forward to the time-slice write.
     transform.fusion.greedy_input_producers_into_consumer %inner_loop : (!any) -> !any
-    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+
+    // Exchange the time recurrence with the BxC worker loop. This requires a lot of preparation steps
+    // (below) because it only works with perfectly nested scf.for and scf.forall.
+    transform.apply_patterns to %func {
+      transform.apply_patterns.canonicalization 
+      transform.apply_patterns.tensor.merge_consecutive_insert_extract_slice
+    } : !any
     transform.apply_cse to %func : !any
+    transform.apply_licm to %outer_loop : !any
+    %forall_loop, %for_loop = transform.scf.interchange_for_and_forall
+        %outer_loop with %inner_loop : (!any, !any) -> (!any, !any)
 
     transform.scf.localize_scratch_tensors %func : !any
     transform.apply_patterns to %func {
       transform.apply_patterns.scf.fold_unit_extent_dims_via_reshapes
       transform.apply_patterns.linalg.fold_unit_extent_dims_via_reshapes
+      transform.apply_patterns.tensor.merge_consecutive_insert_extract_slice
       transform.apply_patterns.canonicalization
     } : !any
     transform.apply_cse to %func : !any
 
-    // The forall is still inside the recurrence. Moving it outside requires
-    // distribution of the loop-carried state and output tensors.
+    // --- HTile lowering begins ---
+    transform.htile.linalg_to_semantic %func : !any
+    %launches, %kernels = transform.htile.outline_kernels %forall_loop
+        {kernel_names = ["mamba_selective_scan_kernel"]} : (!any) -> (!any, !any)
+    transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
     transform.verify %func : !any
     transform.yield
   }
@@ -158,25 +170,50 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
 // CLEAN: stablehlo.dynamic_update_slice
 // CLEAN-NOT: func.func private
 
-// JAX's counted while is recognized as a for loop. Its synchronized counters
-// become the structural induction variable, leaving only state and output
-// loop-carried.
+// HTile converts every Linalg op, bufferizes the worker boundary, and outlines
+// the exchanged forall as one persistent kernel with an inner sequential scan.
 // CHECK-LABEL: func.func public @main(
-// CHECK-NOT: stablehlo.while
-// CHECK: %{{.+}}:2 = scf.for {{.*}} iter_args{{.*}} -> ({{.*}}) {
-// CHECK-NOT: arith.index_cast
-// CHECK-NOT: arith.maxsi
-// CHECK-NOT: arith.minsi
-// CHECK-NOT: tensor.insert_slice
-// CHECK: %[[TILED:.+]]:2 = scf.forall (%{{.+}}, %{{.+}}) in (8, 12)
-// CHECK-SAME: shared_outs(
-// CHECK: tensor.extract_slice
+// CHECK-NOT: stablehlo.
+// CHECK-NOT: linalg.
+// CHECK: htile.launch_func @mamba_selective_scan_kernel(
+// CHECK-SAME: {program_bounds = array<i64: 8, 12>}
+// CHECK: return
+
+// CHECK-LABEL: htile.kernel @mamba_selective_scan_kernel(
+// CHECK-SAME: attributes {program_bounds = array<i64: 8, 12>}
+// CHECK: %[[B:.+]] = htile.program_id 0
+// CHECK: %[[CB:.+]] = htile.program_id 1
+// CHECK: %[[C_OFFSET:.+]] = affine.apply {{.*}}[%[[CB]]]
+// CHECK: %[[STATE_INIT:.+]] = htile.load %arg7[%[[B]], %[[C_OFFSET]], %c0]
+// CHECK-SAME: -> tensor<128x16xf32>
+// CHECK: %[[OUTPUT_SLAB:.+]] = htile.load %arg8[%[[B]], %c0, %[[C_OFFSET]]]
+// CHECK-SAME: -> tensor<2048x128xbf16>
+// CHECK: %[[SCAN:.+]]:2 = scf.for %[[T:[^ ]+]] =
+// CHECK-SAME: iter_args(%[[STATE:.+]] = %[[STATE_INIT]], %[[SLAB:.+]] = %[[OUTPUT_SLAB]])
+// CHECK-SAME: -> (tensor<128x16xf32>, tensor<2048x128xbf16>)
+// CHECK: %[[STATE_3D:.+]] = htile.unsqueeze %[[STATE]]
+// CHECK-SAME: tensor<128x16xf32> -> tensor<1x128x16xf32>
+// CHECK: %[[SLAB_3D:.+]] = htile.unsqueeze %[[SLAB]]
+// CHECK-SAME: tensor<2048x128xbf16> -> tensor<1x2048x128xbf16>
+// CHECK: htile.load %arg1[%[[B]], %[[T]], %[[C_OFFSET]]]
+// CHECK: htile.load %arg6[%[[C_OFFSET]]]
 // CHECK: math.absf
 // CHECK: math.exp
 // CHECK: math.log1p
-// CHECK: tensor.extract_slice {{.*}} : tensor<8x1536x16xf32> to tensor<1x128x16xf32>
-// CHECK: linalg.generic {{.*}}iterator_types = ["parallel", "reduction"]{{.*}}tensor<128x16xf32>
-// CHECK: tensor.parallel_insert_slice {{.*}} [1, 1, 128]
-// CHECK: tensor.parallel_insert_slice {{.*}} [1, 128, 16]
-// CHECK: scf.yield %[[TILED]]#1, %[[TILED]]#0
+// CHECK: htile.load %arg2[%[[C_OFFSET]], %c0]
+// CHECK: math.exp
+// CHECK: htile.load %arg3[%[[B]], %[[T]], %c0]
+// CHECK: htile.load %arg0[%[[B]], %[[T]], %[[C_OFFSET]]]
+// CHECK: htile.load %arg4[%[[B]], %[[T]], %c0]
+// CHECK: %[[STATE_NEXT:.+]] = htile.squeeze {{.*}} : tensor<1x128x16xf32> -> tensor<128x16xf32>
+// CHECK: htile.dot %[[STATE_NEXT]], {{.*}} : tensor<128x16xf32>, tensor<16xf32> -> tensor<128xf32>
+// CHECK: htile.load %arg5[%[[C_OFFSET]]]
+// CHECK: %[[INSERTED:.+]] = tensor.insert_slice {{.*}} into %[[SLAB_3D]][0, %[[T]], 0]
+// CHECK-SAME: [1, 1, 128]
+// CHECK: %[[SLAB_NEXT:.+]] = htile.squeeze %[[INSERTED]]
+// CHECK-SAME: -> tensor<2048x128xbf16>
+// CHECK: scf.yield %[[STATE_NEXT]], %[[SLAB_NEXT]]
+// CHECK: htile.store %[[SCAN]]#1, %arg10[%[[B]], %c0, %[[C_OFFSET]]]
+// CHECK: htile.return
 // CHECK-NOT: stablehlo.
+// CHECK-NOT: linalg.
