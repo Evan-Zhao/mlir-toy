@@ -386,9 +386,8 @@ ForallOutputExtension cloneForallWithAppendedOutputs(RewriterBase &rewriter, scf
                                .clonedOps = std::move(clonedOps)};
 }
 
-void notifyClonedOpsRecursively(
-    RewriterBase &rewriter,
-    ArrayRef<std::pair<Operation *, Operation *>> clonedOps) {
+void notifyClonedOpsRecursively(RewriterBase &rewriter,
+                                ArrayRef<std::pair<Operation *, Operation *>> clonedOps) {
   auto *listener = dyn_cast_if_present<RewriterBase::Listener>(rewriter.getListener());
   if (!listener)
     return;
@@ -458,32 +457,30 @@ SmallVector<OpFoldResult> getMixedTensorSizes(RewriterBase &rewriter, Location l
 using ClonedOperation = std::pair<Operation *, Operation *>;
 
 static FailureOr<Value>
-cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Value value, IRMapping &mapping,
+cloneValueDefChainAtInsertionPoint(RewriterBase &rewriter, Value value,
+                                   const DominanceInfo &dominance, IRMapping &mapping,
                                    SmallVectorImpl<ClonedOperation> *clonedOps) {
+  // If the value is already available at the insertion point, return it.
+  // This includes values already cloned into the mapping
   if (Value mapped = mapping.lookupOrNull(value))
     return mapped;
+  // as well as values that are already available before the insertion point.
+  if (dominance.properlyDominates(value, &*rewriter.getInsertionPoint()))
+    return value;
 
+  // If we actually need to clone the value, it doesn't work if the value doesn't have a defining
+  // operation (for example, is a block argument) or its definition contains the insertion point.
   Operation *def = value.getDefiningOp();
-  if (!def)
-    return value;
-
-  Block *insertBlock = rewriter.getInsertionBlock();
-  auto insertPoint = rewriter.getInsertionPoint();
-  Operation *insertPointOp = insertPoint == insertBlock->end() ? nullptr : &*insertPoint;
-  if (!insertPointOp || def->getBlock() != insertBlock || !insertPointOp->isBeforeInBlock(def))
-    return value;
-
-  IRMapping localMapping = mapping;
+  Operation *insertionPoint = &*rewriter.getInsertionPoint();
+  if (!def || def == insertionPoint || def->isAncestor(insertionPoint))
+    return failure();
   for (Value operand : def->getOperands()) {
-    FailureOr<Value> remappedOperand =
-        cloneValueDefChainAtInsertionPoint(rewriter, operand, mapping, clonedOps);
-    if (failed(remappedOperand))
+    if (failed(
+            cloneValueDefChainAtInsertionPoint(rewriter, operand, dominance, mapping, clonedOps)))
       return failure();
-    localMapping.map(operand, *remappedOperand);
   }
 
-  Operation *cloned = rewriter.clone(*def, localMapping);
-  mapping.map(def->getResults(), cloned->getResults());
+  Operation *cloned = rewriter.clone(*def, mapping);
   if (clonedOps)
     clonedOps->emplace_back(def, cloned);
   return mapping.lookup(value);
@@ -493,12 +490,17 @@ FailureOr<SmallVector<Value>> makeValuesAvailableAtInsertionPoint(RewriterBase &
                                                                   ValueRange values,
                                                                   IRMapping &mapping,
                                                                   DefChainAction action) {
+  Block *insertionBlock = rewriter.getInsertionBlock();
+  if (!insertionBlock || rewriter.getInsertionPoint() == insertionBlock->end())
+    return failure();
+  DominanceInfo dominance;
+
   SmallVector<ClonedOperation> clonedOps;
   SmallVector<Value> availableValues;
   availableValues.reserve(values.size());
   for (Value value : values) {
     FailureOr<Value> available =
-        cloneValueDefChainAtInsertionPoint(rewriter, value, mapping, &clonedOps);
+        cloneValueDefChainAtInsertionPoint(rewriter, value, dominance, mapping, &clonedOps);
     if (failed(available)) {
       for (auto &[original, cloned] : llvm::reverse(clonedOps))
         rewriter.eraseOp(cloned);
@@ -515,10 +517,13 @@ FailureOr<SmallVector<Value>> makeValuesAvailableAtInsertionPoint(RewriterBase &
 
 LogicalResult recursiveMoveOperandsBeforeOp(Operation &toMoveOperands, RewriterBase &rewriter,
                                             Operation &moveBefore) {
+  SmallVector<Value> operands =
+      llvm::filter_to_vector(toMoveOperands.getOperands(),
+                             [&](Value operand) { return operand.getDefiningOp() != &moveBefore; });
   IRMapping mapping;
   rewriter.setInsertionPoint(&moveBefore);
-  if (failed(makeValuesAvailableAtInsertionPoint(rewriter, toMoveOperands.getOperands(), mapping,
-                                                 DefChainAction::Move))) {
+  if (failed(
+          makeValuesAvailableAtInsertionPoint(rewriter, operands, mapping, DefChainAction::Move))) {
     toMoveOperands.emitRemark("when moving operand definition chains");
     return failure();
   }

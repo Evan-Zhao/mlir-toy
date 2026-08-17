@@ -58,7 +58,17 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
     // tile, then carry the skip/cast/output path forward to the time-slice write.
     transform.fusion.greedy_input_producers_into_consumer %inner_loop : (!any) -> !any
     transform.apply_patterns to %func { transform.apply_patterns.canonicalization } : !any
+
+    // Exchange the time recurrence with the BxC worker loop. This requires a lot of preparation steps
+    // (below) because it only works with perfectly nested scf.for and scf.forall.
+    transform.apply_patterns to %func {
+      transform.apply_patterns.canonicalization 
+      transform.apply_patterns.tensor.merge_consecutive_insert_extract_slice
+    } : !any
     transform.apply_cse to %func : !any
+    transform.apply_licm to %outer_loop : !any
+    %forall_loop, %for_loop = transform.scf.interchange_for_and_forall
+        %outer_loop with %inner_loop : (!any, !any) -> (!any, !any)
 
     transform.scf.localize_scratch_tensors %func : !any
     transform.apply_patterns to %func {
@@ -163,20 +173,19 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
 // loop-carried.
 // CHECK-LABEL: func.func public @main(
 // CHECK-NOT: stablehlo.while
-// CHECK: %{{.+}}:2 = scf.for {{.*}} iter_args{{.*}} -> ({{.*}}) {
+// CHECK: %{{.+}} = scf.forall (%{{.+}}, %{{.+}}) in (8, 12)
+// CHECK-SAME: shared_outs(
+// CHECK: tensor.extract_slice {{.*}} : tensor<8x1536x16xf32> to tensor<128x16xf32>
 // CHECK-NOT: arith.index_cast
 // CHECK-NOT: arith.maxsi
 // CHECK-NOT: arith.minsi
-// CHECK-NOT: tensor.insert_slice
-// CHECK: %[[TILED:.+]]:2 = scf.forall (%{{.+}}, %{{.+}}) in (8, 12)
-// CHECK-SAME: shared_outs(
+// CHECK: %{{.+}}:2 = scf.for {{.*}} iter_args{{.*}} -> ({{.*}}) {
 // CHECK: tensor.extract_slice
 // CHECK: math.absf
 // CHECK: math.exp
 // CHECK: math.log1p
-// CHECK: tensor.extract_slice {{.*}} : tensor<8x1536x16xf32> to tensor<1x128x16xf32>
 // CHECK: linalg.generic {{.*}}iterator_types = ["parallel", "reduction"]{{.*}}tensor<128x16xf32>
-// CHECK: tensor.parallel_insert_slice {{.*}} [1, 1, 128]
-// CHECK: tensor.parallel_insert_slice {{.*}} [1, 128, 16]
-// CHECK: scf.yield %[[TILED]]#1, %[[TILED]]#0
+// CHECK: tensor.insert_slice
+// CHECK: scf.yield {{.*}} : tensor<128x16xf32>, tensor<2048x128xbf16>
+// CHECK: tensor.parallel_insert_slice {{.*}} [1, 2048, 128]
 // CHECK-NOT: stablehlo.

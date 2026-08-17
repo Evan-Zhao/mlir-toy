@@ -163,16 +163,17 @@ ForallOutputExtension cloneForallWithAppendedOutputs(RewriterBase &rewriter, scf
 
 /// Notify the rewriter listener that each cloned operation, and each nested
 /// operation at the same preorder position, replaces its original counterpart.
-void notifyClonedOpsRecursively(
-    RewriterBase &rewriter,
-    ArrayRef<std::pair<Operation *, Operation *>> clonedOps);
+void notifyClonedOpsRecursively(RewriterBase &rewriter,
+                                ArrayRef<std::pair<Operation *, Operation *>> clonedOps);
 
 enum class DefChainAction : uint8_t { Clone, Move };
 
-/// Make all `values` available at the insertion point. In `Clone` mode, later
-/// same-block definition chains are copied. In `Move` mode, cloning is followed
-/// by replacing every result of each original operation and erasing it.
-/// Replacement is deferred until every chain has been cloned successfully.
+/// Make all of `values` available at the insertion point of `rewriter`, which recursively clones or
+/// moves `values` and their defining operations as needed. Every operation-defined value that does
+/// not dominate the insertion point is copied; a non-dominating block argument causes failure.
+/// In `DefChainAction::Move` mode, cloning is followed by replacing every result of each original
+/// operation and erasing it. Replacement is deferred until every chain has been cloned
+/// successfully.
 ///
 /// Callers are responsible for establishing that cloning or moving the
 /// operations is legal and that the insertion point dominates replaced uses.
