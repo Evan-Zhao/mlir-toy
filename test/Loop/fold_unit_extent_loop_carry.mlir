@@ -94,6 +94,41 @@ module attributes {transform.with_named_sequence} {
 }
 // -----
 
+// CHECK-LABEL: func.func @fold_insert_bridge(
+// CHECK: %[[INIT:.+]] = tensor.collapse_shape %{{.*}} {{\[}}[0, 1], [2]]
+// CHECK: %[[RESULT:.+]] = scf.for %[[I:.+]] = {{.*}} iter_args(%[[SLAB:.+]] = %[[INIT]]) -> (tensor<4x8xf32>) {
+// CHECK-NOT: tensor.expand_shape
+// CHECK: %[[INSERTED:.+]] = tensor.insert_slice %{{.*}} into %[[SLAB]][%[[I]], 0] [1, 8] [1, 1] : tensor<8xf32> into tensor<4x8xf32>
+// CHECK: scf.yield %[[INSERTED]] : tensor<4x8xf32>
+// CHECK: tensor.expand_shape %[[RESULT]] {{\[}}[0, 1], [2]
+
+!any = !transform.any_op
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !any) {
+    %funcs = transform.structured.match ops{["func.func"]} in %module : (!any) -> !any
+    transform.apply_patterns to %funcs {
+      transform.apply_patterns.scf.fold_unit_extent_dims_via_reshapes
+    } : !any
+    transform.print %funcs : !any
+    transform.yield
+  }
+
+  func.func @fold_insert_bridge(%init: tensor<1x4x8xf32>, %row: tensor<8xf32>)
+      -> tensor<1x4x8xf32> {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    %result = scf.for %i = %c0 to %c4 step %c1
+        iter_args(%slab = %init) -> tensor<1x4x8xf32> {
+      %inserted = tensor.insert_slice %row into %slab[0, %i, 0] [1, 1, 8] [1, 1, 1]
+          : tensor<8xf32> into tensor<1x4x8xf32>
+      scf.yield %inserted : tensor<1x4x8xf32>
+    }
+    return %result : tensor<1x4x8xf32>
+  }
+}
+// -----
+
 // CHECK-LABEL: func.func @fold_empty_init(
 // CHECK: tensor.empty() : tensor<8xf32>
 // CHECK-NOT: tensor.collapse_shape %{{.*}} {{\[}}[0, 1, 2]] : tensor<1x1x8xf32> into tensor<8xf32>

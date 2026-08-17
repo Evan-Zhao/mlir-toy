@@ -350,6 +350,69 @@ template <typename LoopOp> struct FoldUnitExtentDimsInLoopPattern : OpRewritePat
   }
 };
 
+// Rank-reduce an insert through the reshape bridges created when a loop-carried
+// tensor loses unit dimensions:
+//
+//   %expanded = tensor.expand_shape %slab : tensor<4x8xf32> into tensor<1x4x8xf32>
+//   %inserted = tensor.insert_slice %row into %expanded[0, %i, 0] [1, 1, 8]
+//   %result = tensor.collapse_shape %inserted : tensor<1x4x8xf32> into tensor<4x8xf32>
+//
+// becomes `tensor.insert_slice %row into %slab[%i, 0] [1, 8]`.
+struct FoldCollapseOfInsertIntoExpand final : OpRewritePattern<tensor::CollapseShapeOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tensor::CollapseShapeOp collapse,
+                                PatternRewriter &rewriter) const override {
+    auto insert = collapse.getSrc().getDefiningOp<tensor::InsertSliceOp>();
+    if (!insert)
+      return failure();
+    auto expand = insert.getDest().getDefiningOp<tensor::ExpandShapeOp>();
+    if (!expand)
+      return failure();
+
+    FailureOr<FoldedTensorInfo> info = getFoldedTensorInfo(rewriter, expand.getResultType());
+    if (failed(info) || info->newType != expand.getSrcType() ||
+        info->newType != collapse.getResultType() ||
+        info->reassociation != expand.getReassociationIndices() ||
+        info->reassociation != collapse.getReassociationIndices())
+      return failure();
+
+    SmallVector<OpFoldResult> oldOffsets = insert.getMixedOffsets();
+    SmallVector<OpFoldResult> oldSizes = insert.getMixedSizes();
+    SmallVector<OpFoldResult> oldStrides = insert.getMixedStrides();
+    for (const ReassociationIndices &group : info->reassociation) {
+      int64_t selectedDim = group.back();
+      for (int64_t dim : group) {
+        if (info->oldType.getDimSize(dim) != 1) {
+          selectedDim = dim;
+          break;
+        }
+      }
+      for (int64_t dim : group) {
+        if (dim == selectedDim)
+          continue;
+        if (getConstantIntValue(oldOffsets[dim]) != 0 || getConstantIntValue(oldSizes[dim]) != 1 ||
+            getConstantIntValue(oldStrides[dim]) != 1)
+          return failure();
+      }
+    }
+
+    SmallVector<OpFoldResult> offsets = info->collapseSliceParams(oldOffsets);
+    SmallVector<OpFoldResult> sizes = info->collapseSliceParams(oldSizes);
+    SmallVector<OpFoldResult> strides = info->collapseSliceParams(oldStrides);
+    RankedTensorType expectedSourceType =
+        tensor::ExtractSliceOp::inferResultType(info->newType, sizes);
+    auto sourceType = dyn_cast<RankedTensorType>(insert.getSource().getType());
+    if (!sourceType ||
+        isRankReducedType(expectedSourceType, sourceType) != SliceVerificationResult::Success)
+      return failure();
+
+    rewriter.replaceOpWithNewOp<tensor::InsertSliceOp>(collapse, insert.getSource(),
+                                                       expand.getSrc(), offsets, sizes, strides);
+    return success();
+  }
+};
+
 struct SplitForallIntoForResult {
   struct TileSlice {
     SmallVector<OpFoldResult> offsets;
@@ -626,7 +689,8 @@ rFactorReductionUnderForall(TransformOpInterface transform, TransformRewriter &r
 
 void ScfFoldUnitExtentDimsViaReshapesPatternsOp::populatePatterns(RewritePatternSet &patterns) {
   patterns.add<FoldUnitExtentDimsInLoopPattern<scf::ForOp>,
-               FoldUnitExtentDimsInLoopPattern<scf::ForallOp>>(patterns.getContext());
+               FoldUnitExtentDimsInLoopPattern<scf::ForallOp>, FoldCollapseOfInsertIntoExpand>(
+      patterns.getContext());
   linalg::populateSwapExtractSliceWithFillPatterns(patterns);
   tensor::populateFoldTensorEmptyPatterns(patterns);
   tensor::populateReassociativeReshapeFoldingPatterns(patterns);
