@@ -190,11 +190,9 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
 // CHECK: %[[C_OFFSET:.+]] = affine.apply {{.*}}[%[[CB]]]
 // CHECK: %[[STATE_INIT:.+]] = htile.load %arg7[%[[B]], %[[C_OFFSET]], %c0]
 // CHECK-SAME: -> tensor<128x16xf32>
-// CHECK: %[[OUTPUT_SLAB:.+]] = htile.load %arg8[%[[B]], %c0, %[[C_OFFSET]]]
-// CHECK-SAME: -> tensor<2048x128xbf16>
-// CHECK: %[[SCAN:.+]]:2 = scf.for %[[T:[^ ]+]] =
-// CHECK-SAME: iter_args(%[[STATE:.+]] = %[[STATE_INIT]], %[[SLAB:.+]] = %[[OUTPUT_SLAB]])
-// CHECK-SAME: -> (tensor<128x16xf32>, tensor<2048x128xbf16>)
+// CHECK-NOT: -> tensor<2048x128xbf16>
+// CHECK: %[[SCAN:.+]] = scf.for %[[T:[^ ]+]] =
+// CHECK-SAME: iter_args(%[[STATE:.+]] = %[[STATE_INIT]]) -> (tensor<128x16xf32>)
 // CHECK: htile.load %arg1[%[[B]], %[[T]], %[[C_OFFSET]]]
 // CHECK: htile.load %arg6[%[[C_OFFSET]]]
 // CHECK: math.absf
@@ -208,10 +206,10 @@ module @jit_selective_scan attributes {mhlo.num_partitions = 1 : i32, mhlo.num_r
 // CHECK: htile.load %arg4[%[[B]], %[[T]], %c0]
 // CHECK: htile.dot %[[STATE_NEXT]], {{.*}} : tensor<128x16xf32>, tensor<16xf32> -> tensor<128xf32>
 // CHECK: htile.load %arg5[%[[C_OFFSET]]]
-// CHECK: %[[SLAB_NEXT:.+]] = tensor.insert_slice {{.*}} into %[[SLAB]][%[[T]], 0]
-// CHECK-SAME: [1, 128]
-// CHECK: scf.yield %[[STATE_NEXT]], %[[SLAB_NEXT]]
-// CHECK: htile.store %[[SCAN]]#1, %arg10[%[[B]], %c0, %[[C_OFFSET]]]
+// CHECK: %[[ROW:.+]] = arith.truncf {{.*}} : tensor<128xf32> to tensor<128xbf16>
+// CHECK: htile.store %[[ROW]], %arg9[%[[B]], %[[T]], %[[C_OFFSET]]]
+// CHECK: scf.yield %[[STATE_NEXT]] : tensor<128x16xf32>
+// CHECK-NOT: tensor.insert_slice
 // CHECK: htile.return
 // CHECK-NOT: stablehlo.
 // CHECK-NOT: linalg.

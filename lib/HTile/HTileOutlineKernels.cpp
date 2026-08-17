@@ -2,6 +2,7 @@
 
 #include "LoopTr/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -153,6 +154,167 @@ Value materializeLoadForWholeTensor(OpBuilder &builder, Location loc, RankedTens
     return htile::LoadOp::create(builder, loc, tensorType, buffer, ValueRange{});
   return ToTensorOp::create(builder, loc, tensorType, buffer,
                             /*restrict=*/true, /*writable=*/true);
+}
+
+// Adds two index offsets, folding constant-zero operands into the other side.
+Value addIndexOffsets(RewriterBase &rewriter, Location loc, Value lhs, Value rhs) {
+  std::optional<int64_t> lhsConst = getConstantIntValue(OpFoldResult(lhs));
+  std::optional<int64_t> rhsConst = getConstantIntValue(OpFoldResult(rhs));
+  if (lhsConst && *lhsConst == 0)
+    return rhs;
+  if (rhsConst && *rhsConst == 0)
+    return lhs;
+  if (lhsConst && rhsConst)
+    return arith::ConstantIndexOp::create(rewriter, loc, *lhsConst + *rhsConst);
+  return arith::AddIOp::create(rewriter, loc, lhs, rhs);
+}
+
+// Rewrites a dest-only loop-carried output slab into per-iteration stores.
+//
+// Persistent recurrences assemble their output tile row-by-row through a
+// loop-carried tensor that is only ever written, never read:
+//
+//   %slab:2 = scf.for %t = ... iter_args(..., %slab = %slabInit) {
+//     %inserted = tensor.insert_slice %row into %slab[%t, 0] [1, ...]
+//     scf.yield ..., %inserted
+//   }
+//   htile.store %slab#1, %dest[...]                  // whole-slab publication
+//
+// becomes:
+//
+//   scf.for %t = ... iter_args(...) {
+//     htile.store %row, %dest[...]                   // per-token publication
+//     scf.yield ...
+//   }
+//
+// Returns true if the store was rewritten; false leaves it untouched.
+bool demoteDestOnlyLoopCarriedSlab(RewriterBase &rewriter, htile::StoreOp store) {
+  if (store.getMask())
+    return false;
+
+  // The publication source must be an scf.for result.
+  Value storedValue = store.getValue();
+  OpResult forResult = dyn_cast<OpResult>(storedValue);
+  if (!forResult)
+    return false;
+  auto loop = dyn_cast<scf::ForOp>(forResult.getOwner());
+  if (!loop)
+    return false;
+  unsigned slot = forResult.getResultNumber();
+
+  auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+  BlockArgument iterArg = loop.getRegionIterArg(slot);
+  Value yielded = yield.getOperand(slot);
+
+  // Match the single-use dest-only chain iterArg -> insert -> yield.
+  auto insert = yielded.getDefiningOp<tensor::InsertSliceOp>();
+  if (!insert || !insert->hasOneUse() || !insert.hasUnitStride() || insert.getDest() != iterArg ||
+      !iterArg.hasOneUse())
+    return false;
+
+  auto slabType = cast<RankedTensorType>(iterArg.getType());
+  int64_t slabRank = slabType.getRank();
+  auto rowType = cast<RankedTensorType>(insert.getSource().getType());
+  int64_t rowRank = rowType.getRank();
+  if (rowRank != slabRank - 1)
+    return false;
+
+  SmallVector<OpFoldResult> insOffsets = insert.getMixedOffsets();
+  SmallVector<OpFoldResult> insSizes = insert.getMixedSizes();
+  if (insOffsets.size() != static_cast<size_t>(slabRank) ||
+      insSizes.size() != static_cast<size_t>(slabRank))
+    return false;
+
+  // The leading unit dimension selects the row for this iteration. The
+  // remaining dimensions cover the entire row.
+  Value loopIv = loop.getInductionVar();
+  if (insOffsets.front().dyn_cast<Value>() != loopIv || !isConstantIntValue(insSizes.front(), 1))
+    return false;
+  for (int64_t dim = 1; dim < slabRank; ++dim) {
+    std::optional<int64_t> constantSize = getConstantIntValue(insSizes[dim]);
+    if (!constantSize || *constantSize != rowType.getDimSize(dim - 1) ||
+        !isConstantIntValue(insOffsets[dim], 0))
+      return false;
+  }
+
+  // Derive per-token store offsets from the whole-slab store offsets and the
+  // insert's slab-relative row position. New index arithmetic is created inside
+  // the loop body, where the per-token store lives.
+  rewriter.setInsertionPoint(insert);
+  Value dest = store.getDest();
+  auto destType = cast<MemRefType>(dest.getType());
+  int64_t destRank = destType.getRank();
+  if (destRank < slabRank)
+    return false;
+  SmallVector<Value> base = llvm::to_vector(store.getOffsets());
+
+  SmallVector<Value> slabOffsets;
+  slabOffsets.reserve(static_cast<size_t>(slabRank));
+  for (OpFoldResult offset : insOffsets)
+    slabOffsets.push_back(getValueOrCreateConstantIndexOp(rewriter, insert.getLoc(), offset));
+
+  SmallVector<Value> storeOffsets;
+  storeOffsets.reserve(static_cast<size_t>(destRank));
+  for (int64_t dim = 0; dim < destRank; ++dim) {
+    if (dim < destRank - slabRank)
+      storeOffsets.push_back(base[static_cast<size_t>(dim)]);
+    else
+      storeOffsets.push_back(
+          addIndexOffsets(rewriter, insert.getLoc(), base[static_cast<size_t>(dim)],
+                          slabOffsets[static_cast<size_t>(dim - (destRank - slabRank))]));
+  }
+
+  // Create the per-token store inside the loop body.
+  htile::StoreOp::create(rewriter, insert.getLoc(), insert.getSource(), dest, storeOffsets);
+
+  // Detach and erase the yielded slab update.
+  BitVector yieldOperandsToDrop(yield->getNumOperands());
+  yieldOperandsToDrop.set(slot);
+  rewriter.modifyOpInPlace(yield, [&]() { yield->eraseOperands(yieldOperandsToDrop); });
+  rewriter.eraseOp(insert);
+
+  // Erase the whole-slab publication; the per-token store replaces it.
+  rewriter.eraseOp(store);
+
+  // Drop the slab from the loop's iter_args, init operands, and results.
+  OpOperand &initOperand = loop.getInitArgsMutable()[slot];
+  Value init = initOperand.get();
+  unsigned initOperandNumber = initOperand.getOperandNumber();
+
+  BitVector bodyArgsToDrop(loop.getBody()->getNumArguments());
+  bodyArgsToDrop.set(iterArg.getArgNumber());
+  rewriter.modifyOpInPlace(loop, [&]() { loop.getBody()->eraseArguments(bodyArgsToDrop); });
+
+  BitVector operandsToDrop(loop->getNumOperands());
+  operandsToDrop.set(initOperandNumber);
+  rewriter.modifyOpInPlace(loop, [&]() { loop->eraseOperands(operandsToDrop); });
+
+  BitVector resultsToDrop(loop.getNumResults());
+  resultsToDrop.set(slot);
+  rewriter.eraseOpResults(loop, resultsToDrop);
+
+  // Erase the now-dead slab-init read so its buffer does not become a kernel
+  // argument.
+  if (init.use_empty()) {
+    if (Operation *def = init.getDefiningOp()) {
+      if (isa<htile::LoadOp, tensor::ExtractSliceOp, tensor::EmptyOp, htile::FullOp>(def))
+        rewriter.eraseOp(def);
+    }
+  }
+
+  return true;
+}
+
+// Applies the dest-only slab demotion to every whole-slab store in the given
+// foralls. Stores are snapshotted because the rewrite replaces the anchor and
+// creates a new store inside the loop body.
+void demoteDestOnlyLoopCarriedSlabs(RewriterBase &rewriter, ArrayRef<scf::ForallOp> forallOps) {
+  for (scf::ForallOp forall : forallOps) {
+    SmallVector<htile::StoreOp> stores;
+    forall.getBody()->walk([&](htile::StoreOp store) { stores.push_back(store); });
+    for (htile::StoreOp store : stores)
+      (void)demoteDestOnlyLoopCarriedSlab(rewriter, store);
+  }
 }
 
 LogicalResult bufferizeForallResults(RewriterBase &rewriter, ArrayRef<scf::ForallOp> forallOps,
@@ -747,6 +909,10 @@ DiagnosedSilenceableFailure HTileOutlineKernelsOp::apply(TransformRewriter &rewr
   // Convert any remaining uses of forall result tensors to memref reads, such as func.func return.
   if (failed(bufferizeForallResultUses(rewriter, forallOps, bufferMap)))
     BAIL("failed to bufferize forall result uses");
+  // Demote dest-only loop-carried output slabs to per-iteration stores. This
+  // must run before rebuildForallWithoutOutputs so the dead slab-init read is
+  // erased before it can become a kernel argument.
+  demoteDestOnlyLoopCarriedSlabs(rewriter, forallOps);
   // Remove all results and shared out arguments from every forall op.
   for (auto &forall : forallOps) {
     auto newForall = rebuildForallWithoutOutputs(rewriter, forall);
