@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
+// RUN: %neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
 //
 // Transform-dialect schedule for packed variable-length attention. Document
 // offsets are loaded as scalar metadata, while masked tile accesses prevent

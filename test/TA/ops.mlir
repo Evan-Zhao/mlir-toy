@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --split-input-file --verify-diagnostics | FileCheck %s
+// RUN: %neptune-opt %s --split-input-file --verify-diagnostics | FileCheck %s
 
 // CHECK-LABEL: func.func @minimal_ta
 func.func @minimal_ta(%tensor: tensor<16xf32>) -> tensor<16xf32> {

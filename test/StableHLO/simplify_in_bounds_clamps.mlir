@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter --split-input-file | FileCheck %s
+// RUN: %neptune-opt %s --transform-interpreter --split-input-file | FileCheck %s
 
 // CHECK-LABEL: func.func @bounded
 // CHECK: scf.for %[[IV:.+]] =

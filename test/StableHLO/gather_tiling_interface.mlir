@@ -1,4 +1,4 @@
-// RUN: neptune-opt --transform-interpreter --split-input-file %s | FileCheck %s
+// RUN: %neptune-opt --transform-interpreter --split-input-file %s | FileCheck %s
 
 // Verify that stablehlo.gather can be tile-and-fused directly into a tiled
 // consumer without first lowering the gather to linalg.generic.

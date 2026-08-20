@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --canonicalize | FileCheck %s
+// RUN: %neptune-opt %s --canonicalize | FileCheck %s
 
 module {
   // CHECK-LABEL: func.func @fold_cast_of_float_constant

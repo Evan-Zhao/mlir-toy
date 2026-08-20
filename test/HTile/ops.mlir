@@ -1,4 +1,4 @@
-// RUN: neptune-opt --verify-diagnostics --split-input-file %s | FileCheck %s
+// RUN: %neptune-opt --verify-diagnostics --split-input-file %s | FileCheck %s
 
 module {
   // CHECK-LABEL: func.func @unmasked_load

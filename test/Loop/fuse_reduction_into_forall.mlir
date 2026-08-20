@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter | FileCheck %s
+// RUN: %neptune-opt %s --transform-interpreter | FileCheck %s
 
 // CHECK-COUNT-2: IR printer
 // CHECK-COUNT-2: linalg.map

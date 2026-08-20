@@ -1,4 +1,4 @@
-// RUN: neptune-opt --transform-interpreter %s 2>&1 | FileCheck %s
+// RUN: %neptune-opt --transform-interpreter %s 2>&1 | FileCheck %s
 //
 // Transform-dialect schedule for Torch-MLIR ALiBi causal attention.
 // This intentionally starts from the masked-attention schedule because ALiBi

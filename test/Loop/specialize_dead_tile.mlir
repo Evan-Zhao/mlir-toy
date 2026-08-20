@@ -1,5 +1,5 @@
-// RUN: neptune-opt %s --split-input-file --transform-interpreter | FileCheck %s
-// RUN: neptune-opt %s --split-input-file --transform-interpreter 2>&1 >/dev/null | FileCheck %s --check-prefix=DIAG
+// RUN: %neptune-opt %s --split-input-file --transform-interpreter | FileCheck %s
+// RUN: %neptune-opt %s --split-input-file --transform-interpreter 2>&1 >/dev/null | FileCheck %s --check-prefix=DIAG
 
 !any = !transform.any_op
 

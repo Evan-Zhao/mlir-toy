@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter --split-input-file --verify-diagnostics | FileCheck %s
+// RUN: %neptune-opt %s --transform-interpreter --split-input-file --verify-diagnostics | FileCheck %s
 
 // CHECK-LABEL: func.func @matmul_transb(
 // CHECK: htile.dot %arg0, %arg1, %arg2 {transpose_b}

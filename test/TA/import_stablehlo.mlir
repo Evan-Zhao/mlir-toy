@@ -1,4 +1,4 @@
-// RUN: neptune-opt --pass-pipeline='builtin.module(func.func(stablehlo-to-ta))' --mlir-print-debuginfo %s | FileCheck %s --check-prefix=LOC
+// RUN: %neptune-opt --pass-pipeline='builtin.module(func.func(stablehlo-to-ta))' --mlir-print-debuginfo %s | FileCheck %s --check-prefix=LOC
 
 // CHECK-LABEL: func.func @attention
 // CHECK-NEXT: %[[SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 1, %i1 "i1" extent 2, %i2 "i2" extent 4, %i3 "i3" extent 3, %j0 "j0" extent 3, %j1 "j1" extent 4) {

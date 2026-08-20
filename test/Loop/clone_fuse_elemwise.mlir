@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter --split-input-file 2>&1 | FileCheck %s
+// RUN: %neptune-opt %s --transform-interpreter --split-input-file 2>&1 | FileCheck %s
 
 // Minimal clone-fuse case: the forall/for loop nest produces a single tensor,
 // and one out-of-loop unary elementwise consumer is cloned and fused back into

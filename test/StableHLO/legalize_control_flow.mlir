@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter --split-input-file | FileCheck %s
+// RUN: %neptune-opt %s --transform-interpreter --split-input-file | FileCheck %s
 
 // CHECK-LABEL: func.func @fori_loop(
 // CHECK-DAG: %[[LB_I32:.+]] = tensor.extract %arg0[] : tensor<i32>

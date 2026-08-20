@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter --split-input-file | FileCheck %s
+// RUN: %neptune-opt %s --transform-interpreter --split-input-file | FileCheck %s
 
 // CHECK-LABEL: func.func @sink_left_positive_scale_after_max_reduce(
 // CHECK: %[[INPUT:.+]] = ta.at

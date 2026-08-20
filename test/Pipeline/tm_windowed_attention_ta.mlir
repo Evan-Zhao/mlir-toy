@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
+// RUN: %neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
 //
 // Transform-dialect schedule for the windowed-attention payload through HTile.
 

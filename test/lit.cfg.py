@@ -5,6 +5,7 @@ import sysconfig
 
 import lit.formats
 from lit.llvm import llvm_config
+from lit.llvm.subst import FindTool, ToolSubst
 
 config.name = "NEPTUNE_MLIR"
 config.test_format = lit.formats.ShTest(not llvm_config.use_lit_shell)
@@ -28,10 +29,10 @@ if existing_python_path:
 config.environment["PYTHONPATH"] = os.pathsep.join(python_paths)
 
 llvm_config.add_tool_substitutions(
-    ["neptune-opt", "neptune-lsp-server"],
+    [
+        ToolSubst("%neptune-opt", FindTool("neptune-opt"), unresolved="fatal"),
+        "neptune-lsp-server",
+    ],
     [config.neptune_mlir_obj_root],
 )
-llvm_config.add_tool_substitutions(
-    ["FileCheck", "not"],
-    [config.llvm_tools_dir],
-)
+llvm_config.add_tool_substitutions(["FileCheck", "not"], [config.llvm_tools_dir])

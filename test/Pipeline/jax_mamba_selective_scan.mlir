@@ -1,5 +1,5 @@
-// RUN: neptune-opt %s --canonicalize --cse | FileCheck %s --check-prefix=CLEAN
-// RUN: neptune-opt %s --canonicalize --cse --transform-interpreter --canonicalize --cse | FileCheck %s
+// RUN: %neptune-opt %s --canonicalize --cse | FileCheck %s --check-prefix=CLEAN
+// RUN: %neptune-opt %s --canonicalize --cse --transform-interpreter --canonicalize --cse | FileCheck %s
 //
 // StableHLO payload obtained by inlining the default output of:
 //

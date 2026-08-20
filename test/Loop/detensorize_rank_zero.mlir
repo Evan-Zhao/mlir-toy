@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --split-input-file --transform-interpreter | FileCheck %s
+// RUN: %neptune-opt %s --split-input-file --transform-interpreter | FileCheck %s
 
 // CHECK-LABEL: func.func @rank_zero_linalg(
 // CHECK-NOT: tensor.extract_slice

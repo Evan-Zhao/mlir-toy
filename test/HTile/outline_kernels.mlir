@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter --split-input-file --verify-diagnostics | FileCheck %s
+// RUN: %neptune-opt %s --transform-interpreter --split-input-file --verify-diagnostics | FileCheck %s
 
 !any = !transform.any_op
 

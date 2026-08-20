@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter --split-input-file 2>&1 | FileCheck %s
+// RUN: %neptune-opt %s --transform-interpreter --split-input-file 2>&1 | FileCheck %s
 
 // CHECK: IR printer
 // CHECK: ta.reduce <add> {{.*}} -> !ta.expr<f32, [b, h, i, j]>

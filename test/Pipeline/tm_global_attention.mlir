@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
+// RUN: %neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
 //
 // Transform-dialect schedule that transforms the Torch-MLIR attention payload
 // below into a FlashAttention-like fused program.

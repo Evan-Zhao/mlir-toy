@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter | FileCheck %s
+// RUN: %neptune-opt %s --transform-interpreter | FileCheck %s
 //
 // Sparse-attention schedule for the default output of:
 //

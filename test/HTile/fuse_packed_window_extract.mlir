@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter --split-input-file --verify-diagnostics | FileCheck %s
+// RUN: %neptune-opt %s --transform-interpreter --split-input-file --verify-diagnostics | FileCheck %s
 
 // CHECK-LABEL: func.func @fuse_packed_window_extract(
 // CHECK-SAME: %[[PACKED:[^,]+]]: tensor<8x3xf32>

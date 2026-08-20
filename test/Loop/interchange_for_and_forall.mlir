@@ -1,5 +1,5 @@
-// RUN: neptune-opt %s -o /dev/null
-// RUN: neptune-opt %s --split-input-file --transform-interpreter --verify-diagnostics | FileCheck %s
+// RUN: %neptune-opt %s -o /dev/null
+// RUN: %neptune-opt %s --split-input-file --transform-interpreter --verify-diagnostics | FileCheck %s
 // CHECK-LABEL: func.func @perfectly_nested(
 // CHECK-SAME: %[[INIT0:.+]]: tensor<4xf32>, %[[INIT1:.+]]: tensor<4xf32>)
 // CHECK: %[[LB:.+]] = arith.constant 0 : index

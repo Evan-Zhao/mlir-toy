@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter --split-input-file 2>&1 | FileCheck %s
+// RUN: %neptune-opt %s --transform-interpreter --split-input-file 2>&1 | FileCheck %s
 
 // CHECK-LABEL: func.func @ta_sink_left_div_through_f16_after_matmul(
 // CHECK: %[[NUM:.+]] = ta.at %{{.+}}[%i, %j]

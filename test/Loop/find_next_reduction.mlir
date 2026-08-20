@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter --split-input-file 2>&1 | FileCheck %s
+// RUN: %neptune-opt %s --transform-interpreter --split-input-file 2>&1 | FileCheck %s
 
 // @linear_chain: loop -> scale(mulf) -> sum(addf). One elemwise, one reduction.
 // Reduction result: addf with reduction iterator.

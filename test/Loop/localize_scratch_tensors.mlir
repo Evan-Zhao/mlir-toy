@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter --split-input-file | FileCheck %s
+// RUN: %neptune-opt %s --transform-interpreter --split-input-file | FileCheck %s
 
 // CHECK-LABEL: func.func @localize_inner_scratch
 // CHECK: %[[ROW_INIT:.*]] = linalg.fill

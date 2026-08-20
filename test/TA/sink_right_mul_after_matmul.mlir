@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter --split-input-file | FileCheck %s
+// RUN: %neptune-opt %s --transform-interpreter --split-input-file | FileCheck %s
 
 // CHECK-LABEL: func.func @ta_sink_right_mul_with_fp8_prewiden(
 // CHECK: %[[SCORES:.+]] = ta.at %{{.+}}[%i, %j]

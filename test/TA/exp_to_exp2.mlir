@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter --split-input-file | FileCheck %s
+// RUN: %neptune-opt %s --transform-interpreter --split-input-file | FileCheck %s
 
 // CHECK-LABEL: func.func @hoist_positive_scale_before_max_reduce(
 // CHECK: %[[X:.+]] = ta.at %{{.+}}[%i, %j]

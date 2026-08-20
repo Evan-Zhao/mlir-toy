@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
+// RUN: %neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
 //
 // Transform-dialect schedule for a causal-rect masked-attention payload. This
 // models cross-attention shape pressure: Q has a shorter sequence than K/V,

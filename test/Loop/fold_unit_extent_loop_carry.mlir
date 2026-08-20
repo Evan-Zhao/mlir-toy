@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --split-input-file --transform-interpreter 2>&1 | FileCheck %s
+// RUN: %neptune-opt %s --split-input-file --transform-interpreter 2>&1 | FileCheck %s
 
 // CHECK-LABEL: func.func @fold_for(
 // CHECK: return %{{.*}} : tensor<1x1x8xf32>

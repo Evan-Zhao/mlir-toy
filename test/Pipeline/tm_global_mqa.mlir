@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
+// RUN: %neptune-opt %s --transform-interpreter 2>&1 | FileCheck %s
 //
 // Transform-dialect schedule that transforms the Torch-MLIR MQA payload below
 // into a FlashAttention-like fused program with a `(group, unit-head)` outer loop shape.

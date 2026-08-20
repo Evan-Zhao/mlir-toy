@@ -1,4 +1,4 @@
-// RUN: neptune-opt %s --split-input-file --transform-interpreter --canonicalize 2>&1 | FileCheck %s
+// RUN: %neptune-opt %s --split-input-file --transform-interpreter --canonicalize 2>&1 | FileCheck %s
 
 // CHECK: remark: failed to fuse this consumer into the producer loop
 // CHECK: func.return
