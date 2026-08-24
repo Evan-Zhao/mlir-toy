@@ -280,6 +280,33 @@ def test_translators_support_selective_scan_math(translator, expected):
     assert " = -" in translated
 
 
+def test_triton_translates_vector_dots_as_reductions():
+    source = """
+    module {
+      htile.kernel @vector_dots() attributes {program_bounds = array<i64: 1>} {
+        %zero = arith.constant 0.0 : f32
+        %matrix_lhs = htile.full %zero : f32 -> tensor<4x8xf32>
+        %vector_rhs = htile.full %zero : f32 -> tensor<8xf32>
+        %matvec = htile.dot %matrix_lhs, %vector_rhs
+            : tensor<4x8xf32>, tensor<8xf32> -> tensor<4xf32>
+        %vector_lhs = htile.full %zero : f32 -> tensor<8xf32>
+        %matrix_rhs = htile.full %zero : f32 -> tensor<8x4xf32>
+        %acc = htile.full %zero : f32 -> tensor<4xf32>
+        %vecmat = htile.dot %vector_lhs, %matrix_rhs, %acc
+            : tensor<8xf32>, tensor<8x4xf32>, tensor<4xf32> -> tensor<4xf32>
+        htile.return
+      }
+    }
+    """
+    translated = ast.unparse(translate_triton(source))
+    assert "tl.dot(" not in translated
+    assert translated.count("tl.sum(") == 2
+    assert "[None, :]" in translated
+    assert "[:, None]" in translated
+    assert "dtype=tl.float32" in translated
+    assert ") + tile_" in translated
+
+
 def test_triton_translates_unsqueeze_and_squeeze():
     source = """
     module {

@@ -409,8 +409,8 @@ class Translator(shared.BaseTranslator):
         name = self._bind(op.results[0], "tile")
         lhs = self._expr(spec.lhs)
         rhs = self._expr(spec.rhs)
-        _, lhs_dtype = shared._tensor_shape(spec.lhs.type)
-        _, rhs_dtype = shared._tensor_shape(spec.rhs.type)
+        lhs_shape, lhs_dtype = shared._tensor_shape(spec.lhs.type)
+        rhs_shape, rhs_dtype = shared._tensor_shape(spec.rhs.type)
         lhs_is_fp8, rhs_is_fp8 = lhs_dtype == "f8", rhs_dtype == "f8"
         if lhs_is_fp8 != rhs_is_fp8:
             raise NotImplementedError(
@@ -418,11 +418,47 @@ class Translator(shared.BaseTranslator):
                 f"got {lhs_dtype} x {rhs_dtype}. Dequantize FP8 operands before htile.dot."
             )
         acc = self._expr(spec.accumulator) if spec.accumulator is not None else None
-        call = (
-            shared._tl_call("dot", lhs, rhs)
-            if acc is None
-            else shared._tl_call("dot", lhs, rhs, acc)
-        )
+
+        if len(lhs_shape) == 2 and len(rhs_shape) == 1:
+            if lhs_shape[1] != rhs_shape[0] or spec.result_shape != [lhs_shape[0]]:
+                raise ValueError(
+                    f"invalid matrix-vector htile.dot shapes: {lhs_shape} x {rhs_shape} "
+                    f"-> {spec.result_shape}"
+                )
+            expanded_rhs = shared._subscript(rhs, [shared._const(None), ast.Slice()])
+            product = ast.BinOp(left=lhs, op=ast.Mult(), right=expanded_rhs)
+            call = shared._tl_call(
+                "sum",
+                product,
+                shared._const(1),
+                keep_dims=shared._const(False),
+                dtype=shared._mlir_dtype_to_tl(spec.result_dtype),
+            )
+        elif len(lhs_shape) == 1 and len(rhs_shape) == 2:
+            if lhs_shape[0] != rhs_shape[0] or spec.result_shape != [rhs_shape[1]]:
+                raise ValueError(
+                    f"invalid vector-matrix htile.dot shapes: {lhs_shape} x {rhs_shape} "
+                    f"-> {spec.result_shape}"
+                )
+            expanded_lhs = shared._subscript(lhs, [ast.Slice(), shared._const(None)])
+            product = ast.BinOp(left=expanded_lhs, op=ast.Mult(), right=rhs)
+            call = shared._tl_call(
+                "sum",
+                product,
+                shared._const(0),
+                keep_dims=shared._const(False),
+                dtype=shared._mlir_dtype_to_tl(spec.result_dtype),
+            )
+        else:
+            call = (
+                shared._tl_call("dot", lhs, rhs)
+                if acc is None
+                else shared._tl_call("dot", lhs, rhs, acc)
+            )
+            return [shared._assign(name, call)]
+
+        if acc is not None:
+            call = ast.BinOp(left=call, op=ast.Add(), right=acc)
         return [shared._assign(name, call)]
 
     def _htile_reduce(self, op: ir.OpView) -> list[ast.stmt]:
