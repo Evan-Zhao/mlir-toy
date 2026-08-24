@@ -74,6 +74,10 @@ class Translator(shared.BaseTranslator):
             )
         ]
 
+    def _unary_op(self, op: ir.OpView, py_op: ast.unaryop) -> list[ast.stmt]:
+        name = self._bind(op.results[0], "v")
+        return [shared._assign(name, ast.UnaryOp(op=py_op, operand=self._expr(op.operands[0])))]
+
     def _ct_binop(self, op: ir.OpView, fn: str) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
         return [
@@ -96,14 +100,14 @@ class Translator(shared.BaseTranslator):
     def _arith_maximumf(self, op: ir.OpView) -> list[ast.stmt]:
         return self._ct_binop(op, "maximum")
 
-    def _math_exp2(self, op: ir.OpView) -> list[ast.stmt]:
-        return self._ct_unary(op, "exp2")
+    def _math_op(self, op: ir.OpView, function: str) -> list[ast.stmt]:
+        return self._ct_unary(op, function)
 
     def _arith_index_cast(self, op: ir.OpView) -> list[ast.stmt]:
         self._names[op.results[0]] = self._get(op.operands[0])
         return []
 
-    def _arith_cmpi(self, op: ir.OpView) -> list[ast.stmt]:
+    def _arith_cmp(self, op: ir.OpView) -> list[ast.stmt]:
         cmp_op = shared._decode_cmp_predicate(op)
         name = self._bind(op.results[0], "cmp")
         return [

@@ -78,6 +78,7 @@ def _store_subscript(value: ast.expr, indices: list[ast.expr]) -> ast.Subscript:
 
 _MLIR_DTYPE_NAMES = {
     "index": "int64",
+    "bf16": "bfloat16",
     "f8E4M3FN": "float8_e4m3fn",
     "f16": "float16",
     "f32": "float32",
@@ -263,25 +264,42 @@ def _decode_constant(op: ir.OpView) -> int | float:
 
 
 def _decode_cmp_predicate(op: ir.OpView) -> ast.cmpop:
+    op_name = _op_type_name(op)
     attr = op.attributes.get("predicate")
     if attr is None:
-        raise ValueError("arith.cmpi missing 'predicate' attribute")
-    predicate_to_op: dict[int, type[ast.cmpop]] = {
-        0: ast.Eq,
-        1: ast.NotEq,
-        2: ast.Lt,
-        3: ast.LtE,
-        4: ast.Gt,
-        5: ast.GtE,
-        6: ast.Lt,
-        7: ast.LtE,
-        8: ast.Gt,
-        9: ast.GtE,
-    }
+        raise ValueError(f"{op_name} missing 'predicate' attribute")
+
+    if op_name == "arith.cmpi":
+        predicate_to_op: dict[int, type[ast.cmpop]] = {
+            0: ast.Eq,
+            1: ast.NotEq,
+            2: ast.Lt,
+            3: ast.LtE,
+            4: ast.Gt,
+            5: ast.GtE,
+            6: ast.Lt,
+            7: ast.LtE,
+            8: ast.Gt,
+            9: ast.GtE,
+        }
+    elif op_name == "arith.cmpf":
+        # Native comparisons preserve the ordered predicates and unordered
+        # not-equal semantics needed by isnan(x) = cmpf une, x, x.
+        predicate_to_op = {
+            1: ast.Eq,  # oeq
+            2: ast.Gt,  # ogt
+            3: ast.GtE,  # oge
+            4: ast.Lt,  # olt
+            5: ast.LtE,  # ole
+            13: ast.NotEq,  # une
+        }
+    else:
+        raise NotImplementedError(f"unsupported comparison op: {op_name}")
+
     predicate = ir.IntegerAttr(attr).value
     cmp_op = predicate_to_op.get(predicate)
     if cmp_op is None:
-        raise NotImplementedError(f"unsupported arith.cmpi predicate: {predicate}")
+        raise NotImplementedError(f"unsupported {op_name} predicate: {predicate}")
     return cmp_op()
 
 
@@ -404,18 +422,27 @@ class BaseTranslator(ABC):
         "arith.subf": ast.Sub,
         "arith.divf": ast.Div,
     }
+    _UNARY_OPS: ClassVar[dict[str, type[ast.unaryop]]] = {
+        "arith.negf": ast.USub,
+    }
+    _MATH_OPS: ClassVar[dict[str, str]] = {
+        "math.absf": "abs",
+        "math.exp": "exp",
+        "math.exp2": "exp2",
+        "math.log1p": "log1p",
+    }
     _OP_METHODS: ClassVar[dict[str, str]] = {
         "arith.constant": "_arith_constant",
         "arith.maxsi": "_arith_maxsi",
         "arith.minsi": "_arith_minsi",
         "arith.maximumf": "_arith_maximumf",
         "arith.index_cast": "_arith_index_cast",
-        "arith.cmpi": "_arith_cmpi",
+        "arith.cmpi": "_arith_cmp",
+        "arith.cmpf": "_arith_cmp",
         "arith.select": "_arith_select",
         "arith.sitofp": "_arith_cast",
         "arith.extf": "_arith_cast",
         "arith.truncf": "_arith_cast",
-        "math.exp2": "_math_exp2",
         "htile.program_id": "_htile_program_id",
         "htile.load": "_htile_load",
         "htile.store": "_htile_store",
@@ -456,11 +483,11 @@ class BaseTranslator(ABC):
         return _name(self._get(value))
 
     def translate(self, module: ir.Module) -> ast.Module:
-        body = self._module_prelude()
+        kernels = []
         for op in _module_top_ops(module):
             if _op_type_name(op) == "htile.kernel":
-                body.append(self._htile_kernel(op))
-        result = ast.Module(body=body, type_ignores=[])
+                kernels.append(self._htile_kernel(op))
+        result = ast.Module(body=self._module_prelude() + kernels, type_ignores=[])
         ast.fix_missing_locations(result)
         return result
 
@@ -476,6 +503,14 @@ class BaseTranslator(ABC):
     def _binary_op(self, op: ir.OpView, py_op: ast.operator) -> list[ast.stmt]:
         """Translate an arithmetic operation represented by a Python binary operator."""
 
+    @abstractmethod
+    def _unary_op(self, op: ir.OpView, py_op: ast.unaryop) -> list[ast.stmt]:
+        """Translate an arithmetic operation represented by a Python unary operator."""
+
+    @abstractmethod
+    def _math_op(self, op: ir.OpView, function: str) -> list[ast.stmt]:
+        """Translate an elementwise math operation."""
+
     def _block_ops(self, block: ir.Block) -> list[ast.stmt]:
         statements: list[ast.stmt] = []
         for op in block.operations:
@@ -487,6 +522,12 @@ class BaseTranslator(ABC):
         binary_op = self._BINARY_OPS.get(op_name)
         if binary_op is not None:
             return self._binary_op(op, binary_op())
+        unary_op = self._UNARY_OPS.get(op_name)
+        if unary_op is not None:
+            return self._unary_op(op, unary_op())
+        math_function = self._MATH_OPS.get(op_name)
+        if math_function is not None:
+            return self._math_op(op, math_function)
         if op_name in self._IGNORED_OPS:
             return []
         method_name = self._OP_METHODS.get(op_name)

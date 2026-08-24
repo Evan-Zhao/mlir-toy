@@ -229,6 +229,57 @@ def test_tilelang_translates_varlen_primitives():
     assert "if frag_" in translated
 
 
+@pytest.mark.parametrize(
+    ("translator", "expected"),
+    [
+        (
+            translate_triton,
+            (
+                "from triton.language.extra import libdevice",
+                "tl.abs(",
+                "tl.exp(",
+                "libdevice.log1p(",
+                "tl.bfloat16",
+                " != ",
+            ),
+        ),
+        (
+            translate_cutile,
+            ("ct.abs(", "ct.exp(", "ct.log1p(", "ct.bfloat16", " != "),
+        ),
+        (
+            translate_tilelang,
+            ("T.abs(", "T.exp(", "T.log1p(", "'bfloat16'", " != "),
+        ),
+    ],
+    ids=("triton", "cutile", "tilelang"),
+)
+def test_translators_support_selective_scan_math(translator, expected):
+    source = """
+    module {
+      htile.kernel @softplus(%src: memref<8xbf16>, %dst: memref<8xbf16>)
+          attributes {program_bounds = array<i64: 1>} {
+        %c0 = arith.constant 0 : index
+        %input = htile.load %src[%c0] : memref<8xbf16> -> tensor<8xbf16>
+        %x = arith.extf %input : tensor<8xbf16> to tensor<8xf32>
+        %abs = math.absf %x : tensor<8xf32>
+        %neg = arith.negf %abs : tensor<8xf32>
+        %exp = math.exp %neg : tensor<8xf32>
+        %log = math.log1p %exp : tensor<8xf32>
+        %nan = arith.cmpf une, %x, %x : tensor<8xf32>
+        %selected = arith.select %nan, %x, %log : tensor<8xi1>, tensor<8xf32>
+        %output = arith.truncf %selected : tensor<8xf32> to tensor<8xbf16>
+        htile.store %output, %dst[%c0] : tensor<8xbf16>, memref<8xbf16>
+        htile.return
+      }
+    }
+    """
+    translated = ast.unparse(translator(source))
+    for fragment in expected:
+        assert fragment in translated
+    assert " = -" in translated
+
+
 def test_triton_translates_unsqueeze_and_squeeze():
     source = """
     module {

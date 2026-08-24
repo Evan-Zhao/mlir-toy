@@ -291,6 +291,7 @@ def _import_generated_source(source: str, module_prefix: str):
 
 def _torch_dtype(torch, dtype: str):
     mapping = {
+        "bf16": "bfloat16",
         "f8E4M3FN": "float8_e4m3fn",
         "f16": "float16",
         "f32": "float32",

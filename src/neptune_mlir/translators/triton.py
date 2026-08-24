@@ -11,16 +11,22 @@ class Translator(shared.BaseTranslator):
     def __init__(self):
         super().__init__()
         self._for_output_names: list[list[str]] = []
+        self._uses_libdevice = False
 
     def _module_prelude(self) -> list[ast.stmt]:
-        return [
+        imports: list[ast.stmt] = [
             ast.Import(names=[ast.alias(name="triton")]),
             ast.ImportFrom(
-                module="triton",
-                names=[ast.alias(name="language", asname="tl")],
-                level=0,
+                module="triton", names=[ast.alias(name="language", asname="tl")], level=0
             ),
         ]
+        if self._uses_libdevice:
+            imports.append(
+                ast.ImportFrom(
+                    module="triton.language.extra", names=[ast.alias(name="libdevice")], level=0
+                )
+            )
+        return imports
 
     def _htile_kernel(self, op: ir.OpView) -> ast.FunctionDef:
         entry = op.regions[0].blocks[0]
@@ -66,6 +72,10 @@ class Translator(shared.BaseTranslator):
         rhs = self._expr(op.operands[1])
         return [shared._assign(name, ast.BinOp(left=lhs, op=py_op, right=rhs))]
 
+    def _unary_op(self, op: ir.OpView, py_op: ast.unaryop) -> list[ast.stmt]:
+        name = self._bind(op.results[0], "v")
+        return [shared._assign(name, ast.UnaryOp(op=py_op, operand=self._expr(op.operands[0])))]
+
     def _tl_binop(self, op: ir.OpView, fn: str) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
         return [
@@ -102,14 +112,22 @@ class Translator(shared.BaseTranslator):
     def _arith_maximumf(self, op: ir.OpView) -> list[ast.stmt]:
         return self._tl_binop(op, "maximum")
 
-    def _math_exp2(self, op: ir.OpView) -> list[ast.stmt]:
-        return self._tl_unary(op, "exp2")
+    def _math_op(self, op: ir.OpView, function: str) -> list[ast.stmt]:
+        if function == "log1p":
+            self._uses_libdevice = True
+            name = self._bind(op.results[0], "v")
+            call = shared._call(
+                shared._attr(shared._name("libdevice"), "log1p"),
+                self._expr(op.operands[0]),
+            )
+            return [shared._assign(name, call)]
+        return self._tl_unary(op, function)
 
     def _arith_index_cast(self, op: ir.OpView) -> list[ast.stmt]:
         self._names[op.results[0]] = self._get(op.operands[0])
         return []
 
-    def _arith_cmpi(self, op: ir.OpView) -> list[ast.stmt]:
+    def _arith_cmp(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "cmp")
         cmp_op = shared._decode_cmp_predicate(op)
         return [
@@ -199,9 +217,9 @@ class Translator(shared.BaseTranslator):
                     base=base_ptr,
                     shape=shared._list(*[shared._const(s) for s in logical_shape]),
                     strides=shared._list(*[shared._const(s) for s in logical_strides]),
-                    offsets=shared._list(
-                        *[self._expr(i) for i in logical_offsets[: len(tile_shape)]]
-                    ),
+                    offsets=shared._list(*[
+                        self._expr(i) for i in logical_offsets[: len(tile_shape)]
+                    ]),
                     block_shape=shared._list(*[shared._const(s) for s in tile_shape]),
                     order=shared._list(*[shared._const(i) for i in block_ptr_order]),
                 ),
@@ -250,9 +268,9 @@ class Translator(shared.BaseTranslator):
                     strides=shared._list(*[shared._const(s) for s in tile_strides]),
                     offsets=shared._list(*[self._expr(i) for i in tile_indices[: len(tile_shape)]]),
                     block_shape=shared._list(*[shared._const(s) for s in tile_shape]),
-                    order=shared._list(
-                        *[shared._const(i) for i in reversed(range(len(tile_shape)))]
-                    ),
+                    order=shared._list(*[
+                        shared._const(i) for i in reversed(range(len(tile_shape)))
+                    ]),
                 ),
             )
         )

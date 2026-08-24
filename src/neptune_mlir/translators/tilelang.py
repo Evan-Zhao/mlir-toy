@@ -141,7 +141,10 @@ class Translator(shared.BaseTranslator):
             "htile.reduce": "red",
             "htile.broadcast": "bcast",
             "arith.truncf": "cast",
+            "math.absf": "abs",
+            "math.exp": "exp",
             "math.exp2": "exp",
+            "math.log1p": "log",
         }.get(op_name, "frag")
 
     # --- scalar and elementwise ops ---
@@ -177,6 +180,15 @@ class Translator(shared.BaseTranslator):
 
         return self._parallel_store(op.results[0], build)
 
+    def _unary_op(self, op: ir.OpView, py_op: ast.unaryop) -> list[ast.stmt]:
+        if not shared._is_ranked_tensor_type(op.results[0].type):
+            name = self._bind(op.results[0], "v")
+            return [shared._assign(name, ast.UnaryOp(op=py_op, operand=self._expr(op.operands[0])))]
+        return self._parallel_store(
+            op.results[0],
+            lambda indices: ast.UnaryOp(op=py_op, operand=self._value_at(op.operands[0], indices)),
+        )
+
     def _scalar_call_binop(self, op: ir.OpView, fn: str) -> list[ast.stmt]:
         name = self._bind(op.results[0], "v")
         return [
@@ -211,10 +223,13 @@ class Translator(shared.BaseTranslator):
 
         return self._parallel_store(op.results[0], build)
 
-    def _math_exp2(self, op: ir.OpView) -> list[ast.stmt]:
+    def _math_op(self, op: ir.OpView, function: str) -> list[ast.stmt]:
+        if not shared._is_ranked_tensor_type(op.results[0].type):
+            name = self._bind(op.results[0], "v")
+            return [shared._assign(name, shared._T_call(function, self._expr(op.operands[0])))]
         return self._parallel_store(
             op.results[0],
-            lambda indices: shared._T_call("exp2", self._value_at(op.operands[0], indices)),
+            lambda indices: shared._T_call(function, self._value_at(op.operands[0], indices)),
         )
 
     def _arith_index_cast(self, op: ir.OpView) -> list[ast.stmt]:
@@ -237,7 +252,7 @@ class Translator(shared.BaseTranslator):
             ),
         )
 
-    def _arith_cmpi(self, op: ir.OpView) -> list[ast.stmt]:
+    def _arith_cmp(self, op: ir.OpView) -> list[ast.stmt]:
         cmp_op = shared._decode_cmp_predicate(op)
         if not shared._is_ranked_tensor_type(op.results[0].type):
             name = self._bind(op.results[0], "cmp")
