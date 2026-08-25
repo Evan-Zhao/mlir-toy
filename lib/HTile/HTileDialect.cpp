@@ -84,8 +84,44 @@ mlir::LogicalResult GatherNdOp::verify() {
       return emitOpError() << "requires index tensor #" << index
                            << " to have integer or index element type";
     if (indexType.getShape() != resultType.getShape())
-      return emitOpError() << "requires index tensor #" << index
-                           << " shape to match result shape";
+      return emitOpError() << "requires index tensor #" << index << " shape to match result shape";
+  }
+  return mlir::success();
+}
+
+static mlir::LogicalResult
+verifyMemoryDimensions(mlir::Operation *op, mlir::ShapedType memoryType, unsigned tileRank,
+                       mlir::Type tileElementType, mlir::ValueRange offsets,
+                       std::optional<llvm::ArrayRef<int64_t>> dimensions) {
+  if (!memoryType.hasRank())
+    return op->emitOpError("requires a ranked memory-like type");
+  unsigned memoryRank = memoryType.getRank();
+  if (offsets.size() != memoryRank)
+    return op->emitOpError() << "requires one offset per memory dimension; expected " << memoryRank
+                             << " but got " << offsets.size();
+  if (memoryType.getElementType() != tileElementType)
+    return op->emitOpError("requires memory and tile element types to match");
+  if (tileRank > memoryRank)
+    return op->emitOpError() << "requires tile rank not to exceed memory rank; got " << tileRank
+                             << " and " << memoryRank;
+
+  if (!dimensions) {
+    if (tileRank != 0 && tileRank != memoryRank)
+      return op->emitOpError("requires dimensions when tile and memory ranks differ");
+    return mlir::success();
+  }
+  if (dimensions->size() != tileRank)
+    return op->emitOpError() << "requires one dimension per tile dimension; expected " << tileRank
+                             << " but got " << dimensions->size();
+
+  llvm::SmallBitVector seen(memoryRank);
+  for (int64_t dimension : *dimensions) {
+    if (dimension < 0 || dimension >= memoryRank)
+      return op->emitOpError() << "has out-of-range dimension " << dimension << " for memory rank "
+                               << memoryRank;
+    if (seen.test(dimension))
+      return op->emitOpError() << "has duplicate dimension " << dimension;
+    seen.set(dimension);
   }
   return mlir::success();
 }
@@ -95,10 +131,18 @@ mlir::LogicalResult LoadOp::verify() {
       !mlir::isa<mlir::MemRefType>(getSource().getType()))
     return emitOpError("requires source to be a memref inside an htile.kernel");
 
+  auto sourceType = mlir::dyn_cast<mlir::ShapedType>(getSource().getType());
+  if (!sourceType)
+    return emitOpError("requires a ranked tensor or memref source");
   mlir::Type resultType = getResult().getType();
   auto resultTensorType = mlir::dyn_cast<mlir::RankedTensorType>(resultType);
   if (!resultTensorType && !resultType.isIntOrIndexOrFloat())
     return emitOpError("requires result to be a scalar or ranked tensor");
+  unsigned resultRank = resultTensorType ? resultTensorType.getRank() : 0;
+  mlir::Type resultElementType = resultTensorType ? resultTensorType.getElementType() : resultType;
+  if (failed(verifyMemoryDimensions(getOperation(), sourceType, resultRank, resultElementType,
+                                    getOffsets(), getDimensions())))
+    return mlir::failure();
 
   bool hasMask = static_cast<bool>(getMask());
   bool hasOther = static_cast<bool>(getOther());
@@ -118,18 +162,22 @@ mlir::LogicalResult LoadOp::verify() {
   mlir::Type otherType = getOther().getType();
   if (mlir::isa<mlir::ShapedType>(otherType))
     return emitOpError("requires other to be a scalar");
-  mlir::Type resultElementType =
-      resultTensorType ? resultTensorType.getElementType() : resultType;
   if (otherType != resultElementType)
     return emitOpError("requires other type to match the result element type");
   return mlir::success();
 }
 
 mlir::LogicalResult StoreOp::verify() {
+  auto destType = mlir::dyn_cast<mlir::ShapedType>(getDest().getType());
+  if (!destType)
+    return emitOpError("requires a ranked tensor or memref destination");
+  auto valueType = mlir::cast<mlir::RankedTensorType>(getValue().getType());
+  if (failed(verifyMemoryDimensions(getOperation(), destType, valueType.getRank(),
+                                    valueType.getElementType(), getOffsets(), getDimensions())))
+    return mlir::failure();
   if (!getMask())
     return mlir::success();
 
-  auto valueType = mlir::cast<mlir::RankedTensorType>(getValue().getType());
   auto maskType = mlir::cast<mlir::RankedTensorType>(getMask().getType());
   if (!maskType.getElementType().isInteger(1))
     return emitOpError("requires mask to have i1 element type");
@@ -209,8 +257,8 @@ mlir::LogicalResult UnsqueezeOp::verify() {
     if (inputDim >= inputType.getRank())
       return emitOpError() << "requires input rank plus inserted dimensions to equal result rank";
     int64_t inputExtent = inputType.getDimSize(inputDim);
-    if (inputExtent != mlir::ShapedType::kDynamic &&
-        resultExtent != mlir::ShapedType::kDynamic && inputExtent != resultExtent)
+    if (inputExtent != mlir::ShapedType::kDynamic && resultExtent != mlir::ShapedType::kDynamic &&
+        inputExtent != resultExtent)
       return emitOpError() << "input dimension " << inputDim << " has extent " << inputExtent
                            << " but mapped result dimension " << resultDim << " has extent "
                            << resultExtent;
@@ -243,8 +291,8 @@ mlir::LogicalResult SqueezeOp::verify() {
     if (resultDim >= resultType.getRank())
       return emitOpError() << "requires input rank minus removed dimensions to equal result rank";
     int64_t resultExtent = resultType.getDimSize(resultDim);
-    if (inputExtent != mlir::ShapedType::kDynamic &&
-        resultExtent != mlir::ShapedType::kDynamic && inputExtent != resultExtent)
+    if (inputExtent != mlir::ShapedType::kDynamic && resultExtent != mlir::ShapedType::kDynamic &&
+        inputExtent != resultExtent)
       return emitOpError() << "input dimension " << inputDim << " has extent " << inputExtent
                            << " but mapped result dimension " << resultDim << " has extent "
                            << resultExtent;

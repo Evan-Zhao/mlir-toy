@@ -250,6 +250,11 @@ def HTile_LoadOp : Op<HTile_Dialect, "load", [AttrSizedOperandSegments]> {
     offsets. Inside an outlined `htile.kernel`, the source must be a memref.
     Tensor sources may occur transiently before kernel outlining.
 
+    `dimensions[i]` identifies the source dimension varied by result dimension
+    `i`. The attribute may be omitted for equal-rank accesses, where it defaults
+    to the identity mapping. It is required when a non-scalar result has lower
+    rank than the source.
+
     An optional `mask` and `other` pair gives the load predicated semantics.
     For every result coordinate, a true mask element loads from the source and
     a false mask element produces `other` without accessing memory. An address
@@ -262,19 +267,21 @@ def HTile_LoadOp : Op<HTile_Dialect, "load", [AttrSizedOperandSegments]> {
   }];
 
   let arguments = (ins AnyType:$source, Variadic<Index>:$offsets,
-                       Optional<AnyRankedTensor>:$mask, Optional<AnyType>:$other);
+                       Optional<AnyRankedTensor>:$mask, Optional<AnyType>:$other,
+                       OptionalAttr<DenseI64ArrayAttr>:$dimensions);
   let results = (outs AnyType:$result);
 
   let builders = [
     OpBuilder<(ins "::mlir::Type":$resultType, "::mlir::Value":$source,
                    "::mlir::ValueRange":$offsets), [{
       build($_builder, $_state, resultType, source, offsets,
-            ::mlir::Value(), ::mlir::Value());
+            ::mlir::Value(), ::mlir::Value(), ::mlir::DenseI64ArrayAttr());
     }]>
   ];
 
   let assemblyFormat = [{
     $source `[` $offsets `]`
+      (`dimensions` `=` $dimensions^)?
       (`mask` `(` $mask^ `:` type($mask) `)`
        `other` `(` $other `:` type($other) `)`)?
       attr-dict `:` type($source) `->` type($result)
@@ -380,6 +387,11 @@ def HTile_StoreOp
     makes explicit the tile write semantics that Neptune currently represents
     with TIR BufferRegion stores.
 
+    `dimensions[i]` identifies the destination dimension varied by value
+    dimension `i`. The attribute may be omitted for equal-rank accesses, where
+    it defaults to the identity mapping. It is required when the value has lower
+    rank than the destination.
+
     An optional `mask` gives the store predicated semantics. For every value
     coordinate, a true mask element stores to the destination and a false mask
     element does not access memory. An address selected by a true mask element
@@ -391,17 +403,20 @@ def HTile_StoreOp
   }];
 
   let arguments = (ins AnyRankedTensor:$value, AnyType:$dest, Variadic<Index>:$offsets,
-                       Optional<AnyRankedTensor>:$mask);
+                       Optional<AnyRankedTensor>:$mask,
+                       OptionalAttr<DenseI64ArrayAttr>:$dimensions);
 
   let builders = [
     OpBuilder<(ins "::mlir::Value":$value, "::mlir::Value":$dest,
                    "::mlir::ValueRange":$offsets), [{
-      build($_builder, $_state, value, dest, offsets, ::mlir::Value());
+      build($_builder, $_state, value, dest, offsets, ::mlir::Value(),
+            ::mlir::DenseI64ArrayAttr());
     }]>
   ];
 
   let assemblyFormat = [{
     $value `,` $dest `[` $offsets `]`
+      (`dimensions` `=` $dimensions^)?
       (`mask` `(` $mask^ `:` type($mask) `)`)?
       attr-dict `:` type($value) `,` type($dest)
   }];

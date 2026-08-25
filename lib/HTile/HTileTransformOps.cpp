@@ -1303,8 +1303,9 @@ DiagnosedSilenceableFailure HTileFusePackedWindowExtractOp::apply(TransformRewri
     SmallVector<Value> loadOffsets =
         getValueOrCreateConstantIndexOp(rewriter, loc, materialized.packedOffsets);
     Value other = tensor::ExtractOp::create(rewriter, loc, plan.call.other, ValueRange{});
-    auto load = htile::LoadOp::create(rewriter, loc, materialized.physicalTileType,
-                                      plan.call.packed, loadOffsets, materialized.mask, other);
+    auto load =
+        htile::LoadOp::create(rewriter, loc, materialized.physicalTileType, plan.call.packed,
+                              loadOffsets, materialized.mask, other, DenseI64ArrayAttr());
     Value replacement = restoreLogicalWindowTile(rewriter, loc, load, plan);
     rewriter.replaceOp(slice, replacement);
     loads.push_back(load);

@@ -168,13 +168,9 @@ class Translator(shared.BaseTranslator):
         if len(offsets) != len(mem_shape):
             raise NotImplementedError("cuTile load expects one offset per memref dimension")
 
-        batch_dims = len(mem_shape) - len(tile_shape)
-        if batch_dims < 0:
-            raise NotImplementedError("cuTile load rank mismatch")
-
-        dimension_order = spec.dimension_order
-        full_order = list(range(batch_dims)) + [batch_dims + dim for dim in dimension_order]
-        full_tile_shape = [1] * batch_dims + [tile_shape[dim] for dim in range(len(tile_shape))]
+        fixed_dims = [dim for dim in range(len(mem_shape)) if dim not in spec.dimensions]
+        full_order = fixed_dims + spec.dimensions
+        full_tile_shape = [1] * len(fixed_dims) + tile_shape
         index = self._tile_space_index(offsets, full_order, full_tile_shape)
 
         loaded = self._fresh("load")
@@ -217,9 +213,14 @@ class Translator(shared.BaseTranslator):
         if len(offsets) != len(mem_shape):
             raise NotImplementedError("cuTile store expects one offset per memref dimension")
 
-        batch_dims = len(mem_shape) - len(tile_shape)
+        expected_dimensions = list(range(len(mem_shape) - len(tile_shape), len(mem_shape)))
+        if spec.dimensions != expected_dimensions:
+            raise NotImplementedError(
+                f"cuTile store does not support dimensions {spec.dimensions}; "
+                f"expected {expected_dimensions}"
+            )
         full_order = list(range(len(mem_shape)))
-        full_tile_shape = [1] * batch_dims + tile_shape
+        full_tile_shape = [1] * (len(mem_shape) - len(tile_shape)) + tile_shape
         index = self._tile_space_index(offsets, full_order, full_tile_shape)
         tile = _ct_call(
             "reshape",
@@ -242,7 +243,7 @@ class Translator(shared.BaseTranslator):
         if spec.mask is None:
             raise ValueError("masked memref call requires a mask")
         linear_offsets = self._linear_memref_offsets(
-            spec.offsets, spec.memref_shape, spec.tile_shape, spec.dimension_order
+            spec.offsets, spec.memref_shape, spec.tile_shape, spec.dimensions
         )
         raw = self._fresh("raw")
         raw_assignment = shared._assign(
@@ -262,7 +263,7 @@ class Translator(shared.BaseTranslator):
         offsets: list[ir.Value],
         mem_shape: list[int],
         tile_shape: list[int],
-        dimension_order: list[int],
+        dimensions: list[int],
     ) -> ast.expr:
         if len(offsets) != len(mem_shape):
             raise NotImplementedError(
@@ -281,7 +282,6 @@ class Translator(shared.BaseTranslator):
             )
             linear_offset = ast.BinOp(left=linear_offset, op=ast.Add(), right=contribution)
 
-        first_tile_mem_dim = len(mem_shape) - len(tile_shape)
         has_tile_axis = False
         for logical_dim, extent in enumerate(tile_shape):
             if extent == 1:
@@ -294,7 +294,7 @@ class Translator(shared.BaseTranslator):
                 _ct_call("arange", shared._const(extent), dtype=_ct("int64")),
                 shared._tuple(*[shared._const(size) for size in axis_shape]),
             )
-            mem_dim = first_tile_mem_dim + dimension_order[logical_dim]
+            mem_dim = dimensions[logical_dim]
             contribution = ast.BinOp(
                 left=axis_offsets, op=ast.Mult(), right=shared._const(strides[mem_dim])
             )

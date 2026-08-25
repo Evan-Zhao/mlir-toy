@@ -15,7 +15,7 @@ module {
     %lhs = htile.load %lhs_mem[%c0, %c0]
         : memref<4x8xf16> -> tensor<4x8xf16, #shared>
 
-    // CHECK-DAG: %[[RHS:.+]] = htile.load %arg1[%{{.*}}, %{{.*}}] {dimension_order = array<i64: 1, 0>} : memref<2x8xf16> -> tensor<8x2xf16, #htile.encoding<placement = shared>>
+    // CHECK-DAG: %[[RHS:.+]] = htile.load %arg1[%{{.*}}, %{{.*}}] dimensions = [1, 0] : memref<2x8xf16> -> tensor<8x2xf16, #htile.encoding<placement = shared>>
     %rhs = htile.load %rhs_mem[%c0, %c0]
         : memref<2x8xf16> -> tensor<2x8xf16, #shared>
 

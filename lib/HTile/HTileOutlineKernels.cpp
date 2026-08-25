@@ -88,13 +88,27 @@ struct TensorToBufferMap {
   DenseMap<Value, Value> tensorToMemref;
 };
 
+DenseI64ArrayAttr dimensionsFromDroppedDims(OpBuilder &builder, int64_t memoryRank,
+                                            const llvm::SmallBitVector &droppedDims) {
+  SmallVector<int64_t> dimensions;
+  dimensions.reserve(memoryRank - droppedDims.count());
+  for (int64_t dim = 0; dim < memoryRank; ++dim)
+    if (!droppedDims.test(dim))
+      dimensions.push_back(dim);
+  return builder.getDenseI64ArrayAttr(dimensions);
+}
+
 LogicalResult materializeStoreForInsertSlice(RewriterBase &rewriter,
                                              tensor::ParallelInsertSliceOp insert, Value buffer) {
   if (!insert.hasUnitStride())
     return insert.emitError() << "unsupported non-unit tensor.parallel_insert_slice stride";
   SmallVector<Value> offsets =
       getValueOrCreateConstantIndexOp(rewriter, insert.getLoc(), insert.getMixedOffsets());
-  htile::StoreOp::create(rewriter, insert.getLoc(), insert.getSource(), buffer, offsets);
+  auto store =
+      htile::StoreOp::create(rewriter, insert.getLoc(), insert.getSource(), buffer, offsets);
+  if (insert.getSourceType().getRank() != insert.getDestType().getRank())
+    store.setDimensionsAttr(dimensionsFromDroppedDims(rewriter, insert.getDestType().getRank(),
+                                                      insert.getDroppedDims()));
   return success();
 }
 
@@ -108,7 +122,7 @@ LogicalResult materializeStoreForInsertSlice(RewriterBase &rewriter,
   SmallVector<Value> offsets =
       getValueOrCreateConstantIndexOp(rewriter, insert.getLoc(), insert.getMixedOffsets());
   htile::StoreOp::create(rewriter, insert.getLoc(), insert.getSource(), buffer, offsets,
-                         insert.getMask());
+                         insert.getMask(), DenseI64ArrayAttr());
   return success();
 }
 
@@ -129,6 +143,9 @@ FailureOr<Value> materializeLoadForExtractSlice(OpBuilder &builder, tensor::Extr
         getValueOrCreateConstantIndexOp(builder, extract.getLoc(), extract.getMixedOffsets());
     auto loadOp =
         htile::LoadOp::create(builder, extract.getLoc(), extract.getResultType(), buffer, offsets);
+    if (extract.getSourceType().getRank() != extract.getResultType().getRank())
+      loadOp.setDimensionsAttr(dimensionsFromDroppedDims(builder, extract.getSourceType().getRank(),
+                                                         extract.getDroppedDims()));
     return loadOp.getResult();
   } else {
     auto sourceMemrefType = cast<MemRefType>(buffer.getType());
@@ -265,7 +282,12 @@ bool demoteDestOnlyLoopCarriedSlab(RewriterBase &rewriter, htile::StoreOp store)
   }
 
   // Create the per-token store inside the loop body.
-  htile::StoreOp::create(rewriter, insert.getLoc(), insert.getSource(), dest, storeOffsets);
+  auto tokenStore =
+      htile::StoreOp::create(rewriter, insert.getLoc(), insert.getSource(), dest, storeOffsets);
+  SmallVector<int64_t> tokenDimensions;
+  for (int64_t dim = destRank - rowRank; dim < destRank; ++dim)
+    tokenDimensions.push_back(dim);
+  tokenStore.setDimensionsAttr(rewriter.getDenseI64ArrayAttr(tokenDimensions));
 
   // Detach and erase the yielded slab update.
   BitVector yieldOperandsToDrop(yield->getNumOperands());

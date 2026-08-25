@@ -16,7 +16,7 @@ namespace htile {
 
 namespace {
 
-constexpr StringLiteral kDimensionOrderAttrName = "dimension_order";
+constexpr StringLiteral kDimensionsAttrName = "dimensions";
 
 RankedTensorType permuteTensorType(RankedTensorType type, ArrayRef<int64_t> permutation) {
   SmallVector<int64_t> shape;
@@ -26,14 +26,15 @@ RankedTensorType permuteTensorType(RankedTensorType type, ArrayRef<int64_t> perm
   return RankedTensorType::get(shape, type.getElementType(), type.getEncoding());
 }
 
-DenseI64ArrayAttr composeDimensionOrder(OpBuilder &builder, LoadOp load,
-                                        ArrayRef<int64_t> permutation) {
+DenseI64ArrayAttr composeDimensions(OpBuilder &builder, LoadOp load,
+                                    ArrayRef<int64_t> permutation) {
   SmallVector<int64_t> existing;
-  if (auto attr = load->getAttrOfType<DenseI64ArrayAttr>(kDimensionOrderAttrName))
-    existing.append(attr.asArrayRef().begin(), attr.asArrayRef().end());
+  if (std::optional<ArrayRef<int64_t>> dimensions = load.getDimensions())
+    llvm::append_range(existing, *dimensions);
   else
-    for (int64_t i = 0, e = permutation.size(); i < e; ++i)
-      existing.push_back(i);
+    for (int64_t dim = 0, e = cast<ShapedType>(load.getSource().getType()).getRank(); dim < e;
+         ++dim)
+      existing.push_back(dim);
 
   SmallVector<int64_t> composed;
   composed.reserve(permutation.size());
@@ -112,7 +113,7 @@ struct DotTransposeToLoadOrderPass
     auto fusedLoad = LoadOp::create(builder, permute.getLoc(), permute.getResult().getType(),
                                     load.getSource(), load.getOffsets());
     fusedLoad->setAttrs(load->getAttrDictionary());
-    fusedLoad->setAttr(kDimensionOrderAttrName, composeDimensionOrder(builder, load, permutation));
+    fusedLoad->setAttr(kDimensionsAttrName, composeDimensions(builder, load, permutation));
 
     permute.getResult().replaceAllUsesWith(fusedLoad.getResult());
     permute.erase();

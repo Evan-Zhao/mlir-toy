@@ -7,7 +7,7 @@ def DotTransposeToLoadOrderPass : Pass<"htile-dot-transpose-to-load-order", ""> 
   let summary = "Fission htile.dot transposes and fold load-fed permutes";
   let description = [{
     Fission htile.dot transpose attributes into htile.permute operations and
-    fold load-fed permutes into htile.load dimension_order attributes.
+    fold load-fed permutes into htile.load dimensions attributes.
   }];
   let dependentDialects = ["htile::HTileDialect"];
 }

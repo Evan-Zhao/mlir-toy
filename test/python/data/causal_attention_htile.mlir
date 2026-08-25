@@ -29,8 +29,8 @@ module {
     %8 = arith.minsi %7, %c16 : index
     %9:3 = scf.for %arg4 = %c0 to %8 step %c1 iter_args(%arg5 = %3, %arg6 = %4, %arg7 = %5) -> (tensor<128xf32>, tensor<128xf32>, tensor<128x64xf32>){
       %17 = arith.muli %arg4, %c64 overflow<nsw> : index
-      %18 = htile.load %arg0[%c0, %0, %2, %c0] : memref<1x4x1024x64xf16> -> tensor<128x64xf16>
-      %19 = htile.load %arg1[%c0, %0, %17, %c0] {dimension_order = array<i64: 1, 0>} : memref<1x4x1024x64xf16> -> tensor<64x64xf16>
+      %18 = htile.load %arg0[%c0, %0, %2, %c0] dimensions = [2, 3] : memref<1x4x1024x64xf16> -> tensor<128x64xf16>
+      %19 = htile.load %arg1[%c0, %0, %17, %c0] dimensions = [3, 2] : memref<1x4x1024x64xf16> -> tensor<64x64xf16>
       %20 = htile.dot %18, %19, %5 : tensor<128x64xf16>, tensor<64x64xf16>, tensor<128x64xf32> -> tensor<128x64xf32>
       %21 = htile.full %cst : f32 -> tensor<128x64xf32>
       %22 = arith.mulf %20, %21 : tensor<128x64xf32>
@@ -50,7 +50,7 @@ module {
       %36 = arith.subf %34, %35 : tensor<128x64xf32>
       %37 = math.exp2 %36 : tensor<128x64xf32>
       %38 = arith.mulf %arg7, %37 : tensor<128x64xf32>
-      %39 = htile.load %arg2[%c0, %0, %17, %c0] : memref<1x4x1024x64xf16> -> tensor<64x64xf16>
+      %39 = htile.load %arg2[%c0, %0, %17, %c0] dimensions = [2, 3] : memref<1x4x1024x64xf16> -> tensor<64x64xf16>
       %40 = htile.dot %33, %39, %38 : tensor<128x64xf16>, tensor<64x64xf16>, tensor<128x64xf32> -> tensor<128x64xf32>
       scf.yield %24, %32, %40 : tensor<128xf32>, tensor<128xf32>, tensor<128x64xf32>
     }
@@ -59,8 +59,8 @@ module {
     %12 = arith.minsi %11, %c16 : index
     %13:3 = scf.for %arg4 = %8 to %12 step %c1 iter_args(%arg5 = %9#0, %arg6 = %9#1, %arg7 = %9#2) -> (tensor<128xf32>, tensor<128xf32>, tensor<128x64xf32>) {
       %17 = arith.muli %arg4, %c64 overflow<nsw> : index
-      %18 = htile.load %arg0[%c0, %0, %2, %c0] : memref<1x4x1024x64xf16> -> tensor<128x64xf16>
-      %19 = htile.load %arg1[%c0, %0, %17, %c0] {dimension_order = array<i64: 1, 0>} : memref<1x4x1024x64xf16> -> tensor<64x64xf16>
+      %18 = htile.load %arg0[%c0, %0, %2, %c0] dimensions = [2, 3] : memref<1x4x1024x64xf16> -> tensor<128x64xf16>
+      %19 = htile.load %arg1[%c0, %0, %17, %c0] dimensions = [3, 2] : memref<1x4x1024x64xf16> -> tensor<64x64xf16>
       %20 = htile.dot %18, %19, %5 : tensor<128x64xf16>, tensor<64x64xf16>, tensor<128x64xf32> -> tensor<128x64xf32>
       %21 = htile.full %cst : f32 -> tensor<128x64xf32>
       %22 = arith.mulf %20, %21 : tensor<128x64xf32>
@@ -97,14 +97,14 @@ module {
       %53 = arith.subf %51, %52 : tensor<128x64xf32>
       %54 = math.exp2 %53 : tensor<128x64xf32>
       %55 = arith.mulf %arg7, %54 : tensor<128x64xf32>
-      %56 = htile.load %arg2[%c0, %0, %17, %c0] : memref<1x4x1024x64xf16> -> tensor<64x64xf16>
+      %56 = htile.load %arg2[%c0, %0, %17, %c0] dimensions = [2, 3] : memref<1x4x1024x64xf16> -> tensor<64x64xf16>
       %57 = htile.dot %50, %56, %55 : tensor<128x64xf16>, tensor<64x64xf16>, tensor<128x64xf32> -> tensor<128x64xf32>
       scf.yield %41, %49, %57 : tensor<128xf32>, tensor<128xf32>, tensor<128x64xf32>
     }
     %14 = htile.broadcast %13#1 dimensions = [1] : tensor<128xf32> -> tensor<128x64xf32>
     %15 = arith.divf %13#2, %14 : tensor<128x64xf32>
     %16 = arith.truncf %15 : tensor<128x64xf32> to tensor<128x64xf16>
-    htile.store %16, %arg3[%c0, %0, %2, %c0] : tensor<128x64xf16>, memref<1x4x1024x64xf16>
+    htile.store %16, %arg3[%c0, %0, %2, %c0] dimensions = [2, 3] : tensor<128x64xf16>, memref<1x4x1024x64xf16>
     htile.return
   }
 }

@@ -113,8 +113,10 @@ class Translator(shared.BaseTranslator):
                 if op_name == "htile.load" and not shape:
                     continue
                 if op_name == "htile.load":
-                    dimension_order = shared._dimension_order(op, len(shape))
-                    shape = [shape[dim] for dim in dimension_order]
+                    mem_shape, _ = shared._memref_shape(op.operands[0].type)
+                    dimensions = shared._dimensions(op, len(mem_shape), len(shape))
+                    physical_order = sorted(range(len(dimensions)), key=dimensions.__getitem__)
+                    shape = [shape[dim] for dim in physical_order]
                 name = self._bind(result, self._result_hint(op_name))
                 alloc_fn = (
                     "alloc_shared"
@@ -371,11 +373,16 @@ class Translator(shared.BaseTranslator):
             name = self._bind(op.results[0], "scalar")
             return [shared._assign(name, self._mem_element(spec.memref, spec.offsets))]
 
-        dimension_order = spec.dimension_order
+        expected_dimensions = list(range(len(spec.memref_shape) - len(shape), len(spec.memref_shape)))
+        if sorted(spec.dimensions) != expected_dimensions:
+            raise NotImplementedError(
+                f"TileLang load does not support dimensions {spec.dimensions}; "
+                f"expected a permutation of {expected_dimensions}"
+            )
         if spec.mask is not None:
             if spec.other is None:
                 raise ValueError("masked htile.load requires an other value")
-            self._require_identity_masked_layout(dimension_order)
+            self._require_identity_dimensions(spec.dimensions, expected_dimensions)
 
             def build(indices: list[ast.expr]) -> ast.expr:
                 source = self._mem_tile_element(spec.memref, spec.offsets, shape, indices)
@@ -388,11 +395,12 @@ class Translator(shared.BaseTranslator):
 
             return self._parallel_store(op.results[0], build)
 
-        physical_shape = [shape[dim] for dim in dimension_order]
-        if dimension_order != list(range(len(shape))):
-            if dimension_order != [1, 0]:
+        physical_order = sorted(range(len(spec.dimensions)), key=spec.dimensions.__getitem__)
+        physical_shape = [shape[dim] for dim in physical_order]
+        if physical_order != list(range(len(shape))):
+            if physical_order != [1, 0]:
                 raise NotImplementedError(
-                    f"unsupported TileLang load dimension_order: {dimension_order}"
+                    f"unsupported TileLang load dimensions: {spec.dimensions}"
                 )
             self._transposed_tiles.add(op.results[0])
         src = self._mem_region(spec.memref, spec.offsets, op.results[0], tile_shape=physical_shape)
@@ -400,8 +408,11 @@ class Translator(shared.BaseTranslator):
 
     def _htile_store(self, op: ir.OpView) -> list[ast.stmt]:
         spec = shared._decode_store(op)
+        expected_dimensions = list(
+            range(len(spec.memref_shape) - len(spec.tile_shape), len(spec.memref_shape))
+        )
+        self._require_identity_dimensions(spec.dimensions, expected_dimensions)
         if spec.mask is not None:
-            self._require_identity_masked_layout(spec.dimension_order)
 
             def build(indices: list[ast.expr]) -> list[ast.stmt]:
                 destination = self._mem_tile_element(
@@ -629,10 +640,13 @@ class Translator(shared.BaseTranslator):
             return shared._store_subscript(self._expr(memref), indices)
         return shared._subscript(self._expr(memref), indices)
 
-    def _require_identity_masked_layout(self, dimension_order: list[int]) -> None:
-        if dimension_order != list(range(len(dimension_order))):
+    def _require_identity_dimensions(
+        self, dimensions: list[int], expected: list[int]
+    ) -> None:
+        if dimensions != expected:
             raise NotImplementedError(
-                "masked TileLang memory access does not yet support dimension_order"
+                f"TileLang memory access does not support dimensions {dimensions}; "
+                f"expected {expected}"
             )
 
     def _mem_region(

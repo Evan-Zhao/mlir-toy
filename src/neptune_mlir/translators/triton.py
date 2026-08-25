@@ -178,7 +178,7 @@ class Translator(shared.BaseTranslator):
             if spec.other is None:
                 raise ValueError("masked htile.load requires an other value")
             stmts, ptr = self._tensor_memref_ptr(
-                spec.memref, indices, mem_shape, tile_shape, spec.dimension_order
+                spec.memref, indices, mem_shape, tile_shape, spec.dimensions
             )
             tile = self._bind(op.results[0], "tile")
             stmts.append(
@@ -198,14 +198,9 @@ class Translator(shared.BaseTranslator):
             stmts.append(shared._assign(tile, shared._tl_call("load", ptr)))
             return stmts
 
-        stmts, base_ptr, tile_indices, tile_strides = self._fold_batch_dims(
-            op.operands[0], indices, mem_shape, tile_shape
+        stmts, base_ptr, logical_shape, logical_offsets, logical_strides = self._split_memref_dims(
+            op.operands[0], indices, mem_shape, spec.dimensions
         )
-        dimension_order = spec.dimension_order
-        mem_tile_shape = mem_shape[-len(tile_shape) :]
-        logical_shape = [mem_tile_shape[i] for i in dimension_order]
-        logical_strides = [tile_strides[i] for i in dimension_order]
-        logical_offsets = [tile_indices[i] for i in dimension_order]
         block_ptr_order = sorted(range(len(logical_strides)), key=logical_strides.__getitem__)
 
         bp = self._fresh("bp")
@@ -217,9 +212,7 @@ class Translator(shared.BaseTranslator):
                     base=base_ptr,
                     shape=shared._list(*[shared._const(s) for s in logical_shape]),
                     strides=shared._list(*[shared._const(s) for s in logical_strides]),
-                    offsets=shared._list(*[
-                        self._expr(i) for i in logical_offsets[: len(tile_shape)]
-                    ]),
+                    offsets=shared._list(*[self._expr(i) for i in logical_offsets]),
                     block_shape=shared._list(*[shared._const(s) for s in tile_shape]),
                     order=shared._list(*[shared._const(i) for i in block_ptr_order]),
                 ),
@@ -238,7 +231,7 @@ class Translator(shared.BaseTranslator):
 
         if spec.mask is not None:
             stmts, ptr = self._tensor_memref_ptr(
-                spec.memref, indices, mem_shape, tile_shape, spec.dimension_order
+                spec.memref, indices, mem_shape, tile_shape, spec.dimensions
             )
             stmts.append(
                 ast.Expr(
@@ -254,9 +247,10 @@ class Translator(shared.BaseTranslator):
             stmts.append(ast.Expr(value=shared._tl_call("store", ptr, self._expr(tile_val))))
             return stmts
 
-        stmts, base_ptr, tile_indices, tile_strides = self._fold_batch_dims(
-            spec.memref, indices, mem_shape, tile_shape
+        stmts, base_ptr, logical_shape, logical_offsets, logical_strides = self._split_memref_dims(
+            spec.memref, indices, mem_shape, spec.dimensions
         )
+        block_ptr_order = sorted(range(len(logical_strides)), key=logical_strides.__getitem__)
         bp = self._fresh("bp")
         stmts.append(
             shared._assign(
@@ -264,13 +258,11 @@ class Translator(shared.BaseTranslator):
                 shared._call(
                     shared._tl("make_block_ptr"),
                     base=base_ptr,
-                    shape=shared._list(*[shared._const(s) for s in mem_shape[-2:]]),
-                    strides=shared._list(*[shared._const(s) for s in tile_strides]),
-                    offsets=shared._list(*[self._expr(i) for i in tile_indices[: len(tile_shape)]]),
+                    shape=shared._list(*[shared._const(s) for s in logical_shape]),
+                    strides=shared._list(*[shared._const(s) for s in logical_strides]),
+                    offsets=shared._list(*[self._expr(i) for i in logical_offsets]),
                     block_shape=shared._list(*[shared._const(s) for s in tile_shape]),
-                    order=shared._list(*[
-                        shared._const(i) for i in reversed(range(len(tile_shape)))
-                    ]),
+                    order=shared._list(*[shared._const(i) for i in block_ptr_order]),
                 ),
             )
         )
@@ -285,7 +277,7 @@ class Translator(shared.BaseTranslator):
         indices: list[ir.Value],
         mem_shape: list[int],
         tile_shape: list[int],
-        dimension_order: list[int],
+        dimensions: list[int],
     ) -> tuple[list[ast.stmt], ast.expr]:
         if len(indices) != len(mem_shape):
             raise NotImplementedError(
@@ -302,7 +294,6 @@ class Translator(shared.BaseTranslator):
             term = ast.BinOp(left=self._expr(index), op=ast.Mult(), right=shared._const(stride))
             linear_offset = ast.BinOp(left=linear_offset, op=ast.Add(), right=term)
 
-        first_tile_mem_dim = len(mem_shape) - len(tile_shape)
         for logical_dim, extent in enumerate(tile_shape):
             if extent == 1:
                 continue
@@ -318,7 +309,7 @@ class Translator(shared.BaseTranslator):
                 slice=index_expr,
                 ctx=ast.Load(),
             )
-            mem_dim = first_tile_mem_dim + dimension_order[logical_dim]
+            mem_dim = dimensions[logical_dim]
             contribution = ast.BinOp(
                 left=axis_offsets, op=ast.Mult(), right=shared._const(strides[mem_dim])
             )
@@ -351,33 +342,35 @@ class Translator(shared.BaseTranslator):
         )
         return [stmt], shared._name(ptr)
 
-    def _fold_batch_dims(
+    def _split_memref_dims(
         self,
         memref_val: ir.Value,
         indices: list[ir.Value],
         mem_shape: list[int],
-        tile_shape: list[int],
-    ):
-        """Fold batch dimensions into a pointer offset.
-
-        Returns (stmts, base_ptr_expr, tile_indices, tile_strides).
-        """
+        dimensions: list[int],
+    ) -> tuple[list[ast.stmt], ast.expr, list[int], list[ir.Value], list[int]]:
+        strides = shared._row_major_strides(mem_shape)
+        selected = set(dimensions)
+        fixed_dims = [dim for dim in range(len(mem_shape)) if dim not in selected]
         stmts: list[ast.stmt] = []
         base_ptr = self._expr(memref_val)
-        if len(mem_shape) > 2 and len(indices) >= len(mem_shape):
-            strides = shared._row_major_strides(mem_shape)
-            batch_dims = len(mem_shape) - 2
+        if fixed_dims:
             offset: ast.expr = shared._const(0)
-            for i in range(batch_dims):
+            for dim in fixed_dims:
                 term = ast.BinOp(
-                    left=self._expr(indices[i]), op=ast.Mult(), right=shared._const(strides[i])
+                    left=self._expr(indices[dim]), op=ast.Mult(), right=shared._const(strides[dim])
                 )
                 offset = ast.BinOp(left=offset, op=ast.Add(), right=term)
             ptr = self._fresh("ptr")
             stmts.append(shared._assign(ptr, ast.BinOp(left=base_ptr, op=ast.Add(), right=offset)))
             base_ptr = shared._name(ptr)
-            return stmts, base_ptr, indices[batch_dims:], strides[batch_dims:]
-        return stmts, base_ptr, indices, [1] * len(tile_shape)
+        return (
+            stmts,
+            base_ptr,
+            [mem_shape[dim] for dim in dimensions],
+            [indices[dim] for dim in dimensions],
+            [strides[dim] for dim in dimensions],
+        )
 
     def _htile_full(self, op: ir.OpView) -> list[ast.stmt]:
         shape, dtype = shared._tensor_shape(op.results[0].type)

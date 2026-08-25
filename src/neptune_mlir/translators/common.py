@@ -171,14 +171,28 @@ def _parse_dense_i64_array(attr) -> list[int]:
     return list(ir.DenseI64ArrayAttr(attr))
 
 
-def _dimension_order(op: ir.OpView, rank: int) -> list[int]:
-    attr = op.attributes.get("dimension_order")
+def _dimensions(op: ir.OpView, memory_rank: int, tile_rank: int) -> list[int]:
+    attr = op.attributes.get("dimensions")
     if attr is None:
-        return list(range(rank))
-    order = _parse_dense_i64_array(attr)
-    if len(order) != rank:
-        raise NotImplementedError(f"dimension_order rank mismatch: got {order}, rank {rank}")
-    return order
+        if tile_rank == 0:
+            return []
+        if memory_rank != tile_rank:
+            raise ValueError(
+                f"{_op_type_name(op)} requires dimensions when tile rank {tile_rank} "
+                f"differs from memory rank {memory_rank}"
+            )
+        return list(range(tile_rank))
+
+    dimensions = _parse_dense_i64_array(attr)
+    if len(dimensions) != tile_rank:
+        raise ValueError(
+            f"dimensions rank mismatch: got {dimensions}, tile rank {tile_rank}"
+        )
+    if len(set(dimensions)) != len(dimensions) or any(
+        dimension < 0 or dimension >= memory_rank for dimension in dimensions
+    ):
+        raise ValueError(f"invalid dimensions {dimensions} for memory rank {memory_rank}")
+    return dimensions
 
 
 def _dot_transpose_attrs(op: ir.OpView) -> list[str]:
@@ -231,7 +245,7 @@ class LoadSpec:
     other: ir.Value | None
     memref_shape: list[int]
     tile_shape: list[int]
-    dimension_order: list[int]
+    dimensions: list[int]
 
 
 @dataclass(frozen=True)
@@ -242,7 +256,7 @@ class StoreSpec:
     mask: ir.Value | None
     memref_shape: list[int]
     tile_shape: list[int]
-    dimension_order: list[int]
+    dimensions: list[int]
 
 
 @dataclass(frozen=True)
@@ -366,7 +380,7 @@ def _decode_load(op: ir.OpView) -> LoadSpec:
         other=other,
         memref_shape=memref_shape,
         tile_shape=tile_shape,
-        dimension_order=_dimension_order(op, len(tile_shape)),
+        dimensions=_dimensions(op, len(memref_shape), len(tile_shape)),
     )
 
 
@@ -389,7 +403,7 @@ def _decode_store(op: ir.OpView) -> StoreSpec:
         mask=mask,
         memref_shape=memref_shape,
         tile_shape=tile_shape,
-        dimension_order=_dimension_order(op, len(tile_shape)),
+        dimensions=_dimensions(op, len(memref_shape), len(tile_shape)),
     )
 
 

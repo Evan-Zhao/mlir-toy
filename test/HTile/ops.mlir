@@ -38,6 +38,62 @@ module {
 // -----
 
 module {
+  // CHECK-LABEL: htile.kernel @rank_reduced_memory
+  htile.kernel @rank_reduced_memory(
+      %source : memref<8x2048x1536xf32>, %dest : memref<8x2048x1536xf32>) {
+    %c0 = arith.constant 0 : index
+    // CHECK: htile.load %{{.*}}[%{{.*}}, %{{.*}}, %{{.*}}] dimensions = [2]
+    %row = htile.load %source[%c0, %c0, %c0] dimensions = [2]
+        : memref<8x2048x1536xf32> -> tensor<128xf32>
+    // CHECK: htile.store %{{.*}}, %{{.*}}[%{{.*}}, %{{.*}}, %{{.*}}] dimensions = [2]
+    htile.store %row, %dest[%c0, %c0, %c0] dimensions = [2]
+        : tensor<128xf32>, memref<8x2048x1536xf32>
+    htile.return
+  }
+}
+
+// -----
+
+module {
+  // CHECK-LABEL: htile.kernel @non_trailing_dimension
+  htile.kernel @non_trailing_dimension(%source : memref<8x2048x1536xf32>) {
+    %c0 = arith.constant 0 : index
+    // CHECK: htile.load %{{.*}}[%{{.*}}, %{{.*}}, %{{.*}}] dimensions = [1]
+    %time = htile.load %source[%c0, %c0, %c0] dimensions = [1]
+        : memref<8x2048x1536xf32> -> tensor<128xf32>
+    htile.return
+  }
+}
+
+// -----
+
+module {
+  htile.kernel @missing_load_dimensions(%source : memref<8x2048x1536xf32>) {
+    %c0 = arith.constant 0 : index
+    // expected-error@+1 {{requires dimensions when tile and memory ranks differ}}
+    %row = htile.load %source[%c0, %c0, %c0]
+        : memref<8x2048x1536xf32> -> tensor<128xf32>
+    htile.return
+  }
+}
+
+// -----
+
+module {
+  htile.kernel @missing_store_dimensions(%dest : memref<8x2048x1536xf32>) {
+    %c0 = arith.constant 0 : index
+    %zero = arith.constant 0.0 : f32
+    %row = htile.full %zero : f32 -> tensor<128xf32>
+    // expected-error@+1 {{requires dimensions when tile and memory ranks differ}}
+    htile.store %row, %dest[%c0, %c0, %c0]
+        : tensor<128xf32>, memref<8x2048x1536xf32>
+    htile.return
+  }
+}
+
+// -----
+
+module {
   htile.kernel @load_from_tensor(%source : tensor<16x8xf32>) {
     %c0 = arith.constant 0 : index
     // expected-error@+1 {{requires source to be a memref inside an htile.kernel}}
@@ -281,6 +337,23 @@ module {
     %0 = htile.load %source[%c0, %c0]
         mask(%mask : tensor<4x8xi1>) other(%other : i32)
         : tensor<16x8xf32> -> tensor<4x8xf32>
+    return
+  }
+}
+
+// -----
+
+module {
+  // CHECK-LABEL: func.func @dimension_syntax
+  func.func @dimension_syntax(%source: memref<8x2048x1536xf32>,
+                              %dest: memref<8x2048x1536xf32>) {
+    %c0 = arith.constant 0 : index
+    // CHECK: %[[TILE:.+]] = htile.load %{{.*}}[%{{.*}}, %{{.*}}, %{{.*}}] dimensions = [2] : memref<8x2048x1536xf32> -> tensor<128xf32>
+    %tile = htile.load %source[%c0, %c0, %c0] dimensions = [2]
+        : memref<8x2048x1536xf32> -> tensor<128xf32>
+    // CHECK: htile.store %[[TILE]], %{{.*}}[%{{.*}}, %{{.*}}, %{{.*}}] dimensions = [2] : tensor<128xf32>, memref<8x2048x1536xf32>
+    htile.store %tile, %dest[%c0, %c0, %c0] dimensions = [2]
+        : tensor<128xf32>, memref<8x2048x1536xf32>
     return
   }
 }
