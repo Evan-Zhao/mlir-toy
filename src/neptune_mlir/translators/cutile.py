@@ -101,6 +101,12 @@ class Translator(shared.BaseTranslator):
         return self._ct_binop(op, "maximum")
 
     def _math_op(self, op: ir.OpView, function: str) -> list[ast.stmt]:
+        if function == "log1p":
+            name = self._bind(op.results[0], "v")
+            argument = ast.BinOp(
+                left=self._expr(op.operands[0]), op=ast.Add(), right=shared._const(1.0)
+            )
+            return [shared._assign(name, _ct_call("log", argument))]
         return self._ct_unary(op, function)
 
     def _arith_index_cast(self, op: ir.OpView) -> list[ast.stmt]:
@@ -167,7 +173,6 @@ class Translator(shared.BaseTranslator):
             return [raw_assignment, shared._assign(result, load)]
         if len(offsets) != len(mem_shape):
             raise NotImplementedError("cuTile load expects one offset per memref dimension")
-
         fixed_dims = [dim for dim in range(len(mem_shape)) if dim not in spec.dimensions]
         full_order = fixed_dims + spec.dimensions
         full_tile_shape = [1] * len(fixed_dims) + tile_shape
@@ -366,27 +371,34 @@ class Translator(shared.BaseTranslator):
 
         spec = shared._decode_dot(op)
         name = self._bind(op.results[0], "tile")
-        acc = (
-            self._expr(spec.accumulator)
-            if spec.accumulator is not None
-            else _ct_call(
-                "full",
-                shared._tuple(*[shared._const(s) for s in spec.result_shape]),
-                shared._const(0),
-                dtype=_mlir_dtype_to_ct(spec.result_dtype),
+        lhs = self._expr(spec.lhs)
+        rhs = self._expr(spec.rhs)
+        acc = self._expr(spec.accumulator) if spec.accumulator is not None else None
+
+        if spec.kind == shared.DotKind.MATRIX_VECTOR:
+            rhs = _ct_call("expand_dims", rhs, shared._const(0))
+            reduction_axis = 1
+        elif spec.kind == shared.DotKind.VECTOR_MATRIX:
+            lhs = _ct_call("expand_dims", lhs, shared._const(1))
+            reduction_axis = 0
+        else:
+            mma_acc = (
+                acc
+                if acc is not None
+                else _ct_call(
+                    "full",
+                    shared._tuple(*[shared._const(s) for s in spec.result_shape]),
+                    shared._const(0),
+                    dtype=_mlir_dtype_to_ct(spec.result_dtype),
+                )
             )
+            return [shared._assign(name, _ct_call("mma", lhs, rhs, mma_acc))]
+
+        product = ast.BinOp(left=lhs, op=ast.Mult(), right=rhs)
+        call = _ct_call(
+            "sum", product, shared._const(reduction_axis), keepdims=shared._const(False)
         )
-        return [
-            shared._assign(
-                name,
-                _ct_call(
-                    "mma",
-                    self._expr(spec.lhs),
-                    self._expr(spec.rhs),
-                    acc,
-                ),
-            )
-        ]
+        return [shared._assign(name, shared._add_optional_accumulator(call, acc))]
 
     def _htile_reduce(self, op: ir.OpView) -> list[ast.stmt]:
         name = self._bind(op.results[0], "red")

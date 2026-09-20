@@ -28,8 +28,15 @@ STAGES = (
     "tilelang-cuda",
     "cutile",
 )
-# Mamba's matrix-vector dot currently has a backend lowering only in Triton.
-MAMBA_STAGES = ("stablehlo", "htile", "triton", "triton-ptx")
+MAMBA_STAGES = (
+    "stablehlo",
+    "htile",
+    "triton",
+    "triton-ptx",
+    "tilelang",
+    "tilelang-cuda",
+    "cutile",
+)
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser, stages: tuple[str, ...]) -> None:
@@ -104,9 +111,7 @@ def parse_args() -> argparse.Namespace:
         help="pipeline stage to print (default: stablehlo)",
     )
     mamba.add_argument("-b", "--batch", type=int, default=8, help="batch size")
-    mamba.add_argument(
-        "-s", "--sequence-length", type=int, default=2048, help="sequence length"
-    )
+    mamba.add_argument("-s", "--sequence-length", type=int, default=2048, help="sequence length")
     mamba.add_argument("--model-dim", type=int, default=768, help="base model dimension")
     mamba.add_argument("--expand", type=int, default=2, help="channel expansion factor")
     mamba.add_argument("--state-dim", type=int, default=16, help="selective state dimension")
@@ -119,15 +124,11 @@ def parse_args() -> argparse.Namespace:
     mamba.add_argument(
         "--block-channels", type=int, default=128, help="channels handled by each program"
     )
-    mamba.add_argument(
-        "--func-name", default="selective_scan", help="exported function name"
-    )
+    mamba.add_argument("--func-name", default="selective_scan", help="exported function name")
     return parser.parse_args()
 
 
-def _emit_backend_stage(
-    stage: str, lowered: str, kernel_name: str = "attention_kernel"
-) -> str:
+def _emit_backend_stage(stage: str, lowered: str, kernel_name: str = "attention_kernel") -> str:
     if stage == "htile":
         return lowered
     if stage.startswith("triton"):
@@ -145,7 +146,7 @@ def _emit_backend_stage(
     if stage == "triton-ptx":
         return compile_triton_source_to_ptx(source, kernel_arguments, kernel_name)
     output_index = len(kernel_arguments) - 1
-    return compile_tilelang_source_to_cuda(source, output_index)
+    return compile_tilelang_source_to_cuda(source, output_index, kernel_name)
 
 
 def _export_operator_at_stage(

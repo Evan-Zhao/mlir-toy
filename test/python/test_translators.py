@@ -245,7 +245,7 @@ def test_tilelang_translates_varlen_primitives():
         ),
         (
             translate_cutile,
-            ("ct.abs(", "ct.exp(", "ct.log1p(", "ct.bfloat16", " != "),
+            ("ct.abs(", "ct.exp(", "ct.log(", " + 1.0", "ct.bfloat16", " != "),
         ),
         (
             translate_tilelang,
@@ -305,6 +305,61 @@ def test_triton_translates_vector_dots_as_reductions():
     assert "[:, None]" in translated
     assert "dtype=tl.float32" in translated
     assert ") + tile_" in translated
+
+
+def test_cutile_translates_vector_dots_as_reductions():
+    source = """
+    module {
+      htile.kernel @vector_dots() attributes {program_bounds = array<i64: 1>} {
+        %zero = arith.constant 0.0 : f32
+        %matrix_lhs = htile.full %zero : f32 -> tensor<4x8xf32>
+        %vector_rhs = htile.full %zero : f32 -> tensor<8xf32>
+        %matvec = htile.dot %matrix_lhs, %vector_rhs
+            : tensor<4x8xf32>, tensor<8xf32> -> tensor<4xf32>
+        %vector_lhs = htile.full %zero : f32 -> tensor<8xf32>
+        %matrix_rhs = htile.full %zero : f32 -> tensor<8x4xf32>
+        %acc = htile.full %zero : f32 -> tensor<4xf32>
+        %vecmat = htile.dot %vector_lhs, %matrix_rhs, %acc
+            : tensor<8xf32>, tensor<8x4xf32>, tensor<4xf32> -> tensor<4xf32>
+        htile.return
+      }
+    }
+    """
+    translated = ast.unparse(translate_cutile(source))
+    assert "ct.mma(" not in translated
+    assert translated.count("ct.sum(") == 2
+    assert "ct.expand_dims(" in translated
+    assert "ct.expand_dims(tile_" in translated
+    assert ", 0)" in translated
+    assert ", 1)" in translated
+    assert ") + tile_" in translated
+
+
+def test_tilelang_translates_vector_dots_as_reductions():
+    source = """
+    module {
+      htile.kernel @vector_dots() attributes {program_bounds = array<i64: 1>} {
+        %zero = arith.constant 0.0 : f32
+        %matrix_lhs = htile.full %zero : f32 -> tensor<4x8xf32>
+        %vector_rhs = htile.full %zero : f32 -> tensor<8xf32>
+        %matvec = htile.dot %matrix_lhs, %vector_rhs
+            : tensor<4x8xf32>, tensor<8xf32> -> tensor<4xf32>
+        %vector_lhs = htile.full %zero : f32 -> tensor<8xf32>
+        %matrix_rhs = htile.full %zero : f32 -> tensor<8x4xf32>
+        %acc = htile.full %zero : f32 -> tensor<4xf32>
+        %vecmat = htile.dot %vector_lhs, %matrix_rhs, %acc
+            : tensor<8xf32>, tensor<8x4xf32>, tensor<4xf32> -> tensor<4xf32>
+        htile.return
+      }
+    }
+    """
+    translated = ast.unparse(translate_tilelang(source))
+    assert "T.gemm(" not in translated
+    assert translated.count("in T.Parallel(4)") == 2
+    assert translated.count("in T.serial(0, 8, 1)") == 2
+    assert "] = 0.0" in translated
+    assert "] = frag_" in translated
+    assert translated.count("] += frag_") == 2
 
 
 def test_triton_translates_unsqueeze_and_squeeze():

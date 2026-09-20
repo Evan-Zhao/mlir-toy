@@ -373,7 +373,9 @@ class Translator(shared.BaseTranslator):
             name = self._bind(op.results[0], "scalar")
             return [shared._assign(name, self._mem_element(spec.memref, spec.offsets))]
 
-        expected_dimensions = list(range(len(spec.memref_shape) - len(shape), len(spec.memref_shape)))
+        expected_dimensions = list(
+            range(len(spec.memref_shape) - len(shape), len(spec.memref_shape))
+        )
         if sorted(spec.dimensions) != expected_dimensions:
             raise NotImplementedError(
                 f"TileLang load does not support dimensions {spec.dimensions}; "
@@ -452,6 +454,9 @@ class Translator(shared.BaseTranslator):
 
     def _htile_dot(self, op: ir.OpView) -> list[ast.stmt]:
         spec = shared._decode_dot(op)
+        if spec.kind != shared.DotKind.MATRIX_MATRIX:
+            return self._vector_dot_reduction(spec, op.results[0])
+
         dst = self._expr(op.results[0])
         stmts: list[ast.stmt] = []
         accumulator = spec.accumulator
@@ -480,6 +485,63 @@ class Translator(shared.BaseTranslator):
             )
         )
         return stmts
+
+    def _vector_dot_reduction(
+        self,
+        spec: shared.DotSpec,
+        result: ir.Value,
+    ) -> list[ast.stmt]:
+        if spec.transpose_a or spec.transpose_b:
+            raise NotImplementedError("TileLang vector dots do not support transpose attributes")
+        if spec.lhs in self._transposed_tiles or spec.rhs in self._transposed_tiles:
+            raise NotImplementedError("TileLang vector dots do not support transposed load order")
+
+        dst_name = self._get(result)
+
+        def build(indices: list[ast.expr]) -> list[ast.stmt]:
+            output_index = indices[0]
+            reduction_name = self._fresh("k")
+            reduction_index = shared._name(reduction_name)
+            if spec.kind == shared.DotKind.MATRIX_VECTOR:
+                lhs = self._value_at(spec.lhs, [output_index, reduction_index])
+                rhs = self._value_at(spec.rhs, [reduction_index])
+            else:
+                lhs = self._value_at(spec.lhs, [reduction_index])
+                rhs = self._value_at(spec.rhs, [reduction_index, output_index])
+
+            initial = (
+                self._value_at(spec.accumulator, indices)
+                if spec.accumulator is not None
+                else shared._const(0.0)
+            )
+            return [
+                ast.Assign(
+                    targets=[shared._store_subscript(shared._name(dst_name), indices)],
+                    value=initial,
+                    lineno=0,
+                ),
+                ast.For(
+                    target=shared._name(reduction_name, ast.Store()),
+                    iter=shared._T_call(
+                        "serial",
+                        shared._const(0),
+                        shared._const(spec.reduction_size),
+                        shared._const(1),
+                    ),
+                    body=[
+                        ast.AugAssign(
+                            target=shared._store_subscript(shared._name(dst_name), indices),
+                            op=ast.Add(),
+                            value=ast.BinOp(left=lhs, op=ast.Mult(), right=rhs),
+                        )
+                    ],
+                    orelse=[],
+                    lineno=0,
+                    col_offset=0,
+                ),
+            ]
+
+        return self._parallel(spec.result_shape, build)
 
     def _htile_reduce(self, op: ir.OpView) -> list[ast.stmt]:
         spec = shared._decode_reduction(op)
@@ -640,9 +702,7 @@ class Translator(shared.BaseTranslator):
             return shared._store_subscript(self._expr(memref), indices)
         return shared._subscript(self._expr(memref), indices)
 
-    def _require_identity_dimensions(
-        self, dimensions: list[int], expected: list[int]
-    ) -> None:
+    def _require_identity_dimensions(self, dimensions: list[int], expected: list[int]) -> None:
         if dimensions != expected:
             raise NotImplementedError(
                 f"TileLang memory access does not support dimensions {dimensions}; "

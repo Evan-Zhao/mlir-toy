@@ -415,7 +415,9 @@ def compile_and_launch_cutile_source(
         torch.cuda.synchronize()
 
 
-def compile_tilelang_source_to_cuda(source: str, output_index: int) -> str:
+def compile_tilelang_source_to_cuda(
+    source: str, output_index: int, kernel_name: str = "attention_kernel"
+) -> str:
     """Compile generated TileLang source and return its lowered CUDA C++ kernel."""
     try:
         import tilelang
@@ -427,7 +429,7 @@ def compile_tilelang_source_to_cuda(source: str, output_index: int) -> str:
     try:
         with _import_generated_source(source, "tilelang_compile") as module:
             kernel = tilelang.compile(
-                module.attention_kernel,
+                getattr(module, kernel_name),
                 out_idx=[output_index],
                 execution_backend="tvm_ffi",
                 target="cuda",

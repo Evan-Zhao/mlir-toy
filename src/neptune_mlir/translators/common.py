@@ -4,6 +4,7 @@ import ast
 import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from enum import Enum
 from typing import ClassVar
 
 from mlir import ir
@@ -74,6 +75,12 @@ def _store_subscript(value: ast.expr, indices: list[ast.expr]) -> ast.Subscript:
     sub = _subscript(value, indices)
     sub.ctx = ast.Store()
     return sub
+
+
+def _add_optional_accumulator(value: ast.expr, accumulator: ast.expr | None) -> ast.expr:
+    if accumulator is None:
+        return value
+    return ast.BinOp(left=value, op=ast.Add(), right=accumulator)
 
 
 _MLIR_DTYPE_NAMES = {
@@ -219,13 +226,23 @@ class ReductionSpec:
     kind: str
 
 
+class DotKind(Enum):
+    MATRIX_MATRIX = "matrix-matrix"
+    MATRIX_VECTOR = "matrix-vector"
+    VECTOR_MATRIX = "vector-matrix"
+
+
 @dataclass(frozen=True)
 class DotSpec:
     lhs: ir.Value
     rhs: ir.Value
     accumulator: ir.Value | None
+    kind: DotKind
     result_shape: list[int]
+    lhs_dtype: str
+    rhs_dtype: str
     result_dtype: str
+    reduction_size: int
     transpose_a: bool
     transpose_b: bool
 
@@ -328,15 +345,45 @@ def _decode_reduction(op: ir.OpView) -> ReductionSpec:
 
 
 def _decode_dot(op: ir.OpView) -> DotSpec:
-    shape, dtype = _tensor_shape(op.results[0].type)
+    lhs, rhs = op.operands[:2]
+    lhs_shape, lhs_dtype = _tensor_shape(lhs.type)
+    rhs_shape, rhs_dtype = _tensor_shape(rhs.type)
+    result_shape, result_dtype = _tensor_shape(op.results[0].type)
+    transpose_a = op.attributes.get("transpose_a") is not None
+    transpose_b = op.attributes.get("transpose_b") is not None
+
+    kind = {
+        (2, 2): DotKind.MATRIX_MATRIX,
+        (2, 1): DotKind.MATRIX_VECTOR,
+        (1, 2): DotKind.VECTOR_MATRIX,
+    }.get((len(lhs_shape), len(rhs_shape)))
+    if kind is None:
+        raise NotImplementedError(
+            f"unsupported htile.dot operand shapes: {lhs_shape} x {rhs_shape}"
+        )
+
+    effective_lhs = lhs_shape[::-1] if transpose_a else lhs_shape
+    effective_rhs = rhs_shape[::-1] if transpose_b else rhs_shape
+    lhs_reduction, rhs_reduction = effective_lhs[-1], effective_rhs[0]
+    expected_shape = effective_lhs[:-1] + effective_rhs[1:]
+    if lhs_reduction != rhs_reduction or result_shape != expected_shape:
+        raise ValueError(
+            f"invalid {kind.value} htile.dot shapes: {lhs_shape} x {rhs_shape} "
+            f"-> {result_shape}"
+        )
+
     return DotSpec(
-        lhs=op.operands[0],
-        rhs=op.operands[1],
+        lhs=lhs,
+        rhs=rhs,
         accumulator=op.operands[2] if len(op.operands) > 2 else None,
-        result_shape=shape,
-        result_dtype=dtype,
-        transpose_a=op.attributes.get("transpose_a") is not None,
-        transpose_b=op.attributes.get("transpose_b") is not None,
+        kind=kind,
+        result_shape=result_shape,
+        lhs_dtype=lhs_dtype,
+        rhs_dtype=rhs_dtype,
+        result_dtype=result_dtype,
+        reduction_size=lhs_reduction,
+        transpose_a=transpose_a,
+        transpose_b=transpose_b,
     )
 
 
