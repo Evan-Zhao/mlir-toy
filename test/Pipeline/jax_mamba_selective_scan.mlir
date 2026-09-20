@@ -3,7 +3,7 @@
 //
 // StableHLO payload obtained by inlining the default output of:
 //
-//   python examples/jax_mamba_selective_scan.py
+//   python -m neptune_mlir.operator.jax_mamba_selective_scan --func-name main
 //
 // Unlike the attention payloads in this directory, selective scan arrives as
 // a sequential recurrence. The intended persistent-kernel schedule is:

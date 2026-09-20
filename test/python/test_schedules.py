@@ -3,8 +3,9 @@ import pytest
 from neptune_mlir.schedules import (
     AttentionSchedule,
     AttentionTileConfig,
+    MambaTileConfig,
     materialize_attention_schedule,
-    read_attention_schedule,
+    materialize_mamba_schedule,
 )
 
 
@@ -40,8 +41,15 @@ def test_gqa_keeps_batch_group_head_tiles_fixed() -> None:
     assert "tile_sizes [1, 1, 1, 64, 32, 0]" in text
 
 
+def test_mamba_schedules() -> None:
+    text = materialize_mamba_schedule(MambaTileConfig(block_channels=64))
+    assert "tile_sizes [1, 64, 0]" in text
+    assert "transform.scf.interchange_for_and_forall" in text
+    assert 'kernel_names = ["mamba_selective_scan_kernel"]' in text
+
+
 def test_string_schedule_names_are_accepted() -> None:
-    assert read_attention_schedule("global-attn") == materialize_attention_schedule(
+    assert materialize_attention_schedule("global-attn") == materialize_attention_schedule(
         AttentionSchedule.GLOBAL_ATTN
     )
 
@@ -51,11 +59,18 @@ def test_string_schedule_names_are_accepted() -> None:
     [
         (AttentionTileConfig(block_m=0), "block_m must be positive"),
         (AttentionTileConfig(block_n=7), "block_n must be a multiple of 16"),
+        (MambaTileConfig(block_channels=7), "block_channels must be a multiple of 16"),
     ],
 )
-def test_rejects_invalid_tile_sizes(config: AttentionTileConfig, error: str) -> None:
-    with pytest.raises(ValueError, match=error):
-        materialize_attention_schedule(AttentionSchedule.GLOBAL_ATTN, config)
+def test_rejects_invalid_tile_sizes(
+    config: AttentionTileConfig | MambaTileConfig, error: str
+) -> None:
+    if isinstance(config, AttentionTileConfig):
+        with pytest.raises(ValueError, match=error):
+            materialize_attention_schedule(AttentionSchedule.GLOBAL_ATTN, config)
+    else:
+        with pytest.raises(ValueError, match=error):
+            materialize_mamba_schedule(config)
 
 
 def test_rejects_unknown_schedule() -> None:

@@ -1,6 +1,5 @@
 """Python orchestration for Neptune MLIR lowering pipelines."""
 
-import ast
 import importlib.util
 import inspect
 import os
@@ -17,10 +16,10 @@ from .operator.variants import AttentionVariant
 from .schedules import (
     AttentionSchedule,
     AttentionTileConfig,
+    MambaTileConfig,
     materialize_attention_schedule,
+    materialize_mamba_schedule,
 )
-
-CodegenTarget = Literal["triton", "tilelang", "cutile"]
 
 
 @dataclass(frozen=True)
@@ -136,14 +135,44 @@ def export_varlen_attention_mlir(
     return stablehlo
 
 
-def attention_to_htile_pass_pipeline(schedule_path: Path) -> str:
+def export_mamba_mlir(
+    *,
+    batch: int = 8,
+    sequence_length: int = 2048,
+    model_dim: int = 768,
+    expand: int = 2,
+    state_dim: int = 16,
+    activation_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16",
+    func_name: str = "selective_scan",
+) -> str:
+    """Export a Mamba selective scan through JAX as StableHLO."""
+    cmd = [sys.executable, "-m", "neptune_mlir.operator.jax_mamba_selective_scan"]
+    cmd += ["--batch", str(batch), "--sequence-length", str(sequence_length)]
+    cmd += ["--model-dim", str(model_dim), "--expand", str(expand)]
+    cmd += ["--state-dim", str(state_dim), "--activation-dtype", activation_dtype]
+    cmd += ["--func-name", func_name]
+    return _run_export_worker(cmd, "JAX Mamba export")
+
+
+def _transform_schedule_pass_pipeline(schedule_path: Path, trailing_passes: str) -> str:
     return (
         "builtin.module("
         "inline,canonicalize,cse,"
         f"transform-preload-library{{transform-library-paths={schedule_path.as_posix()}}},"
-        "transform-interpreter,lower-affine,htile-dot-transpose-to-load-order,cse,canonicalize"
+        f"transform-interpreter,{trailing_passes}"
         ")"
     )
+
+
+def _apply_transform_schedule(input_mlir: str, schedule_mlir: str, trailing_passes: str) -> str:
+    with tempfile.TemporaryDirectory(prefix="neptune_mlir_") as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        input_path = tmp_path / "input.mlir"
+        schedule_path = tmp_path / "schedule.mlir"
+        input_path.write_text(input_mlir)
+        schedule_path.write_text(schedule_mlir)
+        pass_pipeline = _transform_schedule_pass_pipeline(schedule_path, trailing_passes)
+        return _run_neptune_opt_file(input_path, pass_pipeline)
 
 
 def lower_attention_linalg_to_htile_mlir(
@@ -154,14 +183,11 @@ def lower_attention_linalg_to_htile_mlir(
     n_batch_dims: int | None = None,
 ) -> str:
     schedule_mlir = materialize_attention_schedule(schedule, tile_config, n_batch_dims=n_batch_dims)
-    with tempfile.TemporaryDirectory(prefix="neptune_mlir_") as tmp_dir:
-        tmp_path = Path(tmp_dir)
-        input_path = tmp_path / "input.mlir"
-        schedule_path = tmp_path / "schedule.mlir"
-        input_path.write_text(input_mlir)
-        schedule_path.write_text(schedule_mlir)
-        pass_pipeline = attention_to_htile_pass_pipeline(schedule_path)
-        return _run_neptune_opt_file(input_path, pass_pipeline)
+    return _apply_transform_schedule(
+        input_mlir,
+        schedule_mlir,
+        "lower-affine,htile-dot-transpose-to-load-order,cse,canonicalize",
+    )
 
 
 def export_attention_to_htile_mlir(
@@ -228,27 +254,39 @@ def export_varlen_attention_to_htile_mlir(
     )
 
 
-def translate_htile_to_ast(input_mlir: str, codegen_target: CodegenTarget) -> ast.Module:
-    if codegen_target == "triton":
-        from .translators.triton import translate_mlir_text
-    elif codegen_target == "tilelang":
-        from .translators.tilelang import translate_mlir_text
-    elif codegen_target == "cutile":
-        from .translators.cutile import translate_mlir_text
-    else:
-        raise ValueError(f"unknown codegen target: {codegen_target}")
-
-    return translate_mlir_text(input_mlir)
-
-
-def lower_attention_linalg_to_ast(
-    input_mlir: str,
-    schedule: AttentionSchedule | str,
-    codegen_target: CodegenTarget,
-    tile_config: AttentionTileConfig | None = None,
-) -> ast.Module:
-    lowered = lower_attention_linalg_to_htile_mlir(input_mlir, schedule, tile_config)
-    return translate_htile_to_ast(lowered, codegen_target)
+def export_mamba_to_htile_mlir(
+    *,
+    batch: int = 8,
+    sequence_length: int = 2048,
+    model_dim: int = 768,
+    expand: int = 2,
+    state_dim: int = 16,
+    activation_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16",
+    func_name: str = "selective_scan",
+    tile_config: MambaTileConfig | None = None,
+) -> str:
+    tile_config = tile_config or MambaTileConfig()
+    tile_config.validate()
+    channels = model_dim * expand
+    if channels % tile_config.block_channels != 0:
+        raise ValueError(
+            f"expanded channel count ({channels}) must be divisible by block_channels "
+            f"({tile_config.block_channels})"
+        )
+    input_mlir = export_mamba_mlir(
+        batch=batch,
+        sequence_length=sequence_length,
+        model_dim=model_dim,
+        expand=expand,
+        state_dim=state_dim,
+        activation_dtype=activation_dtype,
+        func_name=func_name,
+    )
+    return _apply_transform_schedule(
+        input_mlir,
+        materialize_mamba_schedule(tile_config),
+        "lower-affine,htile-dot-transpose-to-load-order,cse,canonicalize",
+    )
 
 
 def get_htile_kernel_arguments(input_mlir: str) -> tuple[KernelArgument, ...]:
@@ -307,7 +345,11 @@ def _torch_dtype(torch, dtype: str):
     return getattr(torch, name)
 
 
-def compile_triton_source_to_ptx(source: str, kernel_arguments: tuple[KernelArgument, ...]) -> str:
+def compile_triton_source_to_ptx(
+    source: str,
+    kernel_arguments: tuple[KernelArgument, ...],
+    kernel_name: str = "attention_kernel",
+) -> str:
     """Compile generated Triton source for the active CUDA target and return PTX."""
     try:
         import torch
@@ -318,7 +360,7 @@ def compile_triton_source_to_ptx(source: str, kernel_arguments: tuple[KernelArgu
         raise RuntimeError("Triton PTX compilation requires an Nvidia CUDA device")
 
     with _import_generated_source(source, "triton_compile") as module:
-        kernel = module.attention_kernel
+        kernel = getattr(module, kernel_name)
         parameter_count = len(inspect.signature(kernel.fn).parameters)
         if parameter_count != len(kernel_arguments):
             raise ValueError(

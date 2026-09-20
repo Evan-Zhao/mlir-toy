@@ -1,25 +1,36 @@
 import ast
 import importlib.util
 from itertools import product
-from pathlib import Path
 from typing import Literal
 
 import pytest
 
 from neptune_mlir.operator.variants import AttentionVariant
 from neptune_mlir.pipeline import (
-    attention_to_htile_pass_pipeline,
     compile_and_launch_cutile_source,
     compile_tilelang_source_to_cuda,
     compile_triton_source_to_ptx,
     export_attention_mlir,
     export_attention_to_htile_mlir,
+    export_mamba_mlir,
+    export_mamba_to_htile_mlir,
     export_varlen_attention_mlir,
     export_varlen_attention_to_htile_mlir,
     get_htile_kernel_arguments,
-    translate_htile_to_ast,
 )
-from neptune_mlir.schedules import AttentionTileConfig
+from neptune_mlir.schedules import AttentionTileConfig, MambaTileConfig
+
+
+def translate_htile_to_ast(input_mlir: str, codegen_target: str) -> ast.Module:
+    if codegen_target == "triton":
+        from neptune_mlir.translators.triton import translate_mlir_text
+    elif codegen_target == "tilelang":
+        from neptune_mlir.translators.tilelang import translate_mlir_text
+    elif codegen_target == "cutile":
+        from neptune_mlir.translators.cutile import translate_mlir_text
+    else:
+        raise ValueError(f"unknown codegen target: {codegen_target}")
+    return translate_mlir_text(input_mlir)
 
 
 def make_attn_pytest_param(
@@ -193,6 +204,54 @@ def test_export_varlen_attention_to_htile_mlir() -> None:
     translated = ast.unparse(translate_htile_to_ast(lowered, "triton"))
     assert "tl.load(" in translated and "mask=" in translated and "other=" in translated
     assert "tl.store(" in translated and translated.count("mask=") > 1
+
+
+def test_export_mamba_to_triton() -> None:
+    require_jax()
+    kwargs = {
+        "batch": 2,
+        "sequence_length": 8,
+        "model_dim": 256,
+        "expand": 1,
+        "state_dim": 16,
+    }
+
+    exported = export_mamba_mlir(**kwargs)
+    assert "func.func public @selective_scan" in exported
+    assert "stablehlo.while" in exported
+
+    lowered = export_mamba_to_htile_mlir(**kwargs, tile_config=MambaTileConfig(block_channels=128))
+    assert "htile.kernel @mamba_selective_scan_kernel" in lowered
+    assert "dimensions = [2]" in lowered
+    assert "stablehlo." not in lowered
+    assert "linalg." not in lowered
+
+    translated = ast.unparse(translate_htile_to_ast(lowered, "triton"))
+    assert "def mamba_selective_scan_kernel" in translated
+    assert "tl.make_block_ptr" in translated
+    assert "tl.sum(" in translated
+    assert "tl.store(" in translated
+
+
+def test_mamba_triton_backend_compilation() -> None:
+    require_jax()
+    require_torch_with_cuda()
+    require_nvidia_python_backend("triton")
+
+    lowered = export_mamba_to_htile_mlir(
+        batch=2,
+        sequence_length=8,
+        model_dim=256,
+        expand=1,
+        state_dim=16,
+        tile_config=MambaTileConfig(block_channels=128),
+    )
+    kernel_arguments = get_htile_kernel_arguments(lowered)
+    source = ast.unparse(translate_htile_to_ast(lowered, "triton")) + "\n"
+    ptx = compile_triton_source_to_ptx(source, kernel_arguments, "mamba_selective_scan_kernel")
+
+    assert ".version" in ptx
+    assert ".visible .entry mamba_selective_scan_kernel" in ptx
 
 
 def test_export_attention_uses_f16_dots_with_f32_accumulation() -> None:
@@ -422,14 +481,3 @@ def test_varlen_attention_backend_compilation(varlen_backend_compilation_case) -
             source, output_index=len(kernel_arguments) - 1
         )
         assert "__global__" in cuda_source
-
-
-def test_attention_pass_pipeline_embeds_schedule_preload() -> None:
-    pipeline = attention_to_htile_pass_pipeline(Path("/tmp/schedule.mlir"))
-
-    assert "transform-library-paths=/tmp/schedule.mlir" in pipeline
-    assert "transform-interpreter" in pipeline
-    assert "lower-affine" in pipeline
-    assert "gpu-map-parallel-loops" not in pipeline
-    assert "convert-parallel-loops-to-gpu" not in pipeline
-    assert "htile-dot-transpose-to-load-order" in pipeline

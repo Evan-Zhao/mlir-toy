@@ -1,6 +1,6 @@
 """Isolated Torch-MLIR worker for exporting built-in attention variants.
 
-The public ``neptune-export-attn`` CLI invokes this module in a subprocess so
+The public ``neptune-export`` CLI invokes this module in a subprocess so
 Torch-MLIR and Neptune's standalone MLIR Python runtime are not loaded together.
 """
 

@@ -1,4 +1,4 @@
-"""Export attention operators at different compiler pipeline stages."""
+"""Export attention and Mamba operators at different compiler pipeline stages."""
 
 import argparse
 import ast
@@ -10,11 +10,13 @@ from neptune_mlir.pipeline import (
     compile_triton_source_to_ptx,
     export_attention_mlir,
     export_attention_to_htile_mlir,
+    export_mamba_mlir,
+    export_mamba_to_htile_mlir,
     export_varlen_attention_mlir,
     export_varlen_attention_to_htile_mlir,
     get_htile_kernel_arguments,
 )
-from neptune_mlir.schedules import AttentionTileConfig
+from neptune_mlir.schedules import AttentionTileConfig, MambaTileConfig
 
 STAGES = (
     "stablehlo",
@@ -26,6 +28,8 @@ STAGES = (
     "tilelang-cuda",
     "cutile",
 )
+# Mamba's matrix-vector dot currently has a backend lowering only in Triton.
+MAMBA_STAGES = ("stablehlo", "htile", "triton", "triton-ptx")
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser, stages: tuple[str, ...]) -> None:
@@ -91,10 +95,39 @@ def parse_args() -> argparse.Namespace:
         default="int32",
         help="document-offset element type",
     )
+
+    mamba = operators.add_parser("mamba", help="Mamba selective scan")
+    mamba.add_argument(
+        "--stage",
+        choices=MAMBA_STAGES,
+        default="stablehlo",
+        help="pipeline stage to print (default: stablehlo)",
+    )
+    mamba.add_argument("-b", "--batch", type=int, default=8, help="batch size")
+    mamba.add_argument(
+        "-s", "--sequence-length", type=int, default=2048, help="sequence length"
+    )
+    mamba.add_argument("--model-dim", type=int, default=768, help="base model dimension")
+    mamba.add_argument("--expand", type=int, default=2, help="channel expansion factor")
+    mamba.add_argument("--state-dim", type=int, default=16, help="selective state dimension")
+    mamba.add_argument(
+        "--activation-dtype",
+        choices=("bfloat16", "float16", "float32"),
+        default="bfloat16",
+        help="activation storage type",
+    )
+    mamba.add_argument(
+        "--block-channels", type=int, default=128, help="channels handled by each program"
+    )
+    mamba.add_argument(
+        "--func-name", default="selective_scan", help="exported function name"
+    )
     return parser.parse_args()
 
 
-def _emit_backend_stage(stage: str, lowered: str) -> str:
+def _emit_backend_stage(
+    stage: str, lowered: str, kernel_name: str = "attention_kernel"
+) -> str:
     if stage == "htile":
         return lowered
     if stage.startswith("triton"):
@@ -110,7 +143,7 @@ def _emit_backend_stage(stage: str, lowered: str) -> str:
 
     kernel_arguments = get_htile_kernel_arguments(lowered)
     if stage == "triton-ptx":
-        return compile_triton_source_to_ptx(source, kernel_arguments)
+        return compile_triton_source_to_ptx(source, kernel_arguments, kernel_name)
     output_index = len(kernel_arguments) - 1
     return compile_tilelang_source_to_cuda(source, output_index)
 
@@ -161,12 +194,34 @@ def _export_varlen_at_stage(args: argparse.Namespace) -> str:
     )
 
 
+def _export_mamba_at_stage(args: argparse.Namespace) -> str:
+    common_args = {
+        "batch": args.batch,
+        "sequence_length": args.sequence_length,
+        "model_dim": args.model_dim,
+        "expand": args.expand,
+        "state_dim": args.state_dim,
+        "activation_dtype": args.activation_dtype,
+        "func_name": args.func_name,
+    }
+    if args.stage == "stablehlo":
+        return export_mamba_mlir(**common_args)
+
+    lowered = export_mamba_to_htile_mlir(
+        **common_args,
+        tile_config=MambaTileConfig(block_channels=args.block_channels),
+    )
+    return _emit_backend_stage(args.stage, lowered, "mamba_selective_scan_kernel")
+
+
 def export_at_stage(args: argparse.Namespace) -> str:
     if args.operator == "dense":
         return _export_dense_at_stage(args)
     if args.operator == "varlen":
         return _export_varlen_at_stage(args)
-    raise ValueError(f"unknown attention operator: {args.operator}")
+    if args.operator == "mamba":
+        return _export_mamba_at_stage(args)
+    raise ValueError(f"unknown operator: {args.operator}")
 
 
 def main() -> None:

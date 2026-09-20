@@ -24,16 +24,28 @@ class AttentionTileConfig:
 
     def validate(self) -> None:
         for name, value in (("block_m", self.block_m), ("block_n", self.block_n)):
-            if not isinstance(value, int) or isinstance(value, bool):
-                raise TypeError(f"{name} must be an integer")
-            if value <= 0:
-                raise ValueError(f"{name} must be positive")
-            if value % 16 != 0:
-                raise ValueError(f"{name} must be a multiple of 16")
+            _validate_block_size(name, value)
 
     def get_tile_sizes(self, n_batch_dims: int) -> str:
         tile_sizes = [1] * n_batch_dims + [self.block_m, self.block_n] + [0]
         return "[" + ", ".join(str(size) for size in tile_sizes) + "]"
+
+
+@dataclass(frozen=True)
+class MambaTileConfig:
+    block_channels: int = 128
+
+    def validate(self) -> None:
+        _validate_block_size("block_channels", self.block_channels)
+
+
+def _validate_block_size(name: str, value: int) -> None:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{name} must be an integer")
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    if value % 16 != 0:
+        raise ValueError(f"{name} must be a multiple of 16")
 
 
 # Schedule file name (relative to this __init__.py) and the number of batch dimensions in the attention tensor.
@@ -81,5 +93,8 @@ def materialize_attention_schedule(
     return Template(template_text).substitute(tile_sizes=tile_sizes)
 
 
-def read_attention_schedule(schedule: AttentionSchedule | str) -> str:
-    return materialize_attention_schedule(schedule)
+def materialize_mamba_schedule(tile_config: MambaTileConfig | None = None) -> str:
+    tile_config = tile_config or MambaTileConfig()
+    tile_config.validate()
+    template_text = resources.files(_PACKAGE).joinpath("mamba.mlir.in").read_text()
+    return Template(template_text).substitute(block_channels=tile_config.block_channels)
