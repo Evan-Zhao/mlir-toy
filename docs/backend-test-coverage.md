@@ -9,6 +9,9 @@ not establish the next.
   output with a reference implementation. It replaces the separate compilation-only suites;
   their shape matrices are retained alongside the numerical regression cases.
 
+Kernel timing and optional Nsight capture are available separately through
+[`neptune-bench`](benchmarking.md); these are not performance regression tests.
+
 The test environment is an NVIDIA GeForce RTX 5080 (sm120) with Triton 3.7.1, cuTile 1.6.0,
 TileLang 0.1.9, and apache-tvm-ffi 0.1.10. The 144-case pipeline runtime matrix includes
 windowed-attention regressions for initially masked rows in the rolling softmax.
