@@ -174,6 +174,20 @@ def test_tilelang_translator_functional():
     _assert_causal_attention_output(torch, out, q, k, v)
 
 
+def test_cutile_scalar_memref_uses_one_element_buffer():
+    source = """
+    module {
+      htile.kernel @scalar_load(%src: memref<f32>) attributes {program_bounds = array<i64: 1>} {
+        %value = htile.load %src[] : memref<f32> -> tensor<f32>
+        htile.return
+      }
+    }
+    """
+    translated = ast.unparse(translate_cutile(source))
+    assert "ct.load(arr_0, (0,), (1,), order=(0,))" in translated
+    assert ".item()" in translated
+
+
 def test_tilelang_scalar_memref_uses_one_element_buffer():
     source = """
     module {

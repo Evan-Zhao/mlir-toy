@@ -173,6 +173,23 @@ class Translator(shared.BaseTranslator):
             return [raw_assignment, shared._assign(result, load)]
         if len(offsets) != len(mem_shape):
             raise NotImplementedError("cuTile load expects one offset per memref dimension")
+        if not mem_shape:
+            loaded = self._fresh("load")
+            result = self._bind(op.results[0], "scalar")
+            return [
+                shared._assign(
+                    loaded,
+                    _ct_call(
+                        "load",
+                        self._expr(op.operands[0]),
+                        shared._tuple(shared._const(0)),
+                        shared._tuple(shared._const(1)),
+                        order=shared._tuple(shared._const(0)),
+                    ),
+                ),
+                shared._assign(result, shared._call(shared._attr(shared._name(loaded), "item"))),
+            ]
+
         fixed_dims = [dim for dim in range(len(mem_shape)) if dim not in spec.dimensions]
         full_order = fixed_dims + spec.dimensions
         full_tile_shape = [1] * len(fixed_dims) + tile_shape

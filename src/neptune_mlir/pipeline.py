@@ -395,7 +395,7 @@ def compile_and_launch_cutile_source(
     with _import_generated_source(source, "cutile_compile") as module:
         args = [
             torch.empty(
-                argument.shape,
+                argument.shape or (1,),
                 dtype=_torch_dtype(torch, argument.dtype),
                 device="cuda",
             )
