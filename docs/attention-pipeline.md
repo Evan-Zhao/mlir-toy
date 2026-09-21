@@ -5,7 +5,8 @@ languages like Triton. Each stage in the pipeline has its own design documents, 
 document links to and summarizes. The integrated example for attention lowering is at
 [`test/Pipeline/tm_global_attention.mlir`](../test/Pipeline/tm_global_attention.mlir).
 Current coverage and remaining attention feature axes are tracked in the
-[attention variant roadmap](attention-variants.md).
+[attention variant roadmap](attention-variants.md). Cross-operator compilation and correctness
+coverage is summarized in [backend test coverage](backend-test-coverage.md).
 
 ## Pipeline Overview
 

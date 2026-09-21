@@ -1,21 +1,25 @@
 # HTile Guide
 
-This guide collects the current HTile dialect design decisions in Neptune's lowering pipeline.
+This guide collects the current HTile dialect design decisions in Neptune's lowering pipelines.
 
-HTile sits after scheduled L1 -- see [attention pipeline](attention-pipeline.md) for what L1 means.
+HTile sits after scheduled L1. The [attention pipeline](attention-pipeline.md) and
+[Mamba pipeline](mamba-pipeline.md) show two schedules that target the same HTile contract.
 
 ## L1 To Semantic HTile Translation
 
 `transform.htile.linalg_to_semantic` is the first HTile lowering step.
-It is a local structural rewrite over an already scheduled L1 program; it does not rediscover
-attention from L0 and does not make memory placement or backend ABI decisions.
+It is a local structural rewrite over an already scheduled L1 program; it does not rediscover the
+source algorithm from L0 and does not make memory placement or backend ABI decisions.
 
 The input is assumed to already be scheduled:
 
-- output tiles are explicit through `scf.forall`,
-- the K/V streaming loop is explicit through `scf.for`,
-- online-softmax state is carried as loop `iter_args`,
+- independent output tiles are explicit through `scf.forall`,
+- sequential streaming or recurrent loops are explicit through `scf.for` when needed,
+- loop-carried state is explicit as loop `iter_args` when present, and
 - tile math is still expressed with `tensor`, `linalg`, `arith`, and `math`.
+
+For attention, the sequential loop streams K/V blocks and carries online-softmax state. For Mamba,
+it scans tokens and carries the selective state for one channel block.
 
 The output should preserve that schedule but replace the tile-level structured Linalg compute ops
 with semantic HTile operations where HTile has a direct equivalent. Placement, memory access, and
@@ -25,7 +29,7 @@ The transform preserves the surrounding program shape:
 
 - It keeps `scf.forall`, `scf.for`, loop-carried tensor state, function arguments, tensor
   returns, `tensor.extract_slice`, and `tensor.parallel_insert_slice` in tensor form.
-- It assumes scheduling has made the output tile grid, K/V streaming loop, and recurrence explicit.
+- It assumes scheduling has made the output tile grid, sequential loops, and recurrence explicit.
 - It rewrites only tile-level Linalg compute operations with direct semantic HTile equivalents.
 
 Before this transform, the scheduled program should be normalized so tile-body Linalg ops have
@@ -110,9 +114,8 @@ current pipeline:
 Placement is not part of `transform.htile.linalg_to_semantic`. A later HTile placement transform
 can start with this simple policy:
 
-- input tiles copied from Q/K/V extracts use `#htile.encoding<placement = shared>`,
-- temporary compute tiles and loop-carried online-softmax state use
-  `#htile.encoding<placement = local>`,
+- input tiles copied from payload tensors use `#htile.encoding<placement = shared>`,
+- temporary compute tiles and loop-carried state use `#htile.encoding<placement = local>`, and
 - values crossing back to plain tensor L1 use `htile.copy`.
 
 This is intentionally coarse. More precise placement, cache staging, async copies, warp roles, and
@@ -125,26 +128,29 @@ inserts semantic copies, kernel-ABI legalization still decides which copies beco
 
 ### Broadcast Semantics
 
-MLIR tensor arithmetic requires equal operand types, so L1 materializes row broadcasts explicitly.
+MLIR tensor arithmetic requires equal operand types, so L1 materializes broadcasts explicitly.
 Semantic HTile represents those broadcasts as non-DPS `htile.broadcast` ops. Backend translators can
 lower them to unsqueeze / expand-dims forms appropriate for their target.
 
 ### Tensor-Return ABI Versus Kernel ABI
 
-The scheduled L1 examples return tensors. Triton kernels naturally take pointer arguments and
-store output tiles. A placement/backend pipeline that preserves tensor-return IR may use
+Scheduled L1 programs may return tensors, while backend kernels take memory arguments and store
+output tiles. A placement/backend pipeline that preserves tensor-return IR may use
 `htile.copy` plus `tensor.parallel_insert_slice`; a backend-facing pipeline should instead
 introduce or target an explicit output argument and emit `htile.store`.
 
 ### Numerical Policy
 
-The current scheduled attention keeps softmax probabilities in `f32` for the `P @ V` dot. Some
-backend examples truncate probabilities to `f16` before the dot. That is a numerical policy
-choice, not a mechanical HTile translation requirement. The translator should preserve the L1
-element types unless a separate lowering policy explicitly changes them.
+Backend translators preserve L1 element types unless a separate lowering policy explicitly changes
+them. For example, scheduled attention keeps softmax probabilities in `f32` for the `P @ V` dot,
+and Mamba keeps its recurrent state and matrix-vector projection in `f32` even when activations use
+lower-precision storage. Truncating either computation is a numerical policy choice, not a
+mechanical HTile translation requirement.
 
 ### Backend Constraints
 
 HTile IR may allow combinations that a backend cannot lower efficiently, such as `f32 x f16` dot
 inputs. The semantic compute translator should preserve source element types; backend-specific
-legalization can later insert casts, layout conversions, or choose different dot lowerings.
+legalization can later insert casts, layout conversions, or choose different dot lowerings. The
+current translators use matrix primitives for matrix-matrix `htile.dot` and reductions for
+matrix-vector or vector-matrix forms.
