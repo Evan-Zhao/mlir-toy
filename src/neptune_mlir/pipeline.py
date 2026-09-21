@@ -382,6 +382,7 @@ def compile_and_launch_cutile_source(
     kernel_arguments: tuple[KernelArgument, ...],
     grid: tuple[int, int, int] = (1, 1, 1),
     argument_values: dict[int, list[int | float]] | None = None,
+    kernel_name: str = "attention_kernel",
 ) -> None:
     """Compile and launch generated cuTile source once on the active CUDA device."""
     try:
@@ -411,7 +412,7 @@ def compile_and_launch_cutile_source(
             args[index].copy_(value)
 
         stream = torch.cuda.current_stream()
-        ct.launch(stream, grid, module.attention_kernel, tuple(args))
+        ct.launch(stream, grid, getattr(module, kernel_name), tuple(args))
         torch.cuda.synchronize()
 
 
