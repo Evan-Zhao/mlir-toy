@@ -16,6 +16,7 @@ export = ["torch", "torch-mlir", "jax"]
 
 [project.scripts]
 neptune-export = "neptune_mlir.cli.export:main"
+neptune-bench = "neptune_mlir.cli.bench:main"
 
 [tool.scikit-build]
 cmake.version = ">=3.20"

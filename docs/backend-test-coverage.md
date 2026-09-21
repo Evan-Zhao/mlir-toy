@@ -35,6 +35,9 @@ The dense-attention correctness tests start from
 They validate backend translation and execution, but not the attention exporter or scheduling path.
 Mamba correctness tests do exercise the generated exporter-to-backend path.
 
+Kernel timing and optional Nsight capture are available separately through
+[`neptune-bench`](benchmarking.md); these are not performance regression tests.
+
 ## Missing Coverage
 
 The main gaps are:

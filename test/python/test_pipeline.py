@@ -20,6 +20,7 @@ from neptune_mlir.pipeline import (
     get_htile_kernel_arguments,
 )
 from neptune_mlir.schedules import AttentionTileConfig, MambaTileConfig
+from neptune_mlir.testing import make_mamba_inputs, reference_mamba
 
 
 def translate_htile_to_ast(input_mlir: str, codegen_target: str) -> ast.Module:
@@ -444,43 +445,18 @@ def require_nvidia_python_backend(backend_name: Literal["cutile", "tilelang", "t
 
 
 def _make_mamba_runtime_arguments(torch):
-    generator = torch.Generator(device="cuda")
-    generator.manual_seed(0)
     batch = MAMBA_TEST_KWARGS["batch"]
     seq_len = MAMBA_TEST_KWARGS["sequence_length"]
     channels = MAMBA_TEST_KWARGS["model_dim"] * MAMBA_TEST_KWARGS["expand"]
     state_dim = MAMBA_TEST_KWARGS["state_dim"]
 
-    def randn(shape, dtype=torch.float32):
-        return torch.randn(shape, dtype=dtype, device="cuda", generator=generator) * 0.2
-
-    u = randn((batch, seq_len, channels), torch.bfloat16)
-    delta = randn((batch, seq_len, channels), torch.bfloat16)
-    a = -torch.rand((channels, state_dim), dtype=torch.float32, device="cuda", generator=generator)
-    b = randn((batch, seq_len, state_dim), torch.bfloat16)
-    c = randn((batch, seq_len, state_dim), torch.bfloat16)
-    d_skip = randn((channels,))
-    delta_bias = randn((channels,))
+    inputs = make_mamba_inputs(
+        batch, seq_len, channels, state_dim, torch.bfloat16, "cuda", seed=0, scale=0.2
+    )
     initial_state = torch.zeros((batch, channels, state_dim), dtype=torch.float32, device="cuda")
     scalar_zero = torch.zeros((1,), dtype=torch.float32, device="cuda")
-    output = torch.empty_like(u)
-    return [u, delta, a, b, c, d_skip, delta_bias, initial_state, scalar_zero, output]
-
-
-def _reference_mamba_selective_scan(torch, runtime_arguments):
-    u, delta, a, b, c, d_skip, delta_bias = runtime_arguments[:7]
-    state = torch.zeros_like(runtime_arguments[7])
-    output = torch.empty_like(u)
-    for timestep in range(u.shape[1]):
-        u_t = u[:, timestep].float()
-        dt_t = torch.nn.functional.softplus(delta[:, timestep].float() + delta_bias[None, :])
-        state = (
-            torch.exp(dt_t[..., None] * a[None, :, :]) * state
-            + dt_t[..., None] * b[:, timestep].float()[:, None, :] * u_t[..., None]
-        )
-        y_t = (state * c[:, timestep].float()[:, None, :]).sum(dim=2)
-        output[:, timestep] = (y_t + d_skip[None, :] * u_t).to(output.dtype)
-    return output
+    output = torch.empty_like(inputs[0])
+    return [*inputs, initial_state, scalar_zero, output]
 
 
 def _launch_mamba_backend(torch, codegen_target: str, source: str, runtime_arguments):
@@ -556,7 +532,7 @@ def test_mamba_backend_output_correctness(mamba_backend_case) -> None:
     torch = require_torch_with_cuda()
     require_nvidia_python_backend(codegen_target)
     runtime_arguments = _make_mamba_runtime_arguments(torch)
-    reference = _reference_mamba_selective_scan(torch, runtime_arguments)
+    reference = reference_mamba(*runtime_arguments[:7])
 
     output = _launch_mamba_backend(torch, codegen_target, source, runtime_arguments)
 
