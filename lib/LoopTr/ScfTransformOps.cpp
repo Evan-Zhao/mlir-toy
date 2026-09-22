@@ -724,6 +724,11 @@ DiagnosedSilenceableFailure ScfFuseReductionIntoForallOp::apply(TransformRewrite
   auto splitPlan = detectReductionForallSplit(transform, loop, consumer);
   if (failed(splitPlan))
     BAIL("failed to detect a split plan for the reduction");
+  if (auto initialValue = getInitialValueAttr()) {
+    auto type = cast<RankedTensorType>(splitPlan->reductionInit.getType());
+    if (initialValue.getType() != type.getElementType())
+      BAIL("initial_value type must match the reduction element type");
+  }
 
   // Keep the replacement at the original loop so it continues to dominate all
   // existing users. Move the reduction init's backward slice there first.
@@ -738,6 +743,17 @@ DiagnosedSilenceableFailure ScfFuseReductionIntoForallOp::apply(TransformRewrite
     if (succeeded(rewriter.notifyPayloadOperationReplaced(oldOp, newOp)))
       continue;
     rewriter.silenceTrackingFailure();
+  }
+
+  if (auto initialValue = getInitialValueAttr()) {
+    Value init = split.innerFor.getInitArgs()[1];
+    rewriter.setInsertionPoint(split.innerFor);
+    Value scalar = arith::ConstantOp::create(rewriter, consumer.getLoc(), initialValue);
+    Value filled = linalg::FillOp::create(rewriter, consumer.getLoc(), ValueRange{scalar},
+                                         ValueRange{init}).getResult(0);
+    rewriter.modifyOpInPlace(split.innerFor, [&]() {
+      split.innerFor.getInitArgsMutable()[1].set(filled);
+    });
   }
 
   rewriter.setInsertionPointToEnd(split.innerFor.getBody());

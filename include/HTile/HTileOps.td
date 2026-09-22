@@ -137,7 +137,7 @@ def HTile_ReduceOp : Op<HTile_Dialect, "reduce"> {
       "$input `axis` $axis `kind` $kind attr-dict `:` type($input) `->` type($result)";
 }
 
-def HTile_FullOp : Op<HTile_Dialect, "full"> {
+def HTile_FullOp : Op<HTile_Dialect, "full", [Pure]> {
   let summary = "create a tile filled with a scalar value";
   let description = [{
     Creates a ranked tensor tile where every element is initialized to the scalar operand.

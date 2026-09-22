@@ -118,9 +118,13 @@ class Translator(shared.BaseTranslator):
                     physical_order = sorted(range(len(dimensions)), key=dimensions.__getitem__)
                     shape = [shape[dim] for dim in physical_order]
                 name = self._bind(result, self._result_hint(op_name))
+                # TileLang 0.1.9 mis-lowers register-resident GEMM RHS operands
+                # (notably FP8 K/V converted to FP16). Materialize them in shared
+                # memory; the LHS can remain a fragment for the P @ V dot.
+                is_dot_rhs = self._is_gemm_rhs(result)
                 alloc_fn = (
                     "alloc_shared"
-                    if op_name == "htile.load" or self._is_shared(result.type)
+                    if op_name == "htile.load" or self._is_shared(result.type) or is_dot_rhs
                     else "alloc_fragment"
                 )
                 allocs.append(
@@ -134,6 +138,24 @@ class Translator(shared.BaseTranslator):
                     )
                 )
         return allocs
+
+    def _is_gemm_rhs(self, value: ir.Value) -> bool:
+        for use in value.uses:
+            owner = use.owner
+            name = shared._op_type_name(owner)
+            if (
+                name == "htile.dot"
+                and use.operand_number == 1
+                and shared._decode_dot(owner).kind == shared.DotKind.MATRIX_MATRIX
+            ):
+                return True
+            # These operations are aliases in this translator. In particular,
+            # converted K reaches Q @ K.T through a permute, not a direct use.
+            if name in {"htile.permute", "htile.unsqueeze", "htile.squeeze", "htile.copy"} and any(
+                self._is_gemm_rhs(result) for result in owner.results
+            ):
+                return True
+        return False
 
     def _result_hint(self, op_name: str) -> str:
         return {
@@ -406,7 +428,12 @@ class Translator(shared.BaseTranslator):
                 )
             self._transposed_tiles.add(op.results[0])
         src = self._mem_region(spec.memref, spec.offsets, op.results[0], tile_shape=physical_shape)
-        return [shared._expr_stmt(shared._T_call("copy", src, self._expr(op.results[0])))]
+        # TileLang 0.1.9 can sink the wait for a hoisted TMA load into the first
+        # pipelined loop. If that loop has zero trips (the first causal tile), a
+        # later loop reads the shared buffer before the DMA completes. Keep
+        # loop-invariant loads synchronous; loads inside loops can still use TMA.
+        kwargs = {} if self._yield_dests else {"disable_tma": shared._const(True)}
+        return [shared._expr_stmt(shared._T_call("copy", src, self._expr(op.results[0]), **kwargs))]
 
     def _htile_store(self, op: ir.OpView) -> list[ast.stmt]:
         spec = shared._decode_store(op)

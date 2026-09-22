@@ -192,10 +192,16 @@ def ScfFuseReductionIntoForallOp
     remain valid when payload tracking succeeds.
     The `consumer_op` handle is consumed. The new inner `scf.for` is returned
     explicitly because it did not exist before the transformation.
+
+    `initial_value` optionally overrides the sequential reduction's initial fill.
+    The caller must ensure this preserves the desired result. For online softmax,
+    a finite lower bound avoids inf-inf when early tiles have fully masked rows;
+    every final row must still contain at least one finite score.
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$consumer_op,
-      TransformHandleTypeInterface:$forall_loop);
+      TransformHandleTypeInterface:$forall_loop,
+      OptionalAttr<F32Attr>:$initial_value);
   let results = (outs TransformHandleTypeInterface:$fused_op,
       TransformHandleTypeInterface:$new_inner_loop);
 

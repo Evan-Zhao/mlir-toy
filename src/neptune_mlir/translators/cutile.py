@@ -485,9 +485,13 @@ class Translator(shared.BaseTranslator):
 
     def _scf_for(self, op: ir.OpView) -> list[ast.stmt]:
         spec = shared._decode_for(op)
-        lb = self._expr(spec.lower_bound)
-        ub = self._expr(spec.upper_bound)
-        step = self._expr(spec.step)
+        # cuTile's range induction variable is int32. Normalize tile-loop bounds
+        # to match, including lengths derived from int64 packed offsets. This
+        # does not narrow the offsets used for global-memory addressing.
+        lb, ub, step = [
+            _ct_call("astype", self._expr(value), _ct("int32"))
+            for value in (spec.lower_bound, spec.upper_bound, spec.step)
+        ]
         body_block = spec.body
         loop_var = spec.induction_variable
         iter_bargs = spec.iter_arguments

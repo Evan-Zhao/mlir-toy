@@ -9,7 +9,6 @@ import math
 from collections.abc import Callable
 
 import torch
-from torch_mlir import fx
 
 from neptune_mlir.operator.variants import VARIANTS, AttentionVariant
 
@@ -313,6 +312,9 @@ def export_attention(
     func_name: str = "attention",
     output_type: str = "stablehlo",
 ) -> str:
+    # Keep the eager operator implementations usable as runtime references without
+    # loading Torch-MLIR's native runtime alongside Neptune's MLIR bindings.
+    from torch_mlir import fx
     from torch_mlir.extras.fx_decomp_util import get_decomposition_table
 
     # Custom decomposition for aten.arange. The builtin one translates

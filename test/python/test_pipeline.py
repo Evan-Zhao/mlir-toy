@@ -1,10 +1,11 @@
 import ast
 import importlib.util
-from itertools import product
+from itertools import pairwise, product
 from typing import Literal
 
 import pytest
 
+from neptune_mlir.benchmarks.runtime import kernel_info
 from neptune_mlir.operator.variants import AttentionVariant
 from neptune_mlir.pipeline import (
     _import_generated_source,
@@ -20,7 +21,12 @@ from neptune_mlir.pipeline import (
     get_htile_kernel_arguments,
 )
 from neptune_mlir.schedules import AttentionTileConfig, MambaTileConfig
-from neptune_mlir.testing import make_mamba_inputs, reference_mamba
+from neptune_mlir.testing import (
+    make_attn_inputs,
+    make_mamba_inputs,
+    reference_attn,
+    reference_mamba,
+)
 
 
 def translate_htile_to_ast(input_mlir: str, codegen_target: str) -> ast.Module:
@@ -127,7 +133,7 @@ ATTN_BACKEND_COMPILATION_CASES = [
     for variant, (q_heads, kv_heads) in product(ATTN_VARIANTS, ATTN_HEAD_LAYOUTS)
 ]
 
-# One small Mamba case is shared by backend compilation and output-correctness tests.
+# Small Mamba cases are shared by backend compilation and output-correctness tests.
 MAMBA_KERNEL_NAME = "mamba_selective_scan_kernel"
 MAMBA_TEST_KWARGS = {
     "batch": 2,
@@ -137,7 +143,64 @@ MAMBA_TEST_KWARGS = {
     "state_dim": 16,
 }
 MAMBA_TEST_TILE_CONFIG = MambaTileConfig(block_channels=128)
-MAMBA_TEST_GRID = (2, 2)
+MAMBA_BACKEND_CASES = [
+    pytest.param(
+        (
+            {
+                "batch": batch,
+                "sequence_length": seq_len,
+                "model_dim": model_dim,
+                "expand": expand,
+                "state_dim": state_dim,
+                "activation_dtype": dtype,
+            },
+            MambaTileConfig(block_channels=block),
+        ),
+        id=f"{dtype}-b{batch}-s{seq_len}-m{model_dim}-e{expand}-n{state_dim}-c{block}",
+    )
+    for dtype, (batch, seq_len, model_dim, expand, state_dim, block) in product(
+        ("bfloat16", "float16", "float32"),
+        ((3, 3, 128, 1, 8, 64), (2, 8, 256, 1, 16, 128), (2, 33, 256, 2, 32, 256)),
+    )
+]
+
+# Every variant/layout pair sees multiple batches and query/reduction tiles. The
+# local window is deliberately smaller than the sequence and crosses tile edges.
+ATTN_RUNTIME_CASES = [
+    make_attn_pytest_param(
+        variant,
+        batch=2,
+        q_heads=qh,
+        kv_heads=kh,
+        seq_len=256,
+        head_dim=64,
+        window_size=73 if variant == AttentionVariant.WINDOWED_CAUSAL_ATTN else None,
+    )
+    for variant, (qh, kh) in product(ATTN_VARIANTS, ATTN_HEAD_LAYOUTS)
+] + [
+    make_attn_pytest_param(
+        AttentionVariant.CAUSAL_ATTN,
+        batch=1,
+        q_heads=4,
+        kv_heads=2,
+        seq_len=qs,
+        kv_seq_len=ks,
+        head_dim=128,
+    )
+    for qs, ks in ((128, 256), (256, 128))
+]
+
+VARLEN_RUNTIME_CASES = [
+    pytest.param(
+        (lengths, index_dtype, head_dim, AttentionTileConfig(block_m=bm, block_n=bn)),
+        id=f"{name}-{index_dtype}-d{head_dim}-m{bm}-n{bn}",
+    )
+    for index_dtype in ("int32", "int64")
+    for name, lengths, head_dim, bm, bn in (
+        ("uneven", (1, 63, 129, 256), 64, 128, 64),
+        ("empty-docs", (0, 33, 0, 127, 1, 0), 128, 64, 32),
+    )
+]
 
 
 # Packed variable-length attention cases compiled by each backend.
@@ -360,12 +423,14 @@ def attn_backend_compilation_case(request, attn_codegen_target):
     return attn_codegen_target, ast.unparse(module) + "\n", kernel_arguments
 
 
-@pytest.fixture(scope="module")
-def lowered_mamba_backend_case():
-    """Lower the shared Mamba backend test case once for all code generators."""
+@pytest.fixture(scope="module", params=MAMBA_BACKEND_CASES)
+def lowered_mamba_backend_case(request):
+    """Lower each Mamba case once for all code generators."""
     require_jax()
-    lowered = export_mamba_to_htile_mlir(**MAMBA_TEST_KWARGS, tile_config=MAMBA_TEST_TILE_CONFIG)
-    return lowered, get_htile_kernel_arguments(lowered)
+    kwargs, tile_config = request.param
+    lowered = export_mamba_to_htile_mlir(**kwargs, tile_config=tile_config)
+    _, grid = kernel_info(lowered)
+    return lowered, get_htile_kernel_arguments(lowered), kwargs, grid
 
 
 @pytest.fixture(scope="module", params=CODEGEN_TARGETS)
@@ -375,9 +440,9 @@ def mamba_codegen_target(request):
 
 @pytest.fixture(scope="module")
 def mamba_backend_case(mamba_codegen_target, lowered_mamba_backend_case):
-    lowered, kernel_arguments = lowered_mamba_backend_case
+    lowered, kernel_arguments, kwargs, grid = lowered_mamba_backend_case
     module = translate_htile_to_ast(lowered, mamba_codegen_target)
-    return mamba_codegen_target, ast.unparse(module) + "\n", kernel_arguments
+    return mamba_codegen_target, ast.unparse(module) + "\n", kernel_arguments, kwargs, grid
 
 
 @pytest.fixture(scope="module", params=CODEGEN_TARGETS)
@@ -392,6 +457,7 @@ def lowered_varlen_compilation_case(request):
     kwargs = request.param
     lowered = export_varlen_attention_to_htile_mlir(**kwargs)
     kernel_arguments = get_htile_kernel_arguments(lowered)
+    assert kernel_arguments[3].dtype == {"int32": "i32", "int64": "i64"}[kwargs["index_dtype"]]
     offsets = [
         document * kwargs["total_tokens"] // kwargs["num_docs"]
         for document in range(kwargs["num_docs"] + 1)
@@ -444,33 +510,40 @@ def require_nvidia_python_backend(backend_name: Literal["cutile", "tilelang", "t
             pytest.skip(f"Triton compilation tests require the CUDA backend, got {target_backend}")
 
 
-def _make_mamba_runtime_arguments(torch):
-    batch = MAMBA_TEST_KWARGS["batch"]
-    seq_len = MAMBA_TEST_KWARGS["sequence_length"]
-    channels = MAMBA_TEST_KWARGS["model_dim"] * MAMBA_TEST_KWARGS["expand"]
-    state_dim = MAMBA_TEST_KWARGS["state_dim"]
+def _make_mamba_runtime_arguments(torch, kwargs):
+    batch = kwargs["batch"]
+    seq_len = kwargs["sequence_length"]
+    channels = kwargs["model_dim"] * kwargs["expand"]
+    state_dim = kwargs["state_dim"]
 
     inputs = make_mamba_inputs(
-        batch, seq_len, channels, state_dim, torch.bfloat16, "cuda", seed=0, scale=0.2
+        batch,
+        seq_len,
+        channels,
+        state_dim,
+        getattr(torch, kwargs["activation_dtype"]),
+        "cuda",
+        seed=0,
+        scale=0.2,
     )
     initial_state = torch.zeros((batch, channels, state_dim), dtype=torch.float32, device="cuda")
     scalar_zero = torch.zeros((1,), dtype=torch.float32, device="cuda")
-    output = torch.empty_like(inputs[0])
+    output = torch.full_like(inputs[0], float("nan"))
     return [*inputs, initial_state, scalar_zero, output]
 
 
-def _launch_mamba_backend(torch, codegen_target: str, source: str, runtime_arguments):
-    with _import_generated_source(source, f"mamba_{codegen_target}") as module:
-        kernel = getattr(module, MAMBA_KERNEL_NAME)
+def _launch_backend(torch, codegen_target, source, runtime_arguments, grid, kernel_name):
+    with _import_generated_source(source, f"runtime_{codegen_target}") as module:
+        kernel = getattr(module, kernel_name)
         if codegen_target == "triton":
-            kernel[MAMBA_TEST_GRID](*runtime_arguments)
+            kernel[grid](*runtime_arguments)
             output = runtime_arguments[-1]
         elif codegen_target == "cutile":
             import cuda.tile as ct  # type: ignore
 
             ct.launch(
                 torch.cuda.current_stream(),
-                (*MAMBA_TEST_GRID, 1),
+                grid + (1,) * (3 - len(grid)),
                 kernel,
                 tuple(runtime_arguments),
             )
@@ -480,13 +553,14 @@ def _launch_mamba_backend(torch, codegen_target: str, source: str, runtime_argum
 
             compiled = tilelang.compile(
                 kernel,
-                out_idx=[len(runtime_arguments) - 1],
+                out_idx=[],
                 execution_backend="tvm_ffi",
                 target="cuda",
             )
-            output = compiled(*runtime_arguments[:-1])
-            if isinstance(output, (list, tuple)):
-                output = output[0]
+            # Pass the NaN-filled destination explicitly, so missing stores fail
+            # on TileLang too rather than depending on allocator contents.
+            compiled(*runtime_arguments)
+            output = runtime_arguments[-1]
         torch.cuda.synchronize()
         return output
 
@@ -503,7 +577,7 @@ def test_attention_lowering_pipeline(translated_attn_case) -> None:
 
 
 def test_mamba_backend_compilation(mamba_backend_case) -> None:
-    codegen_target, source, kernel_arguments = mamba_backend_case
+    codegen_target, source, kernel_arguments, _, grid = mamba_backend_case
     require_torch_with_cuda()
     require_nvidia_python_backend(codegen_target)
     if codegen_target == "triton":
@@ -514,7 +588,7 @@ def test_mamba_backend_compilation(mamba_backend_case) -> None:
         compile_and_launch_cutile_source(
             source,
             kernel_arguments,
-            grid=(*MAMBA_TEST_GRID, 1),
+            grid=(*grid, 1),
             kernel_name=MAMBA_KERNEL_NAME,
         )
     else:
@@ -528,18 +602,21 @@ def test_mamba_backend_compilation(mamba_backend_case) -> None:
 
 
 def test_mamba_backend_output_correctness(mamba_backend_case) -> None:
-    codegen_target, source, _ = mamba_backend_case
+    codegen_target, source, _, kwargs, grid = mamba_backend_case
     torch = require_torch_with_cuda()
     require_nvidia_python_backend(codegen_target)
-    runtime_arguments = _make_mamba_runtime_arguments(torch)
+    runtime_arguments = _make_mamba_runtime_arguments(torch, kwargs)
     reference = reference_mamba(*runtime_arguments[:7])
 
-    output = _launch_mamba_backend(torch, codegen_target, source, runtime_arguments)
+    output = _launch_backend(
+        torch, codegen_target, source, runtime_arguments, grid, MAMBA_KERNEL_NAME
+    )
 
     assert tuple(output.shape) == tuple(reference.shape)
     assert output.dtype == reference.dtype
     assert bool(torch.isfinite(output).all())
-    torch.testing.assert_close(output.float(), reference.float(), rtol=1e-2, atol=2e-2)
+    tolerance = {"bfloat16": 2e-3, "float16": 3e-4, "float32": 2e-5}[kwargs["activation_dtype"]]
+    torch.testing.assert_close(output.float(), reference.float(), rtol=tolerance, atol=tolerance)
 
 
 def test_attention_lowering_and_backend_compilation(attn_backend_compilation_case) -> None:
@@ -560,6 +637,150 @@ def test_attention_lowering_and_backend_compilation(attn_backend_compilation_cas
             source, output_index=len(kernel_arguments) - 1
         )
         assert "__global__" in cuda_source
+
+
+@pytest.fixture(scope="module", params=ATTN_RUNTIME_CASES)
+def lowered_attn_runtime_case(request):
+    require_torch_mlir()
+    variant, kwargs, _ = request.param
+    # The rectangular cases also exercise non-default tile sizes.
+    tile = (
+        AttentionTileConfig(block_m=64, block_n=32)
+        if "kv_seq_len" in kwargs
+        else AttentionTileConfig()
+    )
+    lowered = export_attention_to_htile_mlir(variant=variant, **kwargs, tile_config=tile)
+    return variant, kwargs, lowered
+
+
+def test_attention_backend_output_correctness(attn_codegen_target, lowered_attn_runtime_case):
+    torch = require_torch_with_cuda()
+    require_nvidia_python_backend(attn_codegen_target)
+
+    from neptune_mlir.operator.torch_mlir_export import (
+        AlibiCausalAttentionModule,
+        AttentionModule,
+        KVOnlyQuantizedAttentionModule,
+        causal_mask,
+        windowed_causal_mask,
+    )
+
+    variant, kwargs, lowered = lowered_attn_runtime_case
+    if (
+        variant == AttentionVariant.KV_FP8_CAUSAL_ATTN
+        and attn_codegen_target == "cutile"
+        and torch.cuda.get_device_capability()[0] < 10
+    ):
+        pytest.skip("cuTile FP8 execution requires an sm100 or newer GPU")
+    batch, qh, kh = kwargs["batch"], kwargs["q_heads"], kwargs["kv_heads"]
+    qs, ks = kwargs["seq_len"], kwargs.get("kv_seq_len", kwargs["seq_len"])
+    q = make_attn_inputs(batch, qh, qs, kwargs["head_dim"], device="cuda", seed=17)[0]
+    _, k, v = make_attn_inputs(batch, kh, ks, kwargs["head_dim"], device="cuda", seed=29)
+    inputs = [q, k, v]
+    if variant == AttentionVariant.ALIBI_CAUSAL_ATTN:
+        inputs.append(torch.linspace(0.01, 0.3, qh, device="cuda"))
+        model = AlibiCausalAttentionModule()
+    elif variant == AttentionVariant.KV_FP8_CAUSAL_ATTN:
+        inputs[1:3] = [x.to(torch.float8_e4m3fn) for x in (k, v)]
+        # Non-unit, per-KV-head scales catch omitted scaling and head indexing.
+        shape = () if kh == 1 else (1, kh, 1, 1)
+        inputs.extend(
+            [
+                torch.linspace(0.5, 1.25, kh, device="cuda").reshape(shape),
+                torch.linspace(1.5, 0.75, kh, device="cuda").reshape(shape),
+            ]
+        )
+        model = KVOnlyQuantizedAttentionModule()
+    else:
+        mask = {
+            AttentionVariant.GLOBAL_ATTN: lambda _: None,
+            AttentionVariant.CAUSAL_ATTN: causal_mask,
+            AttentionVariant.WINDOWED_CAUSAL_ATTN: windowed_causal_mask(
+                kwargs.get("window_size", 128)
+            ),
+        }[variant]
+        model = AttentionModule(mask)
+    with torch.no_grad():
+        reference = model(*inputs)
+    # Scalar memrefs use one-element runtime buffers in the backend ABI.
+    arguments = [
+        *(x.reshape(1) if x.ndim == 0 else x for x in inputs),
+        torch.full_like(q, float("nan")),
+    ]
+    source = ast.unparse(translate_htile_to_ast(lowered, attn_codegen_target)) + "\n"
+    # Use the exported launch bounds: singleton KV heads are folded differently
+    # from GQA, and TileLang embeds these same bounds in its generated function.
+    _, grid = kernel_info(lowered)
+    output = _launch_backend(
+        torch, attn_codegen_target, source, arguments, grid, "attention_kernel"
+    )
+    assert output.shape == reference.shape
+    assert output.dtype == reference.dtype
+    assert bool(torch.isfinite(output).all())
+    # Eager exporter modules round the QK dot to FP16, while the lowered dots
+    # accumulate in FP32. Allow that difference and the tiled online softmax.
+    torch.testing.assert_close(output, reference, rtol=1e-2, atol=5e-3)
+
+
+@pytest.fixture(scope="module", params=VARLEN_RUNTIME_CASES)
+def lowered_varlen_runtime_case(request):
+    require_jax()
+    lengths, index_dtype, head_dim, tile = request.param
+    kwargs = {
+        "num_docs": len(lengths),
+        "total_tokens": sum(lengths),
+        "heads": 2,
+        "max_doc_tokens": 256,
+        "head_dim": head_dim,
+        "index_dtype": index_dtype,
+    }
+    lowered = export_varlen_attention_to_htile_mlir(**kwargs, tile_config=tile)
+    assert (
+        get_htile_kernel_arguments(lowered)[3].dtype
+        == {"int32": "i32", "int64": "i64"}[index_dtype]
+    )
+    return lengths, kwargs, lowered
+
+
+def test_varlen_attention_backend_output_correctness(
+    varlen_codegen_target, lowered_varlen_runtime_case
+):
+    torch = require_torch_with_cuda()
+    require_nvidia_python_backend(varlen_codegen_target)
+    lengths, kwargs, lowered = lowered_varlen_runtime_case
+    # Reuse the dense FP32 reference independently for each document; the JAX
+    # packed-window custom calls are compiler markers, not executable FFI ops.
+    q, k, v = [
+        x.squeeze(0).transpose(0, 1).contiguous()
+        for x in make_attn_inputs(
+            1, kwargs["heads"], kwargs["total_tokens"], kwargs["head_dim"], seed=41
+        )
+    ]
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    reference = torch.empty_like(q, dtype=torch.float32)
+    for start, end in pairwise(offsets):
+        if start == end:
+            continue
+        doc = [x[start:end].transpose(0, 1).unsqueeze(0) for x in (q, k, v)]
+        reference[start:end] = reference_attn(*doc, causal=False).squeeze(0).transpose(0, 1)
+    arguments = [
+        q,
+        k,
+        v,
+        torch.tensor(offsets, dtype=getattr(torch, kwargs["index_dtype"]), device="cuda"),
+        torch.full_like(q, float("nan")),
+    ]
+    source = ast.unparse(translate_htile_to_ast(lowered, varlen_codegen_target)) + "\n"
+    _, grid = kernel_info(lowered)
+    output = _launch_backend(
+        torch, varlen_codegen_target, source, arguments, grid, "attention_kernel"
+    )
+    assert output.shape == reference.shape
+    assert output.dtype == q.dtype
+    assert bool(torch.isfinite(output).all())
+    torch.testing.assert_close(output.float(), reference, rtol=1e-2, atol=2e-3)
 
 
 def test_varlen_attention_backend_compilation(varlen_backend_compilation_case) -> None:

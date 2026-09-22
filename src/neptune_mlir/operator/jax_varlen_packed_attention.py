@@ -184,6 +184,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    # JAX otherwise silently canonicalizes an explicitly requested int64 offset
+    # signature to int32, which also changes the generated kernel's pointer ABI.
+    if args.index_dtype == "int64":
+        jax.config.update("jax_enable_x64", True)
     max_doc_tokens = args.max_doc_tokens
     index_dtype = jnp.dtype(args.index_dtype)
     shape = (args.total_tokens, args.heads, args.head_dim)

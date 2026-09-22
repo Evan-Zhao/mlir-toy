@@ -62,8 +62,12 @@ module attributes {transform.with_named_sequence} {
     // The subsequent fusion only supports single-output ops, so we remove the unused argmax
     // output before fusion.
     transform.linalg.erase_unused_operands_and_results %bmax : !any
+    // A window can leave individual rows empty in early K/V tiles. Keep the
+    // running max finite so their zero mass does not become exp(-inf - -inf).
+    // The final attention row always contains at least one unmasked score.
     %fused_bmax, %j0_loop = transform.scf.fuse_reduction_into_forall
-        %bmax into %forall_loop : (!any, !any) -> (!any, !any)
+        %bmax into %forall_loop {initial_value = 0xFF7FFFFF : f32}
+        : (!any, !any) -> (!any, !any)
 
     // Fusion 3 (rolling update). First find the nearest reduction reachable from the loop's
     // output value, together with the ordered elementwise chain between them.

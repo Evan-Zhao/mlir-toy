@@ -180,6 +180,58 @@ def test_tilelang_scalar_memref_uses_one_element_buffer():
     assert "scalar_2 = buf_0[0]" in translated
 
 
+def test_tilelang_hoisted_load_and_converted_dot_rhs():
+    source = """
+    module {
+      htile.kernel @converted_rhs(%q: memref<32x32xf16>, %k: memref<32x32xf8E4M3FN>)
+          attributes {program_bounds = array<i64: 1>} {
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %q_tile = htile.load %q[%c0, %c0] : memref<32x32xf16> -> tensor<32x32xf16>
+        scf.for %i = %c0 to %c1 step %c1 {
+          %k_tile = htile.load %k[%c0, %c0] : memref<32x32xf8E4M3FN> -> tensor<32x32xf8E4M3FN>
+          %k_f16 = arith.extf %k_tile : tensor<32x32xf8E4M3FN> to tensor<32x32xf16>
+          %k_transposed = htile.permute %k_f16 permutation [1, 0]
+              : tensor<32x32xf16> -> tensor<32x32xf16>
+          %dot = htile.dot %q_tile, %k_transposed
+              : tensor<32x32xf16>, tensor<32x32xf16> -> tensor<32x32xf32>
+        }
+        htile.return
+      }
+    }
+    """
+    translated = ast.unparse(translate_tilelang(source))
+    # Only the hoisted Q load must opt out of TMA; inner K loads still use it.
+    copies = [line for line in translated.splitlines() if "T.copy(" in line]
+    assert len(copies) == 2
+    assert "buf_0[" in copies[0] and "disable_tma=True" in copies[0]
+    assert "buf_1[" in copies[1] and "disable_tma" not in copies[1]
+    assert translated.count("T.alloc_shared([32, 32], 'float16')") == 2
+    assert "T.alloc_fragment([32, 32], 'float32')" in translated
+
+
+def test_cutile_normalizes_dynamic_loop_bounds():
+    source = """
+    module {
+      htile.kernel @offset_loop(%offsets: memref<2xi64>) {
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %length = htile.load %offsets[%c1] : memref<2xi64> -> i64
+        %bound = arith.index_cast %length : i64 to index
+        scf.for %i = %c0 to %bound step %c1 {
+        }
+        htile.return
+      }
+    }
+    """
+    module = translate_cutile(source)
+    loop = next(node for node in ast.walk(module) if isinstance(node, ast.For))
+    assert all(
+        ast.unparse(arg).startswith("ct.astype(") and ast.unparse(arg).endswith(", ct.int32)")
+        for arg in loop.iter.args
+    )
+
+
 def test_tilelang_translates_varlen_primitives():
     source = """
     module {
