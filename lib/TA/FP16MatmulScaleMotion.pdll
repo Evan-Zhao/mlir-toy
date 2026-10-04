@@ -50,11 +50,15 @@ Rewrite RoundThroughF16(input: Value, matchedNarrowType: Type,
 
   auto narrowType = ta::ExprType::get(rewriter.getContext(),
                                       narrowExprType.getElementType(), inputType.getAxes());
-  auto narrow = ta::CastOp::create(rewriter, input.getLoc(), narrowType, input);
-  narrow->setAttr("ta.import_group", narrowGroup);
+  Value rounded = input;
+  if (inputType != narrowType) {
+    auto narrow = ta::CastOp::create(rewriter, input.getLoc(), narrowType, input);
+    narrow->setAttr("ta.import_group", narrowGroup);
+    rounded = narrow;
+  }
   auto wideType = ta::ExprType::get(rewriter.getContext(), rewriter.getF32Type(),
                                     inputType.getAxes());
-  auto wide = ta::CastOp::create(rewriter, input.getLoc(), wideType, narrow);
+  auto wide = ta::CastOp::create(rewriter, input.getLoc(), wideType, rounded);
   wide->setAttr("ta.import_group", widenGroup);
   return wide.getResult();
 }];

@@ -265,8 +265,7 @@ void TASinkRightMulAfterMatmulPatternsOp::populatePatterns(RewritePatternSet &pa
 }
 
 void TASinkScaleAfterMaxPatternsOp::populatePatterns(RewritePatternSet &patterns) {
-  patterns.add<ta_mul_scale_motion_pdl::SinkLeftPositiveScaleAfterMaxReduce>(
-      patterns.getContext());
+  patterns.add<ta_mul_scale_motion_pdl::SinkLeftPositiveScaleAfterMaxReduce>(patterns.getContext());
   patterns.add<ta_mul_scale_motion_pdl::SinkRightPositiveScaleAfterMaxReduce>(
       patterns.getContext());
   patterns.add<ta_mul_scale_motion_pdl::SinkLeftPositiveScaleAfterMaskedSelect>(

@@ -53,6 +53,53 @@ module attributes {transform.with_named_sequence} {
 }
 // -----
 
+// Bypass the f32 -> f16 -> f32 round trip when the
+// RHS is already f16. In particular, do not create an invalid f16 -> f16 cast.
+// CHECK-LABEL: func.func @ta_sink_right_mul_with_f16_prewiden(
+// CHECK: %[[X:.+]] = ta.at %arg0
+// CHECK: %[[Y:.+]] = ta.at %arg1
+// CHECK: %[[FLOAT:.+]] = ta.cast %[[Y]]
+// CHECK-SAME: (!ta.expr<f16, [k, j]>) -> !ta.expr<f32, [k, j]>
+// CHECK-NEXT: %[[PROD:.+]] = ta.mul %[[X]], %[[FLOAT]]
+// CHECK-NEXT: %[[SUM:.+]] = ta.reduce <add> %[[PROD]]
+// CHECK-NEXT: %[[SCALED:.+]] = ta.mul %[[SUM]],
+// CHECK-NEXT: ta.yield %[[SCALED]]
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %func = transform.structured.match ops{["func.func"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    transform.apply_patterns to %func {
+      transform.apply_patterns.ta.sink_right_mul_after_matmul
+    } : !transform.any_op
+    transform.yield
+  }
+
+  func.func @ta_sink_right_mul_with_f16_prewiden(
+      %lhs: tensor<2x3xf32>, %rhs: tensor<3x4xf16>) -> tensor<2x4xf32> {
+    %out = ta.scope axes(%i "i" extent 2, %j "j" extent 4, %k "k" extent 3) {
+      %x = ta.at %lhs[%i, %k] : tensor<2x3xf32> -> !ta.expr<f32, [i, k]>
+      %y = ta.at %rhs[%k, %j] : tensor<3x4xf16> -> !ta.expr<f16, [k, j]>
+      %c = ta.constant 2.0 : f32 : !ta.expr<f32, []>
+      %wide = ta.cast %y {ta.import_group = 1 : i64}
+          : (!ta.expr<f16, [k, j]>) -> !ta.expr<f32, [k, j]>
+      %scaled = ta.mul %wide, %c {ta.import_group = 2 : i64}
+          : (!ta.expr<f32, [k, j]>, !ta.expr<f32, []>) -> !ta.expr<f32, [k, j]>
+      %half = ta.cast %scaled {ta.import_group = 3 : i64}
+          : (!ta.expr<f32, [k, j]>) -> !ta.expr<f16, [k, j]>
+      %float = ta.cast %half {ta.import_group = 4 : i64}
+          : (!ta.expr<f16, [k, j]>) -> !ta.expr<f32, [k, j]>
+      %product = ta.mul %x, %float {ta.import_group = 5 : i64}
+          : (!ta.expr<f32, [i, k]>, !ta.expr<f32, [k, j]>) -> !ta.expr<f32, [i, k, j]>
+      %sum = ta.reduce <add> %product
+          {axes = #ta.axes<k>, ta.import_group = 6 : i64}
+          : !ta.expr<f32, [i, k, j]> -> !ta.expr<f32, [i, j]>
+      ta.yield %sum : !ta.expr<f32, [i, j]>
+    } : () -> tensor<2x4xf32>
+    return %out : tensor<2x4xf32>
+  }
+}
+// -----
+
 // CHECK-LABEL: func.func @ta_sink_right_mul_through_f16_reject_reduction_axis(
 // CHECK: %[[SCORES:.+]] = ta.at %{{.+}}[%i, %j]
 // CHECK: %[[SCALE:.+]] = ta.at %{{.+}}[%j]
