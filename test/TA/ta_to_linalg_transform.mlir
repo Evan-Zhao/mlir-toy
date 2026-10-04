@@ -132,3 +132,44 @@ module attributes {transform.with_named_sequence} {
     return %out : tensor<4x4xf32>
   }
 }
+
+// -----
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%module: !transform.any_op) {
+    %funcs = transform.structured.match ops{["func.func"]} in %module
+        : (!transform.any_op) -> !transform.any_op
+    transform.ta.to_linalg %funcs : !transform.any_op
+    transform.yield
+  }
+
+  // Regression: ta.cmpf used to reach an unsupported-scalar-op assertion.
+  // CHECK-LABEL: func.func @compare_to_linalg
+  // CHECK: arith.cmpf une,
+  // CHECK: arith.cmpi slt,
+  // CHECK: arith.cmpi uge,
+  // CHECK: arith.select
+  func.func @compare_to_linalg(%flhs: tensor<2x3xf32>, %frhs: tensor<2x3xf32>,
+                               %ilhs: tensor<2x3xi32>, %irhs: tensor<2x3xi32>) -> tensor<2x3xf32> {
+    %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3) {
+      %fl = ta.at %flhs[%i, %j] : tensor<2x3xf32> -> !ta.expr<f32, [i, j]>
+      %fr = ta.at %frhs[%i, %j] : tensor<2x3xf32> -> !ta.expr<f32, [i, j]>
+      %il = ta.at %ilhs[%i, %j] : tensor<2x3xi32> -> !ta.expr<i32, [i, j]>
+      %ir = ta.at %irhs[%i, %j] : tensor<2x3xi32> -> !ta.expr<i32, [i, j]>
+      %fp = ta.cmpf une, %fl, %fr
+          : (!ta.expr<f32, [i, j]>, !ta.expr<f32, [i, j]>) -> !ta.expr<i1, [i, j]>
+      %sp = ta.cmpi slt, %il, %ir
+          : (!ta.expr<i32, [i, j]>, !ta.expr<i32, [i, j]>) -> !ta.expr<i1, [i, j]>
+      %up = ta.cmpi uge, %il, %ir
+          : (!ta.expr<i32, [i, j]>, !ta.expr<i32, [i, j]>) -> !ta.expr<i1, [i, j]>
+      %fs = ta.select %fp, %fl, %fr
+          : (!ta.expr<i1, [i, j]>, !ta.expr<f32, [i, j]>, !ta.expr<f32, [i, j]>) -> !ta.expr<f32, [i, j]>
+      %ss = ta.select %sp, %fs, %fr
+          : (!ta.expr<i1, [i, j]>, !ta.expr<f32, [i, j]>, !ta.expr<f32, [i, j]>) -> !ta.expr<f32, [i, j]>
+      %us = ta.select %up, %ss, %fr
+          : (!ta.expr<i1, [i, j]>, !ta.expr<f32, [i, j]>, !ta.expr<f32, [i, j]>) -> !ta.expr<f32, [i, j]>
+      ta.yield %us : !ta.expr<f32, [i, j]>
+    } : () -> tensor<2x3xf32>
+    return %out : tensor<2x3xf32>
+  }
+}

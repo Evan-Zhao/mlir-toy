@@ -591,6 +591,9 @@ private:
       } else {
         llvm_unreachable("verified ta.cast has unsupported element types");
       }
+    } else if (auto cmpf = dyn_cast<CmpFOp>(def)) {
+      scalar = arith::CmpFOp::create(nestedBuilder, nestedLoc, cmpf.getPredicate(), operands[0],
+                                     operands[1]);
     } else if (auto cmpi = dyn_cast<CmpIOp>(def)) {
       scalar = arith::CmpIOp::create(nestedBuilder, nestedLoc, cmpi.getPredicate(), operands[0],
                                      operands[1]);
