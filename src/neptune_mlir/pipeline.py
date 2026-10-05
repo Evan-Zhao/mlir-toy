@@ -289,6 +289,24 @@ def export_mamba_to_htile_mlir(
     )
 
 
+def get_htile_kernel_info(input_mlir: str) -> tuple[str, tuple[int, ...]]:
+    """Return the name and launch grid of the single outlined HTile kernel."""
+    from mlir import ir
+
+    from .translators.common import parse_mlir_module_from_text
+
+    module = parse_mlir_module_from_text(input_mlir)
+    kernels = [op for op in module.body.operations if op.operation.name == "htile.kernel"]
+    if len(kernels) != 1:
+        raise ValueError(f"expected one htile.kernel, found {len(kernels)}")
+    kernel = kernels[0]
+    name = ir.StringAttr(kernel.attributes["sym_name"]).value
+    grid = tuple(ir.DenseI64ArrayAttr(kernel.attributes["program_bounds"]))
+    if not 1 <= len(grid) <= 3 or any(dim <= 0 for dim in grid):
+        raise ValueError(f"unsupported kernel grid: {grid}")
+    return name, grid
+
+
 def get_htile_kernel_arguments(input_mlir: str) -> tuple[KernelArgument, ...]:
     """Return the static memref signature of the single outlined HTile kernel."""
     from mlir import ir

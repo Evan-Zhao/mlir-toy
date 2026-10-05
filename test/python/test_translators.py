@@ -1,12 +1,12 @@
 import ast
 import importlib.util
-import math
 import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 
+from neptune_mlir.testing import make_attn_inputs, reference_attn
 from neptune_mlir.translators.cutile import translate_mlir_text as translate_cutile
 from neptune_mlir.translators.tilelang import translate_mlir_text as translate_tilelang
 from neptune_mlir.translators.triton import translate_mlir_text as translate_triton
@@ -80,40 +80,18 @@ def _exec_translated_module(module_ast: ast.Module, module_name: str):
 
 
 def _make_causal_attention_inputs(torch):
-    generator = torch.Generator(device="cuda")
-    generator.manual_seed(0)
-    q = torch.randn(CAUSAL_SHAPE, dtype=torch.float16, device="cuda", generator=generator)
-    k = torch.randn(CAUSAL_SHAPE, dtype=torch.float16, device="cuda", generator=generator)
-    v = torch.randn(CAUSAL_SHAPE, dtype=torch.float16, device="cuda", generator=generator)
-    out = torch.empty(CAUSAL_SHAPE, dtype=torch.float16, device="cuda")
-    return q, k, v, out
-
-
-def _reference_causal_attention(torch, q, k, v):
-    reference = torch.empty(CAUSAL_SHAPE, dtype=torch.float32, device=q.device)
-    k_t = k.transpose(-1, -2).float()
-    v_f32 = v.float()
-    scale = 1.0 / math.sqrt(q.shape[-1])
-    key_positions = torch.arange(q.shape[2], device=q.device)
-
-    for row_start in range(0, q.shape[2], CAUSAL_BLOCK_ROWS):
-        row_end = min(row_start + CAUSAL_BLOCK_ROWS, q.shape[2])
-        q_block = q[:, :, row_start:row_end, :].float()
-        scores = torch.matmul(q_block, k_t) * scale
-        row_positions = torch.arange(row_start, row_end, device=q.device)
-        causal_mask = key_positions[None, :] <= row_positions[:, None]
-        scores = scores.masked_fill(~causal_mask, float("-inf"))
-        probabilities = torch.softmax(scores, dim=-1)
-        reference[:, :, row_start:row_end, :] = torch.matmul(probabilities, v_f32)
-
-    return reference
+    batch, heads, seq_len, head_dim = CAUSAL_SHAPE
+    inputs = make_attn_inputs(
+        batch, heads, seq_len, head_dim, torch.float16, "cuda", seed=0, scale=1.0
+    )
+    return (*inputs, torch.empty_like(inputs[0]))
 
 
 def _assert_causal_attention_output(torch, out, q, k, v):
     assert tuple(out.shape) == CAUSAL_SHAPE
     assert out.dtype == torch.float16
     assert bool(torch.isfinite(out).all())
-    reference = _reference_causal_attention(torch, q, k, v)
+    reference = reference_attn(q, k, v, block_rows=CAUSAL_BLOCK_ROWS)
     torch.testing.assert_close(out.float(), reference, rtol=0, atol=2e-2)
 
 
