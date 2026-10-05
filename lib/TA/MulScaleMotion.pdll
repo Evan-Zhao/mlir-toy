@@ -1,5 +1,9 @@
 #include "TA/TAOps.td"
 
+Rewrite WithReductionInput(reduce: Op, input: Value) -> Value [{
+  return cloneReductionWithInput(rewriter, reduce, input);
+}];
+
 Constraint AxislessConstant(value: Value) [{
   auto constant = value.getDefiningOp<ta::ConstantOp>();
   if (!constant)
@@ -40,6 +44,22 @@ Constraint NegativeInfinityAxislessConstant(value: Value) [{
 Constraint MaxReduceKind(kind: Attr) [{
   auto reduceKind = dyn_cast<ta::ReduceKindAttr>(kind);
   return success(reduceKind && reduceKind.getValue() == ta::ReduceKind::Max);
+}];
+
+// Extrema are treated as scheduling sentinels and must stay unchanged. In
+// particular, scaling -max_float could overflow to -inf and defeat finite-seed
+// softmax stabilization. This is a workload-specific policy for finite extrema,
+// not an exact algebraic identity for arbitrary clamped/overflowing inputs.
+Constraint MaxScaleMotionInit(reduce: Op) [{
+  auto reduction = dyn_cast<ta::ReduceOp>(reduce);
+  if (!reduction)
+    return failure();
+  OpFoldResult init = reduction.getMixedInit();
+  if (auto value = dyn_cast<Value>(init))
+    init = getAsOpFoldResult(value);
+  auto attr = dyn_cast_if_present<FloatAttr>(dyn_cast<Attribute>(init));
+  return success(attr && (attr.getValue().isZero() || attr.getValue().isInfinity() ||
+                          attr.getValue().isLargest()));
 }];
 
 Rewrite MakeLog2EConstant(input: Value) -> Value [{
@@ -97,16 +117,20 @@ Pattern PushMulScaleThroughSelect {
   };
 }
 
+// Reduction scale motion preserves known zero, infinity, or finite-extremum
+// initializers under the sentinel policy above. Other seeds are not rewritten.
+
 // c * max_axes(x) => max_axes(c * x), for finite c > 0
 Pattern HoistPositiveScaleBeforeMaxReduce {
-  let reduce = op<ta.reduce>(input: Value) {kind = kind: Attr, axes = axes: Attr, "ta.import_group" = srcReduce: Attr};
+  let reduce = op<ta.reduce>(input: Value, init: ValueRange) {kind = kind: Attr, axes = axes: Attr, "ta.import_group" = srcReduce: Attr};
   let mul = op<ta.mul>(constant: Value, reduce) {"ta.import_group" = srcMul: Attr} -> (resultType: Type);
   PositiveAxislessConstant(constant);
   MaxReduceKind(kind);
+  MaxScaleMotionInit(reduce);
 
   rewrite mul with {
     let scaledInput = op<ta.mul>(constant, input) {"ta.import_group" = srcMul};
-    replace mul with op<ta.reduce>(scaledInput) {kind = kind, axes = axes, "ta.import_group" = srcReduce} -> (resultType);
+    replace mul with WithReductionInput(reduce, scaledInput);
   };
 }
 
@@ -142,12 +166,13 @@ Pattern ReassociateRightNestedConstantMul {
 // This one is the opposite of HoistPositiveScaleBeforeMaxReduce.
 Pattern SinkLeftPositiveScaleAfterMaxReduce {
   let mul = op<ta.mul>(constant: Value, input: Value) {"ta.import_group" = srcMul: Attr};
-  let reduce = op<ta.reduce>(mul) {kind = kind: Attr, axes = axes: Attr, "ta.import_group" = srcReduce: Attr} -> (resultType: Type);
+  let reduce = op<ta.reduce>(mul, init: ValueRange) {kind = kind: Attr, axes = axes: Attr, "ta.import_group" = srcReduce: Attr} -> (resultType: Type);
   PositiveAxislessConstant(constant);
   MaxReduceKind(kind);
+  MaxScaleMotionInit(reduce);
 
   rewrite reduce with {
-    let rawMax = op<ta.reduce>(input) {kind = kind, axes = axes, "ta.import_group" = srcReduce} -> (resultType);
+    let rawMax = WithReductionInput(reduce, input);
     replace reduce with op<ta.mul>(constant, rawMax) {"ta.import_group" = srcMul};
   };
 }
@@ -155,12 +180,13 @@ Pattern SinkLeftPositiveScaleAfterMaxReduce {
 // max_axes(x * c) => max_axes(x) * c, for finite c > 0
 Pattern SinkRightPositiveScaleAfterMaxReduce {
   let mul = op<ta.mul>(input: Value, constant: Value) {"ta.import_group" = srcMul: Attr};
-  let reduce = op<ta.reduce>(mul) {kind = kind: Attr, axes = axes: Attr, "ta.import_group" = srcReduce: Attr} -> (resultType: Type);
+  let reduce = op<ta.reduce>(mul, init: ValueRange) {kind = kind: Attr, axes = axes: Attr, "ta.import_group" = srcReduce: Attr} -> (resultType: Type);
   PositiveAxislessConstant(constant);
   MaxReduceKind(kind);
+  MaxScaleMotionInit(reduce);
 
   rewrite reduce with {
-    let rawMax = op<ta.reduce>(input) {kind = kind, axes = axes, "ta.import_group" = srcReduce} -> (resultType);
+    let rawMax = WithReductionInput(reduce, input);
     replace reduce with op<ta.mul>(rawMax, constant) {"ta.import_group" = srcMul};
   };
 }

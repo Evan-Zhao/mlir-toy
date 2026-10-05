@@ -162,13 +162,35 @@ def TA_SubstOp : TA_Op<"subst", [Pure, InferTypeOpAdaptor]> {
 }
 
 def TA_ReduceOp : TA_Op<"reduce", [Pure, InferTypeOpAdaptor]> {
-  let summary = "mathematical reduction over expression axes";
-  let arguments = (ins TA_ReduceKindEnumAttr:$kind, TA_ExprType:$input, Optional<AnyType>:$identity,
-      TA_AxesAttr:$axes);
+  let summary = "reduction over expression axes with a scalar initializer";
+  let description = [{
+    Combines the payload elements and one initial value per output coordinate.
+    The required initializer is either a scalar SSA operand defined outside the
+    enclosing ta.scope or a scalar integer/float attribute. Exactly one form must
+    be present, with the result element type. An empty reduction returns the
+    initializer.
+  }];
+  let arguments = (ins TA_ReduceKindEnumAttr:$kind, TA_ExprType:$input,
+      Optional<AnyType>:$init, OptionalAttr<AnyAttr>:$init_value, TA_AxesAttr:$axes);
   let results = (outs TA_ExprType:$result);
 
-  let assemblyFormat = "$kind $input (`identity` `(` $identity^ `:` type($identity) `)`)? "
+  let assemblyFormat = "$kind $input `init` `(` "
+                       "custom<ReduceInit>($init, type($init), $init_value) `)` "
                        "attr-dict `:` type($input) `->` type($result)";
+  let builders = [OpBuilder<(ins "::mlir::Type":$result,
+      "::ta::ReduceKind":$kind, "::mlir::Value":$input,
+      "::mlir::OpFoldResult":$init, "::ta::AxesAttr":$axes), [{
+    build($_builder, $_state, result, kind, input,
+          ::llvm::dyn_cast<::mlir::Value>(init),
+          ::llvm::dyn_cast<::mlir::Attribute>(init), axes);
+  }]>];
+  let extraClassDeclaration = [{
+    ::mlir::OpFoldResult getMixedInit() {
+      if (auto attr = getInitValueAttr())
+        return attr;
+      return getInit();
+    }
+  }];
   let hasVerifier = 1;
 }
 

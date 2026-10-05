@@ -248,9 +248,16 @@ private:
   }
 
   SmallVector<Value> collectRoots(func::FuncOp func) {
-    auto hasUnsupportedUser = [](Value value) {
-      return llvm::any_of(value.getUses(),
-                          [](OpOperand &use) { return !isSupportedStableHLOOp(use.getOwner()); });
+    auto needsMaterialization = [](Value value) {
+      return llvm::any_of(value.getUses(), [&](OpOperand &use) {
+        if (!isSupportedStableHLOOp(use.getOwner()))
+          return true;
+        // A computed initializer is a scalar input to the reduction's scope,
+        // not part of its indexed payload. Materialize its producer first.
+        auto reduce = dyn_cast<stablehlo::ReduceOp>(use.getOwner());
+        return reduce && use.getOperandNumber() >= reduce.getInputs().size() &&
+               !isa<stablehlo::ConstantOp, arith::ConstantOp>(value.getDefiningOp());
+      });
     };
 
     SmallVector<Value> roots;
@@ -258,7 +265,7 @@ private:
       if (!isSupportedStableHLOOp(&op))
         continue;
       for (OpResult result : op.getResults())
-        if (isa<RankedTensorType>(result.getType()) && hasUnsupportedUser(result))
+        if (isa<RankedTensorType>(result.getType()) && needsMaterialization(result))
           roots.push_back(result);
     }
     return roots;
@@ -818,9 +825,10 @@ public:
         trueValue, falseValue));
   }
 
-  // Reduction removes named axes from expression support. The StableHLO importer validates the
-  // identity separately, so the bodyless TA reduction does not carry an identity operand here.
-  Value reduce(ReduceKind kind, Value input, ArrayRef<AxisName> reductionAxes, Type elementType) {
+  // Reduction removes named axes from expression support. Its initializer is
+  // explicit, either a scalar constant attribute or a scope capture.
+  Value reduce(ReduceKind kind, Value input, ArrayRef<AxisName> reductionAxes, Type elementType,
+               OpFoldResult init) {
     DenseSet<StringRef> reduced(reductionAxes.begin(), reductionAxes.end());
     AxisNames resultAxes;
     for (Attribute attr : cast<ExprType>(input.getType()).getAxes().getAxes()) {
@@ -829,7 +837,7 @@ public:
         resultAxes.push_back(axis.str());
     }
     return annotate(ReduceOp::create(builder, loc, getExprType(elementType, resultAxes), kind,
-                                     input, Value(), getAxesAttr(reductionAxes)));
+                                     input, init, getAxesAttr(reductionAxes)));
   }
 
   // Relabel an already translated expression for a new consumer. Substitution changes logical
@@ -1468,39 +1476,31 @@ private:
     return op.emitOpError("only add and maximum reductions are supported");
   }
 
-  // TA reductions encode mathematical reduction kind but not arbitrary StableHLO initialization.
-  // Accept only the identities whose omission is semantics-preserving: zero for add and negative
-  // infinity (or the minimum signed integer) for maximum.
-  LogicalResult verifyReductionIdentity(stablehlo::ReduceOp op, ReduceKind kind) {
+  OpFoldResult materializeReductionInit(stablehlo::ReduceOp op) {
     Value init = op.getInitValues().front();
     FailureOr<TypedAttr> value = failure();
     if (auto constant = init.getDefiningOp<stablehlo::ConstantOp>())
       value = getSplatValue(constant.getValue());
     else if (auto constant = init.getDefiningOp<arith::ConstantOp>())
       value = getSplatValue(constant.getValue());
-    if (failed(value))
-      return op.emitOpError("reduction init must be a splat identity constant");
 
-    bool isIdentity = false;
-    if (auto floatValue = dyn_cast<FloatAttr>(*value)) {
-      if (kind == ReduceKind::Add)
-        isIdentity = floatValue.getValue().isZero();
-      else
-        isIdentity = floatValue.getValue().isInfinity() && floatValue.getValue().isNegative();
-    } else if (auto integerValue = dyn_cast<IntegerAttr>(*value)) {
-      if (kind == ReduceKind::Add)
-        isIdentity = integerValue.getValue().isZero();
-      else
-        isIdentity = integerValue.getValue().isMinSignedValue();
-    }
-    if (!isIdentity)
-      return op.emitOpError("reduction init is not the canonical identity");
-    return success();
+    if (succeeded(value))
+      return *value;
+
+    // Nonconstant init producers are separate materialization roots. Their
+    // rank-zero tensors (or function arguments) dominate this scope.
+    OpBuilder builder(ta.getScope());
+    return tensor::ExtractOp::create(builder, op.getLoc(), init, ValueRange{}).getResult();
+  }
+
+  // Dot products and singleton-axis removal introduce sums with a zero seed.
+  Attribute getZeroInit(Type elementType) {
+    return Builder(ta.getScope().getContext()).getZeroAttr(elementType);
   }
 
   LogicalResult emitReduce(stablehlo::ReduceOp op) {
     auto kind = matchReductionKind(op);
-    if (failed(kind) || failed(verifyReductionIdentity(op, *kind)))
+    if (failed(kind))
       return failure();
     Value inputValue = op.getInputs().front();
     Value resultValue = op.getResult(0);
@@ -1521,7 +1521,8 @@ private:
         return op.emitOpError("invalid reduction dimension");
       reductionAxes.push_back((**inputAxes)[dim]->name);
     }
-    Value expr = ta.reduce(*kind, *input, reductionAxes, resultType.getElementType());
+    OpFoldResult init = materializeReductionInit(op);
+    Value expr = ta.reduce(*kind, *input, reductionAxes, resultType.getElementType(), init);
     valueMap[resultValue] = {expr, getPresentTensorAxes(expr, **resultAxes)};
     return success();
   }
@@ -1554,7 +1555,9 @@ private:
     AxisNames reductionAxes;
     for (int64_t dim : op.getDotDimensionNumbers().getLhsContractingDimensions())
       reductionAxes.push_back((**lhsAxes)[dim]->name);
-    Value expr = ta.reduce(ReduceKind::Add, product, reductionAxes, resultType.getElementType());
+    OpFoldResult init = getZeroInit(resultType.getElementType());
+    Value expr =
+        ta.reduce(ReduceKind::Add, product, reductionAxes, resultType.getElementType(), init);
     valueMap[op.getResult()] = {expr, getPresentTensorAxes(expr, **resultAxes)};
     return success();
   }
@@ -1592,9 +1595,11 @@ private:
       Value expr = ta.subst(it->second.expr, replacements);
       // A reduction over a one-element axis is an identity and is the TA way
       // to forget a singleton dimension already materialized by a producer.
-      if (!erasedUnitAxes.empty())
-        expr = ta.reduce(ReduceKind::Add, expr, erasedUnitAxes,
-                         cast<ExprType>(expr.getType()).getElementType());
+      if (!erasedUnitAxes.empty()) {
+        Type type = cast<ExprType>(expr.getType()).getElementType();
+        OpFoldResult init = getZeroInit(type);
+        expr = ta.reduce(ReduceKind::Add, expr, erasedUnitAxes, type, init);
+      }
       return expr;
     }
 

@@ -1,15 +1,49 @@
 // RUN: %neptune-opt %s --split-input-file --verify-diagnostics | FileCheck %s
+// RUN: %neptune-opt %s --split-input-file --verify-diagnostics --mlir-print-op-generic | %neptune-opt --split-input-file | FileCheck %s
+// RUN: %neptune-opt %s --split-input-file --verify-diagnostics --mlir-print-op-generic | FileCheck %s --check-prefix=GENERIC
 
+// Attribute initializers occupy no SSA operand slot.
+// GENERIC: "ta.reduce"(%{{[^, )]+}}) <{axes = #ta.axes<i>, init_value = 0.000000e+00 : f32, kind = #ta.reduce_kind<add>}>
 // CHECK-LABEL: func.func @minimal_ta
+// CHECK: ta.reduce <add> {{.*}} init(0.000000e+00 : f32)
 func.func @minimal_ta(%tensor: tensor<16xf32>) -> tensor<16xf32> {
   %0 = ta.scope axes(%coord "i" extent 16) {
     %1 = ta.at %tensor[%coord]
         : tensor<16xf32> -> !ta.expr<f32, [i]>
-    %2 = ta.reduce #ta.reduce_kind<add> %1 {axes = #ta.axes<i>}
+    %2 = ta.reduce #ta.reduce_kind<add> %1 init(0.0 : f32) {axes = #ta.axes<i>}
         : !ta.expr<f32, [i]> -> !ta.expr<f32, []>
     ta.yield %2 : !ta.expr<f32, []>
   } : () -> tensor<16xf32>
   return %0 : tensor<16xf32>
+}
+
+// -----
+
+// Scalar SSA initializers round-trip in custom and generic assembly.
+// CHECK-LABEL: func.func @operand_max_init
+// CHECK: ta.reduce <max> {{.*}} init(%arg1 : f32)
+func.func @operand_max_init(%input: tensor<2x3xf32>, %init: f32) -> tensor<2xf32> {
+  %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3) {
+    %x = ta.at %input[%i, %j] : tensor<2x3xf32> -> !ta.expr<f32, [i, j]>
+    %max = ta.reduce <max> %x init(%init : f32) {axes = #ta.axes<j>}
+        : !ta.expr<f32, [i, j]> -> !ta.expr<f32, [i]>
+    ta.yield %max : !ta.expr<f32, [i]>
+  } : () -> tensor<2xf32>
+  return %out : tensor<2xf32>
+}
+
+// -----
+
+// CHECK-LABEL: func.func @operand_sum_init
+// CHECK: ta.reduce <add> {{.*}} init(%arg1 : i32)
+func.func @operand_sum_init(%input: tensor<2x3xi32>, %init: i32) -> tensor<2xi32> {
+  %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3) {
+    %x = ta.at %input[%i, %j] : tensor<2x3xi32> -> !ta.expr<i32, [i, j]>
+    %sum = ta.reduce <add> %x init(%init : i32) {axes = #ta.axes<j>}
+        : !ta.expr<i32, [i, j]> -> !ta.expr<i32, [i]>
+    ta.yield %sum : !ta.expr<i32, [i]>
+  } : () -> tensor<2xi32>
+  return %out : tensor<2xi32>
 }
 
 // -----
@@ -20,7 +54,7 @@ func.func @two_axis_ta(%tensor: tensor<16x32xf32>)
   %0 = ta.scope axes(%row "i" extent 16, %col "j" extent 32) {
     %1 = ta.at %tensor[%row, %col]
         : tensor<16x32xf32> -> !ta.expr<f32, [i, j]>
-    %2 = ta.reduce #ta.reduce_kind<add> %1 {axes = #ta.axes<j>}
+    %2 = ta.reduce #ta.reduce_kind<add> %1 init(0.0 : f32) {axes = #ta.axes<j>}
         : !ta.expr<f32, [i, j]> -> !ta.expr<f32, [i]>
     ta.yield %2 : !ta.expr<f32, [i]>
   } : () -> tensor<16x32xf32>
@@ -40,7 +74,7 @@ func.func @matmul_ta(%lhs: tensor<16x64xf32>, %rhs: tensor<64x32xf32>)
     %xy = ta.mul %x, %y
         : (!ta.expr<f32, [i, k]>, !ta.expr<f32, [k, j]>)
        -> !ta.expr<f32, [i, k, j]>
-    %dot = ta.reduce #ta.reduce_kind<add> %xy {axes = #ta.axes<k>}
+    %dot = ta.reduce #ta.reduce_kind<add> %xy init(0.0 : f32) {axes = #ta.axes<k>}
         : !ta.expr<f32, [i, k, j]> -> !ta.expr<f32, [i, j]>
     ta.yield %dot : !ta.expr<f32, [i, j]>
   } : () -> tensor<16x32xf32>
@@ -162,7 +196,7 @@ func.func @attention_ta(%Q: tensor<2x3x4x6xf32>,
     %qk = ta.mul %q, %k
         : (!ta.expr<f32, [b, h, i, d]>, !ta.expr<f32, [b, h, j, d]>)
        -> !ta.expr<f32, [b, h, i, d, j]>
-    %dot = ta.reduce #ta.reduce_kind<add> %qk {axes = #ta.axes<d>}
+    %dot = ta.reduce #ta.reduce_kind<add> %qk init(0.0 : f32) {axes = #ta.axes<d>}
         : !ta.expr<f32, [b, h, i, d, j]> -> !ta.expr<f32, [b, h, i, j]>
 
     %scale = ta.constant 4.082482904638630e-01 : f32 : !ta.expr<f32, []>
@@ -170,7 +204,7 @@ func.func @attention_ta(%Q: tensor<2x3x4x6xf32>,
         : (!ta.expr<f32, []>, !ta.expr<f32, [b, h, i, j]>)
        -> !ta.expr<f32, [b, h, i, j]>
 
-    %m = ta.reduce #ta.reduce_kind<max> %s {axes = #ta.axes<j>}
+    %m = ta.reduce #ta.reduce_kind<max> %s init(0.0 : f32) {axes = #ta.axes<j>}
         : !ta.expr<f32, [b, h, i, j]> -> !ta.expr<f32, [b, h, i]>
 
     %centered = ta.sub %s, %m
@@ -179,7 +213,7 @@ func.func @attention_ta(%Q: tensor<2x3x4x6xf32>,
     %p = ta.exp %centered
         : (!ta.expr<f32, [b, h, i, j]>) -> !ta.expr<f32, [b, h, i, j]>
 
-    %l = ta.reduce #ta.reduce_kind<add> %p {axes = #ta.axes<j>}
+    %l = ta.reduce #ta.reduce_kind<add> %p init(0.0 : f32) {axes = #ta.axes<j>}
         : !ta.expr<f32, [b, h, i, j]> -> !ta.expr<f32, [b, h, i]>
 
     %v = ta.at %V[%b, %h, %j, %e]
@@ -187,7 +221,7 @@ func.func @attention_ta(%Q: tensor<2x3x4x6xf32>,
     %pv = ta.mul %p, %v
         : (!ta.expr<f32, [b, h, i, j]>, !ta.expr<f32, [b, h, j, e]>)
        -> !ta.expr<f32, [b, h, i, j, e]>
-    %num = ta.reduce #ta.reduce_kind<add> %pv {axes = #ta.axes<j>}
+    %num = ta.reduce #ta.reduce_kind<add> %pv init(0.0 : f32) {axes = #ta.axes<j>}
         : !ta.expr<f32, [b, h, i, j, e]> -> !ta.expr<f32, [b, h, i, e]>
 
     %o = ta.div %num, %l
@@ -294,11 +328,91 @@ func.func @bad_reduce_result_axes(%tensor: tensor<16x32xf32>)
     %x = ta.at %tensor[%row, %col]
         : tensor<16x32xf32> -> !ta.expr<f32, [i, j]>
     // expected-error @+1 {{'ta.reduce' op result axes must be payload axes minus reduction axes; expected #ta.axes<i>}}
-    %bad = ta.reduce #ta.reduce_kind<add> %x {axes = #ta.axes<j>}
+    %bad = ta.reduce #ta.reduce_kind<add> %x init(0.0 : f32) {axes = #ta.axes<j>}
         : !ta.expr<f32, [i, j]> -> !ta.expr<f32, [j]>
     ta.yield %bad : !ta.expr<f32, [j]>
   } : () -> tensor<16x32xf32>
   return %0 : tensor<16x32xf32>
+}
+
+// -----
+
+// Initializers must have exactly one representation: operand or attribute.
+func.func @bad_reduce_missing_init(%input: tensor<2x3xf32>) -> tensor<2xf32> {
+  %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3) {
+    %x = ta.at %input[%i, %j] : tensor<2x3xf32> -> !ta.expr<f32, [i, j]>
+    // expected-error @+1 {{requires exactly one init operand or init_value attribute}}
+    %max = "ta.reduce"(%x) <{kind = #ta.reduce_kind<max>, axes = #ta.axes<j>}>
+        : (!ta.expr<f32, [i, j]>) -> !ta.expr<f32, [i]>
+    ta.yield %max : !ta.expr<f32, [i]>
+  } : () -> tensor<2xf32>
+  return %out : tensor<2xf32>
+}
+
+// -----
+
+func.func @bad_reduce_both_init_forms(%input: tensor<2x3xf32>, %init: f32) -> tensor<2xf32> {
+  %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3) {
+    %x = ta.at %input[%i, %j] : tensor<2x3xf32> -> !ta.expr<f32, [i, j]>
+    // expected-error @+1 {{requires exactly one init operand or init_value attribute}}
+    %max = "ta.reduce"(%x, %init) <{kind = #ta.reduce_kind<max>, axes = #ta.axes<j>, init_value = 0.0 : f32}>
+        : (!ta.expr<f32, [i, j]>, f32) -> !ta.expr<f32, [i]>
+    ta.yield %max : !ta.expr<f32, [i]>
+  } : () -> tensor<2xf32>
+  return %out : tensor<2xf32>
+}
+
+// -----
+
+func.func @bad_reduce_init_operand_type(%input: tensor<2x3xf32>, %init: tensor<f32>) -> tensor<2xf32> {
+  %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3) {
+    %x = ta.at %input[%i, %j] : tensor<2x3xf32> -> !ta.expr<f32, [i, j]>
+    // expected-error @+1 {{init type must match result expression element type}}
+    %max = ta.reduce <max> %x init(%init : tensor<f32>) {axes = #ta.axes<j>}
+        : !ta.expr<f32, [i, j]> -> !ta.expr<f32, [i]>
+    ta.yield %max : !ta.expr<f32, [i]>
+  } : () -> tensor<2xf32>
+  return %out : tensor<2xf32>
+}
+
+// -----
+
+func.func @bad_reduce_init_attribute_type(%input: tensor<2x3xf32>) -> tensor<2xf32> {
+  %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3) {
+    %x = ta.at %input[%i, %j] : tensor<2x3xf32> -> !ta.expr<f32, [i, j]>
+    // expected-error @+1 {{init type must match result expression element type}}
+    %max = ta.reduce <max> %x init(0.0 : f64) {axes = #ta.axes<j>}
+        : !ta.expr<f32, [i, j]> -> !ta.expr<f32, [i]>
+    ta.yield %max : !ta.expr<f32, [i]>
+  } : () -> tensor<2xf32>
+  return %out : tensor<2xf32>
+}
+
+// -----
+
+func.func @bad_reduce_init_attribute_kind(%input: tensor<2x3xf32>) -> tensor<2xf32> {
+  %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3) {
+    %x = ta.at %input[%i, %j] : tensor<2x3xf32> -> !ta.expr<f32, [i, j]>
+    // expected-error @+1 {{init attribute must be a scalar integer or floating-point attribute}}
+    %max = ta.reduce <max> %x init(dense<0.0> : tensor<f32>) {axes = #ta.axes<j>}
+        : !ta.expr<f32, [i, j]> -> !ta.expr<f32, [i]>
+    ta.yield %max : !ta.expr<f32, [i]>
+  } : () -> tensor<2xf32>
+  return %out : tensor<2xf32>
+}
+
+// -----
+
+func.func @bad_reduce_scope_local_init(%input: tensor<2x3xf32>) -> tensor<2xf32> {
+  %out = ta.scope axes(%i "i" extent 2, %j "j" extent 3) {
+    %init = arith.constant -100.0 : f32
+    %x = ta.at %input[%i, %j] : tensor<2x3xf32> -> !ta.expr<f32, [i, j]>
+    // expected-error @+1 {{init must be defined outside the enclosing ta.scope}}
+    %max = ta.reduce <max> %x init(%init : f32) {axes = #ta.axes<j>}
+        : !ta.expr<f32, [i, j]> -> !ta.expr<f32, [i]>
+    ta.yield %max : !ta.expr<f32, [i]>
+  } : () -> tensor<2xf32>
+  return %out : tensor<2xf32>
 }
 
 // -----

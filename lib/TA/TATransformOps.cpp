@@ -1,6 +1,7 @@
 #include "TA/TATransformOps.h"
 
 #include "TA/TAPasses.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/ADT/SetVector.h"
@@ -8,6 +9,14 @@
 #include "llvm/ADT/Twine.h"
 
 using namespace mlir;
+
+// Preserve the complete reduction (including either initializer representation
+// and provenance attributes) when a scheduling rewrite changes its payload.
+static Value cloneReductionWithInput(PatternRewriter &rewriter, Operation *reduce, Value input) {
+  Operation *clone = rewriter.clone(*reduce);
+  clone->setOperand(0, input);
+  return clone->getResult(0);
+}
 
 namespace ta_fp16_matmul_scale_motion_pdl {
 using namespace mlir;

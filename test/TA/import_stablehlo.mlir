@@ -1,25 +1,26 @@
-// RUN: %neptune-opt --pass-pipeline='builtin.module(func.func(stablehlo-to-ta))' --mlir-print-debuginfo %s | FileCheck %s --check-prefix=LOC
+// RUN: %neptune-opt %s --split-input-file --pass-pipeline='builtin.module(func.func(stablehlo-to-ta))' --mlir-print-debuginfo | FileCheck %s --check-prefix=LOC
+// RUN: %neptune-opt %s --split-input-file --pass-pipeline='builtin.module(func.func(stablehlo-to-ta))' | FileCheck %s --check-prefix=TA
 
 // CHECK-LABEL: func.func @attention
-// CHECK-NEXT: %[[SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 1, %i1 "i1" extent 2, %i2 "i2" extent 4, %i3 "i3" extent 3, %j0 "j0" extent 3, %j1 "j1" extent 4) {
+// CHECK: %[[SCOPE:.+]] = ta.scope axes(%i0 "i0" extent 1, %i1 "i1" extent 2, %i2 "i2" extent 4, %i3 "i3" extent 3, %j0 "j0" extent 3, %j1 "j1" extent 4) {
 // CHECK: %[[Q16:.+]] = ta.at %{{.+}}[%i0, %i1, %i2, %j0] {{.*}} : tensor<1x2x4x3xf16> -> !ta.expr<f16, [i0, i1, i2, j0]>
 // CHECK: %[[Q:.+]] = ta.cast %[[Q16]] {{.*}} -> !ta.expr<f32, [i0, i1, i2, j0]>
 // CHECK: %[[K16:.+]] = ta.at %{{.+}}[%i0, %i1, %j1, %j0] {{.*}} : tensor<1x2x4x3xf16> -> !ta.expr<f16, [i0, i1, j1, j0]>
 // CHECK: %[[K:.+]] = ta.cast %[[K16]] {{.*}} -> !ta.expr<f32, [i0, i1, j1, j0]>
 // CHECK: %[[QK:.+]] = ta.mul %[[Q]], %[[K]] {{.*}} -> !ta.expr<f32, [i0, i1, i2, j0, j1]>
-// CHECK: %[[DOT:.+]] = ta.reduce <add> %[[QK]] {axes = #ta.axes<j0>{{.*}} -> !ta.expr<f32, [i0, i1, i2, j1]>
+// CHECK: %[[DOT:.+]] = ta.reduce <add> %[[QK]] init(0.000000e+00 : f32) {axes = #ta.axes<j0>{{.*}} -> !ta.expr<f32, [i0, i1, i2, j1]>
 // CHECK: %[[SCALE64:.+]] = ta.constant 0.5773502691896257{{.*}} : !ta.expr<f64, []>
 // CHECK: %[[SCALE:.+]] = ta.cast %[[SCALE64]] {{.*}} -> !ta.expr<f32, []>
 // CHECK: %[[SCORES:.+]] = ta.mul %[[DOT]], %[[SCALE]] {{.*}} -> !ta.expr<f32, [i0, i1, i2, j1]>
-// CHECK: %[[MAX:.+]] = ta.reduce <max> %[[SCORES]] {axes = #ta.axes<j1>{{.*}} -> !ta.expr<f32, [i0, i1, i2]>
+// CHECK: %[[MAX:.+]] = ta.reduce <max> %[[SCORES]] init(0xFF800000 : f32) {axes = #ta.axes<j1>{{.*}} -> !ta.expr<f32, [i0, i1, i2]>
 // CHECK: %[[CENTERED:.+]] = ta.sub %[[SCORES]], %[[MAX]] {{.*}} -> !ta.expr<f32, [i0, i1, i2, j1]>
 // CHECK: %[[EXP:.+]] = ta.exp %[[CENTERED]] {{.*}} -> !ta.expr<f32, [i0, i1, i2, j1]>
-// CHECK: %[[DEN:.+]] = ta.reduce <add> %[[EXP]] {axes = #ta.axes<j1>{{.*}} -> !ta.expr<f32, [i0, i1, i2]>
+// CHECK: %[[DEN:.+]] = ta.reduce <add> %[[EXP]] init(0.000000e+00 : f32) {axes = #ta.axes<j1>{{.*}} -> !ta.expr<f32, [i0, i1, i2]>
 // CHECK: %[[PROB:.+]] = ta.div %[[EXP]], %[[DEN]] {{.*}} -> !ta.expr<f32, [i0, i1, i2, j1]>
 // CHECK: %[[V16:.+]] = ta.at %{{.+}}[%i0, %i1, %j1, %i3] {{.*}} : tensor<1x2x4x3xf16> -> !ta.expr<f16, [i0, i1, j1, i3]>
 // CHECK: %[[V:.+]] = ta.cast %[[V16]] {{.*}} -> !ta.expr<f32, [i0, i1, j1, i3]>
 // CHECK: %[[PV:.+]] = ta.mul %[[PROB]], %[[V]] {{.*}} -> !ta.expr<f32, [i0, i1, i2, j1, i3]>
-// CHECK: %[[NUM:.+]] = ta.reduce <add> %[[PV]] {axes = #ta.axes<j1>{{.*}} -> !ta.expr<f32, [i0, i1, i2, i3]>
+// CHECK: %[[NUM:.+]] = ta.reduce <add> %[[PV]] init(0.000000e+00 : f32) {axes = #ta.axes<j1>{{.*}} -> !ta.expr<f32, [i0, i1, i2, i3]>
 // CHECK: %[[OUT:.+]] = ta.cast %[[NUM]] {{.*}} -> !ta.expr<f16, [i0, i1, i2, i3]>
 // CHECK: ta.yield %[[OUT]] : !ta.expr<f16, [i0, i1, i2, i3]>
 // CHECK: return %[[SCOPE]] : tensor<1x2x4x3xf16>
@@ -303,4 +304,93 @@ func.func @dynamic_iota_and() -> tensor<4x4xi1> {
       : (tensor<4x4xi64>, tensor<4x4xi64>) -> tensor<4x4xi1>
   %result = stablehlo.and %in_window, %causal : tensor<4x4xi1>
   return %result : tensor<4x4xi1>
+}
+
+// -----
+
+// Reduction initializers are preserved by StableHLO -> TA import.
+
+// TA-LABEL: func.func @finite_max
+// TA-NOT: arith.constant
+// TA: ta.reduce <max> {{.*}} init(-3.40282347E+38 : f32)
+func.func @finite_max(%input: tensor<2x3xf32>) -> tensor<2xf32> {
+  %init = stablehlo.constant dense<0xFF7FFFFF> : tensor<f32>
+  %out = stablehlo.reduce(%input init: %init) applies stablehlo.maximum across dimensions = [1]
+      : (tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>
+  return %out : tensor<2xf32>
+}
+
+// TA-LABEL: func.func @nonzero_sum
+// TA-NOT: arith.constant
+// TA: ta.reduce <add> {{.*}} init(7.000000e+00 : f32)
+func.func @nonzero_sum(%input: tensor<2x3xf32>) -> tensor<2xf32> {
+  %init = stablehlo.constant dense<7.0> : tensor<f32>
+  %out = stablehlo.reduce(%input init: %init) applies stablehlo.add across dimensions = [1]
+      : (tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>
+  return %out : tensor<2xf32>
+}
+
+// TA-LABEL: func.func @dynamic_init
+// TA: %[[INIT:.*]] = tensor.extract %arg1[] : tensor<f32>
+// TA: ta.reduce <max> {{.*}} init(%[[INIT]] : f32)
+func.func @dynamic_init(%input: tensor<2x3xf32>, %init: tensor<f32>) -> tensor<2xf32> {
+  %out = stablehlo.reduce(%input init: %init) applies stablehlo.maximum across dimensions = [1]
+      : (tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>
+  return %out : tensor<2xf32>
+}
+
+// A computed initializer gets its own scope so its scalar extraction dominates
+// the reduction scope.
+// TA-LABEL: func.func @computed_init
+// TA: %[[SCALAR:.*]] = ta.scope axes() {
+// TA: ta.add
+// TA: %[[INIT:.*]] = tensor.extract %[[SCALAR]][] : tensor<f32>
+// TA: ta.scope axes(
+// TA: ta.reduce <max> {{.*}} init(%[[INIT]] : f32)
+func.func @computed_init(%input: tensor<2x3xf32>, %a: tensor<f32>, %b: tensor<f32>) -> tensor<2xf32> {
+  %init = stablehlo.add %a, %b : tensor<f32>
+  %out = stablehlo.reduce(%input init: %init) applies stablehlo.maximum across dimensions = [1]
+      : (tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>
+  return %out : tensor<2xf32>
+}
+
+// TA-LABEL: func.func @negative_zero
+// TA-NOT: arith.constant
+// TA: ta.reduce <add> {{.*}} init(-0.000000e+00 : f32)
+func.func @negative_zero(%input: tensor<2x3xf32>) -> tensor<2xf32> {
+  %init = stablehlo.constant dense<-0.0> : tensor<f32>
+  %out = stablehlo.reduce(%input init: %init) applies stablehlo.add across dimensions = [1]
+      : (tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>
+  return %out : tensor<2xf32>
+}
+
+// Dot products use a zero initializer of the accumulator type.
+// TA-LABEL: func.func @dot_init
+// TA-NOT: arith.constant
+// TA: ta.reduce <add> %{{[^ ]+}} init(0.000000e+00 : f32)
+func.func @dot_init(%lhs: tensor<2x3xf16>, %rhs: tensor<3x4xf16>) -> tensor<2x4xf32> {
+  %out = stablehlo.dot_general %lhs, %rhs, contracting_dims = [1] x [0]
+      : (tensor<2x3xf16>, tensor<3x4xf16>) -> tensor<2x4xf32>
+  return %out : tensor<2x4xf32>
+}
+
+// Identity initializers are preserved as attributes.
+// TA-LABEL: func.func @canonical_max
+// TA-NOT: arith.constant
+// TA: ta.reduce <max> %{{[^ ]+}} init(0xFF800000 : f32) {axes
+func.func @canonical_max(%input: tensor<2x3xf32>) -> tensor<2xf32> {
+  %init = stablehlo.constant dense<0xFF800000> : tensor<f32>
+  %out = stablehlo.reduce(%input init: %init) applies stablehlo.maximum across dimensions = [1]
+      : (tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>
+  return %out : tensor<2xf32>
+}
+
+// TA-LABEL: func.func @canonical_sum
+// TA-NOT: arith.constant
+// TA: ta.reduce <add> %{{[^ ]+}} init(0.000000e+00 : f32) {axes
+func.func @canonical_sum(%input: tensor<2x3xf32>) -> tensor<2xf32> {
+  %init = stablehlo.constant dense<0.0> : tensor<f32>
+  %out = stablehlo.reduce(%input init: %init) applies stablehlo.add across dimensions = [1]
+      : (tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>
+  return %out : tensor<2xf32>
 }

@@ -970,8 +970,30 @@ LogicalResult SelectOp::verify() {
   return success();
 }
 
+static ParseResult parseReduceInit(OpAsmParser &parser,
+                                   std::optional<OpAsmParser::UnresolvedOperand> &init,
+                                   Type &initType, Attribute &initValue) {
+  OpAsmParser::UnresolvedOperand operand;
+  OptionalParseResult parsed = parser.parseOptionalOperand(operand);
+  if (parsed.has_value()) {
+    if (failed(*parsed) || parser.parseColonType(initType))
+      return failure();
+    init = operand;
+    return success();
+  }
+  return parser.parseAttribute(initValue);
+}
+
+static void printReduceInit(OpAsmPrinter &printer, Operation *, Value init, Type initType,
+                            Attribute initValue) {
+  if (init)
+    printer << init << " : " << initType;
+  else
+    printer.printAttribute(initValue);
+}
+
 static LogicalResult verifyReducePayload(Operation *op, ScopeOp scope, AxesAttr reductionAxes,
-                                         ExprType payload, ExprType result, Value identity) {
+                                         ExprType payload, ExprType result) {
   if (failed(verifyAxesSubset(op, scope.getAxes(), reductionAxes, "reduction")))
     return failure();
   if (failed(verifyAxesSubset(op, scope.getAxes(), payload.getAxes(), "payload")))
@@ -987,9 +1009,6 @@ static LogicalResult verifyReducePayload(Operation *op, ScopeOp scope, AxesAttr 
     return op->emitOpError() << "result axes must be payload axes minus reduction axes; expected "
                              << expected;
 
-  if (identity && identity.getType() != result.getElementType())
-    return op->emitOpError("identity type must match result expression element type");
-
   return success();
 }
 
@@ -1000,7 +1019,20 @@ LogicalResult ReduceOp::verify() {
 
   auto payload = cast<ExprType>(getInput().getType());
   auto result = cast<ExprType>(getResult().getType());
-  return verifyReducePayload(getOperation(), *scopeOr, getAxes(), payload, result, getIdentity());
+  if (failed(verifyReducePayload(getOperation(), *scopeOr, getAxes(), payload, result)))
+    return failure();
+  Value init = getInit();
+  Attribute initValue = getInitValueAttr();
+  if (static_cast<bool>(init) == static_cast<bool>(initValue))
+    return emitOpError("requires exactly one init operand or init_value attribute");
+  if (initValue && !isa<IntegerAttr, FloatAttr>(initValue))
+    return emitOpError("init attribute must be a scalar integer or floating-point attribute");
+  Type initType = init ? init.getType() : cast<TypedAttr>(initValue).getType();
+  if (initType != result.getElementType())
+    return emitOpError("init type must match result expression element type");
+  if (init && (*scopeOr)->isAncestor(init.getParentRegion()->getParentOp()))
+    return emitOpError("init must be defined outside the enclosing ta.scope");
+  return success();
 }
 
 LogicalResult SubstOp::verify() {

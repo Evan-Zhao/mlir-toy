@@ -455,56 +455,14 @@ private:
     if (!reduce)
       return empty.getResult();
 
-    Value identity = createIdentity(root->getLoc(), resultType.getElementType(), reduce.getKind());
+    OpFoldResult mixedInit = reduce.getMixedInit();
+    Value init = dyn_cast<Value>(mixedInit);
+    if (!init)
+      init = arith::ConstantOp::create(builder, root->getLoc(),
+                                       cast<TypedAttr>(cast<Attribute>(mixedInit)));
     auto fill = linalg::FillOp::create(builder, root->getLoc(), TypeRange{resultType},
-                                       ValueRange{identity}, ValueRange{empty.getResult()});
+                                       ValueRange{init}, ValueRange{empty.getResult()});
     return fill.getResult(0);
-  }
-
-  Value createIdentity(Location identityLoc, Type type, ReduceKind kind) {
-    if (auto floatType = dyn_cast<FloatType>(type)) {
-      const llvm::fltSemantics &semantics = floatType.getFloatSemantics();
-      APFloat value = APFloat::getZero(semantics);
-      switch (kind) {
-      case ReduceKind::Add:
-        value = APFloat::getZero(semantics);
-        break;
-      case ReduceKind::Mul:
-        value = APFloat(semantics, "1.0");
-        break;
-      case ReduceKind::Max:
-        value = APFloat::getInf(semantics, /*Negative=*/true);
-        break;
-      case ReduceKind::Min:
-        value = APFloat::getInf(semantics, /*Negative=*/false);
-        break;
-      }
-      return arith::ConstantOp::create(builder, identityLoc, FloatAttr::get(floatType, value));
-    }
-
-    if (type.isIndex()) {
-      assert((kind == ReduceKind::Add || kind == ReduceKind::Mul) &&
-             "index min/max reductions have no portable identity");
-      return arith::ConstantIndexOp::create(builder, identityLoc, kind == ReduceKind::Add ? 0 : 1);
-    }
-
-    auto integerType = cast<IntegerType>(type);
-    unsigned width = integerType.getWidth();
-    APInt value(width, 0);
-    switch (kind) {
-    case ReduceKind::Add:
-      break;
-    case ReduceKind::Mul:
-      value = APInt(width, 1);
-      break;
-    case ReduceKind::Max:
-      value = isUnsignedInteger(type) ? APInt::getMinValue(width) : APInt::getSignedMinValue(width);
-      break;
-    case ReduceKind::Min:
-      value = isUnsignedInteger(type) ? APInt::getMaxValue(width) : APInt::getSignedMaxValue(width);
-      break;
-    }
-    return arith::ConstantOp::create(builder, identityLoc, IntegerAttr::get(integerType, value));
   }
 
   void buildLinalgBody(OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args,

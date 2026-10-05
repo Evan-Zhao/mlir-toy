@@ -31,7 +31,7 @@ module attributes {transform.with_named_sequence} {
       %prod = ta.mul %q_expr, %k_expr
           : (!ta.expr<f32, [b, h, i, d]>, !ta.expr<f32, [b, h, j, d]>)
          -> !ta.expr<f32, [b, h, i, d, j]>
-      %dot = ta.reduce #ta.reduce_kind<add> %prod {axes = #ta.axes<d>}
+      %dot = ta.reduce #ta.reduce_kind<add> %prod init(0.0 : f32) {axes = #ta.axes<d>}
           : !ta.expr<f32, [b, h, i, d, j]> -> !ta.expr<f32, [b, h, i, j]>
       ta.yield %dot : !ta.expr<f32, [b, h, i, j]>
     } : () -> tensor<2x3x4x5xf32>
@@ -72,7 +72,7 @@ module attributes {transform.with_named_sequence} {
       %prod = ta.mul %q_expr, %k_expr
           : (!ta.expr<f32, [b, g, h, i, d]>, !ta.expr<f32, [b, h, j, d]>)
          -> !ta.expr<f32, [b, g, h, i, d, j]>
-      %dot = ta.reduce #ta.reduce_kind<add> %prod {axes = #ta.axes<d>}
+      %dot = ta.reduce #ta.reduce_kind<add> %prod init(0.0 : f32) {axes = #ta.axes<d>}
           : !ta.expr<f32, [b, g, h, i, d, j]> -> !ta.expr<f32, [b, g, h, i, j]>
       ta.yield %dot : !ta.expr<f32, [b, g, h, i, j]>
     } : () -> tensor<2x7x3x4x5xf32>

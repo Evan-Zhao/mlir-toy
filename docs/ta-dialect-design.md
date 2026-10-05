@@ -81,7 +81,7 @@ Inside the scope, tensor accesses produce scalar indexed expressions:
 %qk = ta.mulf %q, %k
     : (!ta.expr<f32, [b, h, i, d]>, !ta.expr<f32, [b, h, j, d]>)
    -> !ta.expr<f32, [b, h, i, d, j]>
-%dot = ta.reduce #ta.reduce_kind<add> %qk {axes = #ta.axes<d>}
+%dot = ta.reduce #ta.reduce_kind<add> %qk init(0.0 : f32) {axes = #ta.axes<d>}
     : !ta.expr<f32, [b, h, i, d, j]> -> !ta.expr<f32, [b, h, i, j]>
 ```
 
@@ -266,9 +266,11 @@ stablehlo.reduce
 stablehlo.dot_general
 ```
 
-Reductions must have one input and a direct binary `add` or `maximum` combiner.
-Their initial value must be the corresponding identity: zero for addition and
-negative infinity (or the minimum signed integer) for maximum.
+Imported reductions must have one floating-point input and a direct binary `add`
+or `maximum` combiner. Constant initializers become inline attributes.
+Nonconstant rank-zero initializers are extracted outside the reduction's scope;
+computed initializer producers are materialized in separate scopes first. Imported
+dot products and synthetic singleton-axis sums receive zero initializers.
 
 The importer annotates TA operations created from each StableHLO operation with:
 
@@ -479,12 +481,45 @@ that has not been canonicalized.
 Reduces an expression over one or more axes.
 
 ```mlir
-%sum = ta.reduce #ta.reduce_kind<add> %payload {axes = #ta.axes<k>}
+%sum = ta.reduce #ta.reduce_kind<add> %payload init(0.0 : f32) {axes = #ta.axes<k>}
     : !ta.expr<f32, [i, k, j]> -> !ta.expr<f32, [i, j]>
 ```
 
 Built-in reducer kinds are `add`, `mul`, `max`, and `min`. The reducer kind is
 a structured enum attribute, not a string.
+
+The required `init` is a scalar integer/float attribute or a scalar SSA operand
+of the result's element type. An SSA initializer must be defined outside the
+enclosing `ta.scope`.
+
+```mlir
+// %floor is an f32 scalar defined outside the enclosing ta.scope.
+%max = ta.reduce <max> %payload init(%floor : f32) {axes = #ta.axes<k>}
+    : !ta.expr<f32, [i, k]> -> !ta.expr<f32, [i]>
+```
+
+The initializer is combined once per output. An empty reduction returns it.
+TA-to-Linalg uses the SSA scalar directly or materializes an attribute with
+`arith.constant`, then initializes the destination with `linalg.fill`.
+
+Internally, exactly one of the `init` operand and `init_value` attribute is present.
+`ReduceOp::getMixedInit()` and the mixed-init builder use `OpFoldResult` to
+represent either form.
+
+TA scale-motion patterns preserve the initializer and recognize constants in
+either form:
+
+- Additive scale motion requires a floating-point zero: sinking a divisor or
+  factor would also scale the initializer. Moving scales through f16/bf16 rounding
+  remains intentionally approximate.
+- Max scale motion accepts floating-point zero, signed infinities, and signed
+  largest finite values. Other finite values, NaNs, and unknown operands block it.
+  Finite extrema are workload-specific sentinels; they are not scale-invariant,
+  so exact equivalence is not guaranteed for active finite bounds, empty/all-masked
+  domains, or overflowing arithmetic. Mask fills require `-inf`.
+
+Einsum matching recognizes the contraction's payload and axes independently of
+the initializer.
 
 `ta.reduce` has no payload body. Its input is an ordinary expression value, so
 the payload remains visible to standard op-DAG pattern matching.

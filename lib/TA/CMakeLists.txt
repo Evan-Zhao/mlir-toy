@@ -65,6 +65,7 @@ target_link_libraries(NeptuneTA PUBLIC
   StablehloOps
   MLIRAffineDialect
   MLIRArithDialect
+  MLIRDialectUtils
   MLIRFuncDialect
   MLIRLinalgDialect
   MLIRMathDialect

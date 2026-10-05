@@ -84,8 +84,10 @@ def TASinkDivAfterMatmulPatternsOp
     The patterns support the left- and right-operand forms of f16 and bf16
     matmuls with f32 accumulation. Moving the divisor across low-precision
     rounding is intentionally approximate. The `denom` divisor must have axes
-    disjoint from the reduction axes. The patterns preserve the matched add
-    reducer kind, axes, and import-group attributes.
+    disjoint from the reduction axes. The sum initializer must be a known
+    floating-point zero, either an attribute or a constant SSA operand.
+    The patterns preserve the matched initializer, add reducer kind, axes, and
+    import-group attributes.
   }];
 
   let assemblyFormat = "attr-dict";
@@ -109,8 +111,10 @@ def TASinkRightMulAfterMatmulPatternsOp
     The pattern supports f16 and bf16 matmul operands with f32 accumulation.
     Moving the factor across low-precision rounding is intentionally
     approximate. The `factor` must have axes disjoint from the reduction axes.
-    The pattern preserves the matched add reducer kind, axes, and import-group
-    attributes.
+    The sum initializer must be a known floating-point zero, either an attribute
+    or a constant SSA operand.
+    The pattern preserves the matched initializer, add reducer kind, axes, and
+    import-group attributes.
   }];
 
   let assemblyFormat = "attr-dict";
@@ -133,8 +137,13 @@ def TASinkScaleAfterMaxPatternsOp
     The masked form is obtained by composing the first two rewrites. The axisless scale `c`
     must be a finite positive floating-point constant.
     Both operand orders of `ta.mul` are supported. The patterns preserve the
-    matched max reducer kind, axes, and import-group attributes. Apply this
-    descriptor separately from pattern sets that move scales into max reductions.
+    matched max reducer kind, axes, initializer, and import-group attributes.
+    The initializer must be a known floating-point zero, signed infinity, or
+    signed largest finite value, supplied as an attribute or constant SSA operand.
+    Finite extrema are workload-specific sentinels; exact equivalence is not
+    guaranteed for active finite bounds, empty/all-masked domains, or overflowing
+    arithmetic. Mask fills require negative infinity. Apply this descriptor
+    separately from pattern sets that move scales into max reductions.
   }];
 
   let assemblyFormat = "attr-dict";
@@ -156,6 +165,9 @@ def TAExpToExp2PatternsOp : Op<Transform_Dialect, "apply_patterns.ta.exp_to_exp2
     distribution through `ta.sub` and `ta.select`, movement through
     `ta.reduce <max>`, reassociation through `ta.mul`, and canonicalizations
     that fold scalar products and floating-point infinity identities.
+
+    Max-reduction scale motion uses the initializer policy and numerical caveats
+    of `apply_patterns.ta.sink_scale_after_max`.
 
     The pattern set intentionally does not distribute through `ta.add`. It preserves
     `log2(e) * (scores + bias)` rather than producing separately scaled terms. This keeps the
