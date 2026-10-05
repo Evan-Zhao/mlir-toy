@@ -2,6 +2,7 @@
 
 The public ``neptune-export`` CLI invokes this module in a subprocess so
 Torch-MLIR and Neptune's standalone MLIR Python runtime are not loaded together.
+Torch-MLIR imports stay local so the eager modules can also serve as test references.
 """
 
 import argparse
@@ -9,7 +10,6 @@ import math
 from collections.abc import Callable
 
 import torch
-from torch_mlir import fx
 
 from neptune_mlir.operator.variants import VARIANTS, AttentionVariant
 
@@ -188,6 +188,78 @@ def _use_f32_accumulation_for_f16_dots(module) -> int:
     return len(converts)
 
 
+def _use_finite_softmax_max_init(module) -> int:
+    """Give built-in attention's f32 row max a finite rolling-softmax seed.
+
+    This is an attention policy, not a general max canonicalization. Only change
+    the reduction's -inf init operand: the same constant may also supply masked
+    scores, which must remain -inf. All built-in variants have one row max.
+    """
+    from torch_mlir.ir import (
+        DenseElementsAttr,  # type: ignore
+        DenseFPElementsAttr,  # type: ignore
+        F32Type,  # type: ignore
+        FloatAttr,  # type: ignore
+        InsertionPoint,  # type: ignore
+        Operation,  # type: ignore
+        RankedTensorType,  # type: ignore
+        WalkResult,  # type: ignore
+    )
+
+    reductions: list[Operation] = []
+
+    def collect_row_max(op: Operation) -> WalkResult:
+        if op.name != "stablehlo.reduce" or len(op.operands) != 2 or len(op.results) != 1:
+            return WalkResult.ADVANCE
+        input_type = RankedTensorType(op.operands[0].type)
+        init = op.operands[1]
+        init_type = RankedTensorType(init.type)
+        if (
+            not isinstance(init_type.element_type, F32Type)
+            or init_type.rank != 0
+            or list(op.attributes["dimensions"]) != [input_type.rank - 1]
+        ):
+            return WalkResult.ADVANCE
+        block = op.regions[0].blocks[0]
+        body = list(block.operations)
+        if (
+            len(body) != 2
+            or body[0].operation.name != "stablehlo.maximum"
+            or list(body[0].operands) not in (list(block.arguments), list(block.arguments)[::-1])
+            or body[1].operation.name != "stablehlo.return"
+            or list(body[1].operands) != list(body[0].results)
+        ):
+            return WalkResult.ADVANCE
+        constant = getattr(init.owner, "operation", init.owner)
+        if not isinstance(constant, Operation) or constant.name != "stablehlo.constant":
+            return WalkResult.ADVANCE
+        value = constant.attributes["value"]
+        if (
+            isinstance(value, DenseFPElementsAttr)
+            and value.is_splat
+            and FloatAttr(value.get_splat_value()).value == -math.inf
+        ):
+            reductions.append(op)
+        return WalkResult.ADVANCE
+
+    module.operation.walk(collect_row_max)
+    for reduction in reductions:
+        init_type = RankedTensorType(reduction.operands[1].type)
+        with module.context, reduction.location, InsertionPoint(reduction):
+            value = DenseElementsAttr.get_splat(
+                init_type, FloatAttr.get(init_type.element_type, torch.finfo(torch.float32).min)
+            )
+            seed = Operation.create(
+                "stablehlo.constant",
+                results=[init_type],
+                attributes={"value": value},
+                loc=reduction.location,
+            )
+            reduction.operands[1] = seed.results[0]
+    module.operation.verify()
+    return len(reductions)
+
+
 def _module_to_text(module) -> str:
     op = getattr(module, "operation", None)
     if op is not None and hasattr(op, "get_asm"):
@@ -313,6 +385,7 @@ def export_attention(
     func_name: str = "attention",
     output_type: str = "stablehlo",
 ) -> str:
+    from torch_mlir import fx
     from torch_mlir.extras.fx_decomp_util import get_decomposition_table
 
     # Custom decomposition for aten.arange. The builtin one translates
@@ -344,6 +417,11 @@ def export_attention(
         if promoted_dot_count != 2:
             raise RuntimeError(
                 f"expected to promote two f16 attention dots, promoted {promoted_dot_count}"
+            )
+        max_init_count = _use_finite_softmax_max_init(module)
+        if max_init_count != 1:
+            raise RuntimeError(
+                f"expected to initialize one f32 attention row max, initialized {max_init_count}"
             )
     return _module_to_text(module)
 

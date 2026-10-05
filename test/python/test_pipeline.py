@@ -1,5 +1,6 @@
 import ast
 import importlib.util
+import re
 from itertools import pairwise, product
 from typing import Literal
 
@@ -334,6 +335,47 @@ def test_export_attention_uses_f16_dots_with_f32_accumulation() -> None:
     assert all(line.rstrip().endswith("xf32>") for line in dots)
 
 
+@pytest.mark.parametrize("variant", list(AttentionVariant))
+def test_export_attention_uses_finite_max_init_without_changing_mask(variant) -> None:
+    require_torch_mlir()
+
+    exported = export_attention_mlir(
+        variant=variant, q_heads=4, kv_heads=2, seq_len=8, head_dim=4, window_size=3
+    )
+    constants = dict(
+        re.findall(r"(%[\w.]+) = stablehlo.constant dense<([^>]+)> : tensor<f32>", exported)
+    )
+    max_reductions = re.findall(
+        r"stablehlo.reduce\((%[\w.]+) init: (%[\w.]+)\) applies stablehlo.maximum",
+        exported,
+    )
+    assert len(max_reductions) == 1
+    scores, max_init = max_reductions[0]
+    assert constants[max_init] == "-3.40282347E+38"
+
+    sum_inits = re.findall(
+        r"stablehlo.reduce\(%[\w.]+ init: (%[\w.]+)\) applies stablehlo.add", exported
+    )
+    assert len(sum_inits) == 1
+    assert float(constants[sum_inits[0]]) == 0.0
+
+    if variant != AttentionVariant.GLOBAL_ATTN:
+        # The max init used to share its -inf constant with this mask broadcast.
+        # Follow the false branch rather than just checking that -inf still occurs.
+        mask = re.search(
+            rf"{re.escape(scores)} = stablehlo.select %[\w.]+, %[\w.]+, (%[\w.]+)",
+            exported,
+        )
+        assert mask is not None
+        broadcast = re.search(
+            rf"{re.escape(mask[1])} = stablehlo.broadcast_in_dim (%[\w.]+), dims = \[\]",
+            exported,
+        )
+        assert broadcast is not None
+        assert broadcast[1] != max_init
+        assert constants[broadcast[1]] == "0xFF800000"
+
+
 def test_export_fp8_attention_preserves_quantized_kv_inputs() -> None:
     require_torch_mlir()
 
@@ -382,6 +424,20 @@ def test_export_attention_to_htile_mlir(variant, kwargs) -> None:
     assert "transform.named_sequence" not in lowered
     assert "scf.forall" not in lowered
     assert "linalg.batch_matmul" not in lowered
+    finite_seed = re.search(r"(%[\w.]+) = arith.constant -3\.40282347E\+38 : f32", lowered)
+    assert finite_seed is not None
+    if variant == AttentionVariant.WINDOWED_CAUSAL_ATTN:
+        # Check the live loop state, not merely an unused finite constant/fill.
+        initial_max = re.search(
+            rf"(%[\w.]+) = htile.full {re.escape(finite_seed[1])} : f32", lowered
+        )
+        assert initial_max is not None
+        running_max = re.search(
+            rf"scf.for[^\n]+iter_args\([^\n]*?(%[\w.]+) = {re.escape(initial_max[1])}[,)]",
+            lowered,
+        )
+        assert running_max is not None
+        assert f"arith.maximumf {running_max[1]}," in lowered
 
 
 def test_custom_tile_config_reaches_lowered_loop_bounds() -> None:

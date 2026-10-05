@@ -10,8 +10,8 @@ not establish the next.
 - **Runtime correctness** compares device output with a reference implementation.
 
 The test environment is an NVIDIA GeForce RTX 5080 (sm120) with Triton 3.7.1, cuTile 1.6.0,
-TileLang 0.1.9, and apache-tvm-ffi 0.1.10. The 90-case pipeline runtime matrix includes known
-windowed-attention failures from initially masked rows in the rolling softmax.
+TileLang 0.1.9, and apache-tvm-ffi 0.1.10. The 90-case pipeline runtime matrix includes
+windowed-attention regressions for initially masked rows in the rolling softmax.
 The table uses ✅ for covered, ⚠️ for partial coverage, and ❌ for missing coverage.
 
 | Stage / backend | Dense attention | Packed varlen attention | Mamba selective scan |
@@ -20,9 +20,9 @@ The table uses ✅ for covered, ⚠️ for partial coverage, and ❌ for missing
 | Triton compilation | ✅ | ✅ | ✅ |
 | cuTile compilation | ✅ | ✅ | ✅ |
 | TileLang compilation | ✅ | ✅ | ✅ |
-| Triton runtime correctness | ⚠️ All variants/layouts tested; windowed cases fail with NaNs | ✅ Export through backend | ✅ Export through backend; dtype/shape/tile matrix |
-| cuTile runtime correctness | ⚠️ All variants/layouts tested; windowed cases fail with NaNs | ✅ Export through backend | ✅ Export through backend; dtype/shape/tile matrix |
-| TileLang runtime correctness | ⚠️ All variants/layouts tested; windowed cases fail with NaNs | ✅ Export through backend | ✅ Export through backend; dtype/shape/tile matrix |
+| Triton runtime correctness | ✅ All variants/layouts, including windowed attention | ✅ Export through backend | ✅ Export through backend; dtype/shape/tile matrix |
+| cuTile runtime correctness | ✅ All variants/layouts, including windowed attention | ✅ Export through backend | ✅ Export through backend; dtype/shape/tile matrix |
+| TileLang runtime correctness | ✅ All variants/layouts, including windowed attention | ✅ Export through backend | ✅ Export through backend; dtype/shape/tile matrix |
 
 ## Test Locations
 
@@ -56,10 +56,13 @@ buffers to NaN to detect missing stores. Launch bounds come from generated kerne
 
 ## Scope and Execution Requirements
 
-The previously missing runtime tests are present, but the nine windowed-attention cases (three
-head layouts on three backends) currently expose an unresolved numerical bug. Initially masked
-rows can evaluate `-inf - (-inf)` in the rolling softmax and poison the output with NaNs. These
-regressions remain enabled, not skipped or marked xfail.
+The nine windowed-attention cases (three head layouts on three backends) previously produced
+NaNs from `-inf - (-inf)` on initially masked rows. The built-in Torch attention StableHLO
+exporter now sets the FP32 softmax max initializer to `-FLT_MAX` (`0xFF7FFFFF`), leaving masked
+scores at `-inf`. Explicit TA initialization carries this finite seed into the running max.
+These regressions now pass without skips or xfails. Export tests separately verify that the
+max initializer changes while the mask's shared `-inf` constant and sum's zero seed do not.
+This policy addresses empty prefixes, not a defined output for an entirely masked final row.
 
 This is a bounded regression matrix, not exhaustive coverage of all shapes, tail dimensions,
 hardware architectures, or tile configurations.

@@ -518,6 +518,12 @@ either form:
   so exact equivalence is not guaranteed for active finite bounds, empty/all-masked
   domains, or overflowing arithmetic. Mask fills require `-inf`.
 
+The built-in Torch attention StableHLO exporter explicitly chooses `-FLT_MAX`
+(`0xFF7FFFFF : f32`) for the softmax max initializer, while leaving masked scores
+at `-inf`. This keeps the running max finite on initially fully masked tiles;
+TA import and lowering preserve that choice rather than introducing a generic
+finite-max identity. It does not define outputs for entirely masked final rows.
+
 Einsum matching recognizes the contraction's payload and axes independently of
 the initializer.
 
