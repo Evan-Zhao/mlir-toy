@@ -428,7 +428,12 @@ class Translator(shared.BaseTranslator):
                 )
             self._transposed_tiles.add(op.results[0])
         src = self._mem_region(spec.memref, spec.offsets, op.results[0], tile_shape=physical_shape)
-        return [shared._expr_stmt(shared._T_call("copy", src, self._expr(op.results[0])))]
+        # TileLang 0.1.9 can sink the wait for a hoisted TMA load into the first
+        # pipelined loop. If that loop has zero trips (the first causal tile), a
+        # later loop reads the shared buffer before the DMA completes. Keep
+        # loop-invariant loads synchronous; loads inside loops can still use TMA.
+        kwargs = {} if self._yield_dests else {"disable_tma": shared._const(True)}
+        return [shared._expr_stmt(shared._T_call("copy", src, self._expr(op.results[0]), **kwargs))]
 
     def _htile_store(self, op: ir.OpView) -> list[ast.stmt]:
         spec = shared._decode_store(op)

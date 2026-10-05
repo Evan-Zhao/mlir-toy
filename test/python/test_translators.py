@@ -204,6 +204,14 @@ def tilelang_converted_rhs_source():
     return ast.unparse(translate_tilelang(source))
 
 
+def test_tilelang_hoisted_load_is_synchronous(tilelang_converted_rhs_source):
+    # Only the hoisted Q load must opt out of TMA; inner K loads still use it.
+    copies = [line for line in tilelang_converted_rhs_source.splitlines() if "T.copy(" in line]
+    assert len(copies) == 2
+    assert "buf_0[" in copies[0] and "disable_tma=True" in copies[0]
+    assert "buf_1[" in copies[1] and "disable_tma" not in copies[1]
+
+
 def test_tilelang_converted_dot_rhs_uses_shared_memory(tilelang_converted_rhs_source):
     assert tilelang_converted_rhs_source.count("T.alloc_shared([32, 32], 'float16')") == 2
     assert "T.alloc_fragment([32, 32], 'float32')" in tilelang_converted_rhs_source
