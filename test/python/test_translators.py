@@ -180,6 +180,35 @@ def test_tilelang_scalar_memref_uses_one_element_buffer():
     assert "scalar_2 = buf_0[0]" in translated
 
 
+@pytest.fixture
+def tilelang_converted_rhs_source():
+    source = """
+    module {
+      htile.kernel @converted_rhs(%q: memref<32x32xf16>, %k: memref<32x32xf8E4M3FN>)
+          attributes {program_bounds = array<i64: 1>} {
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %q_tile = htile.load %q[%c0, %c0] : memref<32x32xf16> -> tensor<32x32xf16>
+        scf.for %i = %c0 to %c1 step %c1 {
+          %k_tile = htile.load %k[%c0, %c0] : memref<32x32xf8E4M3FN> -> tensor<32x32xf8E4M3FN>
+          %k_f16 = arith.extf %k_tile : tensor<32x32xf8E4M3FN> to tensor<32x32xf16>
+          %k_transposed = htile.permute %k_f16 permutation [1, 0]
+              : tensor<32x32xf16> -> tensor<32x32xf16>
+          %dot = htile.dot %q_tile, %k_transposed
+              : tensor<32x32xf16>, tensor<32x32xf16> -> tensor<32x32xf32>
+        }
+        htile.return
+      }
+    }
+    """
+    return ast.unparse(translate_tilelang(source))
+
+
+def test_tilelang_converted_dot_rhs_uses_shared_memory(tilelang_converted_rhs_source):
+    assert tilelang_converted_rhs_source.count("T.alloc_shared([32, 32], 'float16')") == 2
+    assert "T.alloc_fragment([32, 32], 'float32')" in tilelang_converted_rhs_source
+
+
 def test_cutile_normalizes_dynamic_loop_bounds():
     source = """
     module {
