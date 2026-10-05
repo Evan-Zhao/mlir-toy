@@ -1,5 +1,6 @@
 import cuda.tile as ct
 
+
 @ct.kernel
 def attention_kernel(arr_0, arr_1, arr_2, arr_3):
     c_4 = 2
@@ -23,7 +24,7 @@ def attention_kernel(arr_0, arr_1, arr_2, arr_3):
     acc_22 = tile_16
     acc_23 = tile_17
     acc_24 = tile_18
-    for j_25 in range(c_10, v_21, c_7):
+    for j_25 in range(ct.astype(c_10, ct.int32), ct.astype(v_21, ct.int32), ct.astype(c_7, ct.int32)):
         v_26 = j_25 * c_5
         load_27 = ct.load(arr_0, (c_10, bid_13, v_15 // 128, c_10 // 64), (1, 1, 128, 64), order=(0, 1, 2, 3))
         tile_28 = ct.reshape(load_27, (128, 64))
@@ -60,7 +61,7 @@ def attention_kernel(arr_0, arr_1, arr_2, arr_3):
     acc_56 = acc_22
     acc_57 = acc_23
     acc_58 = acc_24
-    for j_59 in range(v_21, v_55, c_7):
+    for j_59 in range(ct.astype(v_21, ct.int32), ct.astype(v_55, ct.int32), ct.astype(c_7, ct.int32)):
         v_60 = j_59 * c_5
         load_61 = ct.load(arr_0, (c_10, bid_13, v_15 // 128, c_10 // 64), (1, 1, 128, 64), order=(0, 1, 2, 3))
         tile_62 = ct.reshape(load_61, (128, 64))

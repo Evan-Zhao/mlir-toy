@@ -180,6 +180,28 @@ def test_tilelang_scalar_memref_uses_one_element_buffer():
     assert "scalar_2 = buf_0[0]" in translated
 
 
+def test_cutile_normalizes_dynamic_loop_bounds():
+    source = """
+    module {
+      htile.kernel @offset_loop(%offsets: memref<2xi64>) {
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %length = htile.load %offsets[%c1] : memref<2xi64> -> i64
+        %bound = arith.index_cast %length : i64 to index
+        scf.for %i = %c0 to %bound step %c1 {
+        }
+        htile.return
+      }
+    }
+    """
+    module = translate_cutile(source)
+    loop = next(node for node in ast.walk(module) if isinstance(node, ast.For))
+    assert all(
+        ast.unparse(arg).startswith("ct.astype(") and ast.unparse(arg).endswith(", ct.int32)")
+        for arg in loop.iter.args
+    )
+
+
 def test_tilelang_translates_varlen_primitives():
     source = """
     module {
