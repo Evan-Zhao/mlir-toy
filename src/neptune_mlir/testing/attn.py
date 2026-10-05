@@ -29,19 +29,33 @@ def make_attn_inputs(
     )
 
 
-def reference_attn(q, k, v, *, causal: bool = True, rows=None, block_rows: int = 128):
+def reference_attn(
+    q,
+    k,
+    v,
+    *,
+    causal: bool = True,
+    rows=None,
+    block_rows: int = 128,
+    window_size: int | None = None,
+    alibi_slopes=None,
+):
     """Return FP32 attention for all query rows, or selected rows in the supplied order.
 
     Inputs use [batch, heads, seq_len, head_dim] layout. Causal masking uses absolute
     query/key positions (upper-left alignment). Query chunking bounds score storage;
     selected rows use the same math and preserve their absolute positions in the mask.
-    The output is not rounded back to activation storage dtype. Numerical assertions
-    and backend ABI handling stay with callers.
+    Optional ALiBi slopes use key-minus-query distance; a causal window keeps the
+    current query and its preceding window_size - 1 keys. Both use absolute positions
+    even for selected rows. The output is not rounded back to activation storage dtype.
+    Numerical assertions and backend ABI handling stay with callers.
     """
     import torch
 
     if block_rows <= 0:
         raise ValueError("block_rows must be positive")
+    if window_size is not None and (window_size <= 0 or not causal):
+        raise ValueError("window_size must be positive and requires causal attention")
     if rows is None:
         row_positions = torch.arange(q.shape[-2], device=q.device)
         selected_q = q
@@ -62,8 +76,14 @@ def reference_attn(q, k, v, *, causal: bool = True, rows=None, block_rows: int =
     for start in range(0, selected_q.shape[-2], block_rows):
         end = min(start + block_rows, selected_q.shape[-2])
         scores = torch.matmul(selected_q[..., start:end, :].float(), k_t) * scale
+        query_positions = row_positions[start:end, None]
+        if alibi_slopes is not None:
+            distance = (key_positions[None, :] - query_positions).float()
+            scores = scores + distance * alibi_slopes[..., None, None].float()
         if causal:
-            mask = key_positions[None, :] <= row_positions[start:end, None]
+            mask = key_positions[None, :] <= query_positions
+            if window_size is not None:
+                mask = mask & (key_positions[None, :] > query_positions - window_size)
             scores = scores.masked_fill(~mask, float("-inf"))
         output[..., start:end, :] = torch.matmul(torch.softmax(scores, dim=-1), v_f32)
     return output

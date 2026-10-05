@@ -117,6 +117,35 @@ def test_attn_reference_full_and_selected_rows(torch, causal):
         assert torch.equal(original, regenerated)
 
 
+@pytest.mark.parametrize("window_size", [None, 3])
+@pytest.mark.parametrize("with_alibi", [False, True])
+def test_attn_reference_window_and_alibi(torch, window_size, with_alibi):
+    q, k, v = make_attn_inputs(
+        batch=2, heads=2, seq_len=9, head_dim=4, device="cpu", dtype=torch.float32
+    )
+    q = q[:, :, :7]  # Rectangular attention with absolute, upper-left alignment.
+    query = torch.arange(7)[:, None]
+    key = torch.arange(9)[None, :]
+    mask = key <= query
+    if window_size is not None:
+        mask &= key > query - window_size
+    slopes = torch.tensor([0.01, 0.3]) if with_alibi else None
+    bias = torch.zeros((2, 7, 9))
+    if slopes is not None:
+        bias += slopes[:, None, None] * (key - query)
+    bias.masked_fill_(~mask, float("-inf"))
+    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=bias)
+    actual = reference_attn(
+        q, k, v, window_size=window_size, alibi_slopes=slopes, block_rows=2
+    )
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    rows = [6, 0, 4, 4]
+    selected = reference_attn(
+        q, k, v, window_size=window_size, alibi_slopes=slopes, rows=rows, block_rows=3
+    )
+    torch.testing.assert_close(selected, expected[:, :, rows], rtol=1e-5, atol=1e-6)
+
+
 def test_attn_reference_is_fp32_for_low_precision_inputs(torch):
     inputs = make_attn_inputs(batch=1, heads=2, seq_len=7, head_dim=4, device="cpu")
     actual = reference_attn(*inputs)
@@ -134,6 +163,10 @@ def test_attn_reference_validates_row_config(torch):
         reference_attn(*inputs, block_rows=0)
     with pytest.raises(ValueError, match="one-dimensional"):
         reference_attn(*inputs, rows=[[0, 1]])
+    with pytest.raises(ValueError, match="window_size"):
+        reference_attn(*inputs, window_size=0)
+    with pytest.raises(ValueError, match="window_size"):
+        reference_attn(*inputs, causal=False, window_size=2)
 
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16", "float32"])

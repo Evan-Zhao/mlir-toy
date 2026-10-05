@@ -5,12 +5,12 @@ structural lowering, backend compilation, and numerical execution because succes
 not establish the next.
 
 - **HTile lowering** checks exporter and schedule output structurally.
-- **Backend compilation** translates Kernel HTile and invokes the backend compiler. The cuTile path
-  launches once because compilation occurs at launch.
-- **Runtime correctness** compares device output with a reference implementation.
+- **Full-pipeline correctness** exports, lowers, translates, compiles, launches, and compares device
+  output with a reference implementation. It replaces the separate compilation-only suites;
+  their shape matrices are retained alongside the numerical regression cases.
 
 The test environment is an NVIDIA GeForce RTX 5080 (sm120) with Triton 3.7.1, cuTile 1.6.0,
-TileLang 0.1.9, and apache-tvm-ffi 0.1.10. The 90-case pipeline runtime matrix includes
+TileLang 0.1.9, and apache-tvm-ffi 0.1.10. The 144-case pipeline runtime matrix includes
 windowed-attention regressions for initially masked rows in the rolling softmax.
 The table uses ✅ for covered, ⚠️ for partial coverage, and ❌ for missing coverage.
 
@@ -36,12 +36,20 @@ The translator-level dense-attention tests still start from
 [`test/python/data/causal_attention_htile.mlir`](../test/python/data/causal_attention_htile.mlir).
 The pipeline correctness tests instead export, schedule, translate, and execute fresh kernels:
 
-- **Dense attention:** 17 cases per backend. All five variants cross MHA/GQA/MQA layouts
-  with batch size two, sequence length 256, and head dimension 64. A 73-token window,
+- **Dense attention:** 32 cases per backend. The former compilation matrix covers all five
+  variants at MHA (batch 1, sequence 512, head dimension 128), GQA (batch 2, sequence 512,
+  head dimension 64), and MQA (batch 1, sequence 16384, head dimension 64). Another 15 cases
+  cross all variants/layouts at batch 2, sequence 256, and head dimension 64. A 73-token window,
   distinct ALiBi slopes, and non-unit KV-FP8 scales exercise variant-specific semantics.
   Two rectangular causal GQA cases cover both query/KV length directions, head dimension
-  128, and custom 64×32 tiles. References are the existing eager Torch operator modules.
-- **Packed varlen attention:** four cases per backend. Unequal document lengths include
+  128, and custom 64×32 tiles. The shared FP32 `reference_attn` checks every query row in
+  bounded-memory chunks, including the 16K cases, with window and ALiBi semantics checked
+  independently against Torch SDPA. GQA uses the exporter's head mapping; FP8 inputs are
+  dequantized into FP16 as in the operator. Kernel probability rounding and approximate
+  scale motion are allowed by the numerical tolerance.
+- **Packed varlen attention:** seven cases per backend. The three former compilation shapes
+  retain 2/4/8 documents, 512/1024 total tokens, 2/4 heads, and max document bounds 256/512.
+  Four additional cases use unequal document lengths including
   singleton, partial-tile, full-length, and empty documents, with both int32 and int64 offsets,
   head dimensions 64/128, and default/custom tiles. Each document is checked independently
   with the shared FP32 dense-attention reference (noncausal); the JAX packed-window custom
@@ -75,7 +83,7 @@ Backend execution requires the corresponding Python package and an Nvidia CUDA r
 backends are skipped. cuTile KV-FP8 execution additionally requires an sm100-or-newer GPU.
 Exporter tests also require Torch-MLIR (dense attention) or JAX (varlen attention and Mamba).
 
-Run the 90-case end-to-end numerical matrix against a freshly built compiler (rather than an
+Run the 144-case end-to-end numerical matrix against a freshly built compiler (rather than an
 older `neptune-opt` installed in the venv) with:
 
 ```sh

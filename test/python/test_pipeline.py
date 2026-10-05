@@ -9,9 +9,6 @@ import pytest
 from neptune_mlir.operator.variants import AttentionVariant
 from neptune_mlir.pipeline import (
     _import_generated_source,
-    compile_and_launch_cutile_source,
-    compile_tilelang_source_to_cuda,
-    compile_triton_source_to_ptx,
     export_attention_mlir,
     export_attention_to_htile_mlir,
     export_mamba_mlir,
@@ -28,6 +25,8 @@ from neptune_mlir.testing import (
     reference_attn,
     reference_mamba,
 )
+
+# region Translation helper and case matrices
 
 
 def translate_htile_to_ast(input_mlir: str, codegen_target: str) -> ast.Module:
@@ -57,19 +56,6 @@ def make_attn_pytest_param(
         kwargs["kv_heads"] = kv_heads
     if kv_seq_len is not None:
         kwargs["kv_seq_len"] = kv_seq_len
-    if variant == AttentionVariant.ALIBI_CAUSAL_ATTN:
-        input_dtypes = ("float16", "float16", "float16", "float32", "float16")
-    elif variant == AttentionVariant.KV_FP8_CAUSAL_ATTN:
-        input_dtypes = (
-            "float16",
-            "float8_e4m3fn",
-            "float8_e4m3fn",
-            "float32",
-            "float32",
-            "float16",
-        )
-    else:
-        input_dtypes = ("float16", "float16", "float16", "float16")
     if window_size is not None:
         assert variant == AttentionVariant.WINDOWED_CAUSAL_ATTN
         kwargs["window_size"] = window_size
@@ -79,7 +65,7 @@ def make_attn_pytest_param(
     kvh_name = f"-kh{kv_heads}" if kv_heads is not None else ""
     kv_seq_name = f"-ks{kv_seq_len}" if kv_seq_len is not None else ""
     case_id = f"{variant_name}-b{batch}-qh{q_heads}{kvh_name}-qs{seq_len}{kv_seq_name}-d{head_dim}"
-    return pytest.param((variant, kwargs, input_dtypes), id=case_id)
+    return pytest.param((variant, kwargs), id=case_id)
 
 
 CODEGEN_TARGETS = ("triton", "cutile", "tilelang")
@@ -120,9 +106,9 @@ ATTN_TRANSLATOR_CASES = [
     ),
 ]
 
-# Compile every attention variant and head layout on every backend, while distributing the
-# expensive shape edges across head layouts instead of taking their Cartesian product.
-ATTN_BACKEND_COMPILATION_CASES = [
+# Execute and compare every former compilation shape, including 16K sequences.
+# Keep the smaller multi-batch and rectangular regression cases as well.
+ATTN_BACKEND_CASES = [
     make_attn_pytest_param(
         variant,
         batch=2 if (q_heads, kv_heads) == (4, 2) else 1,
@@ -133,8 +119,33 @@ ATTN_BACKEND_COMPILATION_CASES = [
     )
     for variant, (q_heads, kv_heads) in product(ATTN_VARIANTS, ATTN_HEAD_LAYOUTS)
 ]
+ATTN_BACKEND_CASES += [
+    make_attn_pytest_param(
+        variant,
+        batch=2,
+        q_heads=qh,
+        kv_heads=kh,
+        seq_len=256,
+        head_dim=64,
+        # Cross tile edges and exercise fully masked prefixes.
+        window_size=73 if variant == AttentionVariant.WINDOWED_CAUSAL_ATTN else None,
+    )
+    for variant, (qh, kh) in product(ATTN_VARIANTS, ATTN_HEAD_LAYOUTS)
+]
+ATTN_BACKEND_CASES += [
+    make_attn_pytest_param(
+        AttentionVariant.CAUSAL_ATTN,
+        batch=1,
+        q_heads=4,
+        kv_heads=2,
+        seq_len=qs,
+        kv_seq_len=ks,
+        head_dim=128,
+    )
+    for qs, ks in ((128, 256), (256, 128))
+]
 
-# Small Mamba cases are shared by backend compilation and output-correctness tests.
+# Each Mamba dtype/shape/tile case is compiled and numerically checked in one test.
 MAMBA_KERNEL_NAME = "mamba_selective_scan_kernel"
 MAMBA_TEST_KWARGS = {
     "batch": 2,
@@ -165,35 +176,10 @@ MAMBA_BACKEND_CASES = [
     )
 ]
 
-# Every variant/layout pair sees multiple batches and query/reduction tiles. The
-# local window is deliberately smaller than the sequence and crosses tile edges.
-ATTN_RUNTIME_CASES = [
-    make_attn_pytest_param(
-        variant,
-        batch=2,
-        q_heads=qh,
-        kv_heads=kh,
-        seq_len=256,
-        head_dim=64,
-        window_size=73 if variant == AttentionVariant.WINDOWED_CAUSAL_ATTN else None,
-    )
-    for variant, (qh, kh) in product(ATTN_VARIANTS, ATTN_HEAD_LAYOUTS)
-] + [
-    make_attn_pytest_param(
-        AttentionVariant.CAUSAL_ATTN,
-        batch=1,
-        q_heads=4,
-        kv_heads=2,
-        seq_len=qs,
-        kv_seq_len=ks,
-        head_dim=128,
-    )
-    for qs, ks in ((128, 256), (256, 128))
-]
-
-VARLEN_RUNTIME_CASES = [
+# Union of the old compilation shapes and uneven/empty-document regressions.
+VARLEN_BACKEND_CASES = [
     pytest.param(
-        (lengths, index_dtype, head_dim, AttentionTileConfig(block_m=bm, block_n=bn)),
+        (lengths, index_dtype, 2, 256, head_dim, AttentionTileConfig(block_m=bm, block_n=bn)),
         id=f"{name}-{index_dtype}-d{head_dim}-m{bm}-n{bn}",
     )
     for index_dtype in ("int32", "int64")
@@ -201,46 +187,23 @@ VARLEN_RUNTIME_CASES = [
         ("uneven", (1, 63, 129, 256), 64, 128, 64),
         ("empty-docs", (0, 33, 0, 127, 1, 0), 128, 64, 32),
     )
-]
-
-
-# Packed variable-length attention cases compiled by each backend.
-VARLEN_BACKEND_COMPILATION_CASES = [
+] + [
     pytest.param(
-        {
-            "num_docs": 2,
-            "total_tokens": 512,
-            "heads": 2,
-            "max_doc_tokens": 512,
-            "head_dim": 64,
-            "index_dtype": "int32",
-        },
+        ((256, 256), "int32", 2, 512, 64, AttentionTileConfig()),
         id="docs2-tokens512-h2-d64-i32",
     ),
     pytest.param(
-        {
-            "num_docs": 8,
-            "total_tokens": 1024,
-            "heads": 4,
-            "max_doc_tokens": 512,
-            "head_dim": 128,
-            "index_dtype": "int32",
-        },
+        ((128,) * 8, "int32", 4, 512, 128, AttentionTileConfig()),
         id="docs8-tokens1024-h4-d128-i32",
     ),
     pytest.param(
-        {
-            "num_docs": 4,
-            "total_tokens": 512,
-            "heads": 2,
-            "max_doc_tokens": 256,
-            "head_dim": 64,
-            "index_dtype": "int64",
-            "tile_config": AttentionTileConfig(block_m=64, block_n=32),
-        },
+        ((128,) * 4, "int64", 2, 256, 64, AttentionTileConfig(block_m=64, block_n=32)),
         id="docs4-tokens512-h2-d64-i64-m64-n32",
     ),
 ]
+
+# endregion
+# region Native integration and exporter/lowering structure (no GPU required)
 
 
 def test_native_htile_dialect_typeids_match_mlir_runtime() -> None:
@@ -456,6 +419,10 @@ def test_custom_tile_config_reaches_lowered_loop_bounds() -> None:
     assert "htile.store" in lowered
 
 
+# endregion
+# region Shared backend fixtures
+
+
 @pytest.fixture(scope="module", params=CODEGEN_TARGETS)
 def attn_codegen_target(request):
     return request.param
@@ -465,26 +432,14 @@ def attn_codegen_target(request):
 def lowered_attn_case(request):
     """Lower one attention case once before translating it to each backend."""
     require_torch_mlir()
-    variant, kwargs, _ = request.param
-    lowered = export_attention_to_htile_mlir(variant=variant, **kwargs)
-    return lowered, get_htile_kernel_arguments(lowered)
+    variant, kwargs = request.param
+    return export_attention_to_htile_mlir(variant=variant, **kwargs)
 
 
 @pytest.fixture(scope="module")
 def translated_attn_case(attn_codegen_target, lowered_attn_case):
-    lowered, kernel_arguments = lowered_attn_case
-    module = translate_htile_to_ast(lowered, attn_codegen_target)
-    return attn_codegen_target, ast.unparse(module) + "\n", kernel_arguments
-
-
-@pytest.fixture(scope="module", params=ATTN_BACKEND_COMPILATION_CASES)
-def attn_backend_compilation_case(request, attn_codegen_target):
-    require_torch_mlir()
-    variant, kwargs, _ = request.param
-    lowered = export_attention_to_htile_mlir(variant=variant, **kwargs)
-    kernel_arguments = get_htile_kernel_arguments(lowered)
-    module = translate_htile_to_ast(lowered, attn_codegen_target)
-    return attn_codegen_target, ast.unparse(module) + "\n", kernel_arguments
+    module = translate_htile_to_ast(lowered_attn_case, attn_codegen_target)
+    return attn_codegen_target, ast.unparse(module) + "\n"
 
 
 @pytest.fixture(scope="module", params=MAMBA_BACKEND_CASES)
@@ -494,7 +449,7 @@ def lowered_mamba_backend_case(request):
     kwargs, tile_config = request.param
     lowered = export_mamba_to_htile_mlir(**kwargs, tile_config=tile_config)
     _, grid = get_htile_kernel_info(lowered)
-    return lowered, get_htile_kernel_arguments(lowered), kwargs, grid
+    return lowered, kwargs, grid
 
 
 @pytest.fixture(scope="module", params=CODEGEN_TARGETS)
@@ -504,9 +459,9 @@ def mamba_codegen_target(request):
 
 @pytest.fixture(scope="module")
 def mamba_backend_case(mamba_codegen_target, lowered_mamba_backend_case):
-    lowered, kernel_arguments, kwargs, grid = lowered_mamba_backend_case
+    lowered, kwargs, grid = lowered_mamba_backend_case
     module = translate_htile_to_ast(lowered, mamba_codegen_target)
-    return mamba_codegen_target, ast.unparse(module) + "\n", kernel_arguments, kwargs, grid
+    return mamba_codegen_target, ast.unparse(module) + "\n", kwargs, grid
 
 
 @pytest.fixture(scope="module", params=CODEGEN_TARGETS)
@@ -515,38 +470,20 @@ def varlen_codegen_target(request):
     return request.param
 
 
-@pytest.fixture(scope="module", params=VARLEN_BACKEND_COMPILATION_CASES)
-def lowered_varlen_compilation_case(request):
-    require_jax()
-    kwargs = request.param
-    lowered = export_varlen_attention_to_htile_mlir(**kwargs)
-    kernel_arguments = get_htile_kernel_arguments(lowered)
-    assert kernel_arguments[3].dtype == {"int32": "i32", "int64": "i64"}[kwargs["index_dtype"]]
-    offsets = [
-        document * kwargs["total_tokens"] // kwargs["num_docs"]
-        for document in range(kwargs["num_docs"] + 1)
-    ]
-    return lowered, kernel_arguments, offsets
-
-
-@pytest.fixture(scope="module")
-def varlen_backend_compilation_case(varlen_codegen_target, lowered_varlen_compilation_case):
-    require_nvidia_python_backend(varlen_codegen_target)
-    lowered, kernel_arguments, offsets = lowered_varlen_compilation_case
-    module = translate_htile_to_ast(lowered, varlen_codegen_target)
-    return varlen_codegen_target, ast.unparse(module) + "\n", kernel_arguments, offsets
+# endregion
+# region GPU prerequisites, input preparation, and compile/launch helper
 
 
 def require_torch_with_cuda():
     import importlib.util
 
     if importlib.util.find_spec("torch") is None:
-        pytest.skip("PyTorch is required for backend compilation tests")
+        pytest.skip("PyTorch is required for backend execution tests")
 
     import torch
 
     if torch.version.cuda is None or not torch.cuda.is_available():
-        pytest.skip("An Nvidia GPU is required for backend compilation tests")
+        pytest.skip("An Nvidia GPU is required for backend execution tests")
     try:
         torch.cuda.init()
     except Exception as exc:  # noqa: BLE001
@@ -563,7 +500,7 @@ def require_nvidia_python_backend(backend_name: Literal["cutile", "tilelang", "t
     except ModuleNotFoundError:
         module = None
     if module is None:
-        pytest.skip(f"{module_name} is required for its compilation test")
+        pytest.skip(f"{module_name} is required for its execution test")
     if module_name == "triton":
         try:
             target = module.runtime.driver.active.get_current_target()
@@ -571,7 +508,7 @@ def require_nvidia_python_backend(backend_name: Literal["cutile", "tilelang", "t
             pytest.skip(f"Triton CUDA initialization failed: {exc}")
         target_backend = target.backend  # type: ignore
         if target_backend != "cuda":
-            pytest.skip(f"Triton compilation tests require the CUDA backend, got {target_backend}")
+            pytest.skip(f"Triton execution tests require the CUDA backend, got {target_backend}")
 
 
 def _make_mamba_runtime_arguments(torch, kwargs):
@@ -629,8 +566,12 @@ def _launch_backend(torch, codegen_target, source, runtime_arguments, grid, kern
         return output
 
 
+# endregion
+# region Backend source structure (no GPU required)
+
+
 def test_attention_lowering_pipeline(translated_attn_case) -> None:
-    codegen_target, source, _ = translated_attn_case
+    codegen_target, source = translated_attn_case
     expected_decorators = {
         "triton": "@triton.jit",
         "cutile": "@ct.kernel",
@@ -640,33 +581,12 @@ def test_attention_lowering_pipeline(translated_attn_case) -> None:
     assert "def attention_kernel" in source
 
 
-def test_mamba_backend_compilation(mamba_backend_case) -> None:
-    codegen_target, source, kernel_arguments, _, grid = mamba_backend_case
-    require_torch_with_cuda()
-    require_nvidia_python_backend(codegen_target)
-    if codegen_target == "triton":
-        ptx = compile_triton_source_to_ptx(source, kernel_arguments, MAMBA_KERNEL_NAME)
-        assert ".version" in ptx
-        assert f".visible .entry {MAMBA_KERNEL_NAME}" in ptx
-    elif codegen_target == "cutile":
-        compile_and_launch_cutile_source(
-            source,
-            kernel_arguments,
-            grid=(*grid, 1),
-            kernel_name=MAMBA_KERNEL_NAME,
-        )
-    else:
-        cuda_source = compile_tilelang_source_to_cuda(
-            source,
-            output_index=len(kernel_arguments) - 1,
-            kernel_name=MAMBA_KERNEL_NAME,
-        )
-        assert "__global__" in cuda_source
-        assert MAMBA_KERNEL_NAME in cuda_source
+# endregion
+# region Mamba: full-pipeline compilation, execution, and baseline comparison
 
 
 def test_mamba_backend_output_correctness(mamba_backend_case) -> None:
-    codegen_target, source, _, kwargs, grid = mamba_backend_case
+    codegen_target, source, kwargs, grid = mamba_backend_case
     torch = require_torch_with_cuda()
     require_nvidia_python_backend(codegen_target)
     runtime_arguments = _make_mamba_runtime_arguments(torch, kwargs)
@@ -683,30 +603,14 @@ def test_mamba_backend_output_correctness(mamba_backend_case) -> None:
     torch.testing.assert_close(output.float(), reference.float(), rtol=tolerance, atol=tolerance)
 
 
-def test_attention_lowering_and_backend_compilation(attn_backend_compilation_case) -> None:
-    codegen_target, source, kernel_arguments = attn_backend_compilation_case
-    torch = require_torch_with_cuda()
-    require_nvidia_python_backend(codegen_target)
-    if codegen_target == "triton":
-        ptx = compile_triton_source_to_ptx(source, kernel_arguments)
-        assert ".version" in ptx
-    elif codegen_target == "cutile":
-        if any(argument.dtype.startswith("f8") for argument in kernel_arguments):
-            major, _ = torch.cuda.get_device_capability()
-            if major < 10:
-                pytest.skip("cuTile FP8 compilation requires an sm100 or newer GPU")
-        compile_and_launch_cutile_source(source, kernel_arguments)
-    else:
-        cuda_source = compile_tilelang_source_to_cuda(
-            source, output_index=len(kernel_arguments) - 1
-        )
-        assert "__global__" in cuda_source
+# endregion
+# region Dense attention: full-pipeline compilation, execution, and baseline comparison
 
 
-@pytest.fixture(scope="module", params=ATTN_RUNTIME_CASES)
+@pytest.fixture(scope="module", params=ATTN_BACKEND_CASES)
 def lowered_attn_runtime_case(request):
     require_torch_mlir()
-    variant, kwargs, _ = request.param
+    variant, kwargs = request.param
     # The rectangular cases also exercise non-default tile sizes.
     tile = (
         AttentionTileConfig(block_m=64, block_n=32)
@@ -721,14 +625,6 @@ def test_attention_backend_output_correctness(attn_codegen_target, lowered_attn_
     torch = require_torch_with_cuda()
     require_nvidia_python_backend(attn_codegen_target)
 
-    from neptune_mlir.operator.torch_mlir_export import (
-        AlibiCausalAttentionModule,
-        AttentionModule,
-        KVOnlyQuantizedAttentionModule,
-        causal_mask,
-        windowed_causal_mask,
-    )
-
     variant, kwargs, lowered = lowered_attn_runtime_case
     if (
         variant == AttentionVariant.KV_FP8_CAUSAL_ATTN
@@ -741,9 +637,10 @@ def test_attention_backend_output_correctness(attn_codegen_target, lowered_attn_
     q = make_attn_inputs(batch, qh, qs, kwargs["head_dim"], device="cuda", seed=17)[0]
     _, k, v = make_attn_inputs(batch, kh, ks, kwargs["head_dim"], device="cuda", seed=29)
     inputs = [q, k, v]
+    slopes = None
     if variant == AttentionVariant.ALIBI_CAUSAL_ATTN:
-        inputs.append(torch.linspace(0.01, 0.3, qh, device="cuda"))
-        model = AlibiCausalAttentionModule()
+        slopes = torch.linspace(0.01, 0.3, qh, device="cuda")
+        inputs.append(slopes)
     elif variant == AttentionVariant.KV_FP8_CAUSAL_ATTN:
         inputs[1:3] = [x.to(torch.float8_e4m3fn) for x in (k, v)]
         # Non-unit, per-KV-head scales catch omitted scaling and head indexing.
@@ -754,18 +651,25 @@ def test_attention_backend_output_correctness(attn_codegen_target, lowered_attn_
                 torch.linspace(1.5, 0.75, kh, device="cuda").reshape(shape),
             ]
         )
-        model = KVOnlyQuantizedAttentionModule()
-    else:
-        mask = {
-            AttentionVariant.GLOBAL_ATTN: lambda _: None,
-            AttentionVariant.CAUSAL_ATTN: causal_mask,
-            AttentionVariant.WINDOWED_CAUSAL_ATTN: windowed_causal_mask(
-                kwargs.get("window_size", 128)
-            ),
-        }[variant]
-        model = AttentionModule(mask)
+        # Match the exporter's dequantization into FP16 before the two dots.
+        k, v = [(x.float() * scale).half() for x, scale in zip(inputs[1:3], inputs[3:5])]
+    # Exporter GQA uses [groups, kv_heads], i.e. query_head % kv_heads, rather
+    # than repeat_interleave's adjacent grouping. Expanding K/V is linear memory.
+    head_indices = torch.arange(qh, device="cuda") % kh
+    k, v = [x.index_select(1, head_indices) for x in (k, v)]
     with torch.no_grad():
-        reference = model(*inputs)
+        reference = reference_attn(
+            q,
+            k,
+            v,
+            causal=variant != AttentionVariant.GLOBAL_ATTN,
+            window_size=(
+                kwargs.get("window_size", 128)
+                if variant == AttentionVariant.WINDOWED_CAUSAL_ATTN
+                else None
+            ),
+            alibi_slopes=slopes,
+        )
     # Scalar memrefs use one-element runtime buffers in the backend ABI.
     arguments = [
         *(x.reshape(1) if x.ndim == 0 else x for x in inputs),
@@ -779,22 +683,26 @@ def test_attention_backend_output_correctness(attn_codegen_target, lowered_attn_
         torch, attn_codegen_target, source, arguments, grid, "attention_kernel"
     )
     assert output.shape == reference.shape
-    assert output.dtype == reference.dtype
+    assert output.dtype == q.dtype
     assert bool(torch.isfinite(output).all())
-    # Eager exporter modules round the QK dot to FP16, while the lowered dots
-    # accumulate in FP32. Allow that difference and the tiled online softmax.
-    torch.testing.assert_close(output, reference, rtol=1e-2, atol=5e-3)
+    # The FP32, query-chunked reference checks every row even for 16K inputs.
+    # Allow FP16 probability storage and approximate scale motion in the kernel.
+    torch.testing.assert_close(output.float(), reference, rtol=1e-2, atol=5e-3)
 
 
-@pytest.fixture(scope="module", params=VARLEN_RUNTIME_CASES)
+# endregion
+# region Packed varlen attention: full-pipeline compilation, execution, and comparison
+
+
+@pytest.fixture(scope="module", params=VARLEN_BACKEND_CASES)
 def lowered_varlen_runtime_case(request):
     require_jax()
-    lengths, index_dtype, head_dim, tile = request.param
+    lengths, index_dtype, heads, max_doc_tokens, head_dim, tile = request.param
     kwargs = {
         "num_docs": len(lengths),
         "total_tokens": sum(lengths),
-        "heads": 2,
-        "max_doc_tokens": 256,
+        "heads": heads,
+        "max_doc_tokens": max_doc_tokens,
         "head_dim": head_dim,
         "index_dtype": index_dtype,
     }
@@ -847,24 +755,4 @@ def test_varlen_attention_backend_output_correctness(
     torch.testing.assert_close(output.float(), reference, rtol=1e-2, atol=2e-3)
 
 
-def test_varlen_attention_backend_compilation(varlen_backend_compilation_case) -> None:
-    codegen_target, source, kernel_arguments, offsets = varlen_backend_compilation_case
-    require_torch_with_cuda()
-    require_nvidia_python_backend(codegen_target)
-    if codegen_target == "triton":
-        ptx = compile_triton_source_to_ptx(source, kernel_arguments)
-        assert ".version" in ptx
-        assert ".visible .entry attention_kernel" in ptx
-    elif codegen_target == "cutile":
-        assert "get_raw_memory()" in source
-        assert ".load_offset(" in source
-        assert ".store_offset(" in source
-        compile_and_launch_cutile_source(source, kernel_arguments, argument_values={3: offsets})
-    else:
-        assert "T.reshape(" in source
-        assert "T.if_then_else(" in source
-        assert "if view_" in source
-        cuda_source = compile_tilelang_source_to_cuda(
-            source, output_index=len(kernel_arguments) - 1
-        )
-        assert "__global__" in cuda_source
+# endregion
