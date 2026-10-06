@@ -4,7 +4,7 @@ import argparse
 import ast
 from collections.abc import Callable
 
-from neptune_mlir.operator.variants import VARIANTS, AttentionVariant
+from neptune_mlir.cli.operators import OPERATORS, add_operator_arguments
 from neptune_mlir.pipeline import (
     compile_tilelang_source_to_cuda,
     compile_triton_source_to_ptx,
@@ -39,93 +39,19 @@ MAMBA_STAGES = (
 )
 
 
-def _add_common_arguments(parser: argparse.ArgumentParser, stages: tuple[str, ...]) -> None:
-    parser.add_argument(
-        "--stage",
-        choices=stages,
-        default="stablehlo",
-        help="pipeline stage to print (default: stablehlo)",
-    )
-    parser.add_argument("-d", "--head-dim", type=int, default=64, help="head dimension")
-    parser.add_argument("--block-m", type=int, default=128, help="query tile size")
-    parser.add_argument("--block-n", type=int, default=64, help="key/value tile size")
-    parser.add_argument("--func-name", default="attention", help="exported function name")
-
-
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     operators = parser.add_subparsers(dest="operator", required=True)
-
-    dense = operators.add_parser(
-        "dense", help="dense attention variants such as global, causal, and alibi attention"
-    )
-    _add_common_arguments(dense, STAGES)
-    dense.add_argument(
-        "--variant",
-        type=AttentionVariant,
-        choices=VARIANTS,
-        required=True,
-        help="dense attention variant to export",
-    )
-    dense.add_argument("-b", "--batch", type=int, default=1, help="batch size")
-    dense.add_argument("--q-heads", type=int, default=4, help="number of query heads")
-    dense.add_argument(
-        "--kv-heads", type=int, default=None, help="number of KV heads (defaults to --q-heads)"
-    )
-    dense.add_argument("-s", "--seq-len", type=int, default=128, help="query sequence length")
-    dense.add_argument(
-        "--kv-seq-len",
-        type=int,
-        default=None,
-        help="K/V sequence length (defaults to --seq-len)",
-    )
-    dense.add_argument(
-        "--window-size",
-        type=int,
-        default=128,
-        help="local history window for windowed causal attention",
-    )
-
-    varlen = operators.add_parser("varlen", help="packed variable-length attention")
-    _add_common_arguments(varlen, STAGES)
-    varlen.add_argument("--num-docs", type=int, default=8, help="number of packed documents")
-    varlen.add_argument(
-        "--total-tokens", type=int, default=1024, help="total number of packed tokens"
-    )
-    varlen.add_argument("--heads", type=int, default=4, help="number of attention heads")
-    varlen.add_argument(
-        "--max-doc-tokens", type=int, default=512, help="static maximum document length"
-    )
-    varlen.add_argument(
-        "--index-dtype",
-        choices=("int32", "int64"),
-        default="int32",
-        help="document-offset element type",
-    )
-
-    mamba = operators.add_parser("mamba", help="Mamba selective scan")
-    mamba.add_argument(
-        "--stage",
-        choices=MAMBA_STAGES,
-        default="stablehlo",
-        help="pipeline stage to print (default: stablehlo)",
-    )
-    mamba.add_argument("-b", "--batch", type=int, default=8, help="batch size")
-    mamba.add_argument("-s", "--sequence-length", type=int, default=2048, help="sequence length")
-    mamba.add_argument("--model-dim", type=int, default=768, help="base model dimension")
-    mamba.add_argument("--expand", type=int, default=2, help="channel expansion factor")
-    mamba.add_argument("--state-dim", type=int, default=16, help="selective state dimension")
-    mamba.add_argument(
-        "--activation-dtype",
-        choices=("bfloat16", "float16", "float32"),
-        default="bfloat16",
-        help="activation storage type",
-    )
-    mamba.add_argument(
-        "--block-channels", type=int, default=128, help="channels handled by each program"
-    )
-    mamba.add_argument("--func-name", default="selective_scan", help="exported function name")
-    return parser.parse_args()
+    for operator in OPERATORS:
+        child = operators.add_parser(operator)
+        add_operator_arguments(child, operator, require_variant=True)
+        child.add_argument(
+            "--stage",
+            choices=MAMBA_STAGES if operator == "mamba" else STAGES,
+            default="stablehlo",
+            help="pipeline stage to print (default: stablehlo)",
+        )
+    return parser.parse_args(argv)
 
 
 def _emit_backend_stage(stage: str, lowered: str, kernel_name: str = "attention_kernel") -> str:

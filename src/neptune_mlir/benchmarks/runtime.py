@@ -13,17 +13,9 @@ BACKENDS = ("triton", "cutile", "tilelang")
 
 
 def kernel_info(htile):
-    from mlir import ir
+    from neptune_mlir.pipeline import get_htile_kernel_info
 
-    from neptune_mlir.translators.common import parse_mlir_module_from_text
-
-    module = parse_mlir_module_from_text(htile)
-    kernels = [op for op in module.body.operations if op.operation.name == "htile.kernel"]
-    if len(kernels) != 1:
-        raise ValueError(f"benchmark requires one kernel, got {len(kernels)}")
-    kernel = kernels[0]
-    name = ir.StringAttr(kernel.attributes["sym_name"]).value
-    grid = tuple(ir.DenseI64ArrayAttr(kernel.attributes["program_bounds"]))
+    name, grid = get_htile_kernel_info(htile)
     if not 1 <= len(grid) <= 3 or any(dim <= 0 for dim in grid):
         raise ValueError(f"unsupported kernel grid: {grid}")
     return name, grid

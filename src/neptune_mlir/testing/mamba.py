@@ -1,4 +1,4 @@
-"""Mamba-1 selective-scan inputs and an FP32 recurrent Torch reference."""
+"""Mamba-1 selective-scan inputs, kernel ABI arguments and FP32 recurrent reference."""
 
 
 def make_mamba_inputs(
@@ -61,3 +61,25 @@ def reference_mamba(u, delta, a, b, c, d, delta_bias):
         y_t = (state * c[:, t].float()[:, None, :]).sum(dim=2)
         output[:, t] = (y_t + d[None, :] * u_t).to(output.dtype)
     return output
+
+
+def make_mamba_arguments(options, *, device="cuda", seed=0, scale=0.2):
+    import torch
+
+    o = options
+    channels = o["model_dim"] * o["expand"]
+    inputs = make_mamba_inputs(
+        o["batch"],
+        o["sequence_length"],
+        channels,
+        o["state_dim"],
+        getattr(torch, o["activation_dtype"]),
+        device,
+        seed=seed,
+        scale=scale,
+    )
+    initial_state = torch.zeros(
+        (o["batch"], channels, o["state_dim"]), dtype=torch.float32, device=device
+    )
+    scalar_zero = torch.zeros(1, dtype=torch.float32, device=device)
+    return [*inputs, initial_state, scalar_zero, torch.full_like(inputs[0], float("nan"))]

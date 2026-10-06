@@ -1,7 +1,7 @@
 import ast
 import importlib.util
 import re
-from itertools import pairwise, product
+from itertools import product
 from typing import Literal
 
 import pytest
@@ -20,10 +20,12 @@ from neptune_mlir.pipeline import (
 )
 from neptune_mlir.schedules import AttentionTileConfig, MambaTileConfig
 from neptune_mlir.testing import (
-    make_attn_inputs,
-    make_mamba_inputs,
-    reference_attn,
+    make_dense_arguments,
+    make_mamba_arguments,
+    make_varlen_arguments,
+    reference_dense,
     reference_mamba,
+    reference_varlen,
 )
 
 # region Translation helper and case matrices
@@ -511,28 +513,6 @@ def require_nvidia_python_backend(backend_name: Literal["cutile", "tilelang", "t
             pytest.skip(f"Triton execution tests require the CUDA backend, got {target_backend}")
 
 
-def _make_mamba_runtime_arguments(torch, kwargs):
-    batch = kwargs["batch"]
-    seq_len = kwargs["sequence_length"]
-    channels = kwargs["model_dim"] * kwargs["expand"]
-    state_dim = kwargs["state_dim"]
-
-    inputs = make_mamba_inputs(
-        batch,
-        seq_len,
-        channels,
-        state_dim,
-        getattr(torch, kwargs["activation_dtype"]),
-        "cuda",
-        seed=0,
-        scale=0.2,
-    )
-    initial_state = torch.zeros((batch, channels, state_dim), dtype=torch.float32, device="cuda")
-    scalar_zero = torch.zeros((1,), dtype=torch.float32, device="cuda")
-    output = torch.full_like(inputs[0], float("nan"))
-    return [*inputs, initial_state, scalar_zero, output]
-
-
 def _launch_backend(torch, codegen_target, source, runtime_arguments, grid, kernel_name):
     with _import_generated_source(source, f"runtime_{codegen_target}") as module:
         kernel = getattr(module, kernel_name)
@@ -589,7 +569,7 @@ def test_mamba_backend_output_correctness(mamba_backend_case) -> None:
     codegen_target, source, kwargs, grid = mamba_backend_case
     torch = require_torch_with_cuda()
     require_nvidia_python_backend(codegen_target)
-    runtime_arguments = _make_mamba_runtime_arguments(torch, kwargs)
+    runtime_arguments = make_mamba_arguments(kwargs)
     reference = reference_mamba(*runtime_arguments[:7])
 
     output = _launch_backend(
@@ -632,49 +612,10 @@ def test_attention_backend_output_correctness(attn_codegen_target, lowered_attn_
         and torch.cuda.get_device_capability()[0] < 10
     ):
         pytest.skip("cuTile FP8 execution requires an sm100 or newer GPU")
-    batch, qh, kh = kwargs["batch"], kwargs["q_heads"], kwargs["kv_heads"]
-    qs, ks = kwargs["seq_len"], kwargs.get("kv_seq_len", kwargs["seq_len"])
-    q = make_attn_inputs(batch, qh, qs, kwargs["head_dim"], device="cuda", seed=17)[0]
-    _, k, v = make_attn_inputs(batch, kh, ks, kwargs["head_dim"], device="cuda", seed=29)
-    inputs = [q, k, v]
-    slopes = None
-    if variant == AttentionVariant.ALIBI_CAUSAL_ATTN:
-        slopes = torch.linspace(0.01, 0.3, qh, device="cuda")
-        inputs.append(slopes)
-    elif variant == AttentionVariant.KV_FP8_CAUSAL_ATTN:
-        inputs[1:3] = [x.to(torch.float8_e4m3fn) for x in (k, v)]
-        # Non-unit, per-KV-head scales catch omitted scaling and head indexing.
-        shape = () if kh == 1 else (1, kh, 1, 1)
-        inputs.extend(
-            [
-                torch.linspace(0.5, 1.25, kh, device="cuda").reshape(shape),
-                torch.linspace(1.5, 0.75, kh, device="cuda").reshape(shape),
-            ]
-        )
-        # Match the exporter's dequantization into FP16 before the two dots.
-        k, v = [(x.float() * scale).half() for x, scale in zip(inputs[1:3], inputs[3:5])]
-    # Exporter GQA uses [groups, kv_heads], i.e. query_head % kv_heads, rather
-    # than repeat_interleave's adjacent grouping. Expanding K/V is linear memory.
-    head_indices = torch.arange(qh, device="cuda") % kh
-    k, v = [x.index_select(1, head_indices) for x in (k, v)]
+    options = {"variant": variant, **kwargs}
+    arguments = make_dense_arguments(options)
     with torch.no_grad():
-        reference = reference_attn(
-            q,
-            k,
-            v,
-            causal=variant != AttentionVariant.GLOBAL_ATTN,
-            window_size=(
-                kwargs.get("window_size", 128)
-                if variant == AttentionVariant.WINDOWED_CAUSAL_ATTN
-                else None
-            ),
-            alibi_slopes=slopes,
-        )
-    # Scalar memrefs use one-element runtime buffers in the backend ABI.
-    arguments = [
-        *(x.reshape(1) if x.ndim == 0 else x for x in inputs),
-        torch.full_like(q, float("nan")),
-    ]
+        reference = reference_dense(options, arguments)
     source = ast.unparse(translate_htile_to_ast(lowered, attn_codegen_target)) + "\n"
     # Use the exported launch bounds: singleton KV heads are folded differently
     # from GQA, and TileLang embeds these same bounds in its generated function.
@@ -683,7 +624,7 @@ def test_attention_backend_output_correctness(attn_codegen_target, lowered_attn_
         torch, attn_codegen_target, source, arguments, grid, "attention_kernel"
     )
     assert output.shape == reference.shape
-    assert output.dtype == q.dtype
+    assert output.dtype == arguments[0].dtype
     assert bool(torch.isfinite(output).all())
     # The FP32, query-chunked reference checks every row even for 16K inputs.
     # Allow FP16 probability storage and approximate scale motion in the kernel.
@@ -720,37 +661,15 @@ def test_varlen_attention_backend_output_correctness(
     torch = require_torch_with_cuda()
     require_nvidia_python_backend(varlen_codegen_target)
     lengths, kwargs, lowered = lowered_varlen_runtime_case
-    # Reuse the dense FP32 reference independently for each document; the JAX
-    # packed-window custom calls are compiler markers, not executable FFI ops.
-    q, k, v = [
-        x.squeeze(0).transpose(0, 1).contiguous()
-        for x in make_attn_inputs(
-            1, kwargs["heads"], kwargs["total_tokens"], kwargs["head_dim"], seed=41
-        )
-    ]
-    offsets = [0]
-    for length in lengths:
-        offsets.append(offsets[-1] + length)
-    reference = torch.empty_like(q, dtype=torch.float32)
-    for start, end in pairwise(offsets):
-        if start == end:
-            continue
-        doc = [x[start:end].transpose(0, 1).unsqueeze(0) for x in (q, k, v)]
-        reference[start:end] = reference_attn(*doc, causal=False).squeeze(0).transpose(0, 1)
-    arguments = [
-        q,
-        k,
-        v,
-        torch.tensor(offsets, dtype=getattr(torch, kwargs["index_dtype"]), device="cuda"),
-        torch.full_like(q, float("nan")),
-    ]
+    arguments = make_varlen_arguments(kwargs, lengths=lengths)
+    reference = reference_varlen(arguments)
     source = ast.unparse(translate_htile_to_ast(lowered, varlen_codegen_target)) + "\n"
     _, grid = get_htile_kernel_info(lowered)
     output = _launch_backend(
         torch, varlen_codegen_target, source, arguments, grid, "attention_kernel"
     )
     assert output.shape == reference.shape
-    assert output.dtype == q.dtype
+    assert output.dtype == arguments[0].dtype
     assert bool(torch.isfinite(output).all())
     torch.testing.assert_close(output.float(), reference, rtol=1e-2, atol=2e-3)
 

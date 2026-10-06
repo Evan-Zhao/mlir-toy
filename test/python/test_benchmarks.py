@@ -1,5 +1,9 @@
-"""CPU-only tests for benchmark configuration/reporting, not performance gates."""
+"""Benchmark configuration/reporting and optional GPU smoke tests, not performance gates.
 
+Use ``-k benchmark_gpu`` for GPU tests or ``-k 'not benchmark_gpu'`` for CPU-only tests.
+"""
+
+import importlib.util
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,14 +11,20 @@ from types import SimpleNamespace
 import pytest
 
 from neptune_mlir.benchmarks.cases import Case, suite
-from neptune_mlir.benchmarks.runtime import kernel_info, summarize
+from neptune_mlir.benchmarks.runtime import BACKENDS, kernel_info, measure, prepare, summarize
 from neptune_mlir.cli.bench import parse_args, profiler_command, run
+from neptune_mlir.operator.variants import VARIANTS
 
 
 def test_benchmark_presets():
     cases = suite()
-    assert len(cases) == 3
-    assert [case.seq_len for case in cases if case.operator == "mamba"] == [128, 2048]
+    assert len(cases) == 8
+    assert {case.operator for case in cases} == {"dense", "varlen", "mamba"}
+    assert [case.options["sequence_length"] for case in cases if case.operator == "mamba"] == [
+        128,
+        2048,
+    ]
+    assert len({case.name for case in cases}) == len(cases)
     for case in cases:
         case.validate()
         assert Case(**case.config()).config() == case.config()
@@ -40,7 +50,8 @@ def test_benchmark_cli_defaults():
     args = parse_args(["attn", "--profiler", "cudaevent", "--backend", "all"])
     assert args.profiler == "cudaevent"
     assert args.backends == ["triton", "cutile", "tilelang"]
-    assert args.cases[0].dtype == "float16"
+    assert args.cases[0].options["variant"] == "causal"
+    assert args.cases[0].options["seq_len"] == 128  # Same defaults as neptune-export.
     assert args.mode == "graph"
     assert args.cache == "warm"
     assert args.samples == 50
@@ -54,8 +65,10 @@ def test_benchmark_cli_overrides():
             "cudaevent",
             "--batch",
             "2",
-            "--channels",
+            "--model-dim",
             "256",
+            "--expand",
+            "1",
             "--seq-len",
             "8",
             "--dtype",
@@ -66,8 +79,8 @@ def test_benchmark_cli_overrides():
             "cold",
         ]
     )
-    assert args.cases[0].name == "mamba-b2-s8-c256-n16"
-    assert args.cases[0].dtype == "float32"
+    assert args.cases[0].name.startswith("mamba-b2-s8-c256-")
+    assert args.cases[0].options["activation_dtype"] == "float32"
 
 
 @pytest.mark.parametrize(
@@ -78,7 +91,14 @@ def test_benchmark_cli_overrides():
         ["mamba", "--heads", "8"],
         ["attn", "--seq-len", "127"],
         ["attn", "--dtype", "bfloat16"],
-        ["mamba", "--channels", "3"],
+        ["mamba", "--model-dim", "3"],
+        ["mamba", "--sequence-length", "1"],
+        ["mamba", "--batch", "1"],
+        ["mamba", "--model-dim", "64"],
+        ["dense", "--q-heads", "3", "--kv-heads", "2"],
+        ["dense", "--kv-seq-len", "127"],
+        ["varlen", "--num-docs", "1", "--total-tokens", "1024", "--max-doc-tokens", "128"],
+        ["varlen", "--doc-lengths", "-1", "1025"],
         ["mamba", "--state-dim", "3"],
         ["mamba", "--samples", "1"],
         ["mamba", "--sample-ms", "nan"],
@@ -233,3 +253,76 @@ def test_benchmark_nsight_reports_workload_and_timings(monkeypatch, tmp_path, ca
         assert timing["excluded_activities"] == {"eviction": 1}
         saved = json.loads((Path(result["artifacts"]) / "result.json").read_text())
         assert saved["profile"]["timing"] == timing
+
+
+# Real-GPU smoke coverage: correctness and timing execution, without speed gates.
+GPU_CASES = [
+    *[
+        Case(
+            "dense",
+            variant=v,
+            batch=2,
+            q_heads=4,
+            kv_heads=2,
+            seq_len=128,
+            kv_seq_len=256,
+            window_size=73,
+        )
+        for v in VARIANTS
+    ],
+    Case("dense", variant="kv-fp8-causal", q_heads=4, kv_heads=1),
+    *[
+        Case(
+            "varlen",
+            num_docs=4,
+            total_tokens=161,
+            heads=2,
+            max_doc_tokens=128,
+            index_dtype=dtype,
+            doc_lengths=(0, 33, 127, 1),
+        )
+        for dtype in ("int32", "int64")
+    ],
+    *[
+        Case("mamba", batch=2, sequence_length=8, model_dim=128, expand=2, activation_dtype=dtype)
+        for dtype in ("float16", "bfloat16", "float32")
+    ],
+]
+
+
+@pytest.fixture(scope="module", params=GPU_CASES, ids=lambda c: c.name)
+def lowered_gpu_case(request):
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    case = request.param
+    # Do not import torch_mlir in this process: it conflicts with standalone MLIR.
+    dependency = "torch_mlir" if case.operator == "dense" else "jax"
+    if importlib.util.find_spec(dependency) is None:
+        pytest.skip(f"{dependency} required")
+    return case, case.lower()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_benchmark_gpu(lowered_gpu_case, backend, tmp_path):
+    import torch
+
+    pytest.importorskip("cuda.tile" if backend == "cutile" else backend)
+    case, htile = lowered_gpu_case
+    if (
+        backend == "cutile"
+        and case.options.get("variant") == "kv-fp8-causal"
+        and torch.cuda.get_device_capability()[0] < 10
+    ):
+        pytest.skip("cuTile FP8 requires sm100 or newer")
+    args = case.make_args(torch, seed=0)
+    with prepare(torch, htile, backend, args, tmp_path) as (launch, info):
+        case.check(torch, args)
+        for mode in ("graph", "events"):
+            result = measure(
+                torch, launch, mode=mode, cache="warm", warmup_ms=1, sample_ms=0.1, samples=3
+            )
+            assert result["median_us"] > 0
+            assert len(result["samples_us"]) == 3
+            case.check(torch, args)
+    assert info["kernel"]

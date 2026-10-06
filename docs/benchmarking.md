@@ -1,20 +1,29 @@
 # GPU Benchmarking And Profiling
 
-`neptune-bench` benchmarks generated kernels for causal FP16 attention and Mamba selective scan on
-Triton, cuTile, and TileLang. It exports and schedules each case.
+`neptune-bench` benchmarks every operator supported by `neptune-export` on Triton, cuTile, and
+TileLang: dense attention (all five variants, MHA/GQA/MQA, rectangular query/KV lengths), packed
+variable-length attention, and Mamba selective scan. Operator flags, defaults, and export dispatch
+are shared with `neptune-export`; input/ABI preparation and references are shared with pipeline tests.
 
 ## Quick Start
 
 Activate `.venv` with the same MLIR/export/backend dependencies as the pipeline tests. Run
-`neptune-bench -h` for options and defaults; `python -m neptune_mlir.cli.bench` is also available.
+`neptune-bench -h` for subcommands and `neptune-bench dense -h` (or `varlen`/`mamba`) for options;
+`python -m neptune_mlir.cli.bench` is also available.
 
 ```shell
-# Three preset cases, all backends.
+# Eight preset cases, all backends (24 measurements).
 neptune-bench suite --profiler cudaevent --backend all
 
-# Individual operators with shape and tile overrides.
-neptune-bench attn --profiler cudaevent --backend triton --seq-len 4096 --heads 8 --block-m 128
-neptune-bench mamba --profiler cudaevent --backend cutile tilelang --seq-len 2048 --channels 1536
+# Same operator options as neptune-export.
+neptune-bench dense --profiler cudaevent --backend triton --variant windowed-causal \
+  --q-heads 8 --kv-heads 2 --seq-len 4096 --window-size 73 --block-m 128
+neptune-bench dense --profiler cudaevent --backend all --variant kv-fp8-causal \
+  --q-heads 4 --kv-heads 1 --seq-len 128 --kv-seq-len 256
+neptune-bench varlen --profiler cudaevent --backend all --num-docs 4 \
+  --total-tokens 161 --max-doc-tokens 128 --index-dtype int64 --doc-lengths 0 33 127 1
+neptune-bench mamba --profiler cudaevent --backend cutile tilelang \
+  --sequence-length 2048 --model-dim 768 --expand 2 --activation-dtype bfloat16
 
 # Ordinary launches with best-effort L2 eviction.
 neptune-bench attn --profiler cudaevent --backend all --mode events --cache cold
@@ -25,12 +34,34 @@ The suite contains:
 
 | Case | Shape | Storage | Tile |
 |---|---|---|---|
-| Causal attn | batch 1, heads 8, seq_len 2048, head_dim 64 | FP16 | M=128, N=64 |
+| Dense attention × 5 variants | batch 1, query/KV heads 8, seq_len 2048, head_dim 64 | FP16 Q/output; FP8 K/V for KV-FP8 | M=128, N=64 |
+| Packed varlen | 8 documents, 1024 tokens, heads 4, head_dim 64, max_doc_tokens 512 | FP16, int32 offsets | M=128, N=64 |
 | Mamba short | batch 8, seq_len 128, channels 1536, state_dim 16 | BF16 | channels=128 |
 | Mamba long | batch 8, seq_len 2048, channels 1536, state_dim 16 | BF16 | channels=128 |
 
-Device selection respects `CUDA_VISIBLE_DEVICES`. Mamba's `--channels` is the expanded channel
-count, not the base model dimension.
+Dense variants are `global`, `causal`, `windowed-causal`, `alibi-causal`, and `kv-fp8-causal`.
+Dense attention uses FP16 activations (with quantized K/V for KV-FP8), as in the exporter.
+ALiBi slopes and FP8 scales are deterministic, non-unit per-head inputs from the shared test helpers.
+`--q-heads`/`--kv-heads` select MHA/GQA/MQA; omitted KV heads/length default to query heads/length.
+
+Varlen documents default to balanced lengths summing to `--total-tokens`. The benchmark-only
+`--doc-lengths` option allows uneven and empty documents; it must match `--num-docs`, sum to
+`--total-tokens`, and respect `--max-doc-tokens`. Exact lengths are saved in the case specification.
+Mamba channels are `--model-dim * --expand`. Device selection respects `CUDA_VISIBLE_DEVICES`.
+cuTile KV-FP8 execution requires sm100 or newer; unsupported configurations fail, rather than skip.
+
+Migration from the initial benchmark CLI: `attn` remains an alias for `dense`, and dense `--heads`
+remains an alias for `--q-heads`. Replace Mamba `--channels C` with `--model-dim C --expand 1`;
+`--seq-len` and `--dtype` remain Mamba aliases for `--sequence-length` and `--activation-dtype`.
+Single-case defaults now match `neptune-export` (dense: sequence 128, four query heads, default
+causal variant); `suite` retains the original larger cases and adds the missing operators/variants.
+Case JSON uses canonical export option names (results schema version 2); old worker specs are not
+compatible. Use a subcommand, not `suite`, to override operator options.
+
+The GPU schedules still impose shape constraints: dense query/KV lengths must divide by their
+respective tiles; tile sizes and head/state dimensions have power-of-two requirements. Packed
+varlen permits partial tiles. Mamba's known singleton batch/timestep/channel-block schedule
+limitations are rejected before launching a worker.
 
 ## Measurement Method
 
@@ -39,8 +70,8 @@ following the event-timed repeated graph approach used by Triton's `do_bench_cud
 
 1. Export, lower, translate, allocate deterministic inputs, and compile/launch once outside timing.
 2. Validate against an FP32 Torch reference outside timing. Attention checks selected rows including
-   tile boundaries across every batch/head; Mamba checks the full sequence. Both check that the full
-   output is finite. This is a benchmark sanity check, not exhaustive numerical coverage.
+   tile boundaries across every batch/head; packed varlen checks every document independently and
+   Mamba checks the full sequence. All check that the full output is finite. This is a benchmark sanity check, not exhaustive numerical coverage.
 3. Warm up, estimate runtime, and size batches to the requested sample budget.
 4. Collect timed batches and report median/p20/p80 of their per-launch average latencies, excluding
    eviction. The JSON retains every sample. These percentiles describe batch averages, not individual
@@ -151,7 +182,8 @@ Every profiler prints median/p20/p80 in microseconds and sample count `N`. Nsigh
 messages are captured in per-case logs. The default output root is the git-ignored
 `benchmark-results/<UTC timestamp>/`.
 
-- `results.json`: schema version, Neptune revision/dirty status, and all successes/errors.
+- `results.json`: schema version, Neptune revision/dirty status, and all successes/errors. Case
+  directories include a configuration hash to distinguish variants, layouts, dtypes, tiles and packing.
 - `<case>-<backend>/spec.json`: exact input/configuration for the isolated worker, with shared
   `workload` options separated from CUDA-event `timing` options.
 - `command.json`, `worker.log`: replay command and full diagnostics.
@@ -169,4 +201,9 @@ not establish clock stability during measurement. Nsight commands retain forward
 Results are saved incrementally so a later backend failure does not discard earlier results. Missing
 dependencies, compilation errors, failed reference checks, and profiler/export/parser failures produce
 a nonzero exit code; a slow or noisy kernel does not. There are no stored performance baselines or CI gates.
+The real-GPU smoke matrix in `test/python/test_benchmarks.py` exercises shared inputs, backend
+preparation, graph/event timing and pre/post checks without performance thresholds. Select it with
+`-k benchmark_gpu`, or use `-k 'not benchmark_gpu'` for that file's CPU-only tests. GPU tests skip when
+CUDA is unavailable. CPU-only tests cover shared CLI option parity, serialized cases, workload
+composition and profiler parsing.
 See [backend test coverage](backend-test-coverage.md) for the separate automated correctness matrix.

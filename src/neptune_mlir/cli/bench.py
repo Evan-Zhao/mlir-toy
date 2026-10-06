@@ -13,13 +13,7 @@ from pathlib import Path
 from neptune_mlir.benchmarks.cases import Case, suite
 from neptune_mlir.benchmarks.nsight import ProfileParseError, extract_profile
 from neptune_mlir.benchmarks.runtime import BACKENDS
-
-
-def positive_int(value):
-    n = int(value)
-    if n <= 0:
-        raise argparse.ArgumentTypeError("must be positive")
-    return n
+from neptune_mlir.cli.operators import OPERATORS, add_operator_arguments, positive_int
 
 
 def positive_float(value):
@@ -30,16 +24,8 @@ def positive_float(value):
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(
-        prog="neptune-bench",
-        description=__doc__,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "operator",
-        choices=("attn", "mamba", "suite"),
-        help="causal FP16 attention, selective scan, or three preset cases",
-    )
+    # Benchmark policy is shared by subcommands; operator flags come from export.
+    parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--backend", nargs="+", choices=(*BACKENDS, "all"), default=["triton"])
     parser.add_argument(
         "--profiler",
@@ -51,20 +37,6 @@ def parse_args(argv=None):
     parser.add_argument("--output", type=Path, help="new artifact directory (must not exist)")
     parser.add_argument("--device", type=int, default=0, help="CUDA logical device index")
     parser.add_argument("--seed", type=int, default=0)
-    shape = parser.add_argument_group("case overrides (not applicable to suite)")
-    for name in (
-        "batch",
-        "seq-len",
-        "heads",
-        "head-dim",
-        "channels",
-        "state-dim",
-        "block-m",
-        "block-n",
-        "block-channels",
-    ):
-        shape.add_argument(f"--{name}", type=positive_int)
-    shape.add_argument("--dtype", choices=("float16", "bfloat16", "float32"))
     workload = parser.add_argument_group("workload (all profilers)")
     workload.add_argument(
         "--mode",
@@ -111,6 +83,25 @@ def parse_args(argv=None):
         default=[],
         help="extra tool argument; repeat, e.g. --profiler-arg=--set=full",
     )
+    root = argparse.ArgumentParser(prog="neptune-bench", description=__doc__)
+    operators = root.add_subparsers(dest="operator", required=True)
+    for operator in (*OPERATORS, "suite"):
+        child = operators.add_parser(
+            operator,
+            parents=[parser],
+            aliases=["attn"] if operator == "dense" else [],
+            formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        )
+        if operator != "suite":
+            add_operator_arguments(child, operator)
+        if operator == "varlen":
+            child.add_argument(
+                "--doc-lengths",
+                type=int,
+                nargs="+",
+                help="runtime document lengths, including empty docs; default: balanced",
+            )
+    parser = root
     args = parser.parse_args(argv)
     if args.samples < 3:
         parser.error("--samples must be at least 3")
@@ -118,36 +109,7 @@ def parse_args(argv=None):
         parser.error("--device must be nonnegative")
     if args.profiler_arg and args.profiler == "cudaevent":
         parser.error("--profiler-arg requires --profiler nsys or ncu")
-    overrides = {
-        name: getattr(args, name)
-        for name in (
-            "batch",
-            "seq_len",
-            "heads",
-            "head_dim",
-            "channels",
-            "state_dim",
-            "dtype",
-            "block_m",
-            "block_n",
-            "block_channels",
-        )
-        if getattr(args, name) is not None
-    }
-    if args.operator == "suite":
-        if overrides:
-            parser.error("case overrides are not supported with suite; select attn or mamba")
-        args.cases = suite()
-    else:
-        unused = (
-            {"channels", "state_dim", "block_channels"}
-            if args.operator == "attn"
-            else {"heads", "head_dim", "block_m", "block_n"}
-        ) & overrides.keys()
-        if unused:
-            parser.error(f"inapplicable case overrides: {', '.join(sorted(unused))}")
-        defaults = {"dtype": "float16"} if args.operator == "attn" else {"batch": 8}
-        args.cases = [Case(args.operator, **(defaults | overrides))]
+    args.cases = suite() if args.operator == "suite" else [Case.from_args(args)]
     try:
         for case in args.cases:
             case.validate()
@@ -222,7 +184,7 @@ def run(args):
     # Validate profiler availability before creating an output directory.
     profiler_command(args.profiler, output / "unused", args.profiler_arg)
     output.mkdir(parents=True, exist_ok=False)
-    summary = {"schema_version": 1, "created_at": stamp, "revision": revision(), "results": []}
+    summary = {"schema_version": 2, "created_at": stamp, "revision": revision(), "results": []}
     print(
         "Neptune GPU benchmark (cudaevent)"
         if args.profiler == "cudaevent"
@@ -240,7 +202,8 @@ def run(args):
         )
     print(f"  Artifacts: {output}\n", flush=True)
     columns = f"{'MEDIAN us':>11} {'P20 us':>11} {'P80 us':>11} {'N':>5}  STATUS"
-    print(f"{'CASE':<38} {'BACKEND':<10} {columns}", flush=True)
+    case_width = max(38, *(len(case.name) for case in args.cases))
+    print(f"{'CASE':<{case_width}} {'BACKEND':<10} {columns}", flush=True)
     failures = 0
     device_info = None
     for case in args.cases:
@@ -268,7 +231,7 @@ def run(args):
             cmd = profiler_command(args.profiler, path / "profile", args.profiler_arg)
             cmd += [sys.executable, "-m", "neptune_mlir.benchmarks.worker", str(spec_path)]
             (path / "command.json").write_text(json.dumps(cmd, indent=2) + "\n")
-            print(f"{case.name:<38} {backend:<10} ", end="", flush=True)
+            print(f"{case.name:<{case_width}} {backend:<10} ", end="", flush=True)
             start = time.perf_counter()
             with (path / "worker.log").open("w") as log:
                 completed = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, check=False)

@@ -1,6 +1,9 @@
-"""Dense attention input generation and an FP32 Torch correctness reference."""
+"""Dense/packed attention inputs, kernel ABI arguments and FP32 Torch references."""
 
 import math
+from itertools import accumulate, pairwise
+
+from neptune_mlir.operator.variants import AttentionVariant
 
 
 def make_attn_inputs(
@@ -87,3 +90,107 @@ def reference_attn(
             scores = scores.masked_fill(~mask, float("-inf"))
         output[..., start:end, :] = torch.matmul(torch.softmax(scores, dim=-1), v_f32)
     return output
+
+
+def make_dense_arguments(options, *, device="cuda", seed=17, scale=1.0):
+    import torch
+
+    o = options
+    batch, qh = o["batch"], o["q_heads"]
+    kh = o.get("kv_heads") or qh
+    qs, ks = o["seq_len"], o.get("kv_seq_len") or o["seq_len"]
+    q = make_attn_inputs(batch, qh, qs, o["head_dim"], device=device, seed=seed, scale=scale)[0]
+    _, k, v = make_attn_inputs(
+        batch, kh, ks, o["head_dim"], device=device, seed=seed + 12, scale=scale
+    )
+    inputs = [q, k, v]
+    variant = AttentionVariant(o["variant"])
+    if variant == AttentionVariant.ALIBI_CAUSAL_ATTN:
+        inputs.append(torch.linspace(0.01, 0.3, qh, device=device))
+    elif variant == AttentionVariant.KV_FP8_CAUSAL_ATTN:
+        inputs[1:3] = [x.to(torch.float8_e4m3fn) for x in (k, v)]
+        shape = (1,) if kh == 1 else (1, kh, 1, 1)
+        inputs.extend(
+            [
+                torch.linspace(0.5, 1.25, kh, device=device).reshape(shape),
+                torch.linspace(1.5, 0.75, kh, device=device).reshape(shape),
+            ]
+        )
+    return [*inputs, torch.full_like(q, float("nan"))]
+
+
+def reference_dense(options, arguments, *, rows=None):
+    import torch
+
+    q, k, v = arguments[:3]
+    variant = AttentionVariant(options["variant"])
+    slopes = arguments[3] if variant == AttentionVariant.ALIBI_CAUSAL_ATTN else None
+    if variant == AttentionVariant.KV_FP8_CAUSAL_ATTN:
+        # The exporter dequantizes to FP16 before the dot products.
+        k, v = [(x.float() * s).half() for x, s in zip((k, v), arguments[3:5])]
+    # Exporter GQA groups use query_head % kv_heads, not repeat_interleave.
+    indices = torch.arange(q.shape[1], device=q.device) % k.shape[1]
+    k, v = [x.index_select(1, indices) for x in (k, v)]
+    return reference_attn(
+        q,
+        k,
+        v,
+        rows=rows,
+        causal=variant != AttentionVariant.GLOBAL_ATTN,
+        window_size=(
+            options.get("window_size", 128)
+            if variant == AttentionVariant.WINDOWED_CAUSAL_ATTN
+            else None
+        ),
+        alibi_slopes=slopes,
+    )
+
+
+def document_lengths(options, lengths=None):
+    """Default to a balanced deterministic packing; also accept uneven/empty docs."""
+    if lengths is None:
+        n, remainder = divmod(options["total_tokens"], options["num_docs"])
+        lengths = [n + (i < remainder) for i in range(options["num_docs"])]
+    lengths = tuple(lengths)
+    if len(lengths) != options["num_docs"] or sum(lengths) != options["total_tokens"]:
+        raise ValueError("doc_lengths must match num_docs and total_tokens")
+    if any(n < 0 or n > options["max_doc_tokens"] for n in lengths):
+        raise ValueError("document lengths must be between zero and max_doc_tokens")
+    return lengths
+
+
+def make_varlen_arguments(options, *, lengths=None, device="cuda", seed=41, scale=1.0):
+    import torch
+
+    lengths = document_lengths(options, lengths)
+    q, k, v = [
+        x.squeeze(0).transpose(0, 1).contiguous()
+        for x in make_attn_inputs(
+            1,
+            options["heads"],
+            options["total_tokens"],
+            options["head_dim"],
+            device=device,
+            seed=seed,
+            scale=scale,
+        )
+    ]
+    offsets = torch.tensor(
+        list(accumulate(lengths, initial=0)),
+        dtype=getattr(torch, options["index_dtype"]),
+        device=device,
+    )
+    return [q, k, v, offsets, torch.full_like(q, float("nan"))]
+
+
+def reference_varlen(arguments):
+    import torch
+
+    q, k, v, offsets = arguments[:4]
+    reference = torch.empty_like(q, dtype=torch.float32)
+    for start, end in pairwise(offsets.tolist()):
+        if start == end:
+            continue
+        doc = [x[start:end].transpose(0, 1).unsqueeze(0) for x in (q, k, v)]
+        reference[start:end] = reference_attn(*doc, causal=False).squeeze(0).transpose(0, 1)
+    return reference
